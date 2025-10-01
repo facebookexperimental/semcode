@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "semcode"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lancedb = "0.22"
+arrow = "55.2"
+arrow-array = "55.2"
+arrow-schema = "55.2"
+tokio = { version = "1.47.1", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+serde_bytes = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+walkdir = "2.5"
+indicatif = "0.18.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustyline = "17.0"
+colored = "3.0"
+futures = "0.3.31"
+ndarray = "0.16"
+regex = "1.11"
+rayon = "1.10"
+dirs = "5.0"
+num_cpus = "1.16"
+tree-sitter = "0.24"
+tree-sitter-c = "0.23"
+streaming-iterator = "0.1"
+once_cell = "1.20"
+crossbeam-channel = "0.5"
+sha1 = "0.10"
+blake3 = "1.8.2"
+hex = "0.4"
+dashmap = "6.1"
+tempfile = "3.14"
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tokio-tungstenite = "0.24"
+anstream = "0.6"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
+owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
+gix = "0.73"
+model2vec-rs = "0.1.4"
+
+[[bin]]
+name = "semcode-index"
+path = "src/bin/index.rs"
+
+[[bin]]
+name = "semcode"
+path = "src/bin/query.rs"
+
+[[bin]]
+name = "semcode-mcp"
+path = "src/bin/semcode-mcp.rs"
+
+[profile.release]
+debug = false
+
+[workspace]

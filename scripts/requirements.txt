@@ -1,0 +1,13 @@
+torch>=2.0.0
+transformers>=4.30.0
+onnx>=1.14.0
+onnxruntime>=1.16.0
+# For GPU support (optional):
+# onnxruntime-gpu>=1.16.0
+tokenizers>=0.13.0
+numpy>=1.24.0
+requests>=2.25.0
+tqdm>=4.60.0
+model2vec>=0.1.0
+sentence-transformers>=2.2.0
+sentencepiece>=0.1.97

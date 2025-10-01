@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# LanceDB databases
+*.db/
+*.lance/
+.semcode.db/
+linux-kernel.db/
+test.db/
+
+# Build artifacts
+/bin/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test directories
+/test_code/
+/test_output/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# claude
+.claude
