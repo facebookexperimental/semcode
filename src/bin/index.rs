@@ -583,16 +583,18 @@ fn load_git_file_to_temp(
 }
 
 /// Parse git range and get all commit SHAs in the range
+/// Uses gitoxide's built-in rev-spec parsing for proper A..B semantics
 fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>> {
-    // Only range format is supported (validated at entry point)
+    // For simplicity, let's just handle the common A..B case manually for now
+    // and use gitoxide's rev_walk properly
     if !range.contains("..") {
         return Err(anyhow::anyhow!(
-            "Invalid range format '{}': must contain '..' (e.g., 'HEAD~10..HEAD')",
+            "Only range format (A..B) is supported, got: '{}'",
             range
         ));
     }
 
-    // Parse the range (e.g., "HEAD~10..HEAD")
+    // Parse A..B manually
     let parts: Vec<&str> = range.split("..").collect();
     if parts.len() != 2 {
         return Err(anyhow::anyhow!("Invalid range format '{}'", range));
@@ -601,30 +603,50 @@ fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>
     let from_spec = parts[0];
     let to_spec = parts[1];
 
+    // Resolve the commit IDs
     let from_commit = resolve_to_commit(repo, from_spec)?;
     let to_commit = resolve_to_commit(repo, to_spec)?;
+    let from_id = from_commit.id().detach();
+    let to_id = to_commit.id().detach();
 
-    // Use gitoxide's revision walking
-    let mut shas = Vec::new();
-    let walk = to_commit
-        .ancestors()
+    // Use rev_walk with proper include/exclude
+    let walk = repo
+        .rev_walk([to_id])
+        .with_hidden([from_id])
         .sorting(Sorting::ByCommitTime(Default::default()))
         .all()?;
 
-    for commit in walk {
-        let commit = commit?;
-        let commit_id = commit.id();
+    let mut shas = Vec::new();
+    let mut commit_count = 0;
+    const MAX_COMMITS: usize = 100000; // Safety limit
 
-        // Stop when we reach the 'from' commit (exclusive)
-        if commit_id == from_commit.id() {
-            break;
+    // Iterate commits in the set "reachable from B but not from A"
+    for info in walk {
+        let info = info?;
+        commit_count += 1;
+
+        // Safety check to prevent runaway processing
+        if commit_count > MAX_COMMITS {
+            return Err(anyhow::anyhow!(
+                "Commit range {} is too large (>{} commits). This may indicate a problem with the repository.",
+                range, MAX_COMMITS
+            ));
         }
 
-        shas.push(commit_id.to_string());
+        let commit_id = info.id();
+        let commit_sha = commit_id.to_string();
+        shas.push(commit_sha);
     }
 
-    // Reverse to process commits in chronological order (oldest first)
+    // Reverse to get chronological order (oldest first)
     shas.reverse();
+
+    // Validate result count is reasonable
+    if shas.len() > 10000 {
+        eprintln!("WARNING: Range {} produced {} commits, which seems very large", range, shas.len());
+        eprintln!("WARNING: Please verify this range is correct. Use 'git rev-list --count {}' to double-check.", range);
+    }
+
     Ok(shas)
 }
 
@@ -673,8 +695,8 @@ fn stream_git_file_tuples_batch(
             }
 
             let tuple = GitFileTuple {
-                file_path: manifest_entry.relative_path,
-                file_sha,
+                file_path: manifest_entry.relative_path.clone(),
+                file_sha: file_sha.clone(),
                 object_id: manifest_entry.object_id,
             };
 
