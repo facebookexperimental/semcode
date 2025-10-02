@@ -183,7 +183,10 @@ claude --mcp-config mcp-config.json
 > func btrfs_search_slot
 
 mcp-config.json:
+
 {"mcpServers":{"semcode":{"command":"/some_path/semcode-mcp"}}}
+
+See examples/mcp-config.json for an example file
 
 #### Verify MCP Tools Are Available
 
