@@ -30,6 +30,10 @@ The MCP server can also be used by
 
 ## Quick Start
 
+### Dependencies
+
+- Install protobuf-devel
+
 ```
 **Rust:**
 Install from [rustup.rs](https://rustup.rs/)
@@ -44,25 +48,6 @@ cargo build --release
 ```
 
 Binaries end up in target/release
-
-### Model Setup (for semantic search)
-
-Note: this is mostly untested.  I've been trying nomic v2 and running it
-through model2vec to make things faster without a GPU.  There are scripts:
-
-scripts/download_direct.py
-scripts/nomic2vec.py
-
-Take the resulting model and move it to ~/.cache/semcode/model2vec.
-
-Then do a index run:
-semcode-index -s .
-
-Then do a vector run:
-semcode-index -s . --vectors
-
-Then you can do vector searches with the vgrep command either in the
-query tool or MCP.
 
 ### Basic Usage
 
@@ -159,13 +144,6 @@ Use the `-j` flag to control parallelism:
 
 The default is to try and saturate your cpus.
 
-### Model Storage
-
-This is only relevant for vector searching
-
-Models are stored in:
-`~/.cache/semcode/models/`
-
 ### Proxy Support
 
 The model setup script honors standard proxy environment variables:
@@ -174,21 +152,6 @@ The model setup script honors standard proxy environment variables:
 export HTTP_PROXY=http://proxy.company.com:8080
 export HTTPS_PROXY=http://proxy.company.com:8080
 python scripts/direct_download.py
-```
-
-## Development
-
-### Building from Source
-
-```bash
-# Development build
-cargo build
-
-# Release build with optimizations
-cargo build --release
-
-# Run tests (if available)
-cargo test
 ```
 
 ## MCP (Model Context Protocol) Server
@@ -209,7 +172,7 @@ The MCP server provides these tools:
 - `grep_functions` - regex searches through function bodies
 - `vgrep_functions` - vector searches through function bodies
 
-#### Step 2: Configuration
+### MCP Configuration
 
 Check your claude documentation on this one, but it is setup for one
 semcode-mcp server per claude instance.
@@ -222,7 +185,7 @@ claude --mcp-config mcp-config.json
 mcp-config.json:
 {"mcpServers":{"semcode":{"command":"/some_path/semcode-mcp"}}}
 
-#### Step 3: Verify Tools Are Available
+#### Verify MCP Tools Are Available
 
 Ask Claude to list available tools:
 ```
@@ -252,6 +215,33 @@ You can test the MCP server outside of Claude:
 - The MCP server operates in read-only mode
 - It only accesses the pre-indexed database files
 - All queries are logged to stderr for debugging
+
+### Model Setup (for vector search)
+
+Note: this is mostly untested, and not required for general usage.  I've been
+trying nomic v2 and running it through model2vec to make things faster without
+a GPU.  There are scripts:
+
+scripts/direct_download.py
+scripts/nomic2vec.py
+
+Take the resulting model and move it to ~/.cache/semcode/model2vec.
+
+Then do a index run:
+semcode-index -s .
+
+Then do a vector run:
+semcode-index -s . --vectors
+
+Then you can do vector searches with the vgrep command either in the
+query tool or MCP.
+
+### Model Storage
+
+This is only relevant for vector searching
+
+Models are stored in:
+`~/.cache/semcode/models/`
 
 ## License
 
