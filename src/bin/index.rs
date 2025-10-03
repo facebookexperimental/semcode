@@ -856,6 +856,16 @@ fn process_git_tuples_streaming(
         gix::discover(&repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
     let commit_shas = list_shas_in_range(&repo, &git_range)?;
 
+    // Handle empty commit range early - return empty results
+    if commit_shas.is_empty() {
+        return Ok(GitTupleResults {
+            functions: Vec::new(),
+            types: Vec::new(),
+            macros: Vec::new(),
+            files_processed: 0,
+        });
+    }
+
     // Determine number of generator threads (up to 32, but not more than commits)
     let max_generators = std::cmp::min(num_cpus::get(), 32);
     let num_generators = std::cmp::min(max_generators, commit_shas.len()).max(1);
