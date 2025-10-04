@@ -53,20 +53,19 @@ async fn mcp_query_function_or_macro(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            // Get call relationships for this specific function
+            // Get call relationships for this specific function to show counts
             let calls = db
                 .get_function_callees_git_aware(&func.name, git_sha)
                 .await
                 .unwrap_or_default();
 
-            let calls_str = if calls.is_empty() {
-                "none".to_string()
-            } else {
-                calls.join(", ")
-            };
+            let callers = db
+                .get_function_callers_git_aware(name, git_sha)
+                .await
+                .unwrap_or_default();
 
             result.push_str(&format!(
-                "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {}\nBody:\n{}\n\n",
+                "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
                 func.name,
                 git_sha,
                 func.file_path,
@@ -74,22 +73,10 @@ async fn mcp_query_function_or_macro(
                 func.line_end,
                 func.return_type,
                 params_str,
-                calls_str,
+                calls.len(),
+                callers.len(),
                 func.body
             ));
-
-            // Show callers
-            let callers = db
-                .get_function_callers_git_aware(name, git_sha)
-                .await
-                .unwrap_or_default();
-
-            if !callers.is_empty() {
-                let callers_str = callers.join(", ");
-                result.push_str(&format!("Called by: {callers_str}\n"));
-            } else {
-                result.push_str("Called by: none\n");
-            }
 
             result
         }
@@ -100,28 +87,16 @@ async fn mcp_query_function_or_macro(
                 None => "none".to_string(),
             };
 
-            // Get macro call relationships
+            // Get macro call relationships to show counts
             let macro_calls = mac.calls.clone().unwrap_or_default();
             let macro_callers = db
                 .get_function_callers_git_aware(&mac.name, git_sha)
                 .await
                 .unwrap_or_default();
 
-            let calls_str = if macro_calls.is_empty() {
-                "none".to_string()
-            } else {
-                macro_calls.join(", ")
-            };
-
-            let callers_str = if macro_callers.is_empty() {
-                "none".to_string()
-            } else {
-                macro_callers.join(", ")
-            };
-
             format!(
-                "Macro: {} (git SHA: {})\nFile: {}:{}\nParameters: ({})\nCalls: {}\nCalled by: {}\nDefinition:\n{}",
-                mac.name, git_sha, mac.file_path, mac.line_start, params_str, calls_str, callers_str, mac.definition
+                "Macro: {} (git SHA: {})\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}",
+                mac.name, git_sha, mac.file_path, mac.line_start, params_str, macro_calls.len(), macro_callers.len(), mac.definition
             )
         }
         (Some(func), Some(mac)) => {
@@ -138,21 +113,20 @@ async fn mcp_query_function_or_macro(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            // Get call relationships for this function
+            // Get call relationships for counts
             let func_calls = db
                 .get_function_callees_git_aware(&func.name, git_sha)
                 .await
                 .unwrap_or_default();
 
-            let func_calls_str = if func_calls.is_empty() {
-                "none".to_string()
-            } else {
-                func_calls.join(", ")
-            };
+            let func_callers = db
+                .get_function_callers_git_aware(name, git_sha)
+                .await
+                .unwrap_or_default();
 
             result.push_str(&format!(
-                "Function: {}\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {}\nBody:\n{}\n\n",
-                func.name, func.file_path, func.line_start, func.line_end, func.return_type, func_params_str, func_calls_str, func.body
+                "Function: {}\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
+                func.name, func.file_path, func.line_start, func.line_end, func.return_type, func_params_str, func_calls.len(), func_callers.len(), func.body
             ));
 
             // Display macro
@@ -162,29 +136,11 @@ async fn mcp_query_function_or_macro(
             };
 
             let macro_calls = mac.calls.clone().unwrap_or_default();
-            let macro_calls_str = if macro_calls.is_empty() {
-                "none".to_string()
-            } else {
-                macro_calls.join(", ")
-            };
 
             result.push_str(&format!(
-                "==> Macro:\nMacro: {}\nFile: {}:{}\nParameters: ({})\nCalls: {}\nDefinition:\n{}\n\n",
-                mac.name, mac.file_path, mac.line_start, macro_params_str, macro_calls_str, mac.definition
+                "==> Macro:\nMacro: {}\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}\n\n",
+                mac.name, mac.file_path, mac.line_start, macro_params_str, macro_calls.len(), func_callers.len(), mac.definition
             ));
-
-            // Show callers for function and macro
-            let all_callers = db
-                .get_function_callers_git_aware(name, git_sha)
-                .await
-                .unwrap_or_default();
-
-            if !all_callers.is_empty() {
-                let callers_str = all_callers.join(", ");
-                result.push_str(&format!(
-                    "==> Callers to '{name}' function and macro:\nCalled by: {callers_str}\n"
-                ));
-            }
 
             result
         }
