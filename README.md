@@ -32,9 +32,9 @@ The MCP server can also be used by
 
 ### Dependencies
 
-- Install protobuf-devel
-
 ```
+Install protobuf-devel from your distro
+
 **Rust:**
 Install from [rustup.rs](https://rustup.rs/)
 
