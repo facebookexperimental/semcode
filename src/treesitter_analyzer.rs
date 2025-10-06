@@ -34,6 +34,7 @@ impl TreeSitterAnalyzer {
             r#"
             ; Standard function definitions with bodies
             (function_definition
+                type: (_) @return_type
                 declarator: (function_declarator
                     declarator: (identifier) @function_name
                     parameters: (parameter_list) @parameters
@@ -41,8 +42,9 @@ impl TreeSitterAnalyzer {
                 body: (compound_statement) @body
             ) @function
 
-            ; Function pointers with bodies
+            ; Function pointers with bodies (single level)
             (function_definition
+                type: (_) @return_type
                 declarator: (pointer_declarator
                     declarator: (function_declarator
                         declarator: (identifier) @function_name
@@ -52,9 +54,24 @@ impl TreeSitterAnalyzer {
                 body: (compound_statement) @body
             ) @function_ptr
 
+            ; Function pointers with bodies (double level, e.g. struct fsverity_info **)
+            (function_definition
+                type: (_) @return_type
+                declarator: (pointer_declarator
+                    declarator: (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: (identifier) @function_name
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                )
+                body: (compound_statement) @body
+            ) @function_ptr2
+
             ; Function declarations without bodies (prototypes only)
             (declaration
-                (function_declarator
+                type: (_) @return_type
+                declarator: (function_declarator
                     declarator: (identifier) @function_name
                     parameters: (parameter_list) @parameters
                 )
@@ -410,7 +427,7 @@ impl TreeSitterAnalyzer {
                     "body" => {
                         line_end = node.end_position().row as u32 + 1;
                     }
-                    "function" | "function_ptr" => {
+                    "function" | "function_ptr" | "function_ptr2" => {
                         // All function types with bodies - process fully
                         function_start_byte = node.start_byte();
                         function_end_byte = node.end_byte();
@@ -477,7 +494,8 @@ impl TreeSitterAnalyzer {
                 // Determine if this function has a body based on matched patterns
                 let has_body = matched_patterns.contains("body")
                     || matched_patterns.contains("function")
-                    || matched_patterns.contains("function_ptr");
+                    || matched_patterns.contains("function_ptr")
+                    || matched_patterns.contains("function_ptr2");
 
                 // Extract complete function text including top comments
                 let complete_body = self.extract_function_with_comments(
