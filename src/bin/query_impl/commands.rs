@@ -180,7 +180,7 @@ pub async fn handle_command(
                     println!("{}", "Usage: grep [--git <sha>] [-v] [-p <path_regex>] [--limit <N>] <regex_pattern>".red());
                 } else {
                     let pattern = pattern_parts.join(" ");
-                    grep_function_bodies(
+                    match grep_function_bodies(
                         db,
                         &pattern,
                         verbose,
@@ -188,7 +188,14 @@ pub async fn handle_command(
                         limit,
                         &git_sha,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            println!("{} {}", "Error:".red(), e);
+                            println!("{} Check your regex pattern syntax and try again.", "Hint:".yellow());
+                        }
+                    }
                 }
             }
         }

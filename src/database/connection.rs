@@ -2242,10 +2242,8 @@ impl DatabaseManager {
         use futures::TryStreamExt;
 
         // Step 1: Search all content shard tables for matching content
-        // Escape special characters in the pattern for SQL string literal
-        let escaped_pattern = pattern
-            .replace("\\", "\\\\") // Escape backslashes first
-            .replace("'", "''"); // Escape single quotes for SQL
+        // Only escape single quotes for SQL string literal - preserve backslashes for regex
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(content, '{escaped_pattern}')");
 

@@ -1248,10 +1248,8 @@ impl SearchManager {
     pub async fn search_types_regex(&self, pattern: &str) -> Result<Vec<TypeInfo>> {
         let table = self.connection.open_table("types").execute().await?;
 
-        // Escape special characters in the pattern for SQL string literal
-        let escaped_pattern = pattern
-            .replace("\\", "\\\\") // Escape backslashes first
-            .replace("'", "''"); // Escape single quotes for SQL
+        // Only escape single quotes for SQL string literal - preserve backslashes for regex
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let results = table
@@ -1347,7 +1345,7 @@ impl SearchManager {
         git_sha: &str,
     ) -> Result<Vec<TypeInfo>> {
         let table = self.connection.open_table("types").execute().await?;
-        let escaped_pattern = pattern.replace("\\", "\\\\").replace("'", "''");
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let initial_results = table
@@ -1500,10 +1498,8 @@ impl SearchManager {
     pub async fn search_typedefs_regex(&self, pattern: &str) -> Result<Vec<TypedefInfo>> {
         let table = self.connection.open_table("types").execute().await?;
 
-        // Escape special characters in the pattern for SQL string literal
-        let escaped_pattern = pattern
-            .replace("\\", "\\\\") // Escape backslashes first
-            .replace("'", "''"); // Escape single quotes for SQL
+        // Only escape single quotes for SQL string literal - preserve backslashes for regex
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let results = table
@@ -1594,7 +1590,7 @@ impl SearchManager {
         git_sha: &str,
     ) -> Result<Vec<TypedefInfo>> {
         let table = self.connection.open_table("types").execute().await?;
-        let escaped_pattern = pattern.replace("\\", "\\\\").replace("'", "''");
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let initial_results = table
@@ -1730,10 +1726,8 @@ impl SearchManager {
     pub async fn search_functions_regex(&self, pattern: &str) -> Result<Vec<FunctionInfo>> {
         let table = self.connection.open_table("functions").execute().await?;
 
-        // Escape special characters in the pattern for SQL string literal
-        let escaped_pattern = pattern
-            .replace("\\", "\\\\") // Escape backslashes first
-            .replace("'", "''"); // Escape single quotes for SQL
+        // Only escape single quotes for SQL string literal - preserve backslashes for regex
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let results = table
@@ -1845,7 +1839,7 @@ impl SearchManager {
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
         let table = self.connection.open_table("functions").execute().await?;
-        let escaped_pattern = pattern.replace("\\", "\\\\").replace("'", "''");
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let initial_results = table
@@ -2004,7 +1998,7 @@ impl SearchManager {
     pub async fn search_macros_regex(&self, pattern: &str) -> Result<Vec<MacroInfo>> {
         let table = self.connection.open_table("macros").execute().await?;
 
-        let escaped_pattern = pattern.replace("\\", "\\\\").replace("'", "''");
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let results = table
@@ -2116,7 +2110,7 @@ impl SearchManager {
         git_sha: &str,
     ) -> Result<Vec<MacroInfo>> {
         let table = self.connection.open_table("macros").execute().await?;
-        let escaped_pattern = pattern.replace("\\", "\\\\").replace("'", "''");
+        let escaped_pattern = pattern.replace("'", "''");
 
         let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
         let initial_results = table
