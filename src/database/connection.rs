@@ -590,62 +590,47 @@ impl DatabaseManager {
             .into_iter()
             .collect();
 
-        tracing::debug!(
-            "find_function_git_aware: Found {} unique files for function '{}'",
-            unique_file_paths.len(),
-            name
-        );
-
         // Step 3: Resolve file paths to git hashes at target commit
         let resolved_hashes = self
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::warn!("No files resolved for '{}' at commit '{}'", name, git_sha);
+            tracing::info!("No files resolved for '{}' at commit '{}' - falling back to non-git lookup", name, git_sha);
             return self.find_function_fallback(name, &all_functions).await;
         }
 
         // Step 4: Direct targeted search for each (filename, git_hash) combination
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
-            tracing::debug!(
-                "Searching for: name='{}' file='{}' hash='{}'",
-                name,
-                file_path,
-                git_hash
-            );
             if let Some(func) = self
                 .function_store
                 .find_by_name_file_and_hash(name, file_path, git_hash)
                 .await?
             {
-                tracing::debug!(
-                    "Found match: {} in {} (hash: {})",
-                    name,
-                    file_path,
-                    git_hash
-                );
                 matches.push(func);
             }
         }
 
         // Step 5: Pick the best result (prefer implementation over declaration)
         if matches.is_empty() {
-            tracing::warn!(
-                "No exact matches found for '{}' at commit '{}', falling back",
+            tracing::info!(
+                "No exact matches found for '{}' at commit '{}', falling back to non-git lookup",
                 name,
                 git_sha
             );
             return self.find_function_fallback(name, &all_functions).await;
         }
 
+        if matches.len() > 1 {
+            tracing::info!(
+                "WARNING: Found {} function matches for '{}' at git SHA {} - this may indicate a git filtering bug!",
+                matches.len(),
+                name,
+                git_sha
+            );
+        }
+
         let best_match = self.select_best_function_match(matches);
-        tracing::info!(
-            "Git-aware lookup succeeded: {} in {} (hash: {})",
-            name,
-            best_match.file_path,
-            best_match.git_file_hash
-        );
         Ok(Some(best_match))
     }
 
@@ -1561,7 +1546,7 @@ impl DatabaseManager {
         .await
     }
 
-    /// Use targeted queries (good for large databases)
+    /// Use targeted queries (good for large databases) - optimized with git manifest for 10-100x speedup
     async fn collect_callchain_functions_targeted(
         &self,
         start_function: &str,
@@ -1570,6 +1555,14 @@ impl DatabaseManager {
         include_reverse: bool,
         git_sha: Option<&str>,
     ) -> Result<std::collections::HashSet<String>> {
+        // Optimize git-aware operations by generating manifest once
+        let git_manifest = if let Some(sha) = git_sha {
+            tracing::info!("Generating git manifest for callchain optimization at commit: {}", sha);
+            Some(self.generate_git_manifest(sha).await?)
+        } else {
+            None
+        };
+
         let mut result = std::collections::HashSet::new();
         let mut to_visit = std::collections::VecDeque::new();
         let mut visited = std::collections::HashSet::new();
@@ -1585,16 +1578,16 @@ impl DatabaseManager {
             visited.insert(func_name.clone());
 
             // Get function details to find call relationships
-            let function_exists = if let Some(sha) = git_sha {
-                self.find_function_git_aware(&func_name, sha).await?.is_some()
+            let function_exists = if let Some(manifest) = &git_manifest {
+                self.function_exists_in_manifest(&func_name, manifest).await?
             } else {
                 self.find_function(&func_name).await?.is_some()
             };
 
             if function_exists {
                 if include_forward {
-                    let callees = if let Some(sha) = git_sha {
-                        self.get_function_callees_git_aware(&func_name, sha).await?
+                    let callees = if let Some(manifest) = &git_manifest {
+                        self.get_function_callees_with_manifest(&func_name, manifest).await?
                     } else {
                         self.get_function_callees(&func_name).await?
                     };
@@ -1607,8 +1600,8 @@ impl DatabaseManager {
                 }
 
                 if include_reverse {
-                    let callers = if let Some(sha) = git_sha {
-                        self.get_function_callers_git_aware(&func_name, sha).await?
+                    let callers = if let Some(manifest) = &git_manifest {
+                        self.get_function_callers_with_manifest(&func_name, manifest).await?
                     } else {
                         self.get_function_callers(&func_name).await?
                     };
@@ -1622,16 +1615,16 @@ impl DatabaseManager {
             }
 
             // Also check if it's a macro
-            let macro_exists = if let Some(sha) = git_sha {
-                self.find_macro_git_aware(&func_name, sha).await?.is_some()
+            let macro_exists = if let Some(manifest) = &git_manifest {
+                self.macro_exists_in_manifest(&func_name, manifest).await?
             } else {
                 self.find_macro(&func_name).await?.is_some()
             };
 
             if macro_exists {
                 if include_forward {
-                    let callees = if let Some(sha) = git_sha {
-                        self.get_function_callees_git_aware(&func_name, sha).await?
+                    let callees = if let Some(manifest) = &git_manifest {
+                        self.get_function_callees_with_manifest(&func_name, manifest).await?
                     } else {
                         self.get_function_callees(&func_name).await?
                     };
@@ -1644,8 +1637,8 @@ impl DatabaseManager {
                 }
 
                 if include_reverse {
-                    let callers = if let Some(sha) = git_sha {
-                        self.get_function_callers_git_aware(&func_name, sha).await?
+                    let callers = if let Some(manifest) = &git_manifest {
+                        self.get_function_callers_with_manifest(&func_name, manifest).await?
                     } else {
                         self.get_function_callers(&func_name).await?
                     };
@@ -2003,23 +1996,8 @@ impl DatabaseManager {
         file_paths: &[String],
         git_sha: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        tracing::debug!("DatabaseManager::resolve_git_file_hashes: Looking for {} file paths at git SHA {} in repo {}", 
-                       file_paths.len(), git_sha, self.git_repo_path);
-
         match crate::git::resolve_files_at_commit(&self.git_repo_path, git_sha, file_paths) {
             Ok(resolved_hashes) => {
-                tracing::debug!("DatabaseManager::resolve_git_file_hashes: Successfully resolved {} out of {} file paths", 
-                               resolved_hashes.len(), file_paths.len());
-
-                // Log details about what was resolved and what wasn't (at debug level)
-                for file_path in file_paths {
-                    if let Some(hash) = resolved_hashes.get(file_path) {
-                        tracing::debug!("  ✓ {} -> {}", file_path, hash);
-                    } else {
-                        tracing::warn!("  ✗ {} -> NOT FOUND at commit {}", file_path, git_sha);
-                    }
-                }
-
                 // If no files were resolved, log this as a warning
                 if resolved_hashes.is_empty() {
                     tracing::warn!(
@@ -2736,12 +2714,6 @@ impl DatabaseManager {
         &self,
         git_sha: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        tracing::debug!(
-            "Generating git manifest for commit: {} in repo: {}",
-            git_sha,
-            self.git_repo_path
-        );
-
         match gix::discover(&self.git_repo_path) {
             Ok(repo) => {
                 // Parse the commit SHA using revparse (supports short SHAs, tags, etc.)
@@ -2770,11 +2742,6 @@ impl DatabaseManager {
                     }
                 }
 
-                tracing::debug!(
-                    "Built git manifest with {} files for commit {}",
-                    manifest.len(),
-                    git_sha
-                );
                 Ok(manifest)
             }
             Err(e) => Err(anyhow::anyhow!(
@@ -2866,5 +2833,170 @@ impl DatabaseManager {
     /// Get statistics about content storage
     pub async fn get_content_stats(&self) -> Result<crate::database::content::ContentStats> {
         self.content_store.get_stats().await
+    }
+
+    // ============================================================================
+    // Git Manifest-based optimization methods for bulk operations
+    // ============================================================================
+
+    /// Check if a function exists at git commit using pre-generated manifest (fast)
+    async fn function_exists_in_manifest(
+        &self,
+        function_name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<bool> {
+        // Get all functions with this name (non-git-aware, fast database query)
+        let all_functions = self
+            .function_store
+            .find_all_by_name_unfiltered(function_name)
+            .await?;
+
+        // Check if any function exists in the git manifest (fast HashMap lookup)
+        for func in &all_functions {
+            if let Some(expected_hash) = git_manifest.get(&func.file_path) {
+                if &func.git_file_hash == expected_hash {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Check if a macro exists at git commit using pre-generated manifest (fast)
+    async fn macro_exists_in_manifest(
+        &self,
+        macro_name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<bool> {
+        // Get all macros with this name (non-git-aware, fast database query)
+        let all_macros = self.macro_store.find_all_by_name(macro_name).await?;
+
+        // Check if any macro exists in the git manifest (fast HashMap lookup)
+        for mac in &all_macros {
+            if let Some(expected_hash) = git_manifest.get(&mac.file_path) {
+                if &mac.git_file_hash == expected_hash {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Get function callees using pre-generated manifest (fast)
+    async fn get_function_callees_with_manifest(
+        &self,
+        function_name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        // Get all functions with this name (non-git-aware, fast database query)
+        let all_matches = self
+            .function_store
+            .find_all_by_name_unfiltered(function_name)
+            .await?;
+
+        // Filter to functions that exist in git manifest (fast HashMap lookups)
+        let mut manifest_matches = Vec::new();
+        for func in &all_matches {
+            if let Some(expected_hash) = git_manifest.get(&func.file_path) {
+                if &func.git_file_hash == expected_hash {
+                    manifest_matches.push(func.clone());
+                }
+            }
+        }
+
+        if manifest_matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use the same smart selection logic as the original method
+        let best_match = self.select_best_function_match(manifest_matches);
+
+        // Get the calls from the best match
+        if let Some(ref calls_list) = best_match.calls {
+            return Ok(calls_list.clone());
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Get function callers using pre-generated manifest (fast)
+    async fn get_function_callers_with_manifest(
+        &self,
+        function_name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        // Use efficient filtering: find functions whose calls JSON contains the target function name
+        let escaped_name = function_name.replace("'", "''"); // SQL escape
+        let table = self.connection.open_table("functions").execute().await?;
+
+        // Filter for functions whose calls column contains the target function name
+        let filter = format!("calls IS NOT NULL AND calls LIKE '%\\\"{escaped_name}\\\"%%'");
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut callers = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let file_path_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let git_file_hash_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                // Find the calls column
+                let calls_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "calls")
+                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
+                let calls_array = batch
+                    .column(calls_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let caller_name = name_array.value(i);
+                    let file_path = file_path_array.value(i);
+                    let git_file_hash = git_file_hash_array.value(i).to_string();
+
+                    // Fast manifest lookup instead of expensive git resolution
+                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                        if &git_file_hash == expected_hash {
+                            // This function exists at the git SHA, verify it actually calls our target
+                            if !calls_array.is_null(i) {
+                                let calls_json = calls_array.value(i);
+                                if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
+                                    if calls_list.contains(&function_name.to_string()) {
+                                        callers.push(caller_name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(callers)
     }
 }

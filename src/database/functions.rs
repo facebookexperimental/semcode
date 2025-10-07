@@ -392,17 +392,11 @@ impl FunctionStore {
             .try_collect::<Vec<_>>()
             .await?;
 
-        // Search through all batches for the exact hash match using padded hash
+        // Search through all batches for the exact hash match
         for batch in &results {
             for i in 0..batch.num_rows() {
                 if let Some(func) = self.extract_function_from_batch(batch, i).await? {
                     if func.git_file_hash == git_hash_to_match {
-                        tracing::debug!(
-                            "Found exact match for '{}' in '{}' with git hash '{}'",
-                            name,
-                            file_path,
-                            git_file_hash
-                        );
                         return Ok(Some(func));
                     }
                 }
