@@ -6,6 +6,7 @@ use regex;
 use semcode::{git, DatabaseManager};
 
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
+use owo_colors::OwoColorize as _;
 use semcode::display::print_help;
 use semcode::search::{
     dump_calls, dump_content, dump_functions, dump_macros, dump_processed_files, dump_typedefs,
@@ -72,6 +73,181 @@ fn parse_verbose_flag<'a>(parts: &'a [&'a str]) -> (Vec<&'a str>, bool) {
     }
 
     (remaining, verbose)
+}
+
+/// Show callchain using git-aware methods directly (same approach as working MCP tool)
+async fn show_callchain_with_limits(
+    db: &DatabaseManager,
+    function_name: &str,
+    git_sha: &str,
+    up_levels: usize,
+    down_levels: usize,
+    calls_limit: usize,
+) -> Result<()> {
+    println!("Building call chain for: {}", function_name.cyan());
+    println!("Git SHA: {}", git_sha.bright_black());
+    println!(
+        "Configuration: up_levels={}, down_levels={}, calls_limit={}\n",
+        up_levels, down_levels, calls_limit
+    );
+
+    // First, check if function exists using git-aware query
+    let func_opt = db.find_function_git_aware(function_name, git_sha).await?;
+
+    let func = match func_opt {
+        Some(f) => f,
+        None => {
+            println!(
+                "{} Function '{}' not found in database at git SHA {}",
+                "Error:".red(),
+                function_name,
+                git_sha
+            );
+            return Ok(());
+        }
+    };
+
+    println!("{}", "=== Function Information ===".bold().green());
+    println!(
+        "Function: {} ({}:{})",
+        func.name, func.file_path, func.line_start
+    );
+    println!("Return Type: {}", func.return_type);
+
+    if !func.parameters.is_empty() {
+        println!("Parameters:");
+        for param in &func.parameters {
+            println!("  - {} {}", param.type_name, param.name);
+        }
+    }
+
+    // Get callers and callees using git-aware methods (same as MCP tool)
+    let callers = db.get_function_callers_git_aware(function_name, git_sha).await?;
+    let callees = db.get_function_callees_git_aware(function_name, git_sha).await?;
+
+    // Show callers with depth and limit control
+    if !callers.is_empty() && up_levels > 0 {
+        println!(
+            "\n{} ({} levels)",
+            "=== Reverse Chain (Callers) ===".bold().magenta(),
+            up_levels
+        );
+
+        let limited_callers: Vec<_> = if calls_limit == 0 {
+            callers.clone()
+        } else {
+            callers.iter().take(calls_limit).cloned().collect()
+        };
+
+        for (i, caller) in limited_callers.iter().enumerate() {
+            println!("{}. {}", (i + 1).to_string().yellow(), caller.cyan());
+
+            // Show caller details if available
+            if let Ok(Some(caller_func)) = db.find_function_git_aware(caller, git_sha).await {
+                println!(
+                    "   └─ {} ({}:{})",
+                    caller_func.return_type.bright_black(),
+                    caller_func.file_path.bright_black(),
+                    caller_func.line_start.to_string().bright_black()
+                );
+            }
+
+            // For multi-level depth, show second-level callers
+            if up_levels > 1 {
+                if let Ok(second_level_callers) = db.get_function_callers_git_aware(caller, git_sha).await {
+                    let limited_second: Vec<_> = if calls_limit == 0 {
+                        second_level_callers
+                    } else {
+                        second_level_callers.iter().take(calls_limit).cloned().collect()
+                    };
+
+                    for second_caller in limited_second.iter().take(3) {
+                        println!("      └─ {}", second_caller.bright_black());
+                    }
+                    if limited_second.len() > 3 {
+                        println!("      └─ ... and {} more", limited_second.len() - 3);
+                    }
+                }
+            }
+        }
+
+        if calls_limit > 0 && callers.len() > calls_limit {
+            println!(
+                "... and {} more callers (limited by calls_limit={})",
+                callers.len() - calls_limit,
+                calls_limit
+            );
+        }
+    }
+
+    // Show callees with depth and limit control
+    if !callees.is_empty() && down_levels > 0 {
+        println!(
+            "\n{} ({} levels)",
+            "=== Forward Chain (Callees) ===".bold().blue(),
+            down_levels
+        );
+
+        let limited_callees: Vec<_> = if calls_limit == 0 {
+            callees.clone()
+        } else {
+            callees.iter().take(calls_limit).cloned().collect()
+        };
+
+        for (i, callee) in limited_callees.iter().enumerate() {
+            println!("{}. {}", (i + 1).to_string().yellow(), callee.cyan());
+
+            // Show callee details if available
+            if let Ok(Some(callee_func)) = db.find_function_git_aware(callee, git_sha).await {
+                println!(
+                    "   └─ {} ({}:{})",
+                    callee_func.return_type.bright_black(),
+                    callee_func.file_path.bright_black(),
+                    callee_func.line_start.to_string().bright_black()
+                );
+            }
+
+            // For multi-level depth, show second-level callees
+            if down_levels > 1 {
+                if let Ok(second_level_callees) = db.get_function_callees_git_aware(callee, git_sha).await {
+                    let limited_second: Vec<_> = if calls_limit == 0 {
+                        second_level_callees
+                    } else {
+                        second_level_callees.iter().take(calls_limit).cloned().collect()
+                    };
+
+                    for second_callee in limited_second.iter().take(3) {
+                        println!("      └─ {}", second_callee.bright_black());
+                    }
+                    if limited_second.len() > 3 {
+                        println!("      └─ ... and {} more", limited_second.len() - 3);
+                    }
+                }
+            }
+        }
+
+        if calls_limit > 0 && callees.len() > calls_limit {
+            println!(
+                "... and {} more callees (limited by calls_limit={})",
+                callees.len() - calls_limit,
+                calls_limit
+            );
+        }
+    }
+
+    // Summary
+    println!("\n{}", "=== Summary ===".bold().green());
+    println!("Total direct callers: {}", callers.len());
+    println!("Total direct callees: {}", callees.len());
+
+    if callers.is_empty() && callees.is_empty() {
+        println!(
+            "{} This function is isolated (no callers or callees)",
+            "Info:".yellow()
+        );
+    }
+
+    Ok(())
 }
 
 pub async fn handle_command(
@@ -381,15 +557,13 @@ pub async fn handle_command(
                     return Ok(false);
                 }
 
-                // Use the new efficient callchain implementation with custom limits
-                db.show_callchain_efficient_with_limits(
-                    &function_name,
-                    Some(&git_sha),
-                    up_levels,
-                    down_levels,
-                    calls_limit,
-                )
-                .await?;
+                // Use the same approach as the working MCP tool - call git-aware methods directly
+                match show_callchain_with_limits(db, &function_name, &git_sha, up_levels, down_levels, calls_limit).await {
+                    Ok(()) => {},
+                    Err(e) => {
+                        println!("{} Failed to show callchain: {}", "Error:".red(), e);
+                    }
+                }
             }
         }
         "paths" => {

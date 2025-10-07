@@ -1505,6 +1505,7 @@ impl DatabaseManager {
         max_depth: usize,
         include_forward: bool,
         include_reverse: bool,
+        git_sha: Option<&str>,
     ) -> Result<std::collections::HashSet<String>> {
         // For small databases (< 1000 functions), use the old full-scan approach
         // For large databases, use targeted queries
@@ -1517,6 +1518,7 @@ impl DatabaseManager {
                 max_depth,
                 include_forward,
                 include_reverse,
+                git_sha,
             )
             .await
         } else {
@@ -1526,6 +1528,7 @@ impl DatabaseManager {
                 max_depth,
                 include_forward,
                 include_reverse,
+                git_sha,
             )
             .await
         }
@@ -1544,6 +1547,7 @@ impl DatabaseManager {
         max_depth: usize,
         include_forward: bool,
         include_reverse: bool,
+        git_sha: Option<&str>,
     ) -> Result<std::collections::HashSet<String>> {
         // For small databases, we'll still use the targeted approach with call store
         // since the embedded call fields have been removed
@@ -1552,6 +1556,7 @@ impl DatabaseManager {
             max_depth,
             include_forward,
             include_reverse,
+            git_sha,
         )
         .await
     }
@@ -1563,6 +1568,7 @@ impl DatabaseManager {
         max_depth: usize,
         include_forward: bool,
         include_reverse: bool,
+        git_sha: Option<&str>,
     ) -> Result<std::collections::HashSet<String>> {
         let mut result = std::collections::HashSet::new();
         let mut to_visit = std::collections::VecDeque::new();
@@ -1579,9 +1585,19 @@ impl DatabaseManager {
             visited.insert(func_name.clone());
 
             // Get function details to find call relationships
-            if let Some(_func) = self.find_function(&func_name).await? {
+            let function_exists = if let Some(sha) = git_sha {
+                self.find_function_git_aware(&func_name, sha).await?.is_some()
+            } else {
+                self.find_function(&func_name).await?.is_some()
+            };
+
+            if function_exists {
                 if include_forward {
-                    let callees = self.get_function_callees(&func_name).await?;
+                    let callees = if let Some(sha) = git_sha {
+                        self.get_function_callees_git_aware(&func_name, sha).await?
+                    } else {
+                        self.get_function_callees(&func_name).await?
+                    };
                     for callee in callees {
                         if !result.contains(&callee) {
                             result.insert(callee.clone());
@@ -1591,7 +1607,11 @@ impl DatabaseManager {
                 }
 
                 if include_reverse {
-                    let callers = self.get_function_callers(&func_name).await?;
+                    let callers = if let Some(sha) = git_sha {
+                        self.get_function_callers_git_aware(&func_name, sha).await?
+                    } else {
+                        self.get_function_callers(&func_name).await?
+                    };
                     for caller in callers {
                         if !result.contains(&caller) {
                             result.insert(caller.clone());
@@ -1602,9 +1622,19 @@ impl DatabaseManager {
             }
 
             // Also check if it's a macro
-            if let Some(_macro_info) = self.find_macro(&func_name).await? {
+            let macro_exists = if let Some(sha) = git_sha {
+                self.find_macro_git_aware(&func_name, sha).await?.is_some()
+            } else {
+                self.find_macro(&func_name).await?.is_some()
+            };
+
+            if macro_exists {
                 if include_forward {
-                    let callees = self.get_function_callees(&func_name).await?;
+                    let callees = if let Some(sha) = git_sha {
+                        self.get_function_callees_git_aware(&func_name, sha).await?
+                    } else {
+                        self.get_function_callees(&func_name).await?
+                    };
                     for callee in callees {
                         if !result.contains(&callee) {
                             result.insert(callee.clone());
@@ -1614,7 +1644,11 @@ impl DatabaseManager {
                 }
 
                 if include_reverse {
-                    let callers = self.get_function_callers(&func_name).await?;
+                    let callers = if let Some(sha) = git_sha {
+                        self.get_function_callers_git_aware(&func_name, sha).await?
+                    } else {
+                        self.get_function_callers(&func_name).await?
+                    };
                     for caller in callers {
                         if !result.contains(&caller) {
                             result.insert(caller.clone());
@@ -2693,395 +2727,9 @@ impl DatabaseManager {
         Ok(valid_callers)
     }
 
-    /// Efficient callchain function that loads git manifest once and reuses it
-    pub async fn show_callchain_efficient(
-        &self,
-        target_function: &str,
-        git_sha: Option<&str>,
-    ) -> Result<()> {
-        // Use default limits: 2 up, 3 down, 10 calls per level
-        self.show_callchain_efficient_with_limits(target_function, git_sha, 2, 3, 10)
-            .await
-    }
 
-    /// Efficient callchain function with custom depth limits and calls limit
-    pub async fn show_callchain_efficient_with_limits(
-        &self,
-        target_function: &str,
-        git_sha: Option<&str>,
-        up_levels: usize,
-        down_levels: usize,
-        calls_limit: usize,
-    ) -> Result<()> {
-        tracing::info!(
-            "Starting efficient callchain search for function: {} (up: {}, down: {})",
-            target_function,
-            up_levels,
-            down_levels
-        );
-
-        // Step 1: Identify git commit SHA and load manifest once
-        let (effective_git_sha, git_manifest) = match git_sha {
-            Some(sha) => {
-                tracing::info!("Using provided git commit SHA: {}", sha);
-                let manifest = self.generate_git_manifest(sha).await?;
-                (Some(sha.to_string()), Some(manifest))
-            }
-            None => {
-                // Default to current commit
-                match crate::git::get_git_sha(&self.git_repo_path) {
-                    Ok(Some(current_sha)) => {
-                        tracing::info!("Using current git commit SHA: {}", current_sha);
-                        let manifest = self.generate_git_manifest(&current_sha).await?;
-                        (Some(current_sha), Some(manifest))
-                    }
-                    Ok(None) => {
-                        tracing::warn!("Not in a git repository, using non-git-aware callchain");
-                        (None, None)
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to get current git SHA: {}, using non-git-aware callchain",
-                            e
-                        );
-                        (None, None)
-                    }
-                }
-            }
-        };
-
-        // Find the target function
-        let target_func = match self.find_function(target_function).await? {
-            Some(func) => func,
-            None => {
-                println!(
-                    "{} Function '{}' not found in database",
-                    "Error:".red(),
-                    target_function
-                );
-                return Ok(());
-            }
-        };
-
-        println!("Building call chain for: {}", target_function.cyan());
-        println!("{}", "=== Function Call Chain ===".bold().green());
-
-        // Display basic function info
-        println!(
-            "Function: {} ({}:{})",
-            target_func.name, target_func.file_path, target_func.line_start
-        );
-        println!("Return Type: {}", target_func.return_type);
-
-        if !target_func.parameters.is_empty() {
-            println!("Parameters:");
-            for param in &target_func.parameters {
-                println!("  - {} {}", param.type_name, param.name);
-            }
-        }
-
-        // Get callers and callees using the shared manifest
-        let callers = self
-            .get_callers_with_manifest(target_function, &git_manifest)
-            .await?;
-        let callees = self
-            .get_callees_with_manifest(target_function, &git_manifest)
-            .await?;
-
-        // Show reverse callchain (callers)
-        if !callers.is_empty() {
-            let calls_info = if calls_limit == 0 {
-                "no limit".to_string()
-            } else {
-                format!("max {calls_limit} per level")
-            };
-            println!(
-                "\n{} (showing {} levels, {})",
-                "=== Reverse Chain (Callers) ===".bold().magenta(),
-                up_levels,
-                calls_info
-            );
-            let reverse_chain = self
-                .build_reverse_callchain_with_manifest(
-                    target_function,
-                    up_levels,
-                    &git_manifest,
-                    calls_limit,
-                )
-                .await?;
-            self.print_callchain_tree(&reverse_chain, 0);
-        }
-
-        // Show forward callchain (callees)
-        if !callees.is_empty() {
-            let calls_info = if calls_limit == 0 {
-                "no limit".to_string()
-            } else {
-                format!("max {calls_limit} per level")
-            };
-            println!(
-                "\n{} (showing {} levels, {})",
-                "=== Forward Chain (Callees) ===".bold().blue(),
-                down_levels,
-                calls_info
-            );
-            let forward_chain = self
-                .build_forward_callchain_with_manifest(
-                    target_function,
-                    down_levels,
-                    &git_manifest,
-                    calls_limit,
-                )
-                .await?;
-            self.print_callchain_tree(&forward_chain, 0);
-        }
-
-        if callers.is_empty() && callees.is_empty() {
-            println!(
-                "\n{} This function is isolated (no callers or callees)",
-                "Info:".yellow()
-            );
-        }
-
-        // Show git commit info if applicable
-        if let Some(sha) = effective_git_sha {
-            println!(
-                "\n{} Using git commit: {}",
-                "Info:".bright_black(),
-                sha.bright_black()
-            );
-        }
-
-        Ok(())
-    }
 
     /// Get callers using pre-loaded git manifest for filtering
-    async fn get_callers_with_manifest(
-        &self,
-        function_name: &str,
-        git_manifest: &Option<std::collections::HashMap<String, String>>,
-    ) -> Result<Vec<String>> {
-        // Get all potential callers
-        let all_callers = self.get_function_callers(function_name).await?;
-
-        // If no git manifest, return all callers
-        let Some(ref manifest) = git_manifest else {
-            return Ok(all_callers);
-        };
-
-        // Filter using pre-loaded manifest
-        let caller_functions = self.function_store.get_by_names(&all_callers).await?;
-        let mut valid_callers = Vec::new();
-
-        for caller_name in &all_callers {
-            if let Some(func) = caller_functions.get(caller_name) {
-                if let Some(expected_hash) = manifest.get(&func.file_path) {
-                    if &func.git_file_hash == expected_hash {
-                        valid_callers.push(caller_name.clone());
-                    }
-                }
-            }
-        }
-
-        Ok(valid_callers)
-    }
-
-    /// Get callees using pre-loaded git manifest for filtering
-    async fn get_callees_with_manifest(
-        &self,
-        function_name: &str,
-        git_manifest: &Option<std::collections::HashMap<String, String>>,
-    ) -> Result<Vec<String>> {
-        // Get all potential callees
-        let all_callees = self.get_function_callees(function_name).await?;
-
-        // If no git manifest, return all callees
-        let Some(ref manifest) = git_manifest else {
-            return Ok(all_callees);
-        };
-
-        // Filter using pre-loaded manifest
-        let callee_functions = self.function_store.get_by_names(&all_callees).await?;
-        let mut valid_callees = Vec::new();
-
-        for callee_name in &all_callees {
-            if let Some(func) = callee_functions.get(callee_name) {
-                if let Some(expected_hash) = manifest.get(&func.file_path) {
-                    if &func.git_file_hash == expected_hash {
-                        valid_callees.push(callee_name.clone());
-                    }
-                }
-            }
-        }
-
-        Ok(valid_callees)
-    }
-
-    /// Build reverse callchain using pre-loaded git manifest
-    async fn build_reverse_callchain_with_manifest(
-        &self,
-        func_name: &str,
-        max_depth: usize,
-        git_manifest: &Option<std::collections::HashMap<String, String>>,
-        calls_limit: usize,
-    ) -> Result<crate::callchain::CallNode> {
-        self.build_callchain_recursive_with_manifest(
-            func_name,
-            max_depth,
-            false,
-            git_manifest,
-            calls_limit,
-            &mut std::collections::HashSet::new(),
-        )
-        .await
-    }
-
-    /// Build forward callchain using pre-loaded git manifest
-    async fn build_forward_callchain_with_manifest(
-        &self,
-        func_name: &str,
-        max_depth: usize,
-        git_manifest: &Option<std::collections::HashMap<String, String>>,
-        calls_limit: usize,
-    ) -> Result<crate::callchain::CallNode> {
-        self.build_callchain_recursive_with_manifest(
-            func_name,
-            max_depth,
-            true,
-            git_manifest,
-            calls_limit,
-            &mut std::collections::HashSet::new(),
-        )
-        .await
-    }
-
-    /// Recursive callchain building with pre-loaded git manifest
-    fn build_callchain_recursive_with_manifest<'a>(
-        &'a self,
-        func_name: &'a str,
-        remaining_depth: usize,
-        forward: bool,
-        git_manifest: &'a Option<std::collections::HashMap<String, String>>,
-        calls_limit: usize,
-        visited: &'a mut std::collections::HashSet<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::callchain::CallNode>> + 'a>>
-    {
-        Box::pin(async move {
-            use crate::callchain::CallNode;
-
-            // Prevent infinite recursion
-            if remaining_depth == 0 || visited.contains(func_name) {
-                return Ok(CallNode {
-                    name: func_name.to_string(),
-                    file: String::new(),
-                    line: 0,
-                    children: vec![],
-                });
-            }
-
-            visited.insert(func_name.to_string());
-
-            let mut node = CallNode {
-                name: func_name.to_string(),
-                file: String::new(),
-                line: 0,
-                children: vec![],
-            };
-
-            // Try to find as function first
-            if let Some(func) = self.find_function(func_name).await? {
-                node.file = func.file_path.clone();
-                node.line = func.line_start;
-
-                let mut next_funcs = if forward {
-                    self.get_callees_with_manifest(func_name, git_manifest)
-                        .await?
-                } else {
-                    self.get_callers_with_manifest(func_name, git_manifest)
-                        .await?
-                };
-
-                // Apply calls limit if specified (0 means no limit)
-                if calls_limit > 0 && next_funcs.len() > calls_limit {
-                    next_funcs.truncate(calls_limit);
-                }
-
-                for next_func in next_funcs {
-                    let child = self
-                        .build_callchain_recursive_with_manifest(
-                            &next_func,
-                            remaining_depth - 1,
-                            forward,
-                            git_manifest,
-                            calls_limit,
-                            visited,
-                        )
-                        .await?;
-                    node.children.push(child);
-                }
-            } else if let Some(macro_info) = self.find_macro(func_name).await? {
-                // Handle macros
-                node.file = macro_info.file_path.clone();
-                node.line = macro_info.line_start;
-
-                let mut next_funcs = if forward {
-                    self.get_callees_with_manifest(func_name, git_manifest)
-                        .await?
-                } else {
-                    self.get_callers_with_manifest(func_name, git_manifest)
-                        .await?
-                };
-
-                // Apply calls limit if specified (0 means no limit)
-                if calls_limit > 0 && next_funcs.len() > calls_limit {
-                    next_funcs.truncate(calls_limit);
-                }
-
-                for next_func in next_funcs {
-                    let child = self
-                        .build_callchain_recursive_with_manifest(
-                            &next_func,
-                            remaining_depth - 1,
-                            forward,
-                            git_manifest,
-                            calls_limit,
-                            visited,
-                        )
-                        .await?;
-                    node.children.push(child);
-                }
-            }
-
-            Ok(node)
-        })
-    }
-
-    /// Print callchain tree
-    fn print_callchain_tree(&self, node: &crate::callchain::CallNode, indent: usize) {
-        let indent_str = "  ".repeat(indent);
-        let marker = if indent == 0 { "" } else { "└─ " };
-
-        if node.file.is_empty() {
-            println!("{}{}{}", indent_str, marker, node.name.yellow());
-        } else {
-            println!(
-                "{}{}{} ({}:{})",
-                indent_str,
-                marker,
-                node.name.yellow(),
-                node.file.bright_black(),
-                node.line
-            );
-        }
-
-        for child in &node.children {
-            self.print_callchain_tree(child, indent + 1);
-        }
-
-        if indent > 0 && node.children.is_empty() && node.file.is_empty() {
-            println!("{}  {}", indent_str, "(...)".bright_black());
-        }
-    }
 
     /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
     async fn generate_git_manifest(

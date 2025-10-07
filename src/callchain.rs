@@ -81,7 +81,7 @@ async fn build_forward_callchain_with_git(
 ) -> Result<CallNode> {
     // Efficiently collect only the functions we need for this call chain
     let chain_functions = db
-        .collect_callchain_functions(func_name, max_depth, true, false)
+        .collect_callchain_functions(func_name, max_depth, true, false, git_sha)
         .await?;
     let function_names: Vec<String> = chain_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
@@ -107,7 +107,7 @@ async fn build_reverse_callchain_with_git(
 ) -> Result<CallNode> {
     // Efficiently collect only the functions we need for this call chain
     let chain_functions = db
-        .collect_callchain_functions(func_name, max_depth, false, true)
+        .collect_callchain_functions(func_name, max_depth, false, true, git_sha)
         .await?;
     let function_names: Vec<String> = chain_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
@@ -986,7 +986,7 @@ pub async fn find_all_paths_to_writer(
         // For each entry point that might reach the target, collect the chain
         for entry_point in entry_points.iter().take(10) {
             if let Ok(path_functions) = db
-                .collect_callchain_functions(entry_point, 10, true, false)
+                .collect_callchain_functions(entry_point, 10, true, false, Some(git_sha))
                 .await
             {
                 functions_needed.extend(path_functions);

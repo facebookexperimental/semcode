@@ -11,14 +11,14 @@ use crate::display::{
     display_typedef_to_writer,
 };
 
-/// Get functions called by the given function name (or macro name)
-async fn get_function_calls(db: &DatabaseManager, function_name: &str) -> Result<Vec<String>> {
-    // First try to get callees from functions table
-    match db.get_function_callees(function_name).await {
+/// Get functions called by the given function name (or macro name) - git-aware version
+async fn get_function_calls_git_aware(db: &DatabaseManager, function_name: &str, git_sha: &str) -> Result<Vec<String>> {
+    // First try to get callees from functions table using git-aware method
+    match db.get_function_callees_git_aware(function_name, git_sha).await {
         Ok(callees) if !callees.is_empty() => Ok(callees),
         _ => {
-            // If no function found or no callees, try to find a macro
-            match db.find_macro(function_name).await {
+            // If no function found or no callees, try to find a macro using git-aware method
+            match db.find_macro_git_aware(function_name, git_sha).await {
                 Ok(Some(macro_info)) => {
                     // Get calls directly from macro's calls field
                     Ok(macro_info.calls.unwrap_or_default())
@@ -28,6 +28,7 @@ async fn get_function_calls(db: &DatabaseManager, function_name: &str) -> Result
         }
     }
 }
+
 
 /// Get functions that call the given function name
 async fn get_function_callers(db: &DatabaseManager, function_name: &str) -> Result<Vec<String>> {
@@ -713,7 +714,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     for func in &regex_definitions {
                         display_function_to_writer_with_options(func, writer, true)?;
                         // Get and display calls (outgoing) for each function definition
-                        let calls = get_function_calls(db, &func.name).await?;
+                        let calls = get_function_calls_git_aware(db, &func.name, git_sha).await?;
                         display_call_relationships_with_options(
                             &func.name,
                             &calls,
@@ -734,7 +735,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     for macro_info in &regex_macros {
                         display_macro_to_writer(macro_info, writer)?;
                         // Get and display only calls (outgoing) for macros too
-                        let macro_calls = get_function_calls(db, &macro_info.name).await?;
+                        let macro_calls = get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
                         display_call_relationships_with_options(
                             &macro_info.name,
                             &macro_calls,
@@ -790,7 +791,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     for func in &regex_definitions {
                         display_function_to_writer_with_options(func, writer, true)?;
                         // Get and display calls (outgoing) for each function definition
-                        let calls = get_function_calls(db, &func.name).await?;
+                        let calls = get_function_calls_git_aware(db, &func.name, git_sha).await?;
                         display_call_relationships_with_options(
                             &func.name,
                             &calls,
@@ -856,7 +857,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     for macro_info in &regex_macros {
                         display_macro_to_writer(macro_info, writer)?;
                         // Get and display only calls (outgoing) for macros too
-                        let macro_calls = get_function_calls(db, &macro_info.name).await?;
+                        let macro_calls = get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
                         display_call_relationships_with_options(
                             &macro_info.name,
                             &macro_calls,
