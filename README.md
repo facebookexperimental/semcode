@@ -128,6 +128,12 @@ semcode> quit                             # Exit the program
 semcode> q                                # Exit (short form)
 ```
 
+## More Usage guides
+
+Setting up semcode with claude: [docs/claude-semcode-setup.md](docs/claude-semcode-setup.md)
+
+Doing patch review in the kernel: [docs/claude-patch-review.md](docs/claude-patch-review.md)
+
 ## Data Storage
 
 Semcode uses [LanceDB](https://lancedb.com/) to store:
