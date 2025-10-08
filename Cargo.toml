@@ -7,9 +7,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 lancedb = "0.22"
-arrow = "55.2"
-arrow-array = "55.2"
-arrow-schema = "55.2"
+arrow = "56.2"
+arrow-array = "56.2"
+arrow-schema = "56.2"
 tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
