@@ -348,9 +348,10 @@ impl PipelineBuilder {
         let pb = ProgressBar::new(files_to_process.len() as u64);
         pb.set_style(
             ProgressStyle::with_template(
-                "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} files {msg}"
-            ).unwrap()
-            .progress_chars("##-")
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} files {msg}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
         );
         pb.set_message("Processing files...");
 

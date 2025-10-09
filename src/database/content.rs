@@ -228,8 +228,7 @@ impl ContentStore {
 
             for chunk in shard_hashes.chunks(chunk_size) {
                 // Build WHERE IN clause with hex strings
-                let hash_list: Vec<String> =
-                    chunk.iter().map(|hash| format!("'{hash}'")).collect();
+                let hash_list: Vec<String> = chunk.iter().map(|hash| format!("'{hash}'")).collect();
 
                 let in_clause = hash_list.join(", ");
                 let filter = format!("blake3_hash IN ({in_clause})");
@@ -367,10 +366,7 @@ impl ContentStore {
             total_count += count as i64;
 
             // Sample content size from each shard (proportional sampling)
-            let sample_size = std::cmp::min(
-                1000,
-                count.div_ceil(NUM_SHARDS as usize),
-            );
+            let sample_size = std::cmp::min(1000, count.div_ceil(NUM_SHARDS as usize));
             if sample_size > 0 {
                 let sample_results = table
                     .query()

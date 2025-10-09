@@ -101,9 +101,8 @@ async fn mcp_query_function_or_macro(
         }
         (Some(func), Some(mac)) => {
             // Found both function and macro
-            let mut result = format!(
-                "Found function and macro with name '{name}' (git SHA: {git_sha})\n\n"
-            );
+            let mut result =
+                format!("Found function and macro with name '{name}' (git SHA: {git_sha})\n\n");
 
             // Display function
             let func_params_str = func
@@ -198,9 +197,7 @@ async fn mcp_query_function_or_macro(
 
                 result
             } else {
-                format!(
-                    "Function or macro '{name}' not found at git SHA {git_sha}"
-                )
+                format!("Function or macro '{name}' not found at git SHA {git_sha}")
             }
         }
     };
@@ -344,10 +341,7 @@ async fn mcp_show_callers(
             writeln!(buffer, "Note: Found both a function and a macro with this name! Showing function call relationships.")?;
 
             if callers.is_empty() {
-                writeln!(
-                    buffer,
-                    "Info: No functions call function '{function_name}'"
-                )?;
+                writeln!(buffer, "Info: No functions call function '{function_name}'")?;
             } else {
                 writeln!(buffer, "\n=== Direct Callers (Function) ===")?;
                 writeln!(
@@ -440,9 +434,7 @@ async fn mcp_show_calls(
         }
         (None, Some(macro_info)) => {
             // Found macro only - get calls from macro's calls field
-            let calls = macro_info
-                .calls.clone()
-                .unwrap_or_default();
+            let calls = macro_info.calls.clone().unwrap_or_default();
             if calls.is_empty() {
                 writeln!(
                     buffer,
@@ -476,9 +468,7 @@ async fn mcp_show_calls(
                 )?;
 
                 // Also check macro calls
-                let macro_calls = macro_info
-                    .calls.clone()
-                    .unwrap_or_default();
+                let macro_calls = macro_info.calls.clone().unwrap_or_default();
                 if !macro_calls.is_empty() {
                     writeln!(
                         buffer,
@@ -1517,10 +1507,7 @@ async fn mcp_vgrep_similar_functions(
                         filtered
                     }
                     Err(e) => {
-                        writeln!(
-                            buffer,
-                            "Error: Invalid regex pattern '{path_regex}': {e}"
-                        )?;
+                        writeln!(buffer, "Error: Invalid regex pattern '{path_regex}': {e}")?;
                         return Ok(String::from_utf8_lossy(&buffer).to_string());
                     }
                 }

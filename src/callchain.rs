@@ -663,9 +663,7 @@ pub async fn show_callees_to_writer(
         }
         (None, Some(macro_info)) => {
             // Handle macros - get callees directly from macro's calls field
-            let callees = macro_info
-                .calls.clone()
-                .unwrap_or_default();
+            let callees = macro_info.calls.clone().unwrap_or_default();
             if callees.is_empty() {
                 let info_msg = format!(
                     "{} Macro '{}' doesn't call any other functions",
@@ -755,9 +753,7 @@ pub async fn show_callees_to_writer(
                 writeln!(writer, "{info_msg}")?;
 
                 // Also check macro calls
-                let macro_callees = macro_info
-                    .calls.clone()
-                    .unwrap_or_default();
+                let macro_callees = macro_info.calls.clone().unwrap_or_default();
                 if !macro_callees.is_empty() {
                     let info_msg = format!(
                         "{} But macro '{}' calls {} functions",
@@ -833,9 +829,7 @@ pub async fn show_callees_to_writer(
                 }
 
                 // Also show macro callees if they exist
-                let macro_callees = macro_info
-                    .calls.clone()
-                    .unwrap_or_default();
+                let macro_callees = macro_info.calls.clone().unwrap_or_default();
                 if !macro_callees.is_empty() {
                     let header = format!("\n{}", "=== Direct Callees (Macro) ===".bold().green());
                     writeln!(writer, "{header}")?;

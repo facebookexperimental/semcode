@@ -2005,14 +2005,12 @@ impl TreeSitterAnalyzer {
             }
 
             // Look for type usage patterns (struct/union/enum keywords)
-            if (*word == "struct" || *word == "union" || *word == "enum")
-                && i + 1 < words.len() {
-                    let type_name =
-                        words[i + 1].trim_end_matches(&['*', '&', ';', ',', ')', '}'][..]);
-                    if self.is_valid_identifier(type_name) {
-                        types.push(type_name.to_string());
-                    }
+            if (*word == "struct" || *word == "union" || *word == "enum") && i + 1 < words.len() {
+                let type_name = words[i + 1].trim_end_matches(&['*', '&', ';', ',', ')', '}'][..]);
+                if self.is_valid_identifier(type_name) {
+                    types.push(type_name.to_string());
                 }
+            }
         }
 
         // Remove duplicates and sort

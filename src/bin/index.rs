@@ -325,9 +325,7 @@ async fn run_pipeline(args: Args) -> Result<()> {
                     );
                 }
             }
-            println!(
-                "Cleanup completed for {temp_file_count} temporary git files"
-            );
+            println!("Cleanup completed for {temp_file_count} temporary git files");
         }
 
         // Progress is managed by the pipeline itself
@@ -643,7 +641,11 @@ fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>
 
     // Validate result count is reasonable
     if shas.len() > 10000 {
-        eprintln!("WARNING: Range {} produced {} commits, which seems very large", range, shas.len());
+        eprintln!(
+            "WARNING: Range {} produced {} commits, which seems very large",
+            range,
+            shas.len()
+        );
         eprintln!("WARNING: Please verify this range is correct. Use 'git rev-list --count {}' to double-check.", range);
     }
 

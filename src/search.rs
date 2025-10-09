@@ -12,9 +12,16 @@ use crate::display::{
 };
 
 /// Get functions called by the given function name (or macro name) - git-aware version
-async fn get_function_calls_git_aware(db: &DatabaseManager, function_name: &str, git_sha: &str) -> Result<Vec<String>> {
+async fn get_function_calls_git_aware(
+    db: &DatabaseManager,
+    function_name: &str,
+    git_sha: &str,
+) -> Result<Vec<String>> {
     // First try to get callees from functions table using git-aware method
-    match db.get_function_callees_git_aware(function_name, git_sha).await {
+    match db
+        .get_function_callees_git_aware(function_name, git_sha)
+        .await
+    {
         Ok(callees) if !callees.is_empty() => Ok(callees),
         _ => {
             // If no function found or no callees, try to find a macro using git-aware method
@@ -28,7 +35,6 @@ async fn get_function_calls_git_aware(db: &DatabaseManager, function_name: &str,
         }
     }
 }
-
 
 /// Get functions that call the given function name
 async fn get_function_callers(db: &DatabaseManager, function_name: &str) -> Result<Vec<String>> {
@@ -527,9 +533,7 @@ async fn query_function_or_macro_to_writer_with_options(
             writeln!(writer, "\n{} Macro:", "==>".bold().blue())?;
             display_macro_to_writer(&macro_info, writer)?;
             // Get and display call relationships for the macro too (use macro's calls field directly)
-            let macro_calls = macro_info
-                .calls.clone()
-                .unwrap_or_default();
+            let macro_calls = macro_info.calls.clone().unwrap_or_default();
             display_call_relationships_with_options(
                 &macro_info.name,
                 &macro_calls,
@@ -676,9 +680,7 @@ async fn query_function_or_macro_to_writer_with_options(
             // Found macro only
             display_macro_to_writer(&macro_info, writer)?;
             // Get and display call relationships for macros too (use macro's calls field directly)
-            let calls = macro_info
-                .calls.clone()
-                .unwrap_or_default();
+            let calls = macro_info.calls.clone().unwrap_or_default();
             let called_by = db
                 .get_function_callers_git_aware(&macro_info.name, git_sha)
                 .await?;
@@ -735,7 +737,8 @@ async fn query_function_or_macro_to_writer_with_options(
                     for macro_info in &regex_macros {
                         display_macro_to_writer(macro_info, writer)?;
                         // Get and display only calls (outgoing) for macros too
-                        let macro_calls = get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
+                        let macro_calls =
+                            get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
                         display_call_relationships_with_options(
                             &macro_info.name,
                             &macro_calls,
@@ -857,7 +860,8 @@ async fn query_function_or_macro_to_writer_with_options(
                     for macro_info in &regex_macros {
                         display_macro_to_writer(macro_info, writer)?;
                         // Get and display only calls (outgoing) for macros too
-                        let macro_calls = get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
+                        let macro_calls =
+                            get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
                         display_call_relationships_with_options(
                             &macro_info.name,
                             &macro_calls,

@@ -595,7 +595,11 @@ impl DatabaseManager {
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::info!("No files resolved for '{}' at commit '{}' - falling back to non-git lookup", name, git_sha);
+            tracing::info!(
+                "No files resolved for '{}' at commit '{}' - falling back to non-git lookup",
+                name,
+                git_sha
+            );
             return self.find_function_fallback(name, &all_functions).await;
         }
 
@@ -1557,7 +1561,10 @@ impl DatabaseManager {
     ) -> Result<std::collections::HashSet<String>> {
         // Optimize git-aware operations by generating manifest once
         let git_manifest = if let Some(sha) = git_sha {
-            tracing::info!("Generating git manifest for callchain optimization at commit: {}", sha);
+            tracing::info!(
+                "Generating git manifest for callchain optimization at commit: {}",
+                sha
+            );
             Some(self.generate_git_manifest(sha).await?)
         } else {
             None
@@ -1579,7 +1586,8 @@ impl DatabaseManager {
 
             // Get function details to find call relationships
             let function_exists = if let Some(manifest) = &git_manifest {
-                self.function_exists_in_manifest(&func_name, manifest).await?
+                self.function_exists_in_manifest(&func_name, manifest)
+                    .await?
             } else {
                 self.find_function(&func_name).await?.is_some()
             };
@@ -1587,7 +1595,8 @@ impl DatabaseManager {
             if function_exists {
                 if include_forward {
                     let callees = if let Some(manifest) = &git_manifest {
-                        self.get_function_callees_with_manifest(&func_name, manifest).await?
+                        self.get_function_callees_with_manifest(&func_name, manifest)
+                            .await?
                     } else {
                         self.get_function_callees(&func_name).await?
                     };
@@ -1601,7 +1610,8 @@ impl DatabaseManager {
 
                 if include_reverse {
                     let callers = if let Some(manifest) = &git_manifest {
-                        self.get_function_callers_with_manifest(&func_name, manifest).await?
+                        self.get_function_callers_with_manifest(&func_name, manifest)
+                            .await?
                     } else {
                         self.get_function_callers(&func_name).await?
                     };
@@ -1624,7 +1634,8 @@ impl DatabaseManager {
             if macro_exists {
                 if include_forward {
                     let callees = if let Some(manifest) = &git_manifest {
-                        self.get_function_callees_with_manifest(&func_name, manifest).await?
+                        self.get_function_callees_with_manifest(&func_name, manifest)
+                            .await?
                     } else {
                         self.get_function_callees(&func_name).await?
                     };
@@ -1638,7 +1649,8 @@ impl DatabaseManager {
 
                 if include_reverse {
                     let callers = if let Some(manifest) = &git_manifest {
-                        self.get_function_callers_with_manifest(&func_name, manifest).await?
+                        self.get_function_callers_with_manifest(&func_name, manifest)
+                            .await?
                     } else {
                         self.get_function_callers(&func_name).await?
                     };
@@ -2705,8 +2717,6 @@ impl DatabaseManager {
         Ok(valid_callers)
     }
 
-
-
     /// Get callers using pre-loaded git manifest for filtering
 
     /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
@@ -2985,7 +2995,9 @@ impl DatabaseManager {
                             // This function exists at the git SHA, verify it actually calls our target
                             if !calls_array.is_null(i) {
                                 let calls_json = calls_array.value(i);
-                                if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
+                                if let Ok(calls_list) =
+                                    serde_json::from_str::<Vec<String>>(calls_json)
+                                {
                                     if calls_list.contains(&function_name.to_string()) {
                                         callers.push(caller_name.to_string());
                                     }

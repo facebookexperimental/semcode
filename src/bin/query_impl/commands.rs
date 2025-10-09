@@ -5,8 +5,8 @@ use colored::*;
 use regex;
 use semcode::{git, DatabaseManager};
 
-use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use owo_colors::OwoColorize as _;
+use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use semcode::display::print_help;
 use semcode::search::{
     dump_calls, dump_content, dump_functions, dump_macros, dump_processed_files, dump_typedefs,
@@ -122,8 +122,12 @@ async fn show_callchain_with_limits(
     }
 
     // Get callers and callees using git-aware methods (same as MCP tool)
-    let callers = db.get_function_callers_git_aware(function_name, git_sha).await?;
-    let callees = db.get_function_callees_git_aware(function_name, git_sha).await?;
+    let callers = db
+        .get_function_callers_git_aware(function_name, git_sha)
+        .await?;
+    let callees = db
+        .get_function_callees_git_aware(function_name, git_sha)
+        .await?;
 
     // Show callers with depth and limit control
     if !callers.is_empty() && up_levels > 0 {
@@ -154,11 +158,17 @@ async fn show_callchain_with_limits(
 
             // For multi-level depth, show second-level callers
             if up_levels > 1 {
-                if let Ok(second_level_callers) = db.get_function_callers_git_aware(caller, git_sha).await {
+                if let Ok(second_level_callers) =
+                    db.get_function_callers_git_aware(caller, git_sha).await
+                {
                     let limited_second: Vec<_> = if calls_limit == 0 {
                         second_level_callers
                     } else {
-                        second_level_callers.iter().take(calls_limit).cloned().collect()
+                        second_level_callers
+                            .iter()
+                            .take(calls_limit)
+                            .cloned()
+                            .collect()
                     };
 
                     for second_caller in limited_second.iter().take(3) {
@@ -209,11 +219,17 @@ async fn show_callchain_with_limits(
 
             // For multi-level depth, show second-level callees
             if down_levels > 1 {
-                if let Ok(second_level_callees) = db.get_function_callees_git_aware(callee, git_sha).await {
+                if let Ok(second_level_callees) =
+                    db.get_function_callees_git_aware(callee, git_sha).await
+                {
                     let limited_second: Vec<_> = if calls_limit == 0 {
                         second_level_callees
                     } else {
-                        second_level_callees.iter().take(calls_limit).cloned().collect()
+                        second_level_callees
+                            .iter()
+                            .take(calls_limit)
+                            .cloned()
+                            .collect()
                     };
 
                     for second_callee in limited_second.iter().take(3) {
@@ -369,7 +385,10 @@ pub async fn handle_command(
                         Ok(()) => {}
                         Err(e) => {
                             println!("{} {}", "Error:".red(), e);
-                            println!("{} Check your regex pattern syntax and try again.", "Hint:".yellow());
+                            println!(
+                                "{} Check your regex pattern syntax and try again.",
+                                "Hint:".yellow()
+                            );
                         }
                     }
                 }
@@ -558,8 +577,17 @@ pub async fn handle_command(
                 }
 
                 // Use the same approach as the working MCP tool - call git-aware methods directly
-                match show_callchain_with_limits(db, &function_name, &git_sha, up_levels, down_levels, calls_limit).await {
-                    Ok(()) => {},
+                match show_callchain_with_limits(
+                    db,
+                    &function_name,
+                    &git_sha,
+                    up_levels,
+                    down_levels,
+                    calls_limit,
+                )
+                .await
+                {
+                    Ok(()) => {}
                     Err(e) => {
                         println!("{} Failed to show callchain: {}", "Error:".red(), e);
                     }
@@ -774,10 +802,8 @@ pub async fn handle_command(
                 } else {
                     println!(
                         "{}",
-                        format!(
-                            "WARNING: This will drop and recreate the '{table_name}' table!"
-                        )
-                        .yellow()
+                        format!("WARNING: This will drop and recreate the '{table_name}' table!")
+                            .yellow()
                     );
                     println!("This operation:");
                     println!("  - Exports all data from the {table_name} table");
