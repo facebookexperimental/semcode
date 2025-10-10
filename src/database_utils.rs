@@ -23,12 +23,16 @@ pub fn process_database_path(database_arg: Option<&str>, source_dir: Option<&Pat
     match database_arg {
         Some(path) => {
             let path_obj = Path::new(path);
-            // If the path is a directory, look for .semcode.db within it
-            if path_obj.is_dir() {
+
+            // If path already ends with .semcode.db, use it as-is (avoid double appending)
+            if path.ends_with(".semcode.db") {
+                path.to_string()
+            } else if path_obj.is_dir() {
+                // If the path is a directory, look for .semcode.db within it
                 let semcode_db_path = path_obj.join(".semcode.db");
                 semcode_db_path.to_string_lossy().to_string()
             } else {
-                // If the path already ends with .semcode.db or is a specific file, use it as-is
+                // If it's a specific file path, use it as-is
                 path.to_string()
             }
         }

@@ -52,6 +52,7 @@ mkdir -p bin
 ln -sf ../target/release/semcode-index bin/semcode-index
 ln -sf ../target/release/semcode bin/semcode
 ln -sf ../target/release/semcode-mcp bin/semcode-mcp
+ln -sf ../target/release/semcode-lsp bin/semcode-lsp
 
 echo ""
 echo "=== Build Complete ==="
@@ -66,6 +67,10 @@ echo "  ./bin/semcode --database ./code.db"
 echo ""
 echo "To run MCP server:"
 echo "  ./bin/semcode-mcp --database ./code.db"
+echo ""
+echo "To run LSP server (for editor integration):"
+echo "  ./bin/semcode-lsp"
+echo "  See docs/lsp-server.md for Neovim/editor setup"
 echo ""
 
 # Optional: Create a small test directory with sample C files

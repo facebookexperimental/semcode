@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Semcode is a semantic code search tool written in Rust that indexes C/C++ codebases using machine learning embeddings. It consists of two main binaries:
+Semcode is a semantic code search tool written in Rust that indexes C/C++ codebases using machine learning embeddings. It consists of several binaries:
 - `semcode-index`: Analyzes and indexes codebases using the CodeBERT model
 - `semcode`: Interactive query tool for searching the indexed code
+- `semcode-mcp`: Model Context Protocol server for Claude Desktop integration
+- `semcode-lsp`: Language Server Protocol server for editor integration (see [docs/lsp-server.md](docs/lsp-server.md))
 
 ## Build and Development Commands
 
@@ -41,9 +43,9 @@ Semcode uses the following search order to locate the `.semcode.db` database dir
 2. **Source directory**: Look for `.semcode.db` in the source directory specified by `-s`
 3. **Current directory**: Fall back to `./.semcode.db` in the current working directory
 
-**For semcode (query tool) and semcode-mcp:**
-1. **-d flag**: If provided, use the specified path (direct database path or parent directory containing `.semcode.db`)
-2. **Current directory**: Use `./.semcode.db` in the current working directory
+**For semcode (query tool), semcode-mcp, and semcode-lsp:**
+1. **-d flag / configuration**: If provided, use the specified path (direct database path or parent directory containing `.semcode.db`)
+2. **Workspace/Current directory**: Use `./.semcode.db` in the workspace or current working directory
 
 The `-d` flag can specify either:
 - A direct path to the database directory (e.g., `./my-custom.db`)
@@ -77,6 +79,88 @@ semcode --database /path/to/code  # Uses /path/to/code/.semcode.db
 ```
 
 ## Architecture
+
+### Git-Aware Operations (IMPORTANT)
+
+**All features that query the database MUST use git-aware lookup functions.**
+
+Semcode indexes codebases at specific git commits and stores multiple versions of functions, types, and macros as the codebase evolves. When implementing any feature that looks up code entities, always use git-aware functions to ensure you're finding the correct version that matches the user's current working directory.
+
+#### Required Approach
+
+1. **Obtain the current git SHA:**
+   ```rust
+   use semcode::git::get_git_sha;
+
+   let git_sha = get_git_sha(&repo_path)?
+       .ok_or_else(|| anyhow::anyhow!("Not a git repository"))?;
+   ```
+
+2. **Use git-aware lookup functions:**
+   ```rust
+   // ✅ CORRECT: Git-aware function lookup
+   let function = db.find_function_git_aware(name, &git_sha).await?;
+
+   // ❌ WRONG: Non-git-aware lookup (may return wrong version)
+   let function = db.find_function(name).await?;
+   ```
+
+3. **Pass git_repo_path to DatabaseManager:**
+   ```rust
+   // DatabaseManager needs git_repo_path for git-aware resolution
+   let db = DatabaseManager::new(&db_path, git_repo_path).await?;
+   ```
+
+#### Available Git-Aware Functions
+
+In `DatabaseManager` (src/database/connection.rs):
+- `find_function_git_aware(name: &str, git_sha: &str)` - Find function at specific commit
+- `find_macro_git_aware(name: &str, git_sha: &str)` - Find macro at specific commit
+- `get_function_callees_git_aware(name: &str, git_sha: &str)` - Get callees at specific commit
+- `build_callchain_with_manifest()` - Call chain analysis with git manifest
+
+#### When to Use Non-Git-Aware Functions
+
+Non-git-aware functions like `find_function()` should **only** be used:
+- As a fallback when git SHA cannot be determined (not in a git repo)
+- For administrative/debugging operations that need to see all versions
+- When the operation explicitly requires seeing historical data across commits
+
+#### Example: Implementing a New Feature
+
+```rust
+// ✅ CORRECT IMPLEMENTATION
+async fn my_new_feature(db: &DatabaseManager, repo_path: &str) -> Result<()> {
+    // 1. Get current git SHA
+    let git_sha = semcode::git::get_git_sha(repo_path)?
+        .ok_or_else(|| anyhow::anyhow!("Not a git repository"))?;
+
+    // 2. Use git-aware lookup
+    if let Some(func) = db.find_function_git_aware("my_func", &git_sha).await? {
+        println!("Found function at current commit: {}", func.name);
+    }
+
+    Ok(())
+}
+
+// ❌ WRONG IMPLEMENTATION (may return wrong version)
+async fn my_bad_feature(db: &DatabaseManager) -> Result<()> {
+    if let Some(func) = db.find_function("my_func").await? {
+        println!("Found function (but which version?): {}", func.name);
+    }
+    Ok(())
+}
+```
+
+#### Why This Matters
+
+Without git-aware lookups:
+- Users may jump to outdated function definitions
+- Call chains may include deleted or renamed functions
+- Type information may not match current code structure
+- Results are confusing and incorrect for active development
+
+**Remember: When in doubt, use git-aware functions!**
 
 ### Scalability
 - The database is very large.  No operation should be implemented via full table

@@ -45,6 +45,8 @@ anstream = "0.6"        # Auto TTY/NO_COLOR handling; print!/println! and Write 
 owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
 gix = "0.73"
 model2vec-rs = "0.1.4"
+tower-lsp = "0.20"      # Language Server Protocol framework for LSP server
+url = "2.5"             # URL parsing for file URIs in LSP
 
 [[bin]]
 name = "semcode-index"
@@ -58,7 +60,9 @@ path = "src/bin/query.rs"
 name = "semcode-mcp"
 path = "src/bin/semcode-mcp.rs"
 
+[[bin]]
+name = "semcode-lsp"
+path = "src/bin/semcode-lsp.rs"
+
 [profile.release]
 debug = false
-
-[workspace]
