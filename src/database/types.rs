@@ -13,7 +13,6 @@ use std::sync::Arc;
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::content::ContentStore;
 use crate::types::{FieldInfo, MacroInfo, TypeInfo, TypedefInfo};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 struct TypeMetadata {
@@ -622,97 +621,8 @@ impl TypeStore {
         Ok(result)
     }
 
-    /// Git-aware type lookup by name: two-phase resolution
-    pub async fn find_by_name_git_aware(
-        &self,
-        name: &str,
-        git_sha: &str,
-        git_repo_path: &str,
-    ) -> Result<Option<TypeInfo>> {
-        // Phase 1: Search by name to get file paths
-        let table = self.connection.open_table("types").execute().await?;
-        let escaped_name = name.replace("'", "''");
-
-        let initial_results = table
-            .query()
-            .only_if(format!("name = '{escaped_name}'"))
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        if initial_results.is_empty() || initial_results[0].num_rows() == 0 {
-            return Ok(None);
-        }
-
-        // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
-        for batch in &initial_results {
-            let file_path_array = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            for i in 0..batch.num_rows() {
-                let file_path = file_path_array.value(i).to_string();
-                file_paths.insert(file_path);
-            }
-        }
-
-        // Phase 2: Resolve file paths to git_file_hashes
-        let file_paths_vec: Vec<String> = file_paths.into_iter().collect();
-        let resolved_hashes = self
-            .resolve_git_file_hashes(&file_paths_vec, git_sha, git_repo_path)
-            .await?;
-
-        if resolved_hashes.is_empty() {
-            return Ok(None);
-        }
-
-        // Phase 3: Query with specific git_file_hashes
-        let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
-        let types = self
-            .find_by_git_hashes(&hash_values, Some(&escaped_name), None)
-            .await?;
-
-        Ok(types.into_iter().next())
-    }
-
-    /// Helper function to resolve git file hashes using gitoxide
-    async fn resolve_git_file_hashes(
-        &self,
-        file_paths: &[String],
-        git_sha: &str,
-        git_repo_path: &str,
-    ) -> Result<HashMap<String, String>> {
-        // Use the passed git repository path instead of hardcoding "."
-        tracing::debug!(
-            "resolve_git_file_hashes: Looking for {} file paths at git SHA {}",
-            file_paths.len(),
-            git_sha
-        );
-
-        match crate::git::resolve_files_at_commit(git_repo_path, git_sha, file_paths) {
-            Ok(resolved_hashes) => {
-                tracing::debug!(
-                    "resolve_git_file_hashes: Successfully resolved {} out of {} file paths",
-                    resolved_hashes.len(),
-                    file_paths.len()
-                );
-                Ok(resolved_hashes)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "resolve_git_file_hashes: Failed to resolve git files: {}",
-                    e
-                );
-                Ok(HashMap::new()) // Return empty map instead of failing, let caller handle
-            }
-        }
-    }
-
     /// Helper function to find types by git_file_hashes with optional filters
-    async fn find_by_git_hashes(
+    pub async fn find_by_git_hashes(
         &self,
         git_hashes: &[String],
         name_filter: Option<&str>,
@@ -1041,96 +951,8 @@ impl TypedefStore {
         Ok(result)
     }
 
-    /// Git-aware typedef lookup by name: two-phase resolution
-    pub async fn find_by_name_git_aware(
-        &self,
-        name: &str,
-        git_sha: &str,
-        git_repo_path: &str,
-    ) -> Result<Option<TypedefInfo>> {
-        // Phase 1: Search by name to get file paths
-        let table = self.connection.open_table("types").execute().await?;
-        let escaped_name = name.replace("'", "''");
-
-        let initial_results = table
-            .query()
-            .only_if(format!("name = '{escaped_name}' AND kind = 'typedef'"))
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        if initial_results.is_empty() || initial_results[0].num_rows() == 0 {
-            return Ok(None);
-        }
-
-        // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
-        for batch in &initial_results {
-            let file_path_array = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            for i in 0..batch.num_rows() {
-                file_paths.insert(file_path_array.value(i).to_string());
-            }
-        }
-
-        // Phase 2: Resolve file paths to git_file_hashes
-        let file_paths_vec: Vec<String> = file_paths.into_iter().collect();
-        let resolved_hashes = self
-            .resolve_git_file_hashes(&file_paths_vec, git_sha, git_repo_path)
-            .await?;
-
-        if resolved_hashes.is_empty() {
-            return Ok(None);
-        }
-
-        // Phase 3: Query with specific git_file_hashes
-        let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
-        let typedefs = self
-            .find_by_git_hashes(&hash_values, Some(&escaped_name))
-            .await?;
-
-        Ok(typedefs.into_iter().next())
-    }
-
-    /// Helper function to resolve git file hashes using gitoxide
-    async fn resolve_git_file_hashes(
-        &self,
-        file_paths: &[String],
-        git_sha: &str,
-        git_repo_path: &str,
-    ) -> Result<HashMap<String, String>> {
-        // Use the passed git repository path instead of hardcoding "."
-        tracing::debug!(
-            "resolve_git_file_hashes: Looking for {} file paths at git SHA {}",
-            file_paths.len(),
-            git_sha
-        );
-
-        match crate::git::resolve_files_at_commit(git_repo_path, git_sha, file_paths) {
-            Ok(resolved_hashes) => {
-                tracing::debug!(
-                    "resolve_git_file_hashes: Successfully resolved {} out of {} file paths",
-                    resolved_hashes.len(),
-                    file_paths.len()
-                );
-                Ok(resolved_hashes)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "resolve_git_file_hashes: Failed to resolve git files: {}",
-                    e
-                );
-                Ok(HashMap::new()) // Return empty map instead of failing, let caller handle
-            }
-        }
-    }
-
     /// Helper function to find typedefs by git_file_hashes with optional name filter
-    async fn find_by_git_hashes(
+    pub async fn find_by_git_hashes(
         &self,
         git_hashes: &[String],
         name_filter: Option<&str>,

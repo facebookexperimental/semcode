@@ -9,8 +9,9 @@ use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use semcode::display::print_help;
 use semcode::search::{
-    dump_calls, dump_content, dump_functions, dump_macros, dump_processed_files, dump_typedefs,
-    dump_types, query_function_or_macro_verbose, query_type_or_typedef, show_tables,
+    dump_calls, dump_content, dump_functions, dump_macros, dump_processed_files,
+    dump_symbol_filename, dump_typedefs, dump_types, query_function_or_macro_verbose,
+    query_type_or_typedef, show_tables,
 };
 
 /// Parse a potential git SHA from command arguments or default to current HEAD
@@ -663,6 +664,15 @@ pub async fn handle_command(
             } else {
                 let output_file = parts[1..].join(" ");
                 dump_content(db, &output_file).await?;
+            }
+        }
+        "dump-symbol-filename" | "dsf" => {
+            if parts.len() < 2 {
+                println!("{}", "Usage: dump-symbol-filename <output_file>".red());
+                println!("  Export all symbol-filename pairs to JSON");
+            } else {
+                let output_file = parts[1..].join(" ");
+                dump_symbol_filename(db, &output_file).await?;
             }
         }
         "diffinfo" | "di" => {

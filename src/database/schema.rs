@@ -42,6 +42,10 @@ impl SchemaManager {
             self.create_processed_files_table().await?;
         }
 
+        if !table_names.iter().any(|n| n == "symbol_filename") {
+            self.create_symbol_filename_table().await?;
+        }
+
         // Check and create content shard tables (content_0 through content_15)
         self.create_content_shard_tables().await?;
 
@@ -161,6 +165,24 @@ impl SchemaManager {
 
         self.connection
             .create_table("processed_files", batch_iterator)
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    async fn create_symbol_filename_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false), // Symbol name (function, macro, type, or typedef)
+            Field::new("filename", DataType::Utf8, false), // File path where symbol is defined
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("symbol_filename", batch_iterator)
             .execute()
             .await?;
 
@@ -398,6 +420,35 @@ impl SchemaManager {
             .await;
         }
 
+        // Create indices for symbol_filename table
+        if table_names.iter().any(|n| n == "symbol_filename") {
+            let table = self
+                .connection
+                .open_table("symbol_filename")
+                .execute()
+                .await?;
+
+            // Index on symbol for symbol name-based lookups
+            self.try_create_index(&table, &["symbol"], "BTree index on symbol_filename.symbol")
+                .await;
+
+            // Index on filename for file-based lookups
+            self.try_create_index(
+                &table,
+                &["filename"],
+                "BTree index on symbol_filename.filename",
+            )
+            .await;
+
+            // Composite index for efficient (symbol, filename) lookups and deduplication
+            self.try_create_index(
+                &table,
+                &["symbol", "filename"],
+                "Composite index on symbol_filename.(symbol,filename)",
+            )
+            .await;
+        }
+
         // Create indices for all content shard tables
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
@@ -487,8 +538,14 @@ impl SchemaManager {
         // For each table, run compaction
         let table_names = self.connection.table_names().execute().await?;
 
-        let mut tables_to_compact =
-            vec!["functions", "types", "macros", "vectors", "processed_files"];
+        let mut tables_to_compact = vec![
+            "functions",
+            "types",
+            "macros",
+            "vectors",
+            "processed_files",
+            "symbol_filename",
+        ];
 
         // Add all content shard tables
         for shard in 0..16u8 {
@@ -585,8 +642,14 @@ impl SchemaManager {
 
         let table_names = self.connection.table_names().execute().await?;
 
-        let mut tables_to_recreate =
-            vec!["functions", "types", "macros", "vectors", "processed_files"];
+        let mut tables_to_recreate = vec![
+            "functions",
+            "types",
+            "macros",
+            "vectors",
+            "processed_files",
+            "symbol_filename",
+        ];
 
         // Add all content shard tables
         for shard in 0..16u8 {
@@ -721,6 +784,7 @@ impl SchemaManager {
             "macros" => self.create_macros_table().await,
             "vectors" => self.create_vectors_table().await,
             "processed_files" => self.create_processed_files_table().await,
+            "symbol_filename" => self.create_symbol_filename_table().await,
             "content" => self.create_content_table().await,
             name if name.starts_with("content_") => {
                 // Handle content shard tables

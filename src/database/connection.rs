@@ -12,6 +12,7 @@ use lancedb::query::QueryBase;
 use crate::database::functions::FunctionStore;
 use crate::database::schema::SchemaManager;
 use crate::database::search::{SearchManager, VectorSearchManager};
+use crate::database::symbol_filename::SymbolFilenameStore;
 use crate::database::types::{MacroStore, TypeStore, TypedefStore};
 // CallStore removed - call relationships are now embedded in function JSON columns
 use crate::database::content::{ContentInfo, ContentStore};
@@ -35,6 +36,7 @@ pub struct DatabaseManager {
     schema_manager: SchemaManager,
     processed_file_store: ProcessedFileStore,
     content_store: ContentStore,
+    symbol_filename_store: SymbolFilenameStore,
 }
 
 impl DatabaseManager {
@@ -53,6 +55,7 @@ impl DatabaseManager {
             schema_manager: SchemaManager::new(connection.clone()),
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
+            symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
         })
     }
 
@@ -68,7 +71,13 @@ impl DatabaseManager {
 
     pub async fn clear_all_data(&self) -> Result<()> {
         // Delete all data from each main table
-        for table_name in &["functions", "types", "macros", "processed_files"] {
+        for table_name in &[
+            "functions",
+            "types",
+            "macros",
+            "processed_files",
+            "symbol_filename",
+        ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
                 table.delete("1=1").await?;
             }
@@ -90,7 +99,13 @@ impl DatabaseManager {
         println!("{}", "=== Database Duplicate Scan ===".bold().green());
         println!("Scanning for entries where ALL columns are identical...\n");
 
-        let tables_to_scan = ["functions", "types", "macros", "processed_files"];
+        let tables_to_scan = [
+            "functions",
+            "types",
+            "macros",
+            "processed_files",
+            "symbol_filename",
+        ];
 
         // Scan main tables
         for table_name in &tables_to_scan {
@@ -549,8 +564,21 @@ impl DatabaseManager {
 
     // Function operations
     pub async fn insert_functions(&self, functions: Vec<FunctionInfo>) -> Result<()> {
-        // FunctionStore now handles content storage internally
-        self.function_store.insert_batch(functions).await
+        // Extract (symbol_name, filename) pairs for symbol_filename table
+        let symbol_filename_pairs: Vec<(String, String)> = functions
+            .iter()
+            .map(|f| (f.name.clone(), f.file_path.clone()))
+            .collect();
+
+        // Insert functions
+        self.function_store.insert_batch(functions).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(symbol_filename_pairs)
+            .await?;
+
+        Ok(())
     }
 
     pub async fn find_function(&self, name: &str) -> Result<Option<FunctionInfo>> {
@@ -573,24 +601,16 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Option<FunctionInfo>> {
-        // Step 1: Get all functions with this name (no filtering)
-        let all_functions = self
-            .function_store
-            .find_all_by_name_unfiltered(name)
+        // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full function records)
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
             .await?;
-        if all_functions.is_empty() {
+        if unique_file_paths.is_empty() {
             return Ok(None);
         }
 
-        // Step 2: Extract unique file paths where this function appears
-        let unique_file_paths: Vec<String> = all_functions
-            .iter()
-            .map(|f| f.file_path.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        // Step 3: Resolve file paths to git hashes at target commit
+        // Step 2: Resolve file paths to git hashes at target commit
         let resolved_hashes = self
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
@@ -600,10 +620,11 @@ impl DatabaseManager {
                 name,
                 git_sha
             );
-            return self.find_function_fallback(name, &all_functions).await;
+            // Fallback: do a regular find to get any available functions
+            return self.find_function(name).await;
         }
 
-        // Step 4: Direct targeted search for each (filename, git_hash) combination
+        // Step 3: Direct targeted search for each (filename, git_hash) combination
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
             if let Some(func) = self
@@ -615,14 +636,15 @@ impl DatabaseManager {
             }
         }
 
-        // Step 5: Pick the best result (prefer implementation over declaration)
+        // Step 4: Pick the best result (prefer implementation over declaration)
         if matches.is_empty() {
             tracing::info!(
                 "No exact matches found for '{}' at commit '{}', falling back to non-git lookup",
                 name,
                 git_sha
             );
-            return self.find_function_fallback(name, &all_functions).await;
+            // Fallback: do a regular find to get any available function
+            return self.find_function(name).await;
         }
 
         if matches.len() > 1 {
@@ -644,22 +666,14 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
-        // Step 1: Get all functions with this name (no filtering)
-        let all_functions = self
-            .function_store
-            .find_all_by_name_unfiltered(name)
+        // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full function records)
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
             .await?;
-        if all_functions.is_empty() {
+        if unique_file_paths.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Step 2: Extract unique file paths where this function appears
-        let unique_file_paths: Vec<String> = all_functions
-            .iter()
-            .map(|f| f.file_path.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
 
         tracing::debug!(
             "find_all_functions_git_aware: Found {} unique files for function '{}'",
@@ -667,17 +681,21 @@ impl DatabaseManager {
             name
         );
 
-        // Step 3: Resolve file paths to git hashes at target commit
+        // Step 2: Resolve file paths to git hashes at target commit
         let resolved_hashes = self
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
             tracing::warn!("No files resolved for '{}' at commit '{}'", name, git_sha);
-            // Return all functions but filter out declarations
+            // Fallback: get all functions and filter implementations
+            let all_functions = self
+                .function_store
+                .find_all_by_name_unfiltered(name)
+                .await?;
             return Ok(self.filter_implementations_only(all_functions));
         }
 
-        // Step 4: Direct targeted search for each (filename, git_hash) combination
+        // Step 3: Direct targeted search for each (filename, git_hash) combination
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
             tracing::debug!(
@@ -701,13 +719,18 @@ impl DatabaseManager {
             }
         }
 
-        // Step 5: Filter out declarations but keep all implementations
+        // Step 4: Filter out declarations but keep all implementations
         if matches.is_empty() {
             tracing::warn!(
                 "No exact matches found for '{}' at commit '{}', falling back",
                 name,
                 git_sha
             );
+            // Fallback: get all functions and filter implementations
+            let all_functions = self
+                .function_store
+                .find_all_by_name_unfiltered(name)
+                .await?;
             return Ok(self.filter_implementations_only(all_functions));
         }
 
@@ -780,24 +803,6 @@ impl DatabaseManager {
         );
 
         matches.into_iter().next().unwrap()
-    }
-
-    /// Fallback function selection for git-aware lookups
-    async fn find_function_fallback(
-        &self,
-        name: &str,
-        available_functions: &[FunctionInfo],
-    ) -> Result<Option<FunctionInfo>> {
-        if let Some(fallback_func) = available_functions.first() {
-            tracing::info!(
-                "Using fallback function: {} in {} (hash: {})",
-                name,
-                fallback_func.file_path,
-                fallback_func.git_file_hash
-            );
-            return Ok(Some(fallback_func.clone()));
-        }
-        Ok(None)
     }
 
     pub async fn find_all_functions(&self, name: &str) -> Result<Vec<FunctionInfo>> {
@@ -901,8 +906,21 @@ impl DatabaseManager {
             }
         }
 
+        // Extract (type_name, filename) pairs for symbol_filename table
+        let type_filename_pairs: Vec<(String, String)> = types
+            .iter()
+            .map(|t| (t.name.clone(), t.file_path.clone()))
+            .collect();
+
         // Insert types as usual (keeping existing definition column for now)
-        self.type_store.insert_batch(types).await
+        self.type_store.insert_batch(types).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(type_filename_pairs)
+            .await?;
+
+        Ok(())
     }
 
     pub async fn find_type(&self, name: &str) -> Result<Option<TypeInfo>> {
@@ -910,9 +928,48 @@ impl DatabaseManager {
     }
 
     pub async fn find_type_git_aware(&self, name: &str, git_sha: &str) -> Result<Option<TypeInfo>> {
-        self.type_store
-            .find_by_name_git_aware(name, git_sha, &self.git_repo_path)
-            .await
+        // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full type records)
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
+            .await?;
+        if unique_file_paths.is_empty() {
+            return Ok(None);
+        }
+
+        // Step 2: Resolve file paths to git hashes at target commit
+        let resolved_hashes = self
+            .resolve_git_file_hashes(&unique_file_paths, git_sha)
+            .await?;
+        if resolved_hashes.is_empty() {
+            tracing::info!(
+                "No files resolved for type '{}' at commit '{}' - falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available type
+            return self.find_type(name).await;
+        }
+
+        // Step 3: Direct targeted search using git hashes
+        let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
+        let types = self
+            .type_store
+            .find_by_git_hashes(&hash_values, Some(name), None)
+            .await?;
+
+        if types.is_empty() {
+            tracing::info!(
+                "No exact matches found for type '{}' at commit '{}', falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available type
+            return self.find_type(name).await;
+        }
+
+        // Return the first match (types typically don't have the same prioritization as functions)
+        Ok(types.into_iter().next())
     }
 
     pub async fn get_all_types(&self) -> Result<Vec<TypeInfo>> {
@@ -999,8 +1056,21 @@ impl DatabaseManager {
             }
         }
 
+        // Extract (typedef_name, filename) pairs for symbol_filename table
+        let typedef_filename_pairs: Vec<(String, String)> = typedefs
+            .iter()
+            .map(|td| (td.name.clone(), td.file_path.clone()))
+            .collect();
+
         // Insert typedefs as usual (keeping existing definition column for now)
-        self.typedef_store.insert_batch(typedefs).await
+        self.typedef_store.insert_batch(typedefs).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(typedef_filename_pairs)
+            .await?;
+
+        Ok(())
     }
 
     pub async fn find_typedef(&self, name: &str) -> Result<Option<TypedefInfo>> {
@@ -1012,9 +1082,48 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Option<TypedefInfo>> {
-        self.typedef_store
-            .find_by_name_git_aware(name, git_sha, &self.git_repo_path)
-            .await
+        // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full typedef records)
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
+            .await?;
+        if unique_file_paths.is_empty() {
+            return Ok(None);
+        }
+
+        // Step 2: Resolve file paths to git hashes at target commit
+        let resolved_hashes = self
+            .resolve_git_file_hashes(&unique_file_paths, git_sha)
+            .await?;
+        if resolved_hashes.is_empty() {
+            tracing::info!(
+                "No files resolved for typedef '{}' at commit '{}' - falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available typedef
+            return self.find_typedef(name).await;
+        }
+
+        // Step 3: Direct targeted search using git hashes
+        let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
+        let typedefs = self
+            .typedef_store
+            .find_by_git_hashes(&hash_values, Some(name))
+            .await?;
+
+        if typedefs.is_empty() {
+            tracing::info!(
+                "No exact matches found for typedef '{}' at commit '{}', falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available typedef
+            return self.find_typedef(name).await;
+        }
+
+        // Return the first match
+        Ok(typedefs.into_iter().next())
     }
 
     pub async fn get_all_typedefs(&self) -> Result<Vec<TypedefInfo>> {
@@ -1101,8 +1210,21 @@ impl DatabaseManager {
             }
         }
 
+        // Extract (macro_name, filename) pairs for symbol_filename table
+        let macro_filename_pairs: Vec<(String, String)> = macros
+            .iter()
+            .map(|m| (m.name.clone(), m.file_path.clone()))
+            .collect();
+
         // Insert macros as usual (keeping existing definition and expansion columns for now)
-        self.macro_store.insert_batch(macros).await
+        self.macro_store.insert_batch(macros).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(macro_filename_pairs)
+            .await?;
+
+        Ok(())
     }
 
     pub async fn find_macro(&self, name: &str) -> Result<Option<MacroInfo>> {
@@ -1111,7 +1233,21 @@ impl DatabaseManager {
 
     // Metadata-only insertion methods (skip content storage for performance)
     async fn insert_functions_metadata_only(&self, functions: Vec<FunctionInfo>) -> Result<()> {
-        self.function_store.insert_metadata_only(functions).await
+        // Extract (symbol_name, filename) pairs for symbol_filename table
+        let symbol_filename_pairs: Vec<(String, String)> = functions
+            .iter()
+            .map(|f| (f.name.clone(), f.file_path.clone()))
+            .collect();
+
+        // Insert functions metadata
+        self.function_store.insert_metadata_only(functions).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(symbol_filename_pairs)
+            .await?;
+
+        Ok(())
     }
 
     async fn insert_types_metadata_only(&self, types: Vec<TypeInfo>) -> Result<()> {
@@ -1119,7 +1255,21 @@ impl DatabaseManager {
     }
 
     async fn insert_macros_metadata_only(&self, macros: Vec<MacroInfo>) -> Result<()> {
-        self.macro_store.insert_metadata_only(macros).await
+        // Extract (macro_name, filename) pairs for symbol_filename table
+        let macro_filename_pairs: Vec<(String, String)> = macros
+            .iter()
+            .map(|m| (m.name.clone(), m.file_path.clone()))
+            .collect();
+
+        // Insert macros metadata
+        self.macro_store.insert_metadata_only(macros).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(macro_filename_pairs)
+            .await?;
+
+        Ok(())
     }
 
     pub async fn find_macro_git_aware(
@@ -1127,19 +1277,16 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Option<MacroInfo>> {
-        // Phase 1: Get all file paths for macros with this name
-        let all_macros = self.macro_store.find_all_by_name(name).await?;
-        if all_macros.is_empty() {
+        // Phase 1: Get candidate file paths from symbol_filename table (optimized - macros are also stored there)
+        let file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
+            .await?;
+        if file_paths.is_empty() {
             return Ok(None);
         }
 
         // Phase 2: Resolve file paths to git blob hashes using centralized method
-        let file_paths: Vec<String> = all_macros
-            .iter()
-            .map(|m| m.file_path.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
 
         let resolved_hashes = self.resolve_git_file_hashes(&file_paths, git_sha).await?;
         if resolved_hashes.is_empty() {
@@ -1147,9 +1294,11 @@ impl DatabaseManager {
         }
 
         // Phase 3: Find macro with matching git blob hash
-        for mac in all_macros {
-            if let Some(expected_hash) = resolved_hashes.get(&mac.file_path) {
-                if &mac.git_file_hash == expected_hash {
+        for (file_path, expected_hash) in &resolved_hashes {
+            // Query macro store for this specific file and hash combination
+            let all_macros_in_file = self.macro_store.find_all_by_name(name).await?;
+            for mac in all_macros_in_file {
+                if &mac.file_path == file_path && &mac.git_file_hash == expected_hash {
                     return Ok(Some(mac));
                 }
             }
@@ -1220,13 +1369,26 @@ impl DatabaseManager {
     // Call relationship insertion/resolution methods removed - call relationships are now embedded in function JSON columns
 
     pub async fn get_function_callers(&self, function_name: &str) -> Result<Vec<String>> {
+        let total_start = std::time::Instant::now();
+
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
-        let table = self.connection.open_table("functions").execute().await?;
 
-        // Filter for functions whose calls column contains the target function name
-        // This is much more efficient than a full table scan
-        let filter = format!("calls IS NOT NULL AND calls LIKE '%\"{escaped_name}\"%%'");
+        let open_table_start = std::time::Instant::now();
+        let table = self.connection.open_table("functions").execute().await?;
+        tracing::info!(
+            "get_function_callers: open_table took {:?}",
+            open_table_start.elapsed()
+        );
+
+        // Filter for functions whose calls column contains the exact function name
+        // Match as complete JSON array element: "name", or "name"]
+        // This avoids false positives like "name_suffix" or "prefix_name"
+        let filter = format!(
+            "calls IS NOT NULL AND (calls LIKE '%\"{escaped_name}\",%' OR calls LIKE '%\"{escaped_name}\"]%')"
+        );
+
+        let query_start = std::time::Instant::now();
         let results = table
             .query()
             .only_if(filter)
@@ -1234,7 +1396,12 @@ impl DatabaseManager {
             .await?
             .try_collect::<Vec<_>>()
             .await?;
+        tracing::info!(
+            "get_function_callers: query and collect took {:?}",
+            query_start.elapsed()
+        );
 
+        let process_start = std::time::Instant::now();
         let mut callers = std::collections::HashSet::new();
         for batch in results {
             if batch.num_rows() > 0 {
@@ -1273,8 +1440,18 @@ impl DatabaseManager {
                 }
             }
         }
+        tracing::info!(
+            "get_function_callers: batch processing took {:?}",
+            process_start.elapsed()
+        );
 
-        Ok(callers.into_iter().collect())
+        let result: Vec<String> = callers.into_iter().collect();
+        tracing::info!(
+            "get_function_callers: TOTAL time {:?}, found {} callers",
+            total_start.elapsed(),
+            result.len()
+        );
+        Ok(result)
     }
 
     pub async fn get_function_callers_git_aware(
@@ -1282,51 +1459,41 @@ impl DatabaseManager {
         function_name: &str,
         git_sha: &str,
     ) -> Result<Vec<String>> {
-        // Step 1: Get all file paths that exist at the target git SHA
-        // This is much more efficient than checking each file individually
-        let all_file_paths: Vec<String> = {
-            let table = self.connection.open_table("functions").execute().await?;
-            let results = table
-                .query()
-                .execute()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?;
+        let total_start = std::time::Instant::now();
 
-            let mut paths = std::collections::HashSet::new();
-            for batch in results {
-                if batch.num_rows() > 0 {
-                    let file_path_array = batch
-                        .column(1) // file_path is column index 1
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                        .unwrap();
-                    for i in 0..batch.num_rows() {
-                        paths.insert(file_path_array.value(i).to_string());
-                    }
-                }
-            }
-            paths.into_iter().collect()
-        };
+        // Step 1: Generate git manifest of all files at target commit
+        let step1_start = std::time::Instant::now();
+        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        tracing::info!("get_function_callers_git_aware: Step 1 (generate git manifest) took {:?}, found {} files",
+            step1_start.elapsed(), git_manifest.len());
 
-        // Step 2: Resolve all file hashes at once (bulk operation)
-        let resolved_hashes = self
-            .resolve_git_file_hashes(&all_file_paths, git_sha)
-            .await?;
-        if resolved_hashes.is_empty() {
+        if git_manifest.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Step 3: Build hash set of valid git file hashes for fast lookup
+        // Step 2: Build HashSet of valid git file hashes for O(1) lookup
+        let step2_start = std::time::Instant::now();
         let valid_hashes: std::collections::HashSet<String> =
-            resolved_hashes.values().cloned().collect();
+            git_manifest.values().cloned().collect();
+        tracing::info!(
+            "get_function_callers_git_aware: Step 2 (build hash set) took {:?}, {} hashes",
+            step2_start.elapsed(),
+            valid_hashes.len()
+        );
 
-        // Step 4: Query functions with optimized filtering
+        // Step 3: Query with just LIKE filter (fast and selective)
+        // Don't use huge IN clause - filter in memory instead
+        let step3_start = std::time::Instant::now();
         let escaped_name = function_name.replace("'", "''"); // SQL escape
         let table = self.connection.open_table("functions").execute().await?;
 
-        // Filter for functions whose calls column contains the target function name
-        let filter = format!("calls IS NOT NULL AND calls LIKE '%\"{escaped_name}\"%%'");
+        // Filter for exact function name matches in JSON array
+        // Match as complete JSON array element: "name", or "name"]
+        // This avoids false positives like "name_suffix" or "prefix_name"
+        let filter = format!(
+            "calls IS NOT NULL AND (calls LIKE '%\"{escaped_name}\",%' OR calls LIKE '%\"{escaped_name}\"]%')"
+        );
+
         let results = table
             .query()
             .only_if(filter)
@@ -1334,7 +1501,13 @@ impl DatabaseManager {
             .await?
             .try_collect::<Vec<_>>()
             .await?;
+        tracing::info!(
+            "get_function_callers_git_aware: Step 3 (query with LIKE filter) took {:?}",
+            step3_start.elapsed()
+        );
 
+        // Step 4: Filter by git hash using fast HashSet lookup and verify JSON
+        let step4_start = std::time::Instant::now();
         let mut callers = Vec::new();
 
         for batch in results {
@@ -1367,10 +1540,9 @@ impl DatabaseManager {
                     let caller_name = name_array.value(i);
                     let git_file_hash = git_file_hash_array.value(i).to_string();
 
-                    // Step 5: Fast hash lookup instead of expensive per-file git resolution
+                    // Fast O(1) HashSet lookup to check if this function exists at target commit
                     if valid_hashes.contains(&git_file_hash) {
-                        // This function exists at the git SHA, verify it actually calls our target
-                        // (the LIKE filter might have false positives)
+                        // Verify it actually calls our target (LIKE filter might have false positives)
                         if !calls_array.is_null(i) {
                             let calls_json = calls_array.value(i);
                             if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json)
@@ -1384,7 +1556,14 @@ impl DatabaseManager {
                 }
             }
         }
+        tracing::info!("get_function_callers_git_aware: Step 4 (filter by hash and verify) took {:?}, found {} callers",
+            step4_start.elapsed(), callers.len());
 
+        tracing::info!(
+            "get_function_callers_git_aware: TOTAL time {:?}, found {} callers",
+            total_start.elapsed(),
+            callers.len()
+        );
         Ok(callers)
     }
 
@@ -2094,6 +2273,11 @@ impl DatabaseManager {
         self.processed_file_store.get_all().await
     }
 
+    /// Get all symbol-filename pairs
+    pub async fn get_all_symbol_filename_pairs(&self) -> Result<Vec<(String, String)>> {
+        self.symbol_filename_store.get_all().await
+    }
+
     /// Get all existing git file SHAs from processed files for deduplication (optimized streaming version)
     pub async fn get_existing_git_file_shas(&self) -> Result<std::collections::HashSet<String>> {
         // Use the optimized method that only loads git_file_sha column
@@ -2601,12 +2785,14 @@ impl DatabaseManager {
         target_function: &str,
         git_sha: Option<&str>,
     ) -> Result<Vec<FunctionInfo>> {
+        let total_start = std::time::Instant::now();
         tracing::info!(
             "Starting efficient callers search for function: {}",
             target_function
         );
 
         // Step 1: Identify git commit SHA
+        let step1_start = std::time::Instant::now();
         let effective_git_sha = match git_sha {
             Some(sha) => {
                 tracing::info!("Using provided git commit SHA: {}", sha);
@@ -2632,8 +2818,13 @@ impl DatabaseManager {
                 }
             }
         };
+        tracing::info!(
+            "find_callers_efficient: Step 1 (identify git SHA) took {:?}",
+            step1_start.elapsed()
+        );
 
         // Step 2: Generate manifest of all file SHAs in that git commit
+        let step2_start = std::time::Instant::now();
         tracing::info!(
             "Generating complete git file manifest for commit: {}",
             effective_git_sha
@@ -2644,6 +2835,10 @@ impl DatabaseManager {
             git_manifest.len(),
             effective_git_sha
         );
+        tracing::info!(
+            "find_callers_efficient: Step 2 (generate git manifest) took {:?}",
+            step2_start.elapsed()
+        );
 
         if git_manifest.is_empty() {
             tracing::warn!("No files found in git commit {}", effective_git_sha);
@@ -2651,6 +2846,7 @@ impl DatabaseManager {
         }
 
         // Step 3: Find functions that call the target function using efficient LanceDB query
+        let step3_start = std::time::Instant::now();
         tracing::info!("Searching for functions that call: {}", target_function);
 
         // Use the new embedded JSON schema to find all potential callers
@@ -2672,8 +2868,11 @@ impl DatabaseManager {
             tracing::warn!("No caller function details found");
             return Ok(Vec::new());
         }
+        tracing::info!("find_callers_efficient: Step 3 (find potential callers) took {:?}, found {} potential callers",
+            step3_start.elapsed(), all_callers.len());
 
         // Step 4: Filter callers to only those that exist in the git manifest and report results
+        let step4_start = std::time::Instant::now();
         let mut valid_callers = Vec::new();
 
         for caller_name in &all_callers {
@@ -2706,6 +2905,10 @@ impl DatabaseManager {
                 }
             }
         }
+        tracing::info!(
+            "find_callers_efficient: Step 4 (filter callers against manifest) took {:?}",
+            step4_start.elapsed()
+        );
 
         tracing::info!(
             "Found {} valid callers for '{}' at git commit {}",
@@ -2714,6 +2917,11 @@ impl DatabaseManager {
             effective_git_sha
         );
 
+        tracing::info!(
+            "find_callers_efficient: TOTAL time {:?}, found {} valid callers",
+            total_start.elapsed(),
+            valid_callers.len()
+        );
         Ok(valid_callers)
     }
 

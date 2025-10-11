@@ -34,6 +34,8 @@ cargo build --release
 ./build.sh --with-test
 ```
 
+- Always use cargo fmt after making changes to properly format the files
+
 ### Database Location
 
 Semcode uses the following search order to locate the `.semcode.db` database directory:

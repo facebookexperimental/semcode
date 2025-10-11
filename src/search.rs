@@ -417,6 +417,41 @@ pub async fn dump_content(db: &DatabaseManager, output_file: &str) -> Result<()>
     Ok(())
 }
 
+pub async fn dump_symbol_filename(db: &DatabaseManager, output_file: &str) -> Result<()> {
+    println!(
+        "Dumping all symbol-filename pairs to {}...",
+        output_file.cyan()
+    );
+
+    let pairs = db.get_all_symbol_filename_pairs().await?;
+
+    // Convert to JSON-serializable format
+    #[derive(serde::Serialize)]
+    struct SymbolFilenamePair {
+        symbol: String,
+        filename: String,
+    }
+
+    let json_records: Vec<SymbolFilenamePair> = pairs
+        .into_iter()
+        .map(|(symbol, filename)| SymbolFilenamePair { symbol, filename })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&json_records)?;
+
+    let mut file = File::create(output_file)?;
+    file.write_all(json.as_bytes())?;
+
+    println!(
+        "{} Dumped {} symbol-filename pairs to {}",
+        "Success:".green(),
+        json_records.len(),
+        output_file.cyan()
+    );
+
+    Ok(())
+}
+
 // Writer-based versions of search functions for both CLI and MCP usage
 
 pub async fn query_function_or_macro_to_writer(
