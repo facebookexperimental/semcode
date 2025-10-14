@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use crate::git::resolve_to_commit;
 use crate::CallRelationship;
 use anyhow::Result;
 use arrow::array::{Array, StringArray};
@@ -77,6 +76,7 @@ impl DatabaseManager {
             "macros",
             "processed_files",
             "symbol_filename",
+            "git_commits",
         ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
                 table.delete("1=1").await?;
@@ -105,6 +105,9 @@ impl DatabaseManager {
             "macros",
             "processed_files",
             "symbol_filename",
+            "git_commits",
+            "function_vectors",
+            "commit_vectors",
         ];
 
         // Scan main tables
@@ -581,6 +584,20 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Find a function by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `find_function_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns the "best match" from all indexed versions without considering git history.
+    /// Prefers .c over .h files, implementations over declarations, but may not match
+    /// the version currently in your working directory.
     pub async fn find_function(&self, name: &str) -> Result<Option<FunctionInfo>> {
         // Get all functions with this name and select the best one (prefers .c over .h, implementations over declarations)
         let all_matches = self
@@ -805,6 +822,19 @@ impl DatabaseManager {
         matches.into_iter().next().unwrap()
     }
 
+    /// Find all functions by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return multiple outdated versions.
+    /// For normal operations, use `find_all_functions_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns ALL indexed versions of functions with the given name across all commits,
+    /// which may include outdated versions that don't match your working directory.
     pub async fn find_all_functions(&self, name: &str) -> Result<Vec<FunctionInfo>> {
         self.function_store.find_all_by_name(name).await
     }
@@ -822,6 +852,19 @@ impl DatabaseManager {
         self.function_store.get_all_metadata_only().await
     }
 
+    /// Search for functions using fuzzy matching without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_functions_fuzzy_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns fuzzy matches across all indexed commits without filtering by git history.
+    /// Results may include functions that have been deleted, renamed, or modified.
     pub async fn search_functions_fuzzy(&self, pattern: &str) -> Result<Vec<FunctionInfo>> {
         self.search_manager.search_functions_fuzzy(pattern).await
     }
@@ -838,6 +881,22 @@ impl DatabaseManager {
 
     pub async fn update_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
         self.vector_search_manager.update_vectors(vectorizer).await
+    }
+
+    pub async fn update_commit_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        self.vector_search_manager
+            .update_commit_vectors(vectorizer)
+            .await
+    }
+
+    pub async fn search_similar_commits(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::types::GitCommitInfo, f32)>> {
+        self.vector_search_manager
+            .search_similar_commits(query_vector, limit)
+            .await
     }
 
     pub async fn search_similar_functions_with_scores(
@@ -923,6 +982,19 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Find a type by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return an outdated version.
+    /// For normal operations, use `find_type_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns the first matching type found without considering git history.
+    /// The returned type may not match the version in your working directory.
     pub async fn find_type(&self, name: &str) -> Result<Option<TypeInfo>> {
         self.type_store.find_by_name(name).await
     }
@@ -1001,6 +1073,19 @@ impl DatabaseManager {
         self.typedef_store.count_all().await
     }
 
+    /// Search for types using fuzzy matching without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_types_fuzzy_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns fuzzy matches across all indexed commits without filtering by git history.
+    /// Results may include types that have been deleted, renamed, or modified.
     pub async fn search_types_fuzzy(&self, pattern: &str) -> Result<Vec<TypeInfo>> {
         self.search_manager.search_types_fuzzy(pattern).await
     }
@@ -1073,6 +1158,19 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Find a typedef by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return an outdated version.
+    /// For normal operations, use `find_typedef_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns the first matching typedef found without considering git history.
+    /// The returned typedef may not match the version in your working directory.
     pub async fn find_typedef(&self, name: &str) -> Result<Option<TypedefInfo>> {
         self.typedef_store.find_by_name(name).await
     }
@@ -1130,6 +1228,19 @@ impl DatabaseManager {
         self.typedef_store.get_all().await
     }
 
+    /// Search for typedefs using fuzzy matching without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_typedefs_fuzzy_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns fuzzy matches across all indexed commits without filtering by git history.
+    /// Results may include typedefs that have been deleted, renamed, or modified.
     pub async fn search_typedefs_fuzzy(&self, pattern: &str) -> Result<Vec<TypedefInfo>> {
         self.search_manager.search_typedefs_fuzzy(pattern).await
     }
@@ -1148,7 +1259,19 @@ impl DatabaseManager {
         self.typedef_store.exists(name, file_path).await
     }
 
-    /// Search types using regex patterns on the name column
+    /// Search types using regex patterns on the name column without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_types_regex_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns regex matches across all indexed commits without filtering by git history.
+    /// Results may include types that have been deleted, renamed, or modified.
     pub async fn search_types_regex(&self, pattern: &str) -> Result<Vec<TypeInfo>> {
         self.search_manager.search_types_regex(pattern).await
     }
@@ -1164,7 +1287,19 @@ impl DatabaseManager {
             .await
     }
 
-    /// Search typedefs using regex patterns on the name column
+    /// Search typedefs using regex patterns on the name column without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_typedefs_regex_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns regex matches across all indexed commits without filtering by git history.
+    /// Results may include typedefs that have been deleted, renamed, or modified.
     pub async fn search_typedefs_regex(&self, pattern: &str) -> Result<Vec<TypedefInfo>> {
         self.search_manager.search_typedefs_regex(pattern).await
     }
@@ -1227,6 +1362,19 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Find a macro by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return an outdated version.
+    /// For normal operations, use `find_macro_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns the first matching macro found without considering git history.
+    /// The returned macro may not match the version in your working directory.
     pub async fn find_macro(&self, name: &str) -> Result<Option<MacroInfo>> {
         self.macro_store.find_by_name(name).await
     }
@@ -1315,6 +1463,19 @@ impl DatabaseManager {
         self.macro_store.get_all_metadata_only().await
     }
 
+    /// Search for macros using fuzzy matching without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_macros_fuzzy_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns fuzzy matches across all indexed commits without filtering by git history.
+    /// Results may include macros that have been deleted, renamed, or modified.
     pub async fn search_macros_fuzzy(&self, pattern: &str) -> Result<Vec<MacroInfo>> {
         self.search_manager.search_macros_fuzzy(pattern).await
     }
@@ -1329,7 +1490,19 @@ impl DatabaseManager {
             .await
     }
 
-    /// Search functions using regex patterns on the name column
+    /// Search functions using regex patterns on the name column without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_functions_regex_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns regex matches across all indexed commits without filtering by git history.
+    /// Results may include functions that have been deleted, renamed, or modified.
     pub async fn search_functions_regex(&self, pattern: &str) -> Result<Vec<FunctionInfo>> {
         self.search_manager.search_functions_regex(pattern).await
     }
@@ -1345,7 +1518,19 @@ impl DatabaseManager {
             .await
     }
 
-    /// Search macros using regex patterns on the name column
+    /// Search macros using regex patterns on the name column without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_macros_regex_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns regex matches across all indexed commits without filtering by git history.
+    /// Results may include macros that have been deleted, renamed, or modified.
     pub async fn search_macros_regex(&self, pattern: &str) -> Result<Vec<MacroInfo>> {
         self.search_manager.search_macros_regex(pattern).await
     }
@@ -2928,46 +3113,26 @@ impl DatabaseManager {
     /// Get callers using pre-loaded git manifest for filtering
 
     /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
+    /// Uses the shared git tree traversal utility for consistency
     async fn generate_git_manifest(
         &self,
         git_sha: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
-        match gix::discover(&self.git_repo_path) {
-            Ok(repo) => {
-                // Parse the commit SHA using revparse (supports short SHAs, tags, etc.)
-                let commit = resolve_to_commit(&repo, git_sha)?;
+        let mut manifest = std::collections::HashMap::new();
 
-                let tree = commit.tree().map_err(|e| {
-                    anyhow::anyhow!("Failed to get tree for commit '{}': {}", git_sha, e)
-                })?;
+        // Use shared tree traversal utility
+        crate::git::walk_tree_at_commit(
+            &self.git_repo_path,
+            git_sha,
+            |relative_path, object_id| {
+                // Normalize path by removing any double slashes
+                let normalized_path = relative_path.replace("//", "/");
+                manifest.insert(normalized_path, object_id.to_string());
+                Ok(())
+            },
+        )?;
 
-                let mut manifest = std::collections::HashMap::new();
-
-                // Walk the entire git tree and build manifest
-                use gix::traverse::tree::Recorder;
-                let mut recorder = Recorder::default();
-                tree.traverse().breadthfirst(&mut recorder)?;
-
-                for entry in recorder.records {
-                    if entry.mode.is_blob() {
-                        let relative_path = entry.filepath.to_string();
-
-                        // Normalize path by removing any double slashes
-                        let normalized_path = relative_path.replace("//", "/");
-
-                        let blob_hash = entry.oid.to_string();
-                        manifest.insert(normalized_path, blob_hash);
-                    }
-                }
-
-                Ok(manifest)
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "Failed to discover git repository from '{}': {}",
-                self.git_repo_path,
-                e
-            )),
-        }
+        Ok(manifest)
     }
 
     /// Fallback callers search when not in git repository
@@ -3032,14 +3197,6 @@ impl DatabaseManager {
 
     /// Insert a batch of content items
     pub async fn insert_content_batch(&self, content_items: Vec<ContentInfo>) -> Result<()> {
-        self.content_store.insert_batch(content_items).await
-    }
-
-    /// Insert a batch of content items, but only insert items that don't already exist
-    pub async fn insert_content_batch_deduplicated(
-        &self,
-        content_items: Vec<ContentInfo>,
-    ) -> Result<()> {
         self.content_store.insert_batch(content_items).await
     }
 
@@ -3218,5 +3375,453 @@ impl DatabaseManager {
         }
 
         Ok(callers)
+    }
+
+    // Git commits operations
+
+    /// Insert git commit metadata
+    pub async fn insert_git_commits(
+        &self,
+        commits: Vec<crate::types::GitCommitInfo>,
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "insert_git_commits: Starting batch insertion of {} commits into git_commits table",
+            commits.len()
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_sha", DataType::Utf8, false),
+            Field::new("parent_sha", DataType::Utf8, false),
+            Field::new("author", DataType::Utf8, false),
+            Field::new("subject", DataType::Utf8, false),
+            Field::new("message", DataType::Utf8, false),
+            Field::new("tags", DataType::Utf8, false),
+            Field::new("diff", DataType::Utf8, false),
+            Field::new("symbols", DataType::Utf8, false),
+        ]));
+
+        tracing::info!(
+            "insert_git_commits: Converting {} commits to Arrow arrays (serializing JSON for tags/symbols)...",
+            commits.len()
+        );
+        let array_conversion_start = std::time::Instant::now();
+
+        let mut git_shas = Vec::new();
+        let mut parent_shas = Vec::new();
+        let mut authors = Vec::new();
+        let mut subjects = Vec::new();
+        let mut messages = Vec::new();
+        let mut tags = Vec::new();
+        let mut diffs = Vec::new();
+        let mut symbols = Vec::new();
+
+        for commit in commits {
+            git_shas.push(commit.git_sha);
+            parent_shas.push(serde_json::to_string(&commit.parent_sha)?);
+            authors.push(commit.author);
+            subjects.push(commit.subject);
+            messages.push(commit.message);
+            tags.push(serde_json::to_string(&commit.tags)?);
+            diffs.push(commit.diff);
+            symbols.push(serde_json::to_string(&commit.symbols)?);
+        }
+
+        tracing::info!(
+            "insert_git_commits: Array conversion completed in {:.2}s",
+            array_conversion_start.elapsed().as_secs_f64()
+        );
+
+        tracing::info!(
+            "insert_git_commits: Creating Arrow RecordBatch with {} rows...",
+            git_shas.len()
+        );
+        let batch_creation_start = std::time::Instant::now();
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(git_shas)),
+            Arc::new(StringArray::from(parent_shas)),
+            Arc::new(StringArray::from(authors)),
+            Arc::new(StringArray::from(subjects)),
+            Arc::new(StringArray::from(messages)),
+            Arc::new(StringArray::from(tags)),
+            Arc::new(StringArray::from(diffs)),
+            Arc::new(StringArray::from(symbols)),
+        ];
+
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        let batches = vec![Ok(batch)];
+        let batch_iterator =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+
+        tracing::info!(
+            "insert_git_commits: RecordBatch creation completed in {:.2}s",
+            batch_creation_start.elapsed().as_secs_f64()
+        );
+
+        tracing::info!("insert_git_commits: Opening git_commits table...");
+        let table_open_start = std::time::Instant::now();
+        let table = self.connection.open_table("git_commits").execute().await?;
+        tracing::info!(
+            "insert_git_commits: Table opened in {:.2}s",
+            table_open_start.elapsed().as_secs_f64()
+        );
+
+        // Use merge_insert for upsert functionality (update if exists, insert if not)
+        tracing::info!(
+            "insert_git_commits: Executing merge_insert upsert operation (this may take several seconds)..."
+        );
+        let merge_insert_start = std::time::Instant::now();
+        let mut merge_insert = table.merge_insert(&["git_sha"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
+        tracing::info!(
+            "insert_git_commits: Merge_insert completed in {:.2}s",
+            merge_insert_start.elapsed().as_secs_f64()
+        );
+
+        tracing::info!("insert_git_commits: Batch insertion complete");
+
+        Ok(())
+    }
+
+    /// Get a single git commit by SHA
+    pub async fn get_git_commit_by_sha(
+        &self,
+        git_sha: &str,
+    ) -> Result<Option<crate::types::GitCommitInfo>> {
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+
+        // Escape SQL string literal
+        let escaped_sha = git_sha.replace("'", "''");
+        let filter = format!("git_sha = '{}'", escaped_sha);
+
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let git_sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let parent_sha_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let author_array = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let subject_array = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let message_array = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let tags_array = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let diff_array = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let symbols_array = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            if batch.num_rows() > 0 {
+                let git_sha = git_sha_array.value(0).to_string();
+                let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(0))?;
+                let author = author_array.value(0).to_string();
+                let subject = subject_array.value(0).to_string();
+                let message = message_array.value(0).to_string();
+                let tags = serde_json::from_str(tags_array.value(0))?;
+                let diff = diff_array.value(0).to_string();
+                let symbols: Vec<String> = serde_json::from_str(symbols_array.value(0))?;
+
+                return Ok(Some(crate::types::GitCommitInfo {
+                    git_sha,
+                    parent_sha,
+                    author,
+                    subject,
+                    message,
+                    tags,
+                    diff,
+                    symbols,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Get all git commits from the database
+    pub async fn get_all_git_commits(&self) -> Result<Vec<crate::types::GitCommitInfo>> {
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+        let results = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut commits = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let git_sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let parent_sha_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let author_array = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let subject_array = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let message_array = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let tags_array = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let diff_array = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let symbols_array = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let git_sha = git_sha_array.value(i).to_string();
+                let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(i))?;
+                let author = author_array.value(i).to_string();
+                let subject = subject_array.value(i).to_string();
+                let message = message_array.value(i).to_string();
+                let tags = serde_json::from_str(tags_array.value(i))?;
+                let diff = diff_array.value(i).to_string();
+                let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+
+                commits.push(crate::types::GitCommitInfo {
+                    git_sha,
+                    parent_sha,
+                    author,
+                    subject,
+                    message,
+                    tags,
+                    diff,
+                    symbols,
+                });
+            }
+        }
+
+        Ok(commits)
+    }
+
+    /// Query commits by a chunk of SHAs with post-processing filters
+    /// Regex and symbol filtering are done in Rust code after fetching SHA-filtered results
+    /// This avoids complex SQL operations while still reducing the dataset via SHA filtering
+    pub async fn query_commits_chunk_filtered(
+        &self,
+        sha_chunk: &[String],
+        regex_patterns: &[String],
+        symbol_patterns: &[String],
+    ) -> Result<Vec<crate::types::GitCommitInfo>> {
+        use futures::TryStreamExt;
+
+        if sha_chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+
+        // Build SQL WHERE clause with only SHA IN clause
+        // Regex and symbol filtering will be done in Rust post-processing
+        let escaped_shas: Vec<String> = sha_chunk
+            .iter()
+            .map(|sha| format!("'{}'", sha.replace("'", "''")))
+            .collect();
+        let filter = format!("git_sha IN ({})", escaped_shas.join(", "));
+
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut commits = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let git_sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let parent_sha_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let author_array = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let subject_array = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let message_array = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let tags_array = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let diff_array = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let symbols_array = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let git_sha = git_sha_array.value(i).to_string();
+                let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(i))?;
+                let author = author_array.value(i).to_string();
+                let subject = subject_array.value(i).to_string();
+                let message = message_array.value(i).to_string();
+                let tags = serde_json::from_str(tags_array.value(i))?;
+                let diff = diff_array.value(i).to_string();
+                let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+
+                commits.push(crate::types::GitCommitInfo {
+                    git_sha,
+                    parent_sha,
+                    author,
+                    subject,
+                    message,
+                    tags,
+                    diff,
+                    symbols,
+                });
+            }
+        }
+
+        // Apply regex filtering in Rust code (post-processing)
+        if !regex_patterns.is_empty() {
+            // Compile regex patterns
+            let mut regexes = Vec::new();
+            for pattern in regex_patterns {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => regexes.push(re),
+                    Err(e) => {
+                        tracing::warn!("Invalid regex pattern '{}': {}", pattern, e);
+                        continue;
+                    }
+                }
+            }
+
+            // Filter commits: ALL regex patterns must match (in message OR diff)
+            commits.retain(|commit| {
+                regexes
+                    .iter()
+                    .all(|re| re.is_match(&commit.message) || re.is_match(&commit.diff))
+            });
+        }
+
+        // Apply symbol filtering in Rust code (post-processing)
+        if !symbol_patterns.is_empty() {
+            // Compile symbol regex patterns
+            let mut symbol_regexes = Vec::new();
+            for pattern in symbol_patterns {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => symbol_regexes.push(re),
+                    Err(e) => {
+                        tracing::warn!("Invalid symbol regex pattern '{}': {}", pattern, e);
+                        continue;
+                    }
+                }
+            }
+
+            // Filter commits: ALL symbol patterns must match
+            commits.retain(|commit| {
+                symbol_regexes
+                    .iter()
+                    .all(|re| commit.symbols.iter().any(|symbol| re.is_match(symbol)))
+            });
+        }
+
+        Ok(commits)
     }
 }

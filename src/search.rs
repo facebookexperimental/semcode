@@ -452,6 +452,25 @@ pub async fn dump_symbol_filename(db: &DatabaseManager, output_file: &str) -> Re
     Ok(())
 }
 
+pub async fn dump_git_commits(db: &DatabaseManager, output_file: &str) -> Result<()> {
+    println!("Dumping all git commits to {}...", output_file.cyan());
+
+    let commits = db.get_all_git_commits().await?;
+    let json = serde_json::to_string_pretty(&commits)?;
+
+    let mut file = File::create(output_file)?;
+    file.write_all(json.as_bytes())?;
+
+    println!(
+        "{} Dumped {} git commits to {}",
+        "Success:".green(),
+        commits.len(),
+        output_file.cyan()
+    );
+
+    Ok(())
+}
+
 // Writer-based versions of search functions for both CLI and MCP usage
 
 pub async fn query_function_or_macro_to_writer(

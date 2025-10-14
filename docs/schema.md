@@ -35,6 +35,16 @@ This design provides excellent performance, storage efficiency, and atomic data 
 
 ## Core Tables
 
+The database consists of the following tables:
+
+1. **functions** - Function definitions and declarations with call and type relationships
+2. **types** - Struct, union, enum, and typedef definitions with type dependencies
+3. **macros** - Function-like macro definitions with call and type relationships
+4. **vectors** - CodeBERT embeddings for semantic search
+5. **processed_files** - Tracks processed files for incremental indexing
+6. **commits** - Git commit metadata with unified diffs and changed symbols
+7. **content_0 through content_15** - Deduplicated content storage (16 shards)
+
 ### 1. functions
 
 Stores analyzed C/C++ function definitions and declarations with content deduplication.
@@ -206,7 +216,70 @@ git_file_sha        (Utf8, NOT NULL)     - SHA-1 hash of specific file content a
 - BTree on `git_file_sha` (content-based deduplication)
 - Composite on `(file, git_sha)` (efficient file + git_sha lookups)
 
-### 6. content_0 through content_15 (Content Shards)
+### 6. commits
+
+Stores git commit metadata including unified diffs and symbols changed in each commit. Enables commit-level analysis and tracking code evolution across git history.
+
+**Schema:**
+```
+git_sha             (Utf8, NOT NULL)     - Commit SHA (primary key)
+parent_sha          (Utf8, NOT NULL)     - JSON array of parent commit SHAs (multiple for merges)
+author              (Utf8, NOT NULL)     - Author name and email (format: "Name <email>")
+subject             (Utf8, NOT NULL)     - Commit subject line (first line of message)
+message             (Utf8, NOT NULL)     - Full commit message
+tags                (Utf8, NOT NULL)     - JSON map of commit message tags (e.g., Signed-off-by, Reviewed-by)
+diff                (Utf8, NOT NULL)     - Full unified diff with symbol context in hunk headers
+symbols             (Utf8, NOT NULL)     - JSON array of changed symbols extracted via walk-back algorithm
+```
+
+**Symbol Extraction:**
+- Detects modified functions, types (structs/unions/enums), and macros
+- Handles both additions and deletions by analyzing old and new file versions
+- Symbol formats: "function_name()", "struct type_name", "union type_name", "enum type_name", "#MACRO_NAME"
+- Includes symbol context in unified diff hunk headers (git-style: `@@ ... @@ function_name()`)
+
+**Example JSON columns:**
+```json
+// parent_sha column
+["a1b2c3d4e5f6...", "f6e5d4c3b2a1..."]  // Multiple for merge commits
+
+// tags column
+{
+  "Signed-off-by": ["John Doe <john@example.com>"],
+  "Reviewed-by": ["Jane Smith <jane@example.com>", "Bob Jones <bob@example.com>"],
+  "Fixes": ["#1234"]
+}
+
+// symbols column
+["mem_pool_alloc()", "struct kmemleak_object", "kmemleak_init()", "#KMEMLEAK_DEBUG"]
+```
+
+**Unified Diff Format:**
+- Standard git unified diff format with additions (+), deletions (-), and context lines
+- Enhanced with symbol context in hunk headers: `@@ -old_start,old_count +new_start,new_count @@ symbol`
+- Includes file headers (diff --git, ---, +++) for each modified file
+- Only includes diffs for commits with exactly one parent (skips merge commits and root commits)
+
+**Use Cases:**
+- **Commit Analysis**: Understand what changed in each commit and which symbols were affected
+- **Code Evolution**: Track how functions and types evolve across commits
+- **Review Assistance**: Quickly identify modified symbols without parsing full diffs
+- **Git History Search**: Find commits that modified specific functions or types
+- **Incremental Processing**: Process commit ranges efficiently with deduplication
+
+**Notes:**
+- Populated by `semcode-index --commits SHA1..SHA2` for commit metadata only
+- Also populated automatically during `semcode-index --git SHA1..SHA2` (files + commits)
+- Diff generation uses gitoxide for consistent git-compatible output
+
+**Indices:**
+- BTree on `git_sha` (primary key for commit lookups)
+- BTree on `author` (query commits by author)
+- BTree on `subject` (search commit messages)
+- BTree on `symbols` (find commits that modified specific symbols)
+- BTree on `parent_sha` (traverse commit history)
+
+### 7. content_0 through content_15 (Content Shards)
 
 Stores deduplicated content referenced by other tables, distributed across 16 shard tables for optimal performance.
 
@@ -298,6 +371,17 @@ Every record includes a `git_file_hash` field containing the SHA-1 hash of the f
 - **Git-aware queries**: Find entities from specific git commits
 - **Cross-commit consistency**: Same git hash ensures identical content across commits
 
+### Commit Metadata with Symbol Extraction
+
+The commits table stores git commit history with enhanced metadata:
+- **Unified Diffs**: Full git-style diffs with symbol context in hunk headers
+- **Walk-back Symbol Extraction**: Fast O(modified_lines × 50) algorithm identifies changed functions, types, and macros
+- **Dual-file Analysis**: Extracts symbols from both additions and deletions
+- **Enhanced Hunk Headers**: Git-style `@@ ... @@ symbol` format for better context
+- **Commit Traversal**: Parent relationships enable git history analysis
+- **Tag Parsing**: Extracts structured metadata from commit messages (Signed-off-by, Reviewed-by, etc.)
+- **Use Cases**: Commit analysis, code evolution tracking, review assistance, git history search
+
 ## Query Patterns
 
 ### Basic Lookups
@@ -381,6 +465,38 @@ FROM (
   UNION ALL
   SELECT definition_hash FROM macros WHERE definition_hash IS NOT NULL
 ) GROUP BY blake3_hash HAVING usage_count > 1
+```
+
+### Commit Metadata Queries
+```sql
+-- Find commits by author
+SELECT git_sha, subject, author FROM commits
+WHERE author LIKE '%john@example.com%'
+
+-- Find commits that modified a specific function
+SELECT git_sha, subject, author FROM commits
+WHERE symbols LIKE '%"malloc_wrapper()"%'
+
+-- Find commits that modified any struct definitions
+SELECT git_sha, subject, author FROM commits
+WHERE symbols LIKE '%"struct %'
+
+-- Get full commit details including diff
+SELECT git_sha, subject, message, diff, symbols FROM commits
+WHERE git_sha = 'abc123...'
+
+-- Find commits with multiple parents (merge commits)
+SELECT git_sha, subject, author FROM commits
+WHERE parent_sha LIKE '%,%'
+
+-- Find commits with specific tags (e.g., reviewed commits)
+SELECT git_sha, subject, author FROM commits
+WHERE tags LIKE '%"Reviewed-by"%'
+
+-- Traverse commit history by following parent relationships
+SELECT c1.git_sha, c1.subject, c2.git_sha as parent_sha, c2.subject as parent_subject
+FROM commits c1, commits c2
+WHERE c1.parent_sha LIKE '%"' || c2.git_sha || '"%'
 ```
 
 ### Cross-shard Content Analysis

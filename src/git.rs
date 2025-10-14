@@ -7,12 +7,25 @@ use gix::bstr::ByteSlice;
 /// Helper function to resolve a revspec (SHA, tag, etc.) to a commit object
 /// Ensures that tags are properly dereferenced to their target commits
 pub fn resolve_to_commit<'a>(repo: &'a gix::Repository, revspec: &str) -> Result<gix::Commit<'a>> {
-    // Add ^{commit} suffix to ensure we get a commit object, not a tag object
-    // This follows the pattern used in gitoxide examples
-    let commit_spec = if revspec.contains('^') {
+    // Add ^{commit} to dereference tags to commits, but insert it before ancestry operators
+    // For example: v6.16~8 becomes v6.16^{commit}~8
+    let commit_spec = if revspec.contains("^{") {
+        // Already has explicit dereference syntax, use as-is
         revspec.to_string()
     } else {
-        format!("{revspec}^{{commit}}")
+        // Find the first ancestry operator (~ or ^)
+        let ancestry_pos = revspec.find('~').into_iter().chain(revspec.find('^')).min();
+
+        match ancestry_pos {
+            Some(pos) => {
+                // Insert ^{commit} before the ancestry operator
+                format!("{}^{{commit}}{}", &revspec[..pos], &revspec[pos..])
+            }
+            None => {
+                // No ancestry operators, append ^{commit} at the end
+                format!("{revspec}^{{commit}}")
+            }
+        }
     };
 
     repo.rev_parse_single(commit_spec.as_str())?
@@ -469,6 +482,50 @@ pub fn get_changed_files_to_workdir<P: AsRef<Path>>(
                 changed_files.len()
             );
             Ok(changed_files)
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to discover git repository from '{}': {}",
+            repo_path.display(),
+            e
+        )),
+    }
+}
+
+/// Walk a git tree at a specific commit and process each blob entry with a callback
+/// This is a generic utility function that allows callers to collect or process entries in their own way
+pub fn walk_tree_at_commit<P: AsRef<Path>, F>(
+    repo_path: P,
+    commit_sha: &str,
+    mut process_entry: F,
+) -> Result<()>
+where
+    F: FnMut(&str, &gix::ObjectId) -> Result<()>,
+{
+    let repo_path = repo_path.as_ref();
+
+    match gix::discover(repo_path) {
+        Ok(repo) => {
+            // Parse the commit SHA using revparse (supports short SHAs, tags, etc.)
+            let commit = resolve_to_commit(&repo, commit_sha)?;
+
+            let tree = commit.tree().map_err(|e| {
+                anyhow::anyhow!("Failed to get tree for commit '{}': {}", commit_sha, e)
+            })?;
+
+            // Walk the entire git tree using breadthfirst traversal
+            use gix::traverse::tree::Recorder;
+            let mut recorder = Recorder::default();
+            tree.traverse().breadthfirst(&mut recorder)?;
+
+            // Process each blob entry with the provided callback
+            for entry in recorder.records {
+                if entry.mode.is_blob() {
+                    let relative_path = entry.filepath.to_str_lossy();
+                    process_entry(&relative_path, &entry.oid)?;
+                }
+            }
+
+            Ok(())
         }
         Err(e) => Err(anyhow::anyhow!(
             "Failed to discover git repository from '{}': {}",

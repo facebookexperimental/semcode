@@ -2757,4 +2757,372 @@ impl VectorSearchManager {
         );
         Ok(())
     }
+
+    pub async fn update_commit_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        use crate::database::vectors::VectorEntry;
+        use indicatif::{ProgressBar, ProgressStyle};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        tracing::info!("Starting commit vectorization");
+
+        // Open git_commits table
+        let commits_table = self.connection.open_table("git_commits").execute().await?;
+
+        // Get all commits
+        let commit_results = commits_table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let total_commits: usize = commit_results.iter().map(|batch| batch.num_rows()).sum();
+
+        if total_commits == 0 {
+            println!("No commits found in database");
+            return Ok(());
+        }
+
+        println!("Found {} commits to vectorize", total_commits);
+
+        // Check which commits already have vectors
+        let commit_vectors_table = self
+            .connection
+            .open_table("commit_vectors")
+            .execute()
+            .await?;
+        let existing_vector_results = commit_vectors_table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut existing_commit_shas = std::collections::HashSet::new();
+        for batch in &existing_vector_results {
+            let sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                existing_commit_shas.insert(sha_array.value(i).to_string());
+            }
+        }
+
+        tracing::info!(
+            "Found {} existing commit vectors, {} new commits to vectorize",
+            existing_commit_shas.len(),
+            total_commits - existing_commit_shas.len()
+        );
+
+        // Extract commit data (git_sha, message, diff)
+        let mut commits_to_vectorize = Vec::new();
+        for batch in &commit_results {
+            let git_sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let message_array = batch
+                .column(4) // message is column 4
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let diff_array = batch
+                .column(6) // diff is column 6
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let git_sha = git_sha_array.value(i).to_string();
+
+                // Skip if already vectorized
+                if existing_commit_shas.contains(&git_sha) {
+                    continue;
+                }
+
+                let message = message_array.value(i).to_string();
+                let diff = diff_array.value(i).to_string();
+
+                // Combine message and diff
+                let combined_text = format!("{}\n\n{}", message, diff);
+
+                commits_to_vectorize.push((git_sha, combined_text));
+            }
+        }
+
+        if commits_to_vectorize.is_empty() {
+            println!("All commits already have vectors");
+            return Ok(());
+        }
+
+        println!("Vectorizing {} new commits...", commits_to_vectorize.len());
+
+        let pb = ProgressBar::new(commits_to_vectorize.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%) {msg} [{eta}]",
+            )?
+            .progress_chars("##-"),
+        );
+
+        let processed_count = Arc::new(AtomicUsize::new(0));
+
+        // Process commits in streaming batches for better progress feedback
+        // Larger batch size (500) reduces database insertion overhead while still providing
+        // visible progress updates every 10-15 seconds
+        let streaming_batch_size = 500;
+        let total_to_process = commits_to_vectorize.len();
+
+        for batch_start in (0..total_to_process).step_by(streaming_batch_size) {
+            let batch_end = (batch_start + streaming_batch_size).min(total_to_process);
+            let batch = &commits_to_vectorize[batch_start..batch_end];
+
+            // Vectorize all texts in one call - vectorizer handles internal batching and
+            // parallelism optimally (model2vec-rs uses num_cpus * 64 batch size internally)
+            let texts: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
+            let vectors = vectorizer.vectorize_batch(&texts)?;
+
+            let batch_vectors: Vec<VectorEntry> = batch
+                .iter()
+                .zip(vectors)
+                .map(|((git_sha, _), vector)| VectorEntry {
+                    content_hash: git_sha.clone(), // Using git_commit_sha as the key
+                    vector,
+                })
+                .collect();
+
+            // Insert this batch immediately
+            if !batch_vectors.is_empty() {
+                self.insert_commit_vectors_batch(&batch_vectors).await?;
+
+                let count = processed_count.fetch_add(batch_vectors.len(), Ordering::Relaxed)
+                    + batch_vectors.len();
+                pb.set_position(count as u64);
+                pb.set_message(format!("Inserted {} vectors", count));
+            }
+        }
+
+        let total_generated = processed_count.load(Ordering::Relaxed);
+        pb.finish_with_message(format!(
+            "Commit vectorization complete: {} vectors generated",
+            total_generated
+        ));
+
+        tracing::info!("Successfully vectorized {} commits", total_generated);
+        Ok(())
+    }
+
+    /// Helper to insert commit vectors into commit_vectors table
+    async fn insert_commit_vectors_batch(
+        &self,
+        vectors: &[crate::database::vectors::VectorEntry],
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, FixedSizeListArray, StringBuilder};
+        use arrow::datatypes::{DataType, Field, Float32Type, Schema};
+        use arrow::record_batch::RecordBatchIterator;
+        use std::sync::Arc;
+
+        if vectors.is_empty() {
+            return Ok(());
+        }
+
+        let commit_vectors_table = self
+            .connection
+            .open_table("commit_vectors")
+            .execute()
+            .await?;
+
+        // Get vector dimension from first entry
+        let vector_dim = vectors[0].vector.len();
+
+        // Create git_commit_sha StringArray
+        let mut sha_builder = StringBuilder::new();
+        for entry in vectors {
+            sha_builder.append_value(&entry.content_hash); // content_hash field contains git_commit_sha
+        }
+        let sha_array = sha_builder.finish();
+
+        // Create vector array
+        let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            vectors
+                .iter()
+                .map(|entry| Some(entry.vector.iter().map(|&v| Some(v)))),
+            vector_dim as i32,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    vector_dim as i32,
+                ),
+                false,
+            ),
+        ]));
+
+        let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![
+            ("git_commit_sha", Arc::new(sha_array) as ArrayRef),
+            ("vector", Arc::new(vector_array) as ArrayRef),
+        ])?;
+
+        let batches = vec![Ok(batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+        commit_vectors_table.add(batch_iterator).execute().await?;
+
+        Ok(())
+    }
+
+    /// Search for similar commits based on vector similarity
+    /// Returns commits sorted by similarity score (highest first)
+    pub async fn search_similar_commits(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::types::GitCommitInfo, f32)>> {
+        // Search for similar vectors in commit_vectors table
+        let commit_vectors_table = self
+            .connection
+            .open_table("commit_vectors")
+            .execute()
+            .await?;
+
+        let vector_results = commit_vectors_table
+            .query()
+            .nearest_to(query_vector)?
+            .refine_factor(5)
+            .nprobes(10)
+            .limit(limit)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Extract git_commit_sha and distances from vector search results
+        let mut sha_scores = Vec::new();
+        for batch in &vector_results {
+            let sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let distance_array = batch
+                .column(2) // LanceDB puts distance in column 2
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let sha = sha_array.value(i).to_string();
+                let distance = distance_array.value(i);
+                // Convert cosine distance to similarity score (1.0 - distance/2.0)
+                let similarity = (1.0 - distance / 2.0).max(0.0);
+                sha_scores.push((sha, similarity));
+            }
+        }
+
+        if sha_scores.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Create a map from git_sha to similarity score
+        let score_map: HashMap<String, f32> = sha_scores.iter().cloned().collect();
+        let shas: Vec<String> = sha_scores.into_iter().map(|(sha, _)| sha).collect();
+
+        // Query git_commits table for these commit SHAs
+        let commits_table = self.connection.open_table("git_commits").execute().await?;
+
+        let mut commit_results = Vec::new();
+        for chunk in shas.chunks(100) {
+            let sha_conditions: Vec<String> = chunk
+                .iter()
+                .map(|sha| format!("git_sha = '{}'", sha.replace("'", "''")))
+                .collect();
+            let sha_filter = sha_conditions.join(" OR ");
+
+            let results = commits_table
+                .query()
+                .only_if(sha_filter)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            for batch in &results {
+                let git_sha_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let parent_sha_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let author_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let subject_array = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let message_array = batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let tags_array = batch
+                    .column(5)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let diff_array = batch
+                    .column(6)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let symbols_array = batch
+                    .column(7)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let git_sha = git_sha_array.value(i).to_string();
+                    let similarity_score = score_map.get(&git_sha).copied().unwrap_or(0.0);
+
+                    let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(i))?;
+                    let tags: std::collections::HashMap<String, Vec<String>> =
+                        serde_json::from_str(tags_array.value(i))?;
+                    let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+
+                    let commit_info = crate::types::GitCommitInfo {
+                        git_sha,
+                        parent_sha,
+                        author: author_array.value(i).to_string(),
+                        subject: subject_array.value(i).to_string(),
+                        message: message_array.value(i).to_string(),
+                        tags,
+                        diff: diff_array.value(i).to_string(),
+                        symbols,
+                    };
+
+                    commit_results.push((commit_info, similarity_score));
+                }
+            }
+        }
+
+        // Sort by similarity score (highest first)
+        commit_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(commit_results)
+    }
 }
