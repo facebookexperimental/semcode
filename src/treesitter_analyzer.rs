@@ -3,6 +3,7 @@ use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
@@ -11,6 +12,9 @@ use crate::types::{
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
+
+// Pre-compiled regex for parameter parsing (performance optimization)
+static PARAM_WHITESPACE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
 pub struct TreeSitterAnalyzer {
     parser: Parser,
@@ -1031,7 +1035,7 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Vec<ParameterInfo> {
-        let mut parameters = Vec::new();
+        let mut parameters = Vec::with_capacity(8); // Most functions have <8 parameters
 
         // Walk through the parameter_list node to find parameter_declaration children
         let mut cursor = node.walk();
@@ -1068,12 +1072,12 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Vec<ParameterInfo> {
-        let mut parameters = Vec::new();
+        let mut parameters = Vec::with_capacity(8); // Most functions have <8 parameters
         let text = &source[node.byte_range()];
 
         // Remove newlines and normalize whitespace for easier parsing
         let normalized = text.replace(['\n', '\t'], " ");
-        let normalized = Regex::new(r"\s+").unwrap().replace_all(&normalized, " ");
+        let normalized = PARAM_WHITESPACE_REGEX.replace_all(&normalized, " ");
 
         // Split by commas but be careful about nested parentheses
         let param_parts = self.split_parameters(&normalized);
@@ -1799,7 +1803,7 @@ impl TreeSitterAnalyzer {
 
     /// Generate common variations of type names for lookup
     fn generate_type_name_variants(&self, base_name: &str) -> Vec<String> {
-        let mut variants = Vec::new();
+        let mut variants = Vec::with_capacity(6); // Max 6 variants (struct/union/enum + with/without prefix)
 
         // Add struct prefix if not present
         if !base_name.starts_with("struct ")
