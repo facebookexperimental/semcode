@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "semcode"
 version = "0.1.0"
@@ -65,4 +67,16 @@ name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
 
 [profile.release]
-debug = false
+debug = false          # no debug
+opt-level = 3          # max performance (O3)
+lto = "fat"            # full link-time optimization across crates
+codegen-units = 1      # single codegen unit for better optimization
+panic = "abort"        # remove unwinding runtime
+strip = "symbols"      # remove debug symbols
+incremental = false    # always fully optimize
+overflow-checks = false # no runtime overflow checks
+rpath = false          # omit runtime search paths
+rustflags = [
+  "-C", "target-cpu=native",             # tune for your CPU; enables all supported instructions
+]
+

@@ -1390,6 +1390,9 @@ impl SearchManager {
         // Query with specific git_file_hashes using regexp_match
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
 
+        // Compile regex once before processing batches (performance optimization)
+        let regex = regex::Regex::new(pattern)?;
+
         let mut types = Vec::new();
         for chunk in hash_values.chunks(100) {
             let hash_conditions: Vec<String> = chunk
@@ -1459,10 +1462,6 @@ impl SearchManager {
                     }
 
                     // Apply regex matching in code since LanceDB has issues with combined conditions
-                    let regex = match regex::Regex::new(pattern) {
-                        Ok(r) => r,
-                        Err(_) => continue, // Skip invalid regex patterns
-                    };
                     if !regex.is_match(name) {
                         continue;
                     }
@@ -1635,6 +1634,9 @@ impl SearchManager {
         // Query with specific git_file_hashes using regexp_match for typedefs
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
 
+        // Compile regex once before processing batches (performance optimization)
+        let regex = regex::Regex::new(pattern)?;
+
         let mut typedefs = Vec::new();
         for chunk in hash_values.chunks(100) {
             let hash_conditions: Vec<String> = chunk
@@ -1694,10 +1696,6 @@ impl SearchManager {
                     }
 
                     // Apply regex matching in code since LanceDB has issues with combined conditions
-                    let regex = match regex::Regex::new(pattern) {
-                        Ok(r) => r,
-                        Err(_) => continue, // Skip invalid regex patterns
-                    };
                     if !regex.is_match(name) {
                         continue;
                     }
@@ -2009,6 +2007,9 @@ impl SearchManager {
             .try_collect::<Vec<_>>()
             .await?;
 
+        // Compile regex once before processing batches (performance optimization)
+        let regex = regex::Regex::new(pattern)?;
+
         let mut macros = Vec::new();
         for batch in &results {
             let name_array = batch
@@ -2051,10 +2052,6 @@ impl SearchManager {
                 let name = name_array.value(i);
 
                 // Apply regex matching in code
-                let regex = match regex::Regex::new(pattern) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
                 if !regex.is_match(name) {
                     continue;
                 }

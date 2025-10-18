@@ -556,14 +556,13 @@ impl PipelineBuilder {
                     let start = Instant::now();
                     let mut total_processed = 0;
 
-                    let mut batch = ProcessedBatch {
-                        functions: Vec::new(),
-                        types: Vec::new(),
-                        macros: Vec::new(),
-                        processed_files: Vec::new(),
-                    };
-
                     let mut batch_size = 2000;
+                    let mut batch = ProcessedBatch {
+                        functions: Vec::with_capacity(batch_size),
+                        types: Vec::with_capacity(batch_size),
+                        macros: Vec::with_capacity(batch_size / 5), // Fewer macros typically
+                        processed_files: Vec::with_capacity(50), // ~1 file per batch avg
+                    };
                     let mut last_batch_time = Instant::now();
 
                     loop {
@@ -629,10 +628,10 @@ impl PipelineBuilder {
                                     let batch_to_send = std::mem::replace(
                                         &mut batch,
                                         ProcessedBatch {
-                                            functions: Vec::new(),
-                                            types: Vec::new(),
-                                            macros: Vec::new(),
-                                            processed_files: Vec::new(),
+                                            functions: Vec::with_capacity(batch_size),
+                                            types: Vec::with_capacity(batch_size),
+                                            macros: Vec::with_capacity(batch_size / 5),
+                                            processed_files: Vec::with_capacity(50),
                                         },
                                     );
 
