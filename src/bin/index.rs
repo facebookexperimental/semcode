@@ -25,6 +25,10 @@ use walkdir::WalkDir;
 // Import pipeline
 use semcode::pipeline::PipelineBuilder;
 
+// Import IPC for worker mode
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use anyhow::Context;
+
 #[derive(Parser, Debug)]
 #[command(name = "semcode-index")]
 #[command(about = "Index a codebase for semantic analysis", long_about = None)]
@@ -104,6 +108,32 @@ struct Args {
     /// Uses incremental processing and deduplication with parallel streaming pipeline.
     #[arg(long, value_name = "GIT_RANGE")]
     git: Option<String>,
+
+    /// Enable clangd integration for enriched semantic analysis (requires compile_commands.json)
+    /// When enabled, semcode will use clangd to extract USRs, canonical types, and precise call graphs
+    #[arg(long)]
+    use_clangd: bool,
+
+    /// Path to compile_commands.json for clangd integration (default: looks in source directory)
+    #[arg(long, value_name = "PATH")]
+    compile_commands: Option<PathBuf>,
+
+    // Hidden arguments for worker mode (internal use only)
+    /// Run in clangd worker mode (internal use only)
+    #[arg(long, hide = true)]
+    clangd_worker: bool,
+
+    /// Worker ID for debugging (internal use only)
+    #[arg(long, hide = true)]
+    worker_id: Option<usize>,
+
+    /// IPC server name for work channel (internal use only)
+    #[arg(long, hide = true)]
+    ipc_work_server: Option<String>,
+
+    /// IPC server name for response channel (internal use only)
+    #[arg(long, hide = true)]
+    ipc_response_server: Option<String>,
 }
 
 #[tokio::main]
@@ -112,6 +142,11 @@ async fn main() -> Result<()> {
     std::env::set_var("ORT_LOG_LEVEL", "ERROR");
 
     let args = Args::parse();
+
+    // Check if running in worker mode
+    if args.clangd_worker {
+        return run_clangd_worker_mode(args).await;
+    }
 
     // Enable performance monitoring if --perf flag is set
     if args.perf {
@@ -178,6 +213,42 @@ async fn main() -> Result<()> {
     // Initialize tracing with SEMCODE_DEBUG environment variable support
     semcode::logging::init_tracing();
 
+    // Check clangd integration availability
+    let clangd_config = if args.use_clangd {
+        let compile_commands_path = args
+            .compile_commands
+            .clone()
+            .unwrap_or_else(|| args.source.join("compile_commands.json"));
+
+        // Verify clangd is actually available before claiming it's enabled
+        if semcode::ClangdAnalyzer::is_available(&compile_commands_path) {
+            info!("🚀 Clangd integration ENABLED");
+            info!(
+                "   Using compile_commands.json: {}",
+                compile_commands_path.display()
+            );
+            info!("   Will enrich analysis with:");
+            info!("     • Unified Symbol Resolutions (USRs) for precise symbol tracking");
+            info!("     • Canonical type names (template instantiations, auto, typedef resolution)");
+            info!("     • Precise overload resolution");
+            info!("     • Cross-references into system headers");
+            Some(compile_commands_path)
+        } else {
+            eprintln!("⚠️  Clangd integration requested but compile_commands.json not found");
+            eprintln!("   Falling back to Tree-sitter-only analysis");
+            eprintln!("   To enable clangd, ensure compile_commands.json exists in source directory");
+            eprintln!("   Or specify path with: --compile-commands /path/to/compile_commands.json");
+            None
+        }
+    } else {
+        info!("ℹ️  Using Tree-sitter analysis (fast, works everywhere)");
+        let compile_commands_path = args.source.join("compile_commands.json");
+        if compile_commands_path.exists() {
+            info!("💡 compile_commands.json detected - use --use-clangd for enriched semantic analysis");
+        }
+        None
+    };
+
     info!("Starting semantic code indexing");
     if let Some(ref git_range) = args.git {
         info!("Git commit indexing mode: {}", git_range);
@@ -208,10 +279,93 @@ async fn main() -> Result<()> {
     // Run TreeSitter pipeline processing (the only option now)
     info!("Using Tree-sitter for code analysis");
     info!("Using pipeline processing for better CPU utilization");
-    run_pipeline(args).await
+
+    run_pipeline(args, clangd_config).await
 }
 
-async fn run_pipeline(args: Args) -> Result<()> {
+/// Worker mode entry point - runs when spawned with --clangd-worker flag
+async fn run_clangd_worker_mode(args: Args) -> Result<()> {
+    // Set up minimal logging for worker
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
+
+    let worker_id = args.worker_id.expect("Worker ID required in worker mode");
+    let work_server_name = args
+        .ipc_work_server
+        .expect("IPC work server name required in worker mode");
+    let response_server_name = args
+        .ipc_response_server
+        .expect("IPC response server name required in worker mode");
+
+    tracing::debug!(
+        "Starting clangd worker {} (PID: {})",
+        worker_id,
+        std::process::id()
+    );
+
+    // Get compile_commands path
+    let compile_commands_path = if let Some(ref path) = args.compile_commands {
+        path.clone()
+    } else {
+        args.source.join("compile_commands.json")
+    };
+
+    if !compile_commands_path.exists() {
+        anyhow::bail!(
+            "compile_commands.json not found at {:?}",
+            compile_commands_path
+        );
+    }
+
+    tracing::debug!(
+        "Worker {} using compile_commands.json at {:?}",
+        worker_id,
+        compile_commands_path
+    );
+
+    // Create IPC channels for communication with parent
+    // Parent will send WorkRequest to us, we send WorkResponse back
+
+    // Create channel to receive work from parent
+    let (work_tx_to_parent, work_rx) = ipc::channel()
+        .context("Failed to create work channel")?;
+
+    // Create channel to send responses to parent
+    let (response_tx, response_rx_for_parent) = ipc::channel()
+        .context("Failed to create response channel")?;
+
+    // Connect to parent's work server and send our receiver
+    let work_bootstrap: IpcSender<IpcSender<semcode::clangd_worker::WorkRequest>> =
+        IpcSender::connect(work_server_name.clone())
+            .with_context(|| format!("Failed to connect to work server: {}", work_server_name))?;
+    work_bootstrap.send(work_tx_to_parent)
+        .context("Failed to send work channel to parent")?;
+
+    // Connect to parent's response server and send our sender
+    let response_bootstrap: IpcSender<IpcReceiver<semcode::clangd_worker::WorkResponse>> =
+        IpcSender::connect(response_server_name.clone())
+            .with_context(|| format!("Failed to connect to response server: {}", response_server_name))?;
+    response_bootstrap.send(response_rx_for_parent)
+        .context("Failed to send response channel to parent")?;
+
+    tracing::debug!("Worker {} IPC channels established", worker_id);
+
+    // Call the worker entry point
+    semcode::run_worker(
+        worker_id,
+        work_rx,
+        response_tx,
+        compile_commands_path,
+        args.source,
+    )
+    .await
+}
+
+async fn run_pipeline(args: Args, compile_commands_path: Option<PathBuf>) -> Result<()> {
     info!("Starting Tree-sitter pipeline processing");
 
     // Process database path with search order: 1) -d flag, 2) source directory, 3) current directory
@@ -226,6 +380,11 @@ async fn run_pipeline(args: Args) -> Result<()> {
         println!("Clearing existing data...");
         db_manager.clear_all_data().await?;
         println!("Existing data cleared.");
+
+        // Recreate indices after clearing to ensure optimal performance
+        println!("Recreating indices after clear...");
+        db_manager.rebuild_indices().await?;
+        println!("Indices recreated.");
     }
 
     // Wrap database manager in Arc for sharing across pipeline stages
@@ -261,6 +420,10 @@ async fn run_pipeline(args: Args) -> Result<()> {
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file())
+                .filter(|e| {
+                    // Exclude .semcode.db directory
+                    !e.path().to_string_lossy().contains(".semcode.db")
+                })
             {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
@@ -273,8 +436,8 @@ async fn run_pipeline(args: Args) -> Result<()> {
             info!("Found {} files to process", files_to_process.len());
         }
 
-        // Build and run pipeline (TreeSitter-only now)
-        let pipeline = if args.git.is_some() {
+        // Build and run pipeline
+        let mut pipeline = if args.git.is_some() {
             // Git range mode: use git-specific pipeline with temp tables
             PipelineBuilder::new_for_git_commit(
                 db_manager.clone(),
@@ -284,10 +447,25 @@ async fn run_pipeline(args: Args) -> Result<()> {
         } else {
             PipelineBuilder::new(db_manager.clone(), args.source.clone())
         };
+
+        // Add clangd integration if configured
+        if let Some(compile_commands_path) = compile_commands_path {
+            println!(
+                "Clangd integration enabled with compile_commands.json at: {}",
+                compile_commands_path.display()
+            );
+            pipeline = pipeline.with_clangd(compile_commands_path);
+        }
+
         let processed = pipeline.processed_files.clone();
         let new_functions = pipeline.new_functions.clone();
         let new_types = pipeline.new_types.clone();
         let new_macros = pipeline.new_macros.clone();
+        let enriched_functions = pipeline.enriched_functions.clone();
+        let enriched_types = pipeline.enriched_types.clone();
+        let enriched_macros = pipeline.enriched_macros.clone();
+        let macros_kept_by_clangd = pipeline.macros_kept_by_clangd.clone();
+        let files_with_compile_commands = pipeline.files_with_compile_commands.clone();
 
         // Note: Progress bar will be managed by the pipeline itself since it knows
         // the actual number of files that need processing after filtering
@@ -335,6 +513,11 @@ async fn run_pipeline(args: Args) -> Result<()> {
         let total_functions = new_functions.load(Ordering::Relaxed);
         let total_types = new_types.load(Ordering::Relaxed);
         let total_macros = new_macros.load(Ordering::Relaxed);
+        let total_enriched_functions = enriched_functions.load(Ordering::Relaxed);
+        let total_enriched_types = enriched_types.load(Ordering::Relaxed);
+        let total_enriched_macros = enriched_macros.load(Ordering::Relaxed);
+        let total_macros_kept_by_clangd = macros_kept_by_clangd.load(Ordering::Relaxed);
+        let total_files_with_compile_commands = files_with_compile_commands.load(Ordering::Relaxed);
 
         if args.git.is_some() {
             println!("\n=== Git Commit Pipeline Processing Complete ===");
@@ -346,6 +529,39 @@ async fn run_pipeline(args: Args) -> Result<()> {
         println!("Types indexed: {total_types}");
         if !args.no_macros {
             println!("Macros indexed: {total_macros}");
+        }
+
+        // Display clangd enrichment stats if any enrichment occurred
+        if total_enriched_functions > 0
+            || total_enriched_types > 0
+            || total_enriched_macros > 0
+            || total_files_with_compile_commands > 0
+        {
+            println!("\n=== Clangd Enrichment Statistics ===");
+            if total_files_with_compile_commands > 0 {
+                println!("Files with compile commands: {total_files_with_compile_commands}");
+            }
+            if total_enriched_functions > 0 {
+                println!("Functions enriched with USR: {total_enriched_functions}");
+            }
+            if total_enriched_types > 0 {
+                println!("Types enriched with USR: {total_enriched_types}");
+            }
+            if total_enriched_macros > 0 {
+                println!("Macros enriched with USR: {total_enriched_macros}");
+            }
+            if total_macros_kept_by_clangd > 0 {
+                println!("Non-function-like macros kept due to clangd USR: {total_macros_kept_by_clangd}");
+            }
+        }
+
+        // Compact database after indexing to optimize performance
+        println!("\nCompacting database to optimize performance...");
+        let compact_start = std::time::Instant::now();
+        if let Err(e) = db_manager.compact_and_cleanup().await {
+            eprintln!("Warning: Database compaction failed: {}", e);
+        } else {
+            println!("Database compaction completed in {:.1}s", compact_start.elapsed().as_secs_f64());
         }
     } else {
         println!("Skipping source indexing - vectorization only mode");

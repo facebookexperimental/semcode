@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Module declarations
+pub mod clangd_analyzer;
+pub mod clangd_processor;
+pub mod clangd_worker;
 mod database;
 pub mod database_utils;
 pub mod git;
@@ -18,6 +21,9 @@ pub mod display;
 pub mod search;
 
 // Re-export the main types and structs
+pub use clangd_analyzer::{ClangdAnalyzer, SymbolEnrichment};
+pub use clangd_processor::ClangdProcessor;
+pub use clangd_worker::{run_worker, WorkRequest, WorkResponse};
 pub use database::DatabaseManager;
 pub use database_utils::process_database_path;
 pub use git::{get_git_sha, get_git_sha_for_workdir};
@@ -26,7 +32,7 @@ pub use text_utils::preprocess_code;
 pub use treesitter_analyzer::TreeSitterAnalyzer;
 pub use types::{
     FieldInfo, FunctionInfo, GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry, MacroInfo,
-    ParameterInfo, TypeInfo, TypedefInfo,
+    ParameterInfo, PreciseCallInfo, TypeInfo, TypedefInfo,
 };
 pub use vectorizer::CodeVectorizer;
 

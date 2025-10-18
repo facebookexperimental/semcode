@@ -246,6 +246,116 @@ impl TreeSitterAnalyzer {
         Ok((functions, types, macros))
     }
 
+    /// Analyze a file with optional clangd enrichment
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the source file to analyze
+    /// * `source_root` - Optional source root for relative path computation
+    /// * `clangd` - Optional ClangdAnalyzer for semantic enrichment
+    ///
+    /// # Returns
+    /// Tuple of (functions, types, macros) with enriched data if clangd was provided
+    pub async fn analyze_file_with_enrichment(
+        &mut self,
+        file_path: &Path,
+        source_root: Option<&Path>,
+        clangd: Option<&crate::ClangdAnalyzer>,
+    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<MacroInfo>)> {
+        // First, do standard Tree-sitter analysis
+        let (mut functions, mut types, mut macros) =
+            self.analyze_file_with_source_root(file_path, source_root)?;
+
+        // If clangd is available, enrich the symbols
+        if let Some(analyzer) = clangd {
+            // Check if this file can be enriched
+            if analyzer.can_enrich_file(file_path).await {
+                tracing::debug!(
+                    "Enriching {} symbols from {}",
+                    functions.len() + types.len() + macros.len(),
+                    file_path.display()
+                );
+
+                // Enrich functions
+                for func in &mut functions {
+                    match analyzer
+                        .enrich_function(file_path, &func.name, func.line_start)
+                        .await
+                    {
+                        Ok(enrichment) => {
+                            func.usr = enrichment.usr;
+                            func.signature = enrichment.signature;
+                            func.canonical_return_type = enrichment.canonical_type;
+                            // Note: calls_precise and overload_index would require
+                            // more complex analysis (call hierarchy traversal)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to enrich function {} at {}:{}: {}",
+                                func.name,
+                                file_path.display(),
+                                func.line_start,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Enrich types
+                for type_info in &mut types {
+                    match analyzer
+                        .enrich_type(file_path, &type_info.name, type_info.line_start)
+                        .await
+                    {
+                        Ok(enrichment) => {
+                            type_info.usr = enrichment.usr;
+                            type_info.canonical_name = enrichment.canonical_type;
+                            // template_params would require more complex parsing
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to enrich type {} at {}:{}: {}",
+                                type_info.name,
+                                file_path.display(),
+                                type_info.line_start,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Enrich macros
+                for macro_info in &mut macros {
+                    match analyzer
+                        .enrich_macro(file_path, &macro_info.name, macro_info.line_start)
+                        .await
+                    {
+                        Ok(enrichment) => {
+                            macro_info.usr = enrichment.usr;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to enrich macro {} at {}:{}: {}",
+                                macro_info.name,
+                                file_path.display(),
+                                macro_info.line_start,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                tracing::debug!("Successfully enriched symbols from {}", file_path.display());
+            } else {
+                tracing::debug!(
+                    "No compile commands for {}, skipping enrichment",
+                    file_path.display()
+                );
+            }
+        }
+
+        Ok((functions, types, macros))
+    }
+
     /// Parse a code snippet and extract function definitions
     pub fn analyze_code_snippet(&mut self, code: &str) -> Result<Vec<FunctionInfo>> {
         let tree = self
@@ -552,6 +662,11 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(function_types)
                     },
+                    usr: None,
+                    signature: None,
+                    canonical_return_type: None,
+                    calls_precise: None,
+                    overload_index: None,
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -780,6 +895,9 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(referenced_types)
                     },
+                    usr: None,
+                    canonical_name: None,
+                    template_params: None,
                 };
                 types.push(type_info);
             }
@@ -874,6 +992,9 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(referenced_types)
                     },
+                    usr: None,
+                    canonical_name: None,
+                    template_params: None,
                 };
                 typedef_types.push(type_info);
             }
@@ -1014,12 +1135,12 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(macro_types)
                     },
+                    usr: None,
                 };
 
-                // Only add function-like macros (consistent with libclang mode)
-                if macro_info.is_function_like {
-                    macros.push(macro_info);
-                }
+                // Add all macros - filtering will happen during enrichment
+                // (function-like macros are kept by default, others only if clangd can enrich them)
+                macros.push(macro_info);
             }
         }
 
@@ -1091,6 +1212,8 @@ impl TreeSitterAnalyzer {
                     type_name,
                     type_file_path: None,
                     type_git_file_hash: None,
+                    canonical_type: None,
+                    type_usr: None,
                 });
             }
         }
@@ -1273,6 +1396,8 @@ impl TreeSitterAnalyzer {
                 type_name,
                 type_file_path: None, // Will be resolved later in type resolution phase
                 type_git_file_hash: None, // Will be resolved later in type resolution phase
+                canonical_type: None,
+                type_usr: None,
             })
         } else {
             None
@@ -1487,6 +1612,8 @@ impl TreeSitterAnalyzer {
                             name: field_name,
                             type_name: complete_type,
                             offset: None,
+                            canonical_type: None,
+                            type_usr: None,
                         });
                     }
                 }
@@ -1535,6 +1662,8 @@ impl TreeSitterAnalyzer {
                     name: field_name,
                     type_name: complete_type,
                     offset: None,
+                    canonical_type: None,
+                    type_usr: None,
                 });
             }
         }
@@ -1734,6 +1863,8 @@ impl TreeSitterAnalyzer {
                     type_name: param.type_name.clone(),
                     type_file_path,
                     type_git_file_hash,
+                    canonical_type: None,
+                    type_usr: None,
                 }
             })
             .collect()

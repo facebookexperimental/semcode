@@ -1,0 +1,7 @@
+[
+  {
+    "directory": ".",
+    "command": "gcc -Wall -std=c11 -c test_macro_usr.c -o test_macro_usr.o",
+    "file": "test_macro_usr.c"
+  }
+]

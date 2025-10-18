@@ -24,6 +24,12 @@ struct FunctionMetadata {
     pub body_hash: Option<String>,
     pub calls: Option<Vec<String>>,
     pub types: Option<Vec<String>>,
+    // Clangd-enriched fields
+    pub usr: Option<String>,
+    pub signature: Option<String>,
+    pub canonical_return_type: Option<String>,
+    pub calls_precise: Option<Vec<crate::types::PreciseCallInfo>>,
+    pub overload_index: Option<u32>,
 }
 
 pub struct FunctionStore {
@@ -78,11 +84,25 @@ impl FunctionStore {
             return Ok(());
         }
 
+        let start = std::time::Instant::now();
         let table = self.connection.open_table("functions").execute().await?;
+        let open_time = start.elapsed();
 
         // Process in optimal batch sizes
+        let mut total_insert_time = std::time::Duration::ZERO;
         for chunk in functions.chunks(OPTIMAL_BATCH_SIZE) {
+            let chunk_start = std::time::Instant::now();
             self.insert_metadata_chunk(&table, chunk).await?;
+            total_insert_time += chunk_start.elapsed();
+        }
+
+        if open_time.as_millis() > 10 || total_insert_time.as_millis() > 100 {
+            tracing::info!(
+                "Functions insert timing: open_table={:?}, insert={:?} for {} items",
+                open_time,
+                total_insert_time,
+                functions.len()
+            );
         }
 
         Ok(())
@@ -118,6 +138,12 @@ impl FunctionStore {
         let mut parameters_builder = StringBuilder::new();
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        // Enrichment field builders
+        let mut usr_builder = StringBuilder::new();
+        let mut signature_builder = StringBuilder::new();
+        let mut canonical_return_type_builder = StringBuilder::new();
+        let mut calls_precise_builder = StringBuilder::new();
+        let mut overload_index_builder = Int64Builder::new();
 
         for func in functions {
             name_builder.append_value(&func.name);
@@ -139,6 +165,37 @@ impl FunctionStore {
                 types_builder.append_value(serde_json::to_string(types)?);
             } else {
                 types_builder.append_null();
+            }
+
+            // Add enrichment fields (all nullable)
+            if let Some(ref usr) = func.usr {
+                usr_builder.append_value(usr);
+            } else {
+                usr_builder.append_null();
+            }
+
+            if let Some(ref signature) = func.signature {
+                signature_builder.append_value(signature);
+            } else {
+                signature_builder.append_null();
+            }
+
+            if let Some(ref canonical) = func.canonical_return_type {
+                canonical_return_type_builder.append_value(canonical);
+            } else {
+                canonical_return_type_builder.append_null();
+            }
+
+            if let Some(ref calls_precise) = func.calls_precise {
+                calls_precise_builder.append_value(serde_json::to_string(calls_precise)?);
+            } else {
+                calls_precise_builder.append_null();
+            }
+
+            if let Some(overload_idx) = func.overload_index {
+                overload_index_builder.append_value(overload_idx as i64);
+            } else {
+                overload_index_builder.append_null();
             }
         }
 
@@ -185,6 +242,24 @@ impl FunctionStore {
             ("body_hash", Arc::new(body_hash_array) as ArrayRef),
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            // Enrichment fields
+            ("usr", Arc::new(usr_builder.finish()) as ArrayRef),
+            (
+                "signature",
+                Arc::new(signature_builder.finish()) as ArrayRef,
+            ),
+            (
+                "canonical_return_type",
+                Arc::new(canonical_return_type_builder.finish()) as ArrayRef,
+            ),
+            (
+                "calls_precise",
+                Arc::new(calls_precise_builder.finish()) as ArrayRef,
+            ),
+            (
+                "overload_index",
+                Arc::new(overload_index_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         let batches = vec![Ok(batch)];
@@ -208,6 +283,12 @@ impl FunctionStore {
         let mut parameters_builder = StringBuilder::new();
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        // Enrichment field builders
+        let mut usr_builder = StringBuilder::new();
+        let mut signature_builder = StringBuilder::new();
+        let mut canonical_return_type_builder = StringBuilder::new();
+        let mut calls_precise_builder = StringBuilder::new();
+        let mut overload_index_builder = Int64Builder::new();
 
         for func in functions {
             name_builder.append_value(&func.name);
@@ -234,6 +315,37 @@ impl FunctionStore {
                 .map(|types| serde_json::to_string(types).unwrap_or_default())
                 .unwrap_or_default();
             types_builder.append_value(&types_json);
+
+            // Add enrichment fields (all nullable)
+            if let Some(ref usr) = func.usr {
+                usr_builder.append_value(usr);
+            } else {
+                usr_builder.append_null();
+            }
+
+            if let Some(ref signature) = func.signature {
+                signature_builder.append_value(signature);
+            } else {
+                signature_builder.append_null();
+            }
+
+            if let Some(ref canonical) = func.canonical_return_type {
+                canonical_return_type_builder.append_value(canonical);
+            } else {
+                canonical_return_type_builder.append_null();
+            }
+
+            if let Some(ref calls_precise) = func.calls_precise {
+                calls_precise_builder.append_value(serde_json::to_string(calls_precise)?);
+            } else {
+                calls_precise_builder.append_null();
+            }
+
+            if let Some(overload_idx) = func.overload_index {
+                overload_index_builder.append_value(overload_idx as i64);
+            } else {
+                overload_index_builder.append_null();
+            }
         }
 
         // Create body_hash StringArray (non-nullable for metadata-only)
@@ -278,11 +390,40 @@ impl FunctionStore {
             ("body_hash", Arc::new(body_hash_array) as ArrayRef),
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            // Enrichment fields
+            ("usr", Arc::new(usr_builder.finish()) as ArrayRef),
+            (
+                "signature",
+                Arc::new(signature_builder.finish()) as ArrayRef,
+            ),
+            (
+                "canonical_return_type",
+                Arc::new(canonical_return_type_builder.finish()) as ArrayRef,
+            ),
+            (
+                "calls_precise",
+                Arc::new(calls_precise_builder.finish()) as ArrayRef,
+            ),
+            (
+                "overload_index",
+                Arc::new(overload_index_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         let batches = vec![Ok(batch)];
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        let add_start = std::time::Instant::now();
         table.add(batch_iterator).execute().await?;
+        let add_time = add_start.elapsed();
+
+        if add_time.as_millis() > 50 {
+            tracing::info!(
+                "SLOW table.add() for functions: {:?} for {} items",
+                add_time,
+                functions.len()
+            );
+        }
 
         Ok(())
     }
@@ -406,6 +547,36 @@ impl FunctionStore {
         Ok(None)
     }
 
+    /// Find a function by its USR (Unified Symbol Resolution from clangd)
+    pub async fn find_by_usr(&self, usr: &str) -> Result<Option<FunctionInfo>> {
+        let table = self.connection.open_table("functions").execute().await?;
+
+        // Escape the USR string for SQL
+        let escaped_usr = usr.replace("\\", "\\\\").replace("'", "''");
+        let where_clause = format!("usr = '{}'", escaped_usr);
+
+        let results = table
+            .query()
+            .only_if(&where_clause)
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        if results.is_empty() {
+            return Ok(None);
+        }
+
+        let batch = &results[0];
+        if batch.num_rows() > 0 {
+            let function = self.extract_function_from_batch(batch, 0).await?;
+            return Ok(function);
+        }
+
+        Ok(None)
+    }
+
     pub async fn get_all(&self) -> Result<Vec<FunctionInfo>> {
         // Use optimized bulk retrieval for better performance
         self.get_all_bulk_optimized().await
@@ -459,6 +630,11 @@ impl FunctionStore {
                             body,
                             calls: func_data.calls,
                             types: func_data.types,
+                            usr: func_data.usr,
+                            signature: func_data.signature,
+                            canonical_return_type: func_data.canonical_return_type,
+                            calls_precise: func_data.calls_precise,
+                            overload_index: func_data.overload_index,
                         });
                     }
                 }
@@ -544,6 +720,11 @@ impl FunctionStore {
                 body,
                 calls: func_data.calls,
                 types: func_data.types,
+                usr: func_data.usr,
+                signature: func_data.signature,
+                canonical_return_type: func_data.canonical_return_type,
+                calls_precise: func_data.calls_precise,
+                overload_index: func_data.overload_index,
             });
         }
 
@@ -607,6 +788,33 @@ impl FunctionStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
+        // Extract enrichment fields (columns 10-14)
+        let usr_array = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let signature_array = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let canonical_return_type_array = batch
+            .column(12)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let calls_precise_array = batch
+            .column(13)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let overload_index_array = batch
+            .column(14)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+
         let parameters: Vec<ParameterInfo> =
             serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
 
@@ -630,6 +838,40 @@ impl FunctionStore {
             serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
         };
 
+        // Parse enrichment fields
+        let usr = if usr_array.is_null(row) {
+            None
+        } else {
+            Some(usr_array.value(row).to_string())
+        };
+
+        let signature = if signature_array.is_null(row) {
+            None
+        } else {
+            Some(signature_array.value(row).to_string())
+        };
+
+        let canonical_return_type = if canonical_return_type_array.is_null(row) {
+            None
+        } else {
+            Some(canonical_return_type_array.value(row).to_string())
+        };
+
+        let calls_precise = if calls_precise_array.is_null(row) {
+            None
+        } else {
+            serde_json::from_str::<Vec<crate::types::PreciseCallInfo>>(
+                calls_precise_array.value(row),
+            )
+            .ok()
+        };
+
+        let overload_index = if overload_index_array.is_null(row) {
+            None
+        } else {
+            Some(overload_index_array.value(row) as u32)
+        };
+
         Ok(Some(FunctionMetadata {
             name: name_array.value(row).to_string(),
             file_path: file_path_array.value(row).to_string(),
@@ -641,6 +883,11 @@ impl FunctionStore {
             body_hash,
             calls,
             types,
+            usr,
+            signature,
+            canonical_return_type,
+            calls_precise,
+            overload_index,
         }))
     }
 
@@ -724,6 +971,11 @@ impl FunctionStore {
                 body,
                 calls: func_data.calls,
                 types: func_data.types,
+                usr: func_data.usr,
+                signature: func_data.signature,
+                canonical_return_type: func_data.canonical_return_type,
+                calls_precise: func_data.calls_precise,
+                overload_index: func_data.overload_index,
             };
 
             result.insert(func_data.name, function_info);
@@ -788,6 +1040,33 @@ impl FunctionStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
+        // Extract enrichment fields (columns 10-14)
+        let usr_array = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let signature_array = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let canonical_return_type_array = batch
+            .column(12)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let calls_precise_array = batch
+            .column(13)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let overload_index_array = batch
+            .column(14)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+
         let parameters: Vec<ParameterInfo> =
             serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
 
@@ -846,6 +1125,40 @@ impl FunctionStore {
             serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
         };
 
+        // Parse enrichment fields
+        let usr = if usr_array.is_null(row) {
+            None
+        } else {
+            Some(usr_array.value(row).to_string())
+        };
+
+        let signature = if signature_array.is_null(row) {
+            None
+        } else {
+            Some(signature_array.value(row).to_string())
+        };
+
+        let canonical_return_type = if canonical_return_type_array.is_null(row) {
+            None
+        } else {
+            Some(canonical_return_type_array.value(row).to_string())
+        };
+
+        let calls_precise = if calls_precise_array.is_null(row) {
+            None
+        } else {
+            serde_json::from_str::<Vec<crate::types::PreciseCallInfo>>(
+                calls_precise_array.value(row),
+            )
+            .ok()
+        };
+
+        let overload_index = if overload_index_array.is_null(row) {
+            None
+        } else {
+            Some(overload_index_array.value(row) as u32)
+        };
+
         Ok(Some(FunctionInfo {
             name: name_array.value(row).to_string(),
             file_path: file_path_array.value(row).to_string(),
@@ -857,6 +1170,11 @@ impl FunctionStore {
             body,
             calls,
             types,
+            usr,
+            signature,
+            canonical_return_type,
+            calls_precise,
+            overload_index,
         }))
     }
 
@@ -872,6 +1190,12 @@ impl FunctionStore {
             Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called (nullable)
             Field::new("types", DataType::Utf8, true), // JSON array of type names used (nullable)
+            // Clangd-enriched fields
+            Field::new("usr", DataType::Utf8, true), // Unified Symbol Resolution ID from clangd
+            Field::new("signature", DataType::Utf8, true), // Full resolved function signature
+            Field::new("canonical_return_type", DataType::Utf8, true), // Fully resolved canonical return type
+            Field::new("calls_precise", DataType::Utf8, true), // JSON array of precise call info with USRs
+            Field::new("overload_index", DataType::Int64, true), // Index when multiple overloads exist
         ]))
     }
 }

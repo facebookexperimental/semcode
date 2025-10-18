@@ -187,6 +187,11 @@ impl SearchManager {
                     body,
                     calls: None, // Not populated in search results
                     types: None, // Not populated in search results
+                    usr: None,
+                    signature: None,
+                    canonical_return_type: None,
+                    calls_precise: None,
+                    overload_index: None,
                 });
             }
         }
@@ -365,6 +370,11 @@ impl SearchManager {
                         body,
                         calls: None, // Not populated in search results
                         types: None, // Not populated in search results
+                        usr: None,
+                        signature: None,
+                        canonical_return_type: None,
+                        calls_precise: None,
+                        overload_index: None,
                     });
                 }
             }
@@ -465,6 +475,9 @@ impl SearchManager {
                     members: fields,
                     definition,
                     types: None, // Not populated in search results
+                    usr: None,
+                    canonical_name: None,
+                    template_params: None,
                 });
             }
         }
@@ -637,6 +650,9 @@ impl SearchManager {
                         members: fields,
                         definition,
                         types: None, // Not populated in search results
+                        usr: None,
+                        canonical_name: None,
+                        template_params: None,
                     });
                 }
             }
@@ -722,6 +738,9 @@ impl SearchManager {
                     members: fields,
                     definition,
                     types: None, // Not populated in search results
+                    usr: None,
+                    canonical_name: None,
+                    template_params: None,
                 });
             }
         }
@@ -917,6 +936,7 @@ impl SearchManager {
                     definition: definition_array.value(i).to_string(),
                     calls: None, // Not populated in search results
                     types: None, // Not populated in search results
+                    usr: None,
                 });
             }
         }
@@ -1236,6 +1256,7 @@ impl SearchManager {
                         definition: definition_array.value(i).to_string(),
                         calls: None, // Not populated in search results
                         types: None, // Not populated in search results
+                        usr: None,
                     });
                 }
             }
@@ -1331,6 +1352,9 @@ impl SearchManager {
                     members: fields,
                     definition,
                     types: None, // Not populated in search results
+                    usr: None,
+                    canonical_name: None,
+                    template_params: None,
                 });
             }
         }
@@ -1486,6 +1510,9 @@ impl SearchManager {
                         members: fields,
                         definition,
                         types: None,
+                        usr: None,
+                        canonical_name: None,
+                        template_params: None,
                     });
                 }
             }
@@ -1825,6 +1852,11 @@ impl SearchManager {
                     body,
                     calls: None, // Not populated in search results
                     types: None, // Not populated in search results
+                    usr: None,
+                    signature: None,
+                    canonical_return_type: None,
+                    calls_precise: None,
+                    overload_index: None,
                 });
             }
         }
@@ -1986,6 +2018,11 @@ impl SearchManager {
                         body,
                         calls: None,
                         types: None,
+                        usr: None,
+                        signature: None,
+                        canonical_return_type: None,
+                        calls_precise: None,
+                        overload_index: None,
                     });
                 }
             }
@@ -2096,6 +2133,7 @@ impl SearchManager {
                     definition,
                     calls: None,
                     types: None,
+                    usr: None,
                 });
             }
         }
@@ -2258,6 +2296,7 @@ impl SearchManager {
                         definition,
                         calls: None,
                         types: None,
+                        usr: None,
                     });
                 }
             }
@@ -2545,6 +2584,11 @@ impl VectorSearchManager {
             body,
             calls: None, // Not populated from database extraction helper
             types: None, // Not populated from database extraction helper
+            usr: None,
+            signature: None,
+            canonical_return_type: None,
+            calls_precise: None,
+            overload_index: None,
         }))
     }
 

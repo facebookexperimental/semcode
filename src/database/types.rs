@@ -26,6 +26,10 @@ struct TypeMetadata {
     pub members: Vec<FieldInfo>,
     pub definition_hash: Option<String>,
     pub types: Option<Vec<String>>,
+    // Clangd-enriched fields
+    pub usr: Option<String>,
+    pub canonical_name: Option<String>,
+    pub template_params: Option<Vec<String>>,
 }
 
 pub struct TypeStore {
@@ -112,6 +116,10 @@ impl TypeStore {
         let mut size_builder = Int64Builder::new();
         let mut fields_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        // Enrichment field builders
+        let mut usr_builder = StringBuilder::new();
+        let mut canonical_name_builder = StringBuilder::new();
+        let mut template_params_builder = StringBuilder::new();
 
         for type_info in types {
             name_builder.append_value(&type_info.name);
@@ -133,6 +141,25 @@ impl TypeStore {
                 types_builder.append_value(serde_json::to_string(types_list)?);
             } else {
                 types_builder.append_null();
+            }
+
+            // Add enrichment fields (all nullable)
+            if let Some(ref usr) = type_info.usr {
+                usr_builder.append_value(usr);
+            } else {
+                usr_builder.append_null();
+            }
+
+            if let Some(ref canonical) = type_info.canonical_name {
+                canonical_name_builder.append_value(canonical);
+            } else {
+                canonical_name_builder.append_null();
+            }
+
+            if let Some(ref template_params) = type_info.template_params {
+                template_params_builder.append_value(serde_json::to_string(template_params)?);
+            } else {
+                template_params_builder.append_null();
             }
         }
 
@@ -183,6 +210,16 @@ impl TypeStore {
                 Arc::new(definition_hash_array) as ArrayRef,
             ),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            // Enrichment fields
+            ("usr", Arc::new(usr_builder.finish()) as ArrayRef),
+            (
+                "canonical_name",
+                Arc::new(canonical_name_builder.finish()) as ArrayRef,
+            ),
+            (
+                "template_params",
+                Arc::new(template_params_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         let batches = vec![Ok(batch)];
@@ -205,6 +242,10 @@ impl TypeStore {
         let mut size_builder = Int64Builder::new();
         let mut fields_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        // Enrichment field builders
+        let mut usr_builder = StringBuilder::new();
+        let mut canonical_name_builder = StringBuilder::new();
+        let mut template_params_builder = StringBuilder::new();
 
         for type_info in types {
             name_builder.append_value(&type_info.name);
@@ -224,6 +265,25 @@ impl TypeStore {
                 .map(|ts| serde_json::to_string(ts).unwrap_or_default())
                 .unwrap_or_default();
             types_builder.append_value(&types_json);
+
+            // Add enrichment fields (all nullable)
+            if let Some(ref usr) = type_info.usr {
+                usr_builder.append_value(usr);
+            } else {
+                usr_builder.append_null();
+            }
+
+            if let Some(ref canonical) = type_info.canonical_name {
+                canonical_name_builder.append_value(canonical);
+            } else {
+                canonical_name_builder.append_null();
+            }
+
+            if let Some(ref template_params) = type_info.template_params {
+                template_params_builder.append_value(serde_json::to_string(template_params)?);
+            } else {
+                template_params_builder.append_null();
+            }
         }
 
         let mut definition_hash_builder = StringBuilder::new();
@@ -260,6 +320,16 @@ impl TypeStore {
                 Arc::new(definition_hash_array) as ArrayRef,
             ),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            // Enrichment fields
+            ("usr", Arc::new(usr_builder.finish()) as ArrayRef),
+            (
+                "canonical_name",
+                Arc::new(canonical_name_builder.finish()) as ArrayRef,
+            ),
+            (
+                "template_params",
+                Arc::new(template_params_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         let batches = vec![Ok(batch)];
@@ -310,6 +380,35 @@ impl TypeStore {
         Ok(!results.is_empty() && results[0].num_rows() > 0)
     }
 
+    /// Find a type by its USR (Unified Symbol Resolution from clangd)
+    pub async fn find_by_usr(&self, usr: &str) -> Result<Option<TypeInfo>> {
+        let table = self.connection.open_table("types").execute().await?;
+
+        // Escape the USR string for SQL
+        let escaped_usr = usr.replace("\\", "\\\\").replace("'", "''");
+        let where_clause = format!("usr = '{}'", escaped_usr);
+
+        let results = table
+            .query()
+            .only_if(&where_clause)
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        if results.is_empty() {
+            return Ok(None);
+        }
+
+        let batch = &results[0];
+        if batch.num_rows() > 0 {
+            let type_info = self.extract_type_from_batch(batch, 0).await?;
+            return Ok(type_info);
+        }
+        Ok(None)
+    }
+
     pub async fn get_all(&self) -> Result<Vec<TypeInfo>> {
         // Use optimized bulk retrieval for better performance
         self.get_all_bulk_optimized().await
@@ -355,6 +454,9 @@ impl TypeStore {
                             members: type_data.members,
                             definition,
                             types: type_data.types,
+                            usr: type_data.usr,
+                            canonical_name: type_data.canonical_name,
+                            template_params: type_data.template_params,
                         });
                     }
                 }
@@ -444,6 +546,9 @@ impl TypeStore {
                 members: type_data.members,
                 definition,
                 types: type_data.types,
+                usr: type_data.usr,
+                canonical_name: type_data.canonical_name,
+                template_params: type_data.template_params,
             });
         }
 
@@ -502,6 +607,23 @@ impl TypeStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
+        // Extract enrichment fields (columns 9-11)
+        let usr_array = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let canonical_name_array = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let template_params_array = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
         let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
             None
@@ -523,6 +645,25 @@ impl TypeStore {
             serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
         };
 
+        // Parse enrichment fields
+        let usr = if usr_array.is_null(row) {
+            None
+        } else {
+            Some(usr_array.value(row).to_string())
+        };
+
+        let canonical_name = if canonical_name_array.is_null(row) {
+            None
+        } else {
+            Some(canonical_name_array.value(row).to_string())
+        };
+
+        let template_params = if template_params_array.is_null(row) {
+            None
+        } else {
+            serde_json::from_str::<Vec<String>>(template_params_array.value(row)).ok()
+        };
+
         Ok(Some(TypeMetadata {
             name: name_array.value(row).to_string(),
             file_path: file_path_array.value(row).to_string(),
@@ -533,6 +674,9 @@ impl TypeStore {
             members: fields,
             definition_hash,
             types,
+            usr,
+            canonical_name,
+            template_params,
         }))
     }
 
@@ -614,6 +758,9 @@ impl TypeStore {
                 members: type_data.members,
                 definition,
                 types: type_data.types,
+                usr: type_data.usr,
+                canonical_name: type_data.canonical_name,
+                template_params: type_data.template_params,
             };
 
             result.insert(type_data.name, type_info);
@@ -808,6 +955,23 @@ impl TypeStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
+        // Extract enrichment fields (columns 9-11)
+        let usr_array = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let canonical_name_array = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let template_params_array = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
         let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
             None
@@ -839,6 +1003,25 @@ impl TypeStore {
             serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
         };
 
+        // Parse enrichment fields
+        let usr = if usr_array.is_null(row) {
+            None
+        } else {
+            Some(usr_array.value(row).to_string())
+        };
+
+        let canonical_name = if canonical_name_array.is_null(row) {
+            None
+        } else {
+            Some(canonical_name_array.value(row).to_string())
+        };
+
+        let template_params = if template_params_array.is_null(row) {
+            None
+        } else {
+            serde_json::from_str::<Vec<String>>(template_params_array.value(row)).ok()
+        };
+
         Ok(Some(TypeInfo {
             name: name_array.value(row).to_string(),
             file_path: file_path_array.value(row).to_string(),
@@ -849,6 +1032,9 @@ impl TypeStore {
             members: fields,
             definition,
             types,
+            usr,
+            canonical_name,
+            template_params,
         }))
     }
 
@@ -863,6 +1049,10 @@ impl TypeStore {
             Field::new("fields", DataType::Utf8, false),
             Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
+            // Clangd-enriched fields
+            Field::new("usr", DataType::Utf8, true), // USR from clangd
+            Field::new("canonical_name", DataType::Utf8, true), // Fully qualified canonical name
+            Field::new("template_params", DataType::Utf8, true), // JSON array of template parameters
         ]))
     }
 }
@@ -900,6 +1090,9 @@ impl TypedefStore {
                     members: Vec::new(),
                     definition: full_definition,
                     types: None, // Typedefs don't reference other types directly
+                    usr: None,
+                    canonical_name: None,
+                    template_params: None,
                 }
             })
             .collect();
@@ -1263,6 +1456,8 @@ struct MacroMetadata {
     pub definition_hash: Option<String>,
     pub calls: Option<Vec<String>>,
     pub types: Option<Vec<String>>,
+    // Clangd-enriched field
+    pub usr: Option<String>,
 }
 
 pub struct MacroStore {
@@ -1337,6 +1532,8 @@ impl MacroStore {
         let mut parameters_builder = StringBuilder::new();
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        // Enrichment field builders
+        let mut usr_builder = StringBuilder::new();
 
         for macro_info in macros {
             name_builder.append_value(&macro_info.name);
@@ -1363,6 +1560,13 @@ impl MacroStore {
                 types_builder.append_value(serde_json::to_string(types_list)?);
             } else {
                 types_builder.append_null();
+            }
+
+            // Add enrichment fields (all nullable)
+            if let Some(ref usr) = macro_info.usr {
+                usr_builder.append_value(usr);
+            } else {
+                usr_builder.append_null();
             }
         }
 
@@ -1419,6 +1623,8 @@ impl MacroStore {
             ),
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            // Enrichment fields
+            ("usr", Arc::new(usr_builder.finish()) as ArrayRef),
         ])?;
 
         let batches = vec![Ok(batch)];
@@ -1441,6 +1647,8 @@ impl MacroStore {
         let mut parameters_builder = StringBuilder::new();
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        // Enrichment field builders
+        let mut usr_builder = StringBuilder::new();
 
         for macro_info in macros {
             name_builder.append_value(&macro_info.name);
@@ -1467,6 +1675,13 @@ impl MacroStore {
                 .map(|types| serde_json::to_string(types).unwrap_or_default())
                 .unwrap_or_default();
             types_builder.append_value(&types_json);
+
+            // Add enrichment fields (all nullable)
+            if let Some(ref usr) = macro_info.usr {
+                usr_builder.append_value(usr);
+            } else {
+                usr_builder.append_null();
+            }
         }
 
         // Create definition_hash strings - unused, keeping for documentation
@@ -1521,6 +1736,8 @@ impl MacroStore {
             ),
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            // Enrichment fields
+            ("usr", Arc::new(usr_builder.finish()) as ArrayRef),
         ])?;
 
         let batches = vec![Ok(batch)];
@@ -1595,6 +1812,35 @@ impl MacroStore {
             .await?;
 
         Ok(!results.is_empty() && results[0].num_rows() > 0)
+    }
+
+    /// Find a macro by its USR (Unified Symbol Resolution from clangd)
+    pub async fn find_by_usr(&self, usr: &str) -> Result<Option<MacroInfo>> {
+        let table = self.connection.open_table("macros").execute().await?;
+
+        // Escape the USR string for SQL
+        let escaped_usr = usr.replace("\\", "\\\\").replace("'", "''");
+        let where_clause = format!("usr = '{}'", escaped_usr);
+
+        let results = table
+            .query()
+            .only_if(&where_clause)
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        if results.is_empty() {
+            return Ok(None);
+        }
+
+        let batch = &results[0];
+        if batch.num_rows() > 0 {
+            let macro_info = self.extract_macro_from_batch(batch, 0).await?;
+            return Ok(macro_info);
+        }
+        Ok(None)
     }
 
     pub async fn get_all(&self) -> Result<Vec<MacroInfo>> {
@@ -1681,6 +1927,7 @@ impl MacroStore {
                             definition,
                             calls: macro_data.calls,
                             types: macro_data.types,
+                            usr: macro_data.usr,
                         });
                     }
                 }
@@ -1789,6 +2036,15 @@ impl MacroStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
+        // Extract enrichment field (column 9)
+        tracing::info!("Attempting to extract column 9 (usr) from batch");
+        let usr_array = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        tracing::info!("Successfully extracted usr_array");
+
         let parameters = if parameters_array.is_null(row) {
             None
         } else {
@@ -1826,6 +2082,14 @@ impl MacroStore {
             serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
         };
 
+        // Parse enrichment field
+        let usr = if usr_array.is_null(row) {
+            None
+        } else {
+            let usr_value = usr_array.value(row).to_string();
+            Some(usr_value)
+        };
+
         Ok(Some(MacroInfo {
             name: name_array.value(row).to_string(),
             file_path: file_path_array.value(row).to_string(),
@@ -1836,6 +2100,7 @@ impl MacroStore {
             definition,
             calls,
             types,
+            usr,
         }))
     }
 
@@ -1891,6 +2156,13 @@ impl MacroStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
+        // Extract enrichment field (column 9)
+        let usr_array = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
         let parameters = if parameters_array.is_null(row) {
             None
         } else {
@@ -1918,6 +2190,13 @@ impl MacroStore {
             serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
         };
 
+        // Parse enrichment field
+        let usr = if usr_array.is_null(row) {
+            None
+        } else {
+            Some(usr_array.value(row).to_string())
+        };
+
         Ok(Some(MacroMetadata {
             name: name_array.value(row).to_string(),
             file_path: file_path_array.value(row).to_string(),
@@ -1928,6 +2207,7 @@ impl MacroStore {
             definition_hash,
             calls,
             types,
+            usr,
         }))
     }
 
@@ -1942,6 +2222,8 @@ impl MacroStore {
             Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this macro
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this macro
+            // Clangd-enriched fields
+            Field::new("usr", DataType::Utf8, true), // USR from clangd
         ]))
     }
 }

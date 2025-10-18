@@ -16,6 +16,17 @@ pub struct FunctionInfo {
     pub calls: Option<Vec<String>>, // Function names called by this function
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names used by this function
+    // Clangd-enriched fields (optional, only when clangd analysis is available)
+    #[serde(default)]
+    pub usr: Option<String>, // Unified Symbol Resolution ID from clangd
+    #[serde(default)]
+    pub signature: Option<String>, // Full resolved function signature
+    #[serde(default)]
+    pub canonical_return_type: Option<String>, // Fully resolved canonical return type
+    #[serde(default)]
+    pub calls_precise: Option<Vec<PreciseCallInfo>>, // Precise call information with USRs
+    #[serde(default)]
+    pub overload_index: Option<u32>, // Index when multiple overloads exist
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +37,21 @@ pub struct ParameterInfo {
     pub type_file_path: Option<String>, // File where type is defined
     #[serde(default)]
     pub type_git_file_hash: Option<String>, // Hash of file containing type definition
+    // Clangd-enriched fields
+    #[serde(default)]
+    pub canonical_type: Option<String>, // Fully resolved canonical type from clangd
+    #[serde(default)]
+    pub type_usr: Option<String>, // USR of the type
+}
+
+/// Precise call information with clangd USRs for exact overload resolution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreciseCallInfo {
+    pub name: String,                // Function name
+    pub usr: Option<String>,         // USR of the called function (if available from clangd)
+    pub overload_index: Option<u32>, // Which overload is being called
+    pub is_system: bool,             // Whether this is a system library call
+    pub signature: Option<String>,   // Full signature of the called function
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +66,13 @@ pub struct TypeInfo {
     pub definition: String, // Added to store raw type definition with comments
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names referenced by this type
+    // Clangd-enriched fields
+    #[serde(default)]
+    pub usr: Option<String>, // USR from clangd
+    #[serde(default)]
+    pub canonical_name: Option<String>, // Fully qualified canonical name
+    #[serde(default)]
+    pub template_params: Option<Vec<String>>, // Template parameters if applicable
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +80,11 @@ pub struct FieldInfo {
     pub name: String,
     pub type_name: String,
     pub offset: Option<u64>,
+    // Clangd-enriched fields
+    #[serde(default)]
+    pub canonical_type: Option<String>, // Canonical type from clangd
+    #[serde(default)]
+    pub type_usr: Option<String>, // USR of the field's type
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +110,9 @@ pub struct MacroInfo {
     pub calls: Option<Vec<String>>, // Function names called by this macro
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names used by this macro
+    // Clangd-enriched fields
+    #[serde(default)]
+    pub usr: Option<String>, // USR from clangd
 }
 
 /// Global type registry for cross-file type resolution

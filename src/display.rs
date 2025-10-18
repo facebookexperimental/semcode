@@ -269,6 +269,11 @@ pub fn display_function_to_writer_with_options(
     writeln!(writer, "Hash: {}", func.git_file_hash.bright_black())?;
     writeln!(writer, "Lines: {} - {}", func.line_start, func.line_end)?;
 
+    // Display clangd enrichment if available
+    if let Some(ref usr) = func.usr {
+        writeln!(writer, "USR: {}", usr.bright_black())?;
+    }
+
     // Construct and display function declaration/signature
     let params = if func.parameters.is_empty() {
         "void".to_string()
@@ -279,8 +284,21 @@ pub fn display_function_to_writer_with_options(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let declaration = format!("{} {}({})", func.return_type, func.name, params);
+
+    // Use clangd signature if available, otherwise construct from parts
+    let declaration = if let Some(ref sig) = func.signature {
+        sig.clone()
+    } else {
+        format!("{} {}({})", func.return_type, func.name, params)
+    };
     writeln!(writer, "\nDeclaration: {}", declaration.green())?;
+
+    // Display canonical return type if available from clangd
+    if let Some(ref canonical) = func.canonical_return_type {
+        if canonical != &func.return_type {
+            writeln!(writer, "Canonical Return Type: {}", canonical.magenta())?;
+        }
+    }
 
     if show_body && !func.body.is_empty() {
         writeln!(writer, "\nFunction Definition:")?;
@@ -305,6 +323,17 @@ pub fn display_type_to_writer(type_info: &TypeInfo, writer: &mut dyn Write) -> R
     writeln!(writer, "File: {}", type_info.file_path.cyan())?;
     writeln!(writer, "Hash: {}", type_info.git_file_hash.bright_black())?;
     writeln!(writer, "Line: {}", type_info.line_start)?;
+
+    // Display clangd enrichment if available
+    if let Some(ref usr) = type_info.usr {
+        writeln!(writer, "USR: {}", usr.bright_black())?;
+    }
+
+    if let Some(ref canonical) = type_info.canonical_name {
+        if canonical != &type_info.name {
+            writeln!(writer, "Canonical Name: {}", canonical.magenta())?;
+        }
+    }
 
     if let Some(size) = type_info.size {
         writeln!(writer, "Size: {size} bytes")?;

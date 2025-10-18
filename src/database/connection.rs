@@ -1180,6 +1180,52 @@ impl DatabaseManager {
             .await
     }
 
+    // ==================== USR-based lookups (clangd integration) ====================
+
+    /// Find a function by its USR (Unified Symbol Resolution from clangd)
+    pub async fn find_function_by_usr(&self, usr: &str) -> Result<Option<FunctionInfo>> {
+        self.function_store.find_by_usr(usr).await
+    }
+
+    /// Find a type by its USR
+    pub async fn find_type_by_usr(&self, usr: &str) -> Result<Option<TypeInfo>> {
+        self.type_store.find_by_usr(usr).await
+    }
+
+    /// Find a macro by its USR
+    pub async fn find_macro_by_usr(&self, usr: &str) -> Result<Option<MacroInfo>> {
+        self.macro_store.find_by_usr(usr).await
+    }
+
+    /// Find any symbol by USR (checks functions, macros, and types in priority order)
+    pub async fn find_symbol_by_usr(&self, usr: &str) -> Result<Option<String>> {
+        // Check functions first
+        if let Some(func) = self.find_function_by_usr(usr).await? {
+            return Ok(Some(format!(
+                "function {} in {}:{}",
+                func.name, func.file_path, func.line_start
+            )));
+        }
+
+        // Check macros
+        if let Some(mac) = self.find_macro_by_usr(usr).await? {
+            return Ok(Some(format!(
+                "macro {} in {}:{}",
+                mac.name, mac.file_path, mac.line_start
+            )));
+        }
+
+        // Check types
+        if let Some(ty) = self.find_type_by_usr(usr).await? {
+            return Ok(Some(format!(
+                "type {} in {}:{}",
+                ty.name, ty.file_path, ty.line_start
+            )));
+        }
+
+        Ok(None)
+    }
+
     /// Search functions using regex patterns on the name column
     pub async fn search_functions_regex(&self, pattern: &str) -> Result<Vec<FunctionInfo>> {
         self.search_manager.search_functions_regex(pattern).await

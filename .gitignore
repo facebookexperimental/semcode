@@ -34,6 +34,9 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+compile_commands_absolute.json
 
 # claude
 .claude
+tests/fixtures/test/clangd_integration/.git
+tests/fixtures/test/clangd_integration/.semcode.db

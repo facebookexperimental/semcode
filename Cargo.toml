@@ -20,6 +20,7 @@ walkdir = "2.5"
 indicatif = "0.18.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-indicatif = "0.3"
 rustyline = "17.0"
 colored = "3.0"
 futures = "0.3.31"
@@ -47,6 +48,11 @@ gix = "0.73"
 model2vec-rs = "0.1.4"
 tower-lsp = "0.20"      # Language Server Protocol framework for LSP server
 url = "2.5"             # URL parsing for file URIs in LSP
+clang = "2.0"           # libclang bindings for semantic enrichment
+shell-words = "1.1"     # Proper shell command parsing for compile_commands.json
+sysinfo = "0.32"        # System memory detection for dynamic queue sizing
+ipc-channel = "0.18"    # Cross-platform IPC for worker processes
+bincode = "1.3"         # Fast binary serialization for IPC messages
 
 [[bin]]
 name = "semcode-index"
@@ -63,6 +69,13 @@ path = "src/bin/semcode-mcp.rs"
 [[bin]]
 name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
+
+[dev-dependencies]
+assert_cmd = "2.0"      # Test CLI binaries
+predicates = "3.0"      # Better test assertions
+rstest = "0.18"         # Fixtures & parametric tests
+insta = "1.34"          # Snapshot testing
+pretty_assertions = "1.4"  # Better diffs in test failures
 
 [profile.release]
 debug = false

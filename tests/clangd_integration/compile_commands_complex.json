@@ -1,0 +1,7 @@
+[
+  {
+    "directory": ".",
+    "command": "gcc -Wall -Wextra -std=c11 -O2 -DVERSION=\"1.0.0\" -DMAX_SIZE=1024 -I\"/usr/include/custom path\" -I. -DSTRING=\"hello world\" -c test_sample.c -o test_sample.o",
+    "file": "test_sample.c"
+  }
+]

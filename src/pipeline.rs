@@ -147,8 +147,8 @@
 //
 // ==============================================================================
 use anyhow::Result;
-use crossbeam_channel::bounded;
-use indicatif::{ProgressBar, ProgressStyle};
+use crossbeam_channel::{bounded, unbounded};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -156,6 +156,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+use sysinfo::System;
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::prelude::*;
 
 use crate::{
     git, measure, types::GitFileEntry, DatabaseManager, FunctionInfo, MacroInfo,
@@ -179,15 +182,90 @@ struct ProcessedBatch {
     processed_files: Vec<crate::database::processed_files::ProcessedFileRecord>, // Files to mark as processed
 }
 
+/// Calculate optimal channel sizes based on available system memory
+///
+/// Returns (file_channel_size, parsed_channel_size, processed_channel_size)
+fn calculate_channel_sizes(files_to_process: usize, num_threads: usize) -> (usize, usize, usize) {
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+
+    let available_bytes = sys.available_memory();
+    let available_gb = available_bytes as f64 / 1_073_741_824.0;
+
+    tracing::info!(
+        "Available memory: {:.2} GB ({} bytes)",
+        available_gb,
+        available_bytes
+    );
+
+    // Estimate memory per ParsedFile:
+    // - PathBuf: ~100 bytes
+    // - FunctionInfo: ~500 bytes avg (name, signature, body hash, etc.)
+    // - TypeInfo: ~300 bytes avg
+    // - MacroInfo: ~400 bytes avg
+    // - Assume avg file has 10 functions, 5 types, 3 macros
+    // Total: ~100 + 10*500 + 5*300 + 3*400 = ~7,800 bytes per ParsedFile
+    const BYTES_PER_PARSED_FILE: usize = 8_000;
+
+    // Use up to 25% of available memory for queues (conservative)
+    let max_queue_memory = (available_bytes as f64 * 0.25) as usize;
+    let max_parsed_files_in_queue = max_queue_memory / BYTES_PER_PARSED_FILE;
+
+    tracing::info!(
+        "Memory budget for queues: {:.2} GB, max parsed files in queue: {}",
+        max_queue_memory as f64 / 1_073_741_824.0,
+        max_parsed_files_in_queue
+    );
+
+    // File channel: size = number of files to process
+    // Memory is cheap (~200 bytes per file), and avoiding backpressure here
+    // allows parsers to run at full speed without blocking
+    // With multi-process enrichment, we want maximum throughput
+    let file_channel_size = files_to_process.max(1000); // Minimum 1k for small codebases
+
+    // Parsed channel: NO LIMITS with multi-process enrichment
+    // Old single-threaded enrichment needed caps to prevent OOM (enrichment was 14x slower than parsing)
+    // Now with N workers, enrichment is only ~1.7x slower than parsing
+    // Memory is cheap: even 100k files = ~800MB (nothing on modern machines)
+    // Removing caps eliminates backpressure and maximizes throughput
+    let parsed_channel_size = files_to_process.max(num_threads * 10); // At least 10 per thread
+
+    // Processed channel: batches are large, so keep queue small
+    let processed_channel_size = 200;
+
+    tracing::info!(
+        "Calculated channel sizes: file={}, parsed={}, processed={}",
+        file_channel_size,
+        parsed_channel_size,
+        processed_channel_size
+    );
+
+    (
+        file_channel_size,
+        parsed_channel_size,
+        processed_channel_size,
+    )
+}
+
 pub struct PipelineBuilder {
     db_manager: Arc<DatabaseManager>,
     source_root: PathBuf,
+
+    // Optional path to compile_commands.json for clangd enrichment
+    compile_commands_path: Option<PathBuf>,
 
     // Stats
     pub processed_files: Arc<AtomicUsize>,
     pub new_functions: Arc<AtomicUsize>,
     pub new_types: Arc<AtomicUsize>, // Now includes typedefs with kind="typedef"
     pub new_macros: Arc<AtomicUsize>,
+
+    // Clangd enrichment stats
+    pub files_with_compile_commands: Arc<AtomicUsize>, // Files that had compile commands
+    pub enriched_functions: Arc<AtomicUsize>,          // Functions with USR from clangd
+    pub enriched_types: Arc<AtomicUsize>,              // Types with USR from clangd
+    pub enriched_macros: Arc<AtomicUsize>,             // Macros with USR from clangd
+    pub macros_kept_by_clangd: Arc<AtomicUsize>,       // Non-function-like macros kept due to USR
 
     // Tracking for incremental processing
     pub newly_processed_files: Arc<Mutex<HashSet<String>>>, // git_sha:filename pairs
@@ -244,10 +322,16 @@ impl PipelineBuilder {
         Self {
             db_manager,
             source_root,
+            compile_commands_path: None,
             processed_files: Arc::new(AtomicUsize::new(0)),
             new_functions: Arc::new(AtomicUsize::new(0)),
             new_types: Arc::new(AtomicUsize::new(0)), // Now includes typedefs with kind="typedef"
             new_macros: Arc::new(AtomicUsize::new(0)),
+            files_with_compile_commands: Arc::new(AtomicUsize::new(0)),
+            enriched_functions: Arc::new(AtomicUsize::new(0)),
+            enriched_types: Arc::new(AtomicUsize::new(0)),
+            enriched_macros: Arc::new(AtomicUsize::new(0)),
+            macros_kept_by_clangd: Arc::new(AtomicUsize::new(0)),
             newly_processed_files: Arc::new(Mutex::new(HashSet::new())),
             git_sha,
             force_reprocess,
@@ -266,15 +350,27 @@ impl PipelineBuilder {
         Self {
             db_manager,
             source_root,
+            compile_commands_path: None,
             processed_files: Arc::new(AtomicUsize::new(0)),
             new_functions: Arc::new(AtomicUsize::new(0)),
             new_types: Arc::new(AtomicUsize::new(0)),
             new_macros: Arc::new(AtomicUsize::new(0)),
+            files_with_compile_commands: Arc::new(AtomicUsize::new(0)),
+            enriched_functions: Arc::new(AtomicUsize::new(0)),
+            enriched_types: Arc::new(AtomicUsize::new(0)),
+            enriched_macros: Arc::new(AtomicUsize::new(0)),
+            macros_kept_by_clangd: Arc::new(AtomicUsize::new(0)),
             newly_processed_files: Arc::new(Mutex::new(HashSet::new())),
             git_sha: Some(git_sha),
             force_reprocess: true,       // Always reprocess for git commit mode
             full_tree_incremental: true, // Use incremental processing with deduplication
         }
+    }
+
+    /// Set the compile_commands.json path for clangd enrichment
+    pub fn with_clangd(mut self, compile_commands_path: PathBuf) -> Self {
+        self.compile_commands_path = Some(compile_commands_path);
+        self
     }
 
     pub async fn build_and_run(self, files: Vec<PathBuf>) -> Result<()> {
@@ -326,45 +422,77 @@ impl PipelineBuilder {
             tracing::info!("Git manifest built successfully");
         }
 
-        // Dynamic channel sizes based on number of filtered files and available memory
-        let file_channel_size = (files_to_process.len().min(10000) / 10).max(100);
-        let parsed_channel_size = num_threads * 50; // Allow backpressure but keep threads busy
-        let processed_channel_size = 100; // Larger buffer to prevent backpressure from DB thread
+        // Calculate optimal channel sizes based on available memory
+        let (file_channel_size, parsed_channel_size, processed_channel_size) =
+            calculate_channel_sizes(files_to_process.len(), num_threads);
 
         // Create channels with bounded capacity to prevent memory bloat
         let (file_tx, file_rx) = bounded::<(PathBuf, String)>(file_channel_size);
         let (parsed_tx, parsed_rx) = bounded::<ParsedFile>(parsed_channel_size);
+
+        // Enrichment channel uses UNBOUNDED to ensure parsers never block on slow libclang
+        // Memory usage is monitored in the enrichment thread loop
+        let (enrichment_tx, enrichment_rx) = unbounded::<ParsedFile>();
+
         let (processed_tx, processed_rx) = bounded::<ProcessedBatch>(processed_channel_size);
 
         tracing::info!(
-            "Pipeline configuration: {} threads, channel sizes: files={}, parsed={}, processed={}",
+            "Pipeline configuration: {} threads, channel sizes: files={}, parsed={}, enrichment=unbounded, processed={}",
             num_threads,
             file_channel_size,
             parsed_channel_size,
             processed_channel_size
         );
 
-        // Create progress bar
-        let pb = ProgressBar::new(files_to_process.len() as u64);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} files {msg}",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
-        pb.set_message("Processing files...");
+        // Create multi-progress for pipeline stages with tracing integration
+        let multi = MultiProgress::new();
+        let total = files_to_process.len() as u64;
+
+        // Set up tracing-indicatif layer to prevent log interference with progress bars
+        let indicatif_layer = IndicatifLayer::new();
+        tracing_subscriber::registry()
+            .with(indicatif_layer)
+            .try_init()
+            .ok(); // Ignore error if already initialized
+
+        let style = ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:30.cyan/blue} {pos:>7}/{len:7} {msg} (ETA: {eta})",
+        )
+        .unwrap()
+        .progress_chars("##-");
+
+        let pb_feed = multi.add(ProgressBar::new(total));
+        pb_feed.set_style(style.clone());
+        pb_feed.set_message("fed to pipeline");
+
+        let pb_parse = multi.add(ProgressBar::new(total));
+        pb_parse.set_style(style.clone());
+        pb_parse.set_message("tree-sitter parsed");
+
+        let pb_enrich = multi.add(ProgressBar::new(total));
+        pb_enrich.set_style(style.clone());
+        pb_enrich.set_message("clangd enriched");
+
+        let pb_db = multi.add(ProgressBar::new(total));
+        pb_db.set_style(style);
+        pb_db.set_message("indexed to database");
 
         // Stage 1: File feeder (runs in main thread)
         let file_feeder = {
             let file_tx = file_tx.clone();
             let total_files = files_to_process.len();
+            let pb = pb_feed.clone();
             thread::spawn(move || {
+                tracing::info!("File feeder starting with {} files", total_files);
                 let start = Instant::now();
                 for (idx, (file_path, git_file_sha)) in files_to_process.into_iter().enumerate() {
+                    tracing::debug!("File feeder sending file {}: {:?}", idx, file_path);
                     if file_tx.send((file_path, git_file_sha)).is_err() {
+                        tracing::error!("File feeder: send failed at index {}", idx);
                         break;
                     }
+                    tracing::debug!("File feeder sent file {}", idx);
+                    pb.inc(1);
 
                     // Log progress periodically
                     if idx % 1000 == 0 && idx > 0 {
@@ -378,6 +506,7 @@ impl PipelineBuilder {
                         );
                     }
                 }
+                pb.finish();
                 drop(file_tx); // Signal completion
                 tracing::info!("File feeder completed");
             })
@@ -385,7 +514,6 @@ impl PipelineBuilder {
 
         // Stage 2: Parallel parsing (multiple threads)
         let git_files_shared = Arc::new(git_files);
-        let pb_shared = Arc::new(pb);
         let parsing_threads: Vec<_> = (0..num_threads)
             .map(|thread_id| {
                 let file_rx = file_rx.clone();
@@ -393,7 +521,7 @@ impl PipelineBuilder {
                 let processed = self.processed_files.clone();
                 let source_root = self.source_root.clone();
                 let git_files_map = git_files_shared.clone();
-                let pb_clone = pb_shared.clone();
+                let pb = pb_parse.clone();
 
                 thread::Builder::new()
                     .name(format!("parser-{thread_id}"))
@@ -510,7 +638,7 @@ impl PipelineBuilder {
 
                                 processed.fetch_add(1, Ordering::Relaxed);
                                 files_parsed += 1;
-                                pb_clone.inc(1);
+                                pb.inc(1);
 
                                 // Log slow parses
                                 let parse_time = parse_start.elapsed();
@@ -542,9 +670,215 @@ impl PipelineBuilder {
             })
             .collect();
 
+        // Drop original receivers/senders to signal completion
+        drop(file_rx);       // File feeding channel can close
+        drop(parsed_tx);     // Parsing channel can close when all parsers finish
+
+        // Stage 2.5: Multi-process enrichment coordinator
+        // Extract compile_commands path if configured
+        let compile_commands_path = self.compile_commands_path.clone();
+        let source_root = self.source_root.clone();
+
+        // Create ClangdProcessor with worker pool (or None if no compile_commands)
+        // Also keep stats references for final sync
+        let (processor, final_sync_stats) = if let Some(ref compile_commands_path) = compile_commands_path {
+            tracing::info!("Creating ClangdProcessor with worker pool (num_cpus-2)");
+            match crate::clangd_processor::ClangdProcessor::new_with_defaults(
+                compile_commands_path.clone(),
+                source_root.clone(),
+            ) {
+                Ok(processor) => {
+                    // Copy statistics from processor to pipeline stats
+                    // These will be updated by the processor's collector threads
+                    let proc_stats_files = processor.files_with_compile_commands.clone();
+                    let proc_stats_funcs = processor.enriched_functions.clone();
+                    let proc_stats_types = processor.enriched_types.clone();
+                    let proc_stats_macros = processor.enriched_macros.clone();
+                    let proc_stats_kept = processor.macros_kept_by_clangd.clone();
+
+                    // Link processor stats to pipeline stats
+                    let pipe_stats_files = self.files_with_compile_commands.clone();
+                    let pipe_stats_funcs = self.enriched_functions.clone();
+                    let pipe_stats_types = self.enriched_types.clone();
+                    let pipe_stats_macros = self.enriched_macros.clone();
+                    let pipe_stats_kept = self.macros_kept_by_clangd.clone();
+
+                    // Keep extra copies for final sync
+                    let final_proc_stats_files = proc_stats_files.clone();
+                    let final_proc_stats_funcs = proc_stats_funcs.clone();
+                    let final_proc_stats_types = proc_stats_types.clone();
+                    let final_proc_stats_macros = proc_stats_macros.clone();
+                    let final_proc_stats_kept = proc_stats_kept.clone();
+                    let final_pipe_stats_files = pipe_stats_files.clone();
+                    let final_pipe_stats_funcs = pipe_stats_funcs.clone();
+                    let final_pipe_stats_types = pipe_stats_types.clone();
+                    let final_pipe_stats_macros = pipe_stats_macros.clone();
+                    let final_pipe_stats_kept = pipe_stats_kept.clone();
+
+                    // Spawn thread to periodically sync stats (every 2s to avoid perf overhead)
+                    thread::spawn(move || {
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            pipe_stats_files.store(
+                                proc_stats_files.load(Ordering::Relaxed),
+                                Ordering::Relaxed
+                            );
+                            pipe_stats_funcs.store(
+                                proc_stats_funcs.load(Ordering::Relaxed),
+                                Ordering::Relaxed
+                            );
+                            pipe_stats_types.store(
+                                proc_stats_types.load(Ordering::Relaxed),
+                                Ordering::Relaxed
+                            );
+                            pipe_stats_macros.store(
+                                proc_stats_macros.load(Ordering::Relaxed),
+                                Ordering::Relaxed
+                            );
+                            pipe_stats_kept.store(
+                                proc_stats_kept.load(Ordering::Relaxed),
+                                Ordering::Relaxed
+                            );
+                        }
+                    });
+
+                    tracing::info!("ClangdProcessor created successfully");
+                    (
+                        Some(processor),
+                        Some((
+                            (final_proc_stats_files, final_proc_stats_funcs, final_proc_stats_types, final_proc_stats_macros, final_proc_stats_kept),
+                            (final_pipe_stats_files, final_pipe_stats_funcs, final_pipe_stats_types, final_pipe_stats_macros, final_pipe_stats_kept)
+                        ))
+                    )
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to create ClangdProcessor: {}", e);
+                    (None, None)
+                }
+            }
+        } else {
+            tracing::info!("No compile_commands_path provided, skipping clangd enrichment");
+            (None, None)
+        };
+
+        // Enrichment coordinator thread - simplified: collect all, spawn all workers, process all
+        let enrichment_thread = {
+            // MOVE parsed_rx (don't clone) so channel closes when parsing completes
+            let enrichment_tx = enrichment_tx.clone();
+            let pb = pb_enrich.clone();
+
+            thread::Builder::new()
+                .name("enrichment-coordinator".to_string())
+                .spawn(move || {
+                    tracing::debug!("Enrichment coordinator started - simplified mode");
+
+                    if let Some(mut processor) = processor {
+                        // Step 1: Collect all parsed files first
+                        tracing::debug!("Collecting all parsed files...");
+                        let mut all_parsed_files = Vec::new();
+                        while let Ok(parsed) = parsed_rx.recv() {
+                            all_parsed_files.push(parsed);
+                        }
+                        tracing::debug!("Collected {} files for enrichment", all_parsed_files.len());
+
+                        if all_parsed_files.is_empty() {
+                            tracing::debug!("No files to enrich");
+                            return;
+                        }
+
+                        // Step 2: Spawn ALL workers at once
+                        let num_workers = crate::clangd_processor::ClangdProcessor::default_worker_count();
+                        tracing::debug!("Spawning {} workers", num_workers);
+
+                        for worker_id in 0..num_workers {
+                            if let Err(e) = processor.spawn_worker() {
+                                tracing::error!("Failed to spawn worker {}: {}", worker_id, e);
+                            }
+                        }
+
+                        // Step 3: Submit all work using round-robin distribution
+                        tracing::info!("Submitting {} files to {} workers (round-robin)...", all_parsed_files.len(), num_workers);
+                        let total_files = all_parsed_files.len();
+                        for (idx, parsed) in all_parsed_files.into_iter().enumerate() {
+                            // Round-robin: file 0→worker 0, file 1→worker 1, ..., file 30→worker 0
+                            let worker_id = idx % num_workers;
+
+                            if idx < 3 || idx % 1000 == 0 {
+                                tracing::info!("Pipeline submitting file {} (assigned to worker {})", idx, worker_id);
+                            }
+
+                            let request = crate::clangd_processor::EnrichmentRequest {
+                                path: parsed.path,
+                                functions: parsed.functions,
+                                types: parsed.types,
+                                macros: parsed.macros,
+                                git_file_sha: parsed.git_file_sha,
+                                worker_id,
+                            };
+
+                            if let Err(e) = processor.submit_work(request) {
+                                tracing::error!("Failed to submit work: {}", e);
+                                break;
+                            }
+                        }
+                        tracing::info!("All {} files submitted to processor", total_files);
+
+                        // Step 3.5: Close work channel to signal workers
+                        processor.finish_submitting();
+
+                        // Step 4: Collect all results
+                        tracing::debug!("Waiting for {} enriched files...", total_files);
+                        for _ in 0..total_files {
+                            match processor.recv_result() {
+                                Ok(response) => {
+                                    let enriched = ParsedFile {
+                                        path: response.path,
+                                        functions: response.functions,
+                                        types: response.types,
+                                        macros: response.macros,
+                                        git_file_sha: response.git_file_sha,
+                                    };
+
+                                    if enrichment_tx.send(enriched).is_err() {
+                                        tracing::error!("Failed to send enriched file");
+                                        break;
+                                    }
+                                    pb.inc(1);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to receive result: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+
+                        tracing::debug!("Enrichment complete");
+                    } else {
+                        // No processor: just pass through, but filter macros
+                        tracing::debug!("No processor, using pass-through mode");
+                        while let Ok(mut parsed) = parsed_rx.recv() {
+                            parsed.macros.retain(|m| m.is_function_like);
+                            if enrichment_tx.send(parsed).is_err() {
+                                break;
+                            }
+                            pb.inc(1);
+                        }
+                    }
+
+                    tracing::debug!("Enrichment coordinator finished");
+                    drop(enrichment_tx);
+                })
+                .expect("Failed to spawn enrichment coordinator")
+        };
+
+        // parsed_rx was moved into enrichment thread, so it will be dropped when parsing completes
+
+        // Drop the original enrichment_tx to allow the channel to close when enrichment thread completes
+        drop(enrichment_tx);
+
         // Stage 3: Simple batching (no deduplication needed since git SHA pre-filtering ensures uniqueness)
         let batch_thread = {
-            let parsed_rx = parsed_rx.clone();
+            let enrichment_rx_for_batch = enrichment_rx.clone();
             let processed_tx = processed_tx.clone();
             let new_functions = self.new_functions.clone();
             let new_types = self.new_types.clone();
@@ -553,6 +887,8 @@ impl PipelineBuilder {
             thread::Builder::new()
                 .name("batch-processor".to_string())
                 .spawn(move || {
+                    tracing::info!("Batch processor thread started");
+                    let enrichment_rx = enrichment_rx_for_batch;
                     let start = Instant::now();
                     let mut total_processed = 0;
 
@@ -563,13 +899,24 @@ impl PipelineBuilder {
                         processed_files: Vec::new(),
                     };
 
-                    let mut batch_size = 2000;
+                    // Calculate adaptive batch size based on workload
+                    // Aim for ~10 batches per second with multi-process enrichment
+                    let num_workers = crate::clangd_processor::ClangdProcessor::default_worker_count();
+                    let estimated_files_per_sec = num_workers * 20; // Conservative estimate: 20 files/sec/worker
+                    let target_batch_size = estimated_files_per_sec.max(2000).min(8000);
+                    let mut batch_size = target_batch_size;
                     let mut last_batch_time = Instant::now();
 
+                    tracing::info!("Batch processor ready, waiting for files...");
                     loop {
-                        match parsed_rx.recv() {
+                        match enrichment_rx.recv() {
                             Ok(parsed) => {
                                 total_processed += 1;
+                                tracing::info!(
+                                    "Batch processor received file {}: {:?}",
+                                    total_processed,
+                                    parsed.path
+                                );
 
                                 // Count items before adding to batch
                                 let func_count = parsed.functions.len();
@@ -680,10 +1027,14 @@ impl PipelineBuilder {
                 .expect("Failed to spawn batch processor thread")
         };
 
+        // Drop the original enrichment_rx to allow the channel to close properly
+        drop(enrichment_rx);
+
         // Stage 4: Database insertion (async in tokio runtime)
         let db_thread = {
             let processed_rx = processed_rx.clone();
             let db_manager = self.db_manager.clone();
+            let pb = pb_db.clone();
 
             thread::Builder::new()
                 .name("db-inserter".to_string())
@@ -707,6 +1058,7 @@ impl PipelineBuilder {
                             let func_count = batch.functions.len();
                             let type_count = batch.types.len();
                             let macro_count = batch.macros.len();
+                            let file_count = batch.processed_files.len();
 
                             // Insert processed files and all data in parallel using combined content insertion
                             let (file_result, combined_result) = measure!("database_batch_insert", {
@@ -745,6 +1097,9 @@ impl PipelineBuilder {
                             total_types += type_count;
                             total_macros += macro_count;
 
+                            // Update progress bar after successful database insertion
+                            pb.inc(file_count as u64);
+
                             let batch_time = batch_start.elapsed();
                             if batch_time > Duration::from_secs(1) {
                                 tracing::warn!("Slow DB batch (combined content+metadata): {} functions, {} types, {} macros took {:.1}s",
@@ -760,9 +1115,12 @@ impl PipelineBuilder {
                 .expect("Failed to spawn db thread")
         };
 
+        // Drop the original processed_rx to allow the channel to close properly
+        drop(processed_rx);
+
         // Drop original senders to signal pipeline start
         drop(file_tx);
-        drop(parsed_tx);
+        // parsed_tx already dropped after parsing threads spawned
         drop(processed_tx);
 
         // Wait for all stages to complete
@@ -772,11 +1130,27 @@ impl PipelineBuilder {
             thread.join().unwrap();
         }
 
+        enrichment_thread.join().unwrap();
         batch_thread.join().unwrap();
         db_thread.join().unwrap();
 
-        // Finish progress bar
-        pb_shared.finish_with_message("Processing complete");
+        // Finish all progress bars
+        pb_feed.finish_with_message("complete");
+        pb_parse.finish_with_message("complete");
+        pb_enrich.finish_with_message("complete");
+        pb_db.finish_with_message("complete");
+
+        // Do final sync of clangd statistics before returning
+        // This ensures stats are up-to-date even if periodic sync hasn't run yet
+        if let Some(((proc_files, proc_funcs, proc_types, proc_macros, proc_kept),
+                     (pipe_files, pipe_funcs, pipe_types, pipe_macros, pipe_kept))) = final_sync_stats {
+            tracing::debug!("Performing final sync of clangd statistics");
+            pipe_files.store(proc_files.load(Ordering::Relaxed), Ordering::Relaxed);
+            pipe_funcs.store(proc_funcs.load(Ordering::Relaxed), Ordering::Relaxed);
+            pipe_types.store(proc_types.load(Ordering::Relaxed), Ordering::Relaxed);
+            pipe_macros.store(proc_macros.load(Ordering::Relaxed), Ordering::Relaxed);
+            pipe_kept.store(proc_kept.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
 
         tracing::info!("Pipeline processing complete (no additional resolution needed with git SHA pre-filtering)");
 

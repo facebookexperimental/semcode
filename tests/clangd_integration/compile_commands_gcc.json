@@ -1,0 +1,7 @@
+[
+  {
+    "directory": ".",
+    "command": "gcc -Wall -Wextra -std=c11 -fconserve-stack -mindirect-branch=thunk-extern -mpreferred-stack-boundary=3 -Wno-maybe-uninitialized -fno-var-tracking-assignments -fplugin=my_plugin.so -fplugin-arg-plugin=option -c test_sample.c -o test_sample.o",
+    "file": "test_sample.c"
+  }
+]

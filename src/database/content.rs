@@ -69,7 +69,8 @@ impl ContentStore {
         Ok(blake3_hash)
     }
 
-    /// Insert a batch of content items using upsert - handles duplicates gracefully
+    /// Insert a batch of content items - uses merge_insert for deduplication
+    /// Multiple functions can have identical content (e.g., stub functions)
     pub async fn insert_batch(&self, content_items: Vec<ContentInfo>) -> Result<()> {
         if content_items.is_empty() {
             return Ok(());
@@ -135,6 +136,7 @@ impl ContentStore {
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         // Use merge_insert for upsert functionality
+        // Multiple functions can have the same content hash (e.g., stub functions returning 0)
         let mut merge_insert = table.merge_insert(&["blake3_hash"]);
         merge_insert
             .when_matched_update_all(None)

@@ -60,6 +60,12 @@ impl SchemaManager {
             Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this function
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this function
+            // Clangd-enriched fields
+            Field::new("usr", DataType::Utf8, true), // Unified Symbol Resolution ID from clangd
+            Field::new("signature", DataType::Utf8, true), // Full resolved function signature
+            Field::new("canonical_return_type", DataType::Utf8, true), // Fully resolved canonical return type
+            Field::new("calls_precise", DataType::Utf8, true), // JSON array of precise call info with USRs
+            Field::new("overload_index", DataType::Int64, true), // Index when multiple overloads exist
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -85,6 +91,10 @@ impl SchemaManager {
             Field::new("fields", DataType::Utf8, false),
             Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
+            // Clangd-enriched fields
+            Field::new("usr", DataType::Utf8, true), // USR from clangd
+            Field::new("canonical_name", DataType::Utf8, true), // Fully qualified canonical name
+            Field::new("template_params", DataType::Utf8, true), // JSON array of template parameters
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -110,6 +120,8 @@ impl SchemaManager {
             Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this macro
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this macro
+            // Clangd-enriched fields
+            Field::new("usr", DataType::Utf8, true), // USR from clangd
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -268,6 +280,20 @@ impl SchemaManager {
                 "Composite index on functions.(name,git_file_hash)",
             )
             .await;
+
+            // Clangd-enriched field indices
+            self.try_create_index(&table, &["usr"], "BTree index on functions.usr")
+                .await;
+
+            self.try_create_index(&table, &["signature"], "BTree index on functions.signature")
+                .await;
+
+            self.try_create_index(
+                &table,
+                &["calls_precise"],
+                "BTree index on functions.calls_precise",
+            )
+            .await;
         }
 
         // Create indices for types table
@@ -309,6 +335,17 @@ impl SchemaManager {
                 "Composite index on types.(name,kind,git_file_hash)",
             )
             .await;
+
+            // Clangd-enriched field indices
+            self.try_create_index(&table, &["usr"], "BTree index on types.usr")
+                .await;
+
+            self.try_create_index(
+                &table,
+                &["canonical_name"],
+                "BTree index on types.canonical_name",
+            )
+            .await;
         }
 
         // Create indices for macros table
@@ -346,6 +383,10 @@ impl SchemaManager {
                 "Composite index on macros.(name,git_file_hash)",
             )
             .await;
+
+            // Clangd-enriched field indices
+            self.try_create_index(&table, &["usr"], "BTree index on macros.usr")
+                .await;
         }
 
         // Create indices for vectors table

@@ -64,13 +64,34 @@ async fn mcp_query_function_or_macro(
                 .await
                 .unwrap_or_default();
 
+            // Add clangd enrichment info if available
+            let usr_line = func
+                .usr
+                .as_ref()
+                .map(|u| format!("USR: {}\n", u))
+                .unwrap_or_default();
+            let sig_line = func
+                .signature
+                .as_ref()
+                .map(|s| format!("Signature: {}\n", s))
+                .unwrap_or_default();
+            let canonical_line = func
+                .canonical_return_type
+                .as_ref()
+                .filter(|c| *c != &func.return_type)
+                .map(|c| format!("Canonical Return Type: {}\n", c))
+                .unwrap_or_default();
+
             result.push_str(&format!(
-                "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
+                "Function: {} (git SHA: {})\nFile: {}:{}-{}\n{}{}{}Return Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
                 func.name,
                 git_sha,
                 func.file_path,
                 func.line_start,
                 func.line_end,
+                usr_line,
+                sig_line,
+                canonical_line,
                 func.return_type,
                 params_str,
                 calls.len(),
@@ -123,9 +144,27 @@ async fn mcp_query_function_or_macro(
                 .await
                 .unwrap_or_default();
 
+            // Add clangd enrichment info if available
+            let func_usr_line = func
+                .usr
+                .as_ref()
+                .map(|u| format!("USR: {}\n", u))
+                .unwrap_or_default();
+            let func_sig_line = func
+                .signature
+                .as_ref()
+                .map(|s| format!("Signature: {}\n", s))
+                .unwrap_or_default();
+            let func_canonical_line = func
+                .canonical_return_type
+                .as_ref()
+                .filter(|c| *c != &func.return_type)
+                .map(|c| format!("Canonical Return Type: {}\n", c))
+                .unwrap_or_default();
+
             result.push_str(&format!(
-                "Function: {}\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
-                func.name, func.file_path, func.line_start, func.line_end, func.return_type, func_params_str, func_calls.len(), func_callers.len(), func.body
+                "Function: {}\nFile: {}:{}-{}\n{}{}{}Return Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
+                func.name, func.file_path, func.line_start, func.line_end, func_usr_line, func_sig_line, func_canonical_line, func.return_type, func_params_str, func_calls.len(), func_callers.len(), func.body
             ));
 
             // Display macro
