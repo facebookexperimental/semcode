@@ -45,11 +45,33 @@ impl SymbolFilenameStore {
         table: &lancedb::table::Table,
         pairs: &[(String, String)],
     ) -> Result<()> {
-        // Build arrow arrays
+        // Deduplicate pairs in memory before sending to database
+        // This significantly reduces the workload on LanceDB's merge_insert
+        use std::collections::HashSet;
+
+        let mut seen_keys = HashSet::new();
+        let mut unique_pairs = Vec::new();
+
+        for (symbol_name, file_path) in pairs {
+            // Create combined key for deduplication: "filename:symbol"
+            let key = format!("{}:{}", file_path, symbol_name);
+
+            // Only add if we haven't seen this key before
+            if seen_keys.insert(key) {
+                unique_pairs.push((symbol_name.clone(), file_path.clone()));
+            }
+        }
+
+        // If all pairs were duplicates, return early
+        if unique_pairs.is_empty() {
+            return Ok(());
+        }
+
+        // Build arrow arrays from deduplicated data (no separate key column)
         let mut symbol_builder = StringBuilder::new();
         let mut filename_builder = StringBuilder::new();
 
-        for (symbol_name, file_path) in pairs {
+        for (symbol_name, file_path) in &unique_pairs {
             symbol_builder.append_value(symbol_name);
             filename_builder.append_value(file_path);
         }
@@ -63,7 +85,13 @@ impl SymbolFilenameStore {
 
         let batches = vec![Ok(batch)];
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+
+        // Use merge_insert with composite key (symbol, filename) for deduplication
+        let mut merge_insert = table.merge_insert(&["symbol", "filename"]);
+        merge_insert
+            .when_matched_update_all(None) // Update existing rows with same composite key
+            .when_not_matched_insert_all(); // Insert new rows
+        merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
     }
@@ -95,6 +123,7 @@ impl SymbolFilenameStore {
                 continue;
             }
 
+            // Column 1 is filename (column 0 is symbol)
             let filename_array = batch
                 .column(1)
                 .as_any()
@@ -138,6 +167,7 @@ impl SymbolFilenameStore {
                 continue;
             }
 
+            // Column 0 is symbol, column 1 is filename
             let symbol_array = batch
                 .column(0)
                 .as_any()

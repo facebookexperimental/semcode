@@ -513,7 +513,7 @@ impl SchemaManager {
             )
             .await;
 
-            // Composite index for efficient (symbol, filename) lookups and deduplication
+            // Composite index on (symbol, filename) for fast deduplication
             self.try_create_index(
                 &table,
                 &["symbol", "filename"],

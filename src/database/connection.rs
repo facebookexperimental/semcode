@@ -528,13 +528,33 @@ impl DatabaseManager {
             }
         }
 
-        // Step 2: Single content store operation (uses 16-way parallelization)
-        if !all_content_items.is_empty() {
-            self.content_store.insert_batch(all_content_items).await?;
+        // Step 2: Extract symbol_filename pairs for all entities
+        let mut symbol_filename_pairs = Vec::new();
+
+        // Extract from functions
+        for func in &functions {
+            symbol_filename_pairs.push((func.name.clone(), func.file_path.clone()));
         }
 
-        // Step 3: Insert metadata in parallel (without individual content operations)
-        let (func_result, type_result, macro_result) = tokio::join!(
+        // Extract from types
+        for type_info in &types {
+            symbol_filename_pairs.push((type_info.name.clone(), type_info.file_path.clone()));
+        }
+
+        // Extract from macros
+        for macro_info in &macros {
+            symbol_filename_pairs.push((macro_info.name.clone(), macro_info.file_path.clone()));
+        }
+
+        // Step 3: Insert content and metadata in parallel
+        let (content_result, func_result, type_result, macro_result, symbol_filename_result) = tokio::join!(
+            async {
+                if !all_content_items.is_empty() {
+                    self.content_store.insert_batch(all_content_items).await
+                } else {
+                    Ok(())
+                }
+            },
             async {
                 if !functions.is_empty() {
                     self.insert_functions_metadata_only(functions).await
@@ -555,12 +575,23 @@ impl DatabaseManager {
                 } else {
                     Ok(())
                 }
+            },
+            async {
+                if !symbol_filename_pairs.is_empty() {
+                    self.symbol_filename_store
+                        .insert_batch(symbol_filename_pairs)
+                        .await
+                } else {
+                    Ok(())
+                }
             }
         );
 
+        content_result?;
         func_result?;
         type_result?;
         macro_result?;
+        symbol_filename_result?;
 
         Ok(())
     }
@@ -1381,20 +1412,8 @@ impl DatabaseManager {
 
     // Metadata-only insertion methods (skip content storage for performance)
     async fn insert_functions_metadata_only(&self, functions: Vec<FunctionInfo>) -> Result<()> {
-        // Extract (symbol_name, filename) pairs for symbol_filename table
-        let symbol_filename_pairs: Vec<(String, String)> = functions
-            .iter()
-            .map(|f| (f.name.clone(), f.file_path.clone()))
-            .collect();
-
         // Insert functions metadata
         self.function_store.insert_metadata_only(functions).await?;
-
-        // Insert into symbol_filename table
-        self.symbol_filename_store
-            .insert_batch(symbol_filename_pairs)
-            .await?;
-
         Ok(())
     }
 
@@ -1403,20 +1422,8 @@ impl DatabaseManager {
     }
 
     async fn insert_macros_metadata_only(&self, macros: Vec<MacroInfo>) -> Result<()> {
-        // Extract (macro_name, filename) pairs for symbol_filename table
-        let macro_filename_pairs: Vec<(String, String)> = macros
-            .iter()
-            .map(|m| (m.name.clone(), m.file_path.clone()))
-            .collect();
-
         // Insert macros metadata
         self.macro_store.insert_metadata_only(macros).await?;
-
-        // Insert into symbol_filename table
-        self.symbol_filename_store
-            .insert_batch(macro_filename_pairs)
-            .await?;
-
         Ok(())
     }
 

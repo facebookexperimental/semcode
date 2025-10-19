@@ -491,12 +491,45 @@ pub fn get_changed_files_to_workdir<P: AsRef<Path>>(
     }
 }
 
+/// Walk a git tree at a specific commit with a reused repository reference
+/// This version avoids repeated repository discovery for better performance
+pub fn walk_tree_at_commit_with_repo<F>(
+    repo: &gix::Repository,
+    commit_sha: &str,
+    mut process_entry: F,
+) -> Result<()>
+where
+    F: FnMut(&str, &gix::ObjectId) -> Result<()>,
+{
+    // Parse the commit SHA using revparse (supports short SHAs, tags, etc.)
+    let commit = resolve_to_commit(repo, commit_sha)?;
+
+    let tree = commit
+        .tree()
+        .map_err(|e| anyhow::anyhow!("Failed to get tree for commit '{}': {}", commit_sha, e))?;
+
+    // Walk the entire git tree using breadthfirst traversal
+    use gix::traverse::tree::Recorder;
+    let mut recorder = Recorder::default();
+    tree.traverse().breadthfirst(&mut recorder)?;
+
+    // Process each blob entry with the provided callback
+    for entry in recorder.records {
+        if entry.mode.is_blob() {
+            let relative_path = entry.filepath.to_str_lossy();
+            process_entry(&relative_path, &entry.oid)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Walk a git tree at a specific commit and process each blob entry with a callback
 /// This is a generic utility function that allows callers to collect or process entries in their own way
 pub fn walk_tree_at_commit<P: AsRef<Path>, F>(
     repo_path: P,
     commit_sha: &str,
-    mut process_entry: F,
+    process_entry: F,
 ) -> Result<()>
 where
     F: FnMut(&str, &gix::ObjectId) -> Result<()>,
@@ -504,29 +537,7 @@ where
     let repo_path = repo_path.as_ref();
 
     match gix::discover(repo_path) {
-        Ok(repo) => {
-            // Parse the commit SHA using revparse (supports short SHAs, tags, etc.)
-            let commit = resolve_to_commit(&repo, commit_sha)?;
-
-            let tree = commit.tree().map_err(|e| {
-                anyhow::anyhow!("Failed to get tree for commit '{}': {}", commit_sha, e)
-            })?;
-
-            // Walk the entire git tree using breadthfirst traversal
-            use gix::traverse::tree::Recorder;
-            let mut recorder = Recorder::default();
-            tree.traverse().breadthfirst(&mut recorder)?;
-
-            // Process each blob entry with the provided callback
-            for entry in recorder.records {
-                if entry.mode.is_blob() {
-                    let relative_path = entry.filepath.to_str_lossy();
-                    process_entry(&relative_path, &entry.oid)?;
-                }
-            }
-
-            Ok(())
-        }
+        Ok(repo) => walk_tree_at_commit_with_repo(&repo, commit_sha, process_entry),
         Err(e) => Err(anyhow::anyhow!(
             "Failed to discover git repository from '{}': {}",
             repo_path.display(),

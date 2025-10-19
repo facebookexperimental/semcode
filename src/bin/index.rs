@@ -10,6 +10,7 @@ use semcode::{
 };
 use semcode::{FunctionInfo, MacroInfo, TypeInfo};
 // Temporary call relationships are now embedded in function JSON columns
+use dashmap::DashSet;
 use gix::revision::walk::Sorting;
 use semcode::perf_monitor::PERF_STATS;
 use std::collections::HashSet;
@@ -885,8 +886,8 @@ struct GitFileTuple {
     object_id: gix::ObjectId,
 }
 
-/// Results from processing git file tuples
-#[derive(Debug, Default)]
+/// Results from processing git file tuples (for database insertion batches)
+#[derive(Debug, Default, Clone)]
 struct GitTupleResults {
     functions: Vec<FunctionInfo>,
     types: Vec<TypeInfo>,
@@ -903,17 +904,26 @@ impl GitTupleResults {
     }
 }
 
-/// Get manifest of files from a specific git commit (just paths and object IDs, no content)
-/// Uses the shared git tree traversal utility for consistency
-fn get_git_commit_manifest(
-    repo_path: &std::path::Path,
+/// Statistics from processing git file tuples (lightweight, no accumulated data)
+#[derive(Debug, Default, Clone)]
+struct GitTupleStats {
+    files_processed: usize,
+    functions_count: usize,
+    types_count: usize,
+    macros_count: usize,
+}
+
+/// Get manifest of files from a specific git commit with a reused repository reference
+/// This version avoids repeated repository discovery for better performance
+fn get_git_commit_manifest_with_repo(
+    repo: &gix::Repository,
     git_sha: &str,
     extensions: &[String],
 ) -> Result<Vec<GitFileManifestEntry>> {
     let mut manifest = Vec::new();
 
-    // Use shared tree traversal utility with extension filtering
-    semcode::git::walk_tree_at_commit(repo_path, git_sha, |relative_path, object_id| {
+    // Use shared tree traversal utility with extension filtering (with repo reuse)
+    semcode::git::walk_tree_at_commit_with_repo(repo, git_sha, |relative_path, object_id| {
         // Check if file has one of the target extensions
         if let Some(ext) = std::path::Path::new(relative_path).extension() {
             if extensions.contains(&ext.to_string_lossy().to_string()) {
@@ -1016,17 +1026,20 @@ fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>
 
 /// Stream git file tuples to a channel from a subset of commits (producer)
 fn stream_git_file_tuples_batch(
-    generator_id: usize,
+    _generator_id: usize,
     repo_path: PathBuf,
     commit_batch: Vec<String>,
     extensions: Vec<String>,
     tuple_tx: mpsc::Sender<GitFileTuple>,
     processed_files: Arc<HashSet<String>>,
-    sent_in_this_run: Arc<std::sync::Mutex<HashSet<String>>>,
+    sent_in_this_run: Arc<DashSet<String>>,
 ) -> Result<()> {
+    // Open repository ONCE per generator thread and reuse for all commits
+    let repo = gix::discover(&repo_path)?;
+
     for commit_sha in commit_batch.iter() {
-        // Get all files from this commit
-        let manifest = get_git_commit_manifest(&repo_path, commit_sha, &extensions)?;
+        // Get all files from this commit using reused repo handle
+        let manifest = get_git_commit_manifest_with_repo(&repo, commit_sha, &extensions)?;
 
         for manifest_entry in manifest {
             let file_sha = manifest_entry.object_id.to_string();
@@ -1036,26 +1049,10 @@ fn stream_git_file_tuples_batch(
                 continue;
             }
 
-            // Filter out files already sent in this run (shared across all generators)
-            {
-                let mut sent_set = match sent_in_this_run.lock() {
-                    Ok(set) => set,
-                    Err(e) => {
-                        tracing::error!(
-                            "Generator {} failed to lock sent_in_this_run: {}",
-                            generator_id,
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                if sent_set.contains(&file_sha) {
-                    continue;
-                }
-
-                // Mark as sent and create tuple
-                sent_set.insert(file_sha.clone());
+            // Filter out files already sent in this run (lock-free with DashSet)
+            if !sent_in_this_run.insert(file_sha.clone()) {
+                // File already sent by another generator
+                continue;
             }
 
             let tuple = GitFileTuple {
@@ -1076,25 +1073,21 @@ fn stream_git_file_tuples_batch(
 
 // Mapping extraction functions removed - now using embedded calls/types columns
 
-/// Process a single git file tuple and extract functions/types/macros
-fn process_git_file_tuple(
+/// Process a single git file tuple and extract functions/types/macros (with repo reuse)
+fn process_git_file_tuple_with_repo(
     tuple: &GitFileTuple,
-    repo_path: &std::path::Path,
+    repo: &gix::Repository,
     source_root: &std::path::Path,
     no_macros: bool,
 ) -> Result<GitTupleResults> {
-    // Each thread needs its own repository connection
-    let repo =
-        gix::discover(repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
-
-    // Load git file content to temp file
+    // Load git file content to temp file using the reused repo
     let file_stem = tuple
         .file_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("gitfile");
 
-    let temp_path = load_git_file_to_temp(&repo, tuple.object_id, file_stem)?;
+    let temp_path = load_git_file_to_temp(repo, tuple.object_id, file_stem)?;
 
     // Create temp GitFileEntry for cleanup
     let git_file = GitFileEntry {
@@ -1148,63 +1141,105 @@ fn process_git_file_tuple(
     Ok(results)
 }
 
-/// Worker function that processes tuples from a shared channel (Arc<Mutex<Receiver>>)
+/// Worker function that processes tuples from a shared channel and sends batches to inserters
 fn tuple_worker_shared(
     worker_id: usize,
     shared_tuple_rx: Arc<std::sync::Mutex<mpsc::Receiver<GitFileTuple>>>,
-    result_tx: mpsc::Sender<GitTupleResults>,
+    result_tx: mpsc::SyncSender<GitTupleResults>,
     repo_path: PathBuf,
     source_root: PathBuf,
     no_macros: bool,
     processed_count: Arc<AtomicUsize>,
+    batches_sent: Arc<AtomicUsize>,
 ) {
-    let mut worker_results = GitTupleResults::default();
+    // Open repository ONCE per worker thread and reuse for all tuples
+    let thread_repo = match gix::discover(&repo_path) {
+        Ok(repo) => repo,
+        Err(e) => {
+            tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
+            return;
+        }
+    };
 
-    // Process tuples until channel is closed
+    // Accumulate results into a batch for sending to inserters
+    let mut batch = GitTupleResults::default();
+    const DB_BATCH_SIZE: usize = 2048; // Send to inserters after this many files
+
+    // Process tuples in batches to reduce channel lock overhead
+    const TUPLE_BATCH_SIZE: usize = 8;
     loop {
-        // Lock the receiver to get the next tuple
-        let tuple = {
-            match shared_tuple_rx.lock() {
-                Ok(rx) => rx.recv(),
+        // Collect a batch of tuples (reduces lock contention)
+        let mut tuple_batch = Vec::with_capacity(TUPLE_BATCH_SIZE);
+        {
+            let rx = match shared_tuple_rx.lock() {
+                Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
                     break;
                 }
-            }
-        };
+            };
 
-        match tuple {
-            Ok(tuple) => {
-                match process_git_file_tuple(&tuple, &repo_path, &source_root, no_macros) {
-                    Ok(tuple_result) => {
-                        worker_results.merge(tuple_result);
-                        processed_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Worker {} failed to process tuple {}: {}",
-                            worker_id,
-                            tuple.file_path.display(),
-                            e
-                        );
-                    }
+            // Try to get a batch of tuples without blocking
+            for _ in 0..TUPLE_BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(tuple) => tuple_batch.push(tuple),
+                    Err(mpsc::TryRecvError::Empty) => break, // No more tuples available now
+                    Err(mpsc::TryRecvError::Disconnected) => break, // Channel closed
                 }
             }
-            Err(_) => {
-                // Channel closed, exit worker loop
-                break;
+
+            // If we got nothing with try_recv, do a blocking recv for at least one
+            if tuple_batch.is_empty() {
+                match rx.recv() {
+                    Ok(tuple) => tuple_batch.push(tuple),
+                    Err(_) => break, // Channel closed
+                }
+            }
+        }
+
+        // Process the batch
+        for tuple in tuple_batch {
+            match process_git_file_tuple_with_repo(&tuple, &thread_repo, &source_root, no_macros) {
+                Ok(tuple_result) => {
+                    batch.merge(tuple_result);
+                    processed_count.fetch_add(1, Ordering::Relaxed);
+
+                    // Send batch to inserters when it reaches DB_BATCH_SIZE
+                    if batch.files_processed >= DB_BATCH_SIZE {
+                        batches_sent.fetch_add(1, Ordering::Relaxed);
+                        if result_tx.send(batch.clone()).is_err() {
+                            tracing::warn!(
+                                "Worker {} failed to send batch (channel closed)",
+                                worker_id
+                            );
+                            return;
+                        }
+                        batch = GitTupleResults::default(); // Reset for next batch
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Worker {} failed to process tuple {}: {}",
+                        worker_id,
+                        tuple.file_path.display(),
+                        e
+                    );
+                }
             }
         }
     }
 
-    // Send worker results back
-    if let Err(e) = result_tx.send(worker_results) {
-        tracing::warn!("Worker {} failed to send results: {}", worker_id, e);
+    // Send remaining batch if not empty
+    if batch.files_processed > 0 {
+        batches_sent.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = result_tx.send(batch) {
+            tracing::warn!("Worker {} failed to send final batch: {}", worker_id, e);
+        }
     }
 }
 
-/// Process git file tuples using streaming pipeline with multiple generator and worker threads
-fn process_git_tuples_streaming(
+/// Process git file tuples using streaming pipeline with database inserters
+async fn process_git_tuples_streaming(
     repo_path: PathBuf,
     git_range: String,
     extensions: Vec<String>,
@@ -1212,7 +1247,8 @@ fn process_git_tuples_streaming(
     no_macros: bool,
     processed_files: Arc<HashSet<String>>,
     num_workers: usize,
-) -> Result<GitTupleResults> {
+    db_manager: Arc<DatabaseManager>,
+) -> Result<GitTupleStats> {
     use std::sync::Mutex;
 
     // First, get all commits in the range
@@ -1220,13 +1256,13 @@ fn process_git_tuples_streaming(
         gix::discover(&repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
     let commit_shas = list_shas_in_range(&repo, &git_range)?;
 
-    // Handle empty commit range early - return empty results
+    // Handle empty commit range early - return empty stats
     if commit_shas.is_empty() {
-        return Ok(GitTupleResults {
-            functions: Vec::new(),
-            types: Vec::new(),
-            macros: Vec::new(),
+        return Ok(GitTupleStats {
             files_processed: 0,
+            functions_count: 0,
+            types_count: 0,
+            macros_count: 0,
         });
     }
 
@@ -1256,26 +1292,50 @@ fn process_git_tuples_streaming(
         num_workers
     ));
 
-    // Create channels
+    // Create channels with backpressure
     let (tuple_tx, tuple_rx) = mpsc::channel::<GitFileTuple>();
-    let (result_tx, result_rx) = mpsc::channel::<GitTupleResults>();
+    // Bounded channel for results to prevent memory explosion (3 batches in flight max)
+    // Each batch = 10000 files, so max 30000 files in memory at inserters
+    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(3);
 
-    // Wrap receiver in Arc<Mutex<>> so multiple workers can share it
+    // Wrap receivers for shared access
     let shared_tuple_rx = Arc::new(Mutex::new(tuple_rx));
+    let shared_result_rx = Arc::new(Mutex::new(result_rx));
 
-    // Shared progress counter
+    // Shared progress counters
     let processed_count = Arc::new(AtomicUsize::new(0));
+    let inserted_functions = Arc::new(AtomicUsize::new(0));
+    let inserted_types = Arc::new(AtomicUsize::new(0));
+    let inserted_macros = Arc::new(AtomicUsize::new(0));
+    let batches_sent = Arc::new(AtomicUsize::new(0));
+    let batches_inserted = Arc::new(AtomicUsize::new(0));
 
-    // Shared deduplication set across all generators
-    let sent_in_this_run = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    // Shared deduplication set across all generators (lock-free)
+    let sent_in_this_run = Arc::new(DashSet::new());
 
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
+    let functions_clone = inserted_functions.clone();
+    let types_clone = inserted_types.clone();
+    let macros_clone = inserted_macros.clone();
+    let batches_sent_clone = batches_sent.clone();
+    let batches_inserted_clone = batches_inserted.clone();
     let progress_thread = std::thread::spawn(move || {
         loop {
-            let count = processed_clone.load(Ordering::Relaxed);
-            pb_clone.set_position(count as u64);
+            let files = processed_clone.load(Ordering::Relaxed);
+            let funcs = functions_clone.load(Ordering::Relaxed);
+            let types = types_clone.load(Ordering::Relaxed);
+            let macros = macros_clone.load(Ordering::Relaxed);
+            let sent = batches_sent_clone.load(Ordering::Relaxed);
+            let inserted = batches_inserted_clone.load(Ordering::Relaxed);
+            let pending = sent.saturating_sub(inserted);
+
+            pb_clone.set_position(files as u64);
+            pb_clone.set_message(format!(
+                "{} funcs, {} types, {} macros | {} batches pending",
+                funcs, types, macros, pending
+            ));
 
             // Check if we should exit
             if pb_clone.is_finished() {
@@ -1321,6 +1381,7 @@ fn process_git_tuples_streaming(
         let worker_repo_path = repo_path.clone();
         let worker_source_root = source_root.clone();
         let worker_processed_count = processed_count.clone();
+        let worker_batches_sent = batches_sent.clone();
 
         let handle = thread::spawn(move || {
             tuple_worker_shared(
@@ -1331,6 +1392,7 @@ fn process_git_tuples_streaming(
                 worker_source_root,
                 no_macros,
                 worker_processed_count,
+                worker_batches_sent,
             );
         });
         worker_handles.push(handle);
@@ -1338,6 +1400,91 @@ fn process_git_tuples_streaming(
 
     // Close the original result sender (workers have clones)
     drop(result_tx);
+
+    // Spawn database inserter tasks (use 4 for better parallelism without too much contention)
+    let num_inserters = 4;
+    let mut inserter_handles = Vec::new();
+
+    for inserter_id in 0..num_inserters {
+        let db_manager_clone = Arc::clone(&db_manager);
+        let result_rx_clone = shared_result_rx.clone();
+        let functions_counter = inserted_functions.clone();
+        let types_counter = inserted_types.clone();
+        let macros_counter = inserted_macros.clone();
+        let batches_inserted_counter = batches_inserted.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Get next batch from shared receiver
+                let batch = {
+                    let rx = result_rx_clone.lock().unwrap();
+                    rx.recv()
+                };
+
+                match batch {
+                    Ok(batch) => {
+                        let func_count = batch.functions.len();
+                        let type_count = batch.types.len();
+                        let macro_count = batch.macros.len();
+
+                        // Insert all three types in parallel
+                        let (func_result, type_result, macro_result) = tokio::join!(
+                            async {
+                                if !batch.functions.is_empty() {
+                                    db_manager_clone.insert_functions(batch.functions).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.types.is_empty() {
+                                    db_manager_clone.insert_types(batch.types).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.macros.is_empty() {
+                                    db_manager_clone.insert_macros(batch.macros).await
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        );
+
+                        // Check results and update counters
+                        let mut insertion_successful = true;
+                        if let Err(e) = func_result {
+                            error!("Inserter {} failed to insert functions: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            functions_counter.fetch_add(func_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = type_result {
+                            error!("Inserter {} failed to insert types: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            types_counter.fetch_add(type_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = macro_result {
+                            error!("Inserter {} failed to insert macros: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            macros_counter.fetch_add(macro_count, Ordering::Relaxed);
+                        }
+
+                        // Only increment batches_inserted if insertion was successful
+                        if insertion_successful {
+                            batches_inserted_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => break, // Channel closed, exit task
+                }
+            }
+        });
+
+        inserter_handles.push(handle);
+    }
 
     // Wait for all generators to complete
     for (generator_id, handle) in generator_handles.into_iter().enumerate() {
@@ -1353,21 +1500,29 @@ fn process_git_tuples_streaming(
         }
     }
 
-    // Collect results from all workers
-    let mut final_results = GitTupleResults::default();
-    while let Ok(worker_result) = result_rx.try_recv() {
-        final_results.merge(worker_result);
+    // Wait for all inserter tasks to finish
+    for (inserter_id, handle) in inserter_handles.into_iter().enumerate() {
+        if let Err(e) = handle.await {
+            tracing::error!("Inserter {} task failed: {:?}", inserter_id, e);
+        }
     }
 
-    let total_processed = processed_count.load(Ordering::Relaxed);
+    // Collect final statistics
+    let stats = GitTupleStats {
+        files_processed: processed_count.load(Ordering::Relaxed),
+        functions_count: inserted_functions.load(Ordering::Relaxed),
+        types_count: inserted_types.load(Ordering::Relaxed),
+        macros_count: inserted_macros.load(Ordering::Relaxed),
+    };
 
     // Finish progress bar
     pb.finish_with_message(format!(
-        "Git processing complete: {total_processed} files processed"
+        "Complete: {} files, {} functions, {} types, {} macros",
+        stats.files_processed, stats.functions_count, stats.types_count, stats.macros_count
     ));
     progress_thread.join().unwrap();
 
-    Ok(final_results)
+    Ok(stats)
 }
 
 /// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
@@ -1834,9 +1989,9 @@ async fn process_git_range(
         num_workers
     );
 
-    // Step 3: Process tuples using streaming pipeline
+    // Step 3: Process tuples using streaming pipeline with database inserters
     let processing_start = std::time::Instant::now();
-    let results = process_git_tuples_streaming(
+    let stats = process_git_tuples_streaming(
         args.source.clone(),
         git_range.to_string(),
         extensions.to_vec(),
@@ -1844,93 +1999,34 @@ async fn process_git_range(
         args.no_macros,
         processed_files,
         num_workers,
-    )?;
+        db_manager.clone(),
+    )
+    .await?;
 
     let processing_time = processing_start.elapsed();
 
-    let function_count = results.functions.len();
-    let type_count = results.types.len();
-    let macro_count = results.macros.len();
-
     info!(
-        "Streaming pipeline completed in {:.1}s: {} files, {} functions, {} types, {} macros",
+        "Streaming pipeline completed in {:.1}s: {} files, {} functions, {} types, {} macros (inserted throughout processing)",
         processing_time.as_secs_f64(),
-        results.files_processed,
-        function_count,
-        type_count,
-        macro_count
+        stats.files_processed,
+        stats.functions_count,
+        stats.types_count,
+        stats.macros_count
     );
 
-    // Step 4: Insert results into database in parallel (including call relationships and type mappings originating from processed files)
-    if results.files_processed > 0 {
-        info!("Inserting results into database using parallel insertion");
-        let db_insert_start = std::time::Instant::now();
-
-        // Run all insertions in parallel using tokio::join!
-        let (functions_result, types_result, macros_result) = tokio::join!(
-            async {
-                if !results.functions.is_empty() {
-                    info!(
-                        "Starting parallel function insertion ({} functions)",
-                        results.functions.len()
-                    );
-                    db_manager.insert_functions(results.functions).await
-                } else {
-                    Ok(())
-                }
-            },
-            async {
-                if !results.types.is_empty() {
-                    info!(
-                        "Starting parallel type insertion ({} types)",
-                        results.types.len()
-                    );
-                    db_manager.insert_types(results.types).await
-                } else {
-                    Ok(())
-                }
-            },
-            async {
-                if !results.macros.is_empty() {
-                    info!(
-                        "Starting parallel macro insertion ({} macros)",
-                        results.macros.len()
-                    );
-                    db_manager.insert_macros(results.macros).await
-                } else {
-                    Ok(())
-                }
-            }
-        );
-
-        // Check results and propagate any errors
-        functions_result?;
-        types_result?;
-        macros_result?;
-
-        // Call relationships are now embedded in function/macro JSON columns
-
-        // Function-type and type-type mapping insertion removed - now using embedded columns
-
-        let db_insert_time = db_insert_start.elapsed();
-        info!(
-            "Parallel database insertion completed in {:.1}s",
-            db_insert_time.as_secs_f64()
-        );
-    }
-
-    // Call relationships are now embedded in function/macro JSON columns
+    // Database insertion happened throughout processing via streaming inserters
+    // No batch insertion needed here!
 
     let total_time = start_time.elapsed();
 
     println!("\n=== Git Range Pipeline Complete ===");
     println!("Total time: {:.1}s", total_time.as_secs_f64());
     println!("Commits indexed: {commit_count}");
-    println!("Files processed: {}", results.files_processed);
-    println!("Functions indexed: {function_count}");
-    println!("Types indexed: {type_count}");
+    println!("Files processed: {}", stats.files_processed);
+    println!("Functions indexed: {}", stats.functions_count);
+    println!("Types indexed: {}", stats.types_count);
     if !args.no_macros {
-        println!("Macros indexed: {macro_count}");
+        println!("Macros indexed: {}", stats.macros_count);
     }
 
     Ok(())
