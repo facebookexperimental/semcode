@@ -186,7 +186,11 @@ impl TypeStore {
 
         let batches = vec![Ok(batch)];
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+
+        // Use merge_insert to handle duplicates - do nothing when matched
+        let mut merge_insert = table.merge_insert(&["name", "kind", "file_path", "git_file_hash"]);
+        merge_insert.when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
     }
@@ -263,7 +267,11 @@ impl TypeStore {
 
         let batches = vec![Ok(batch)];
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+
+        // Use merge_insert to handle duplicates - do nothing when matched
+        let mut merge_insert = table.merge_insert(&["name", "kind", "file_path", "git_file_hash"]);
+        merge_insert.when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
     }
@@ -1245,7 +1253,11 @@ impl MacroStore {
 
         let batches = vec![Ok(batch)];
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+
+        // Use merge_insert to handle duplicates - do nothing when matched
+        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
+        merge_insert.when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
     }
@@ -1347,7 +1359,11 @@ impl MacroStore {
 
         let batches = vec![Ok(batch)];
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+
+        // Use merge_insert to handle duplicates - do nothing when matched
+        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
+        merge_insert.when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
     }
