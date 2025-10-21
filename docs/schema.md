@@ -4,46 +4,40 @@ This document describes the LanceDB database schema used by semcode for storing 
 
 ## Overview
 
-Semcode uses LanceDB (Apache Arrow-based) with a **content deduplication architecture** and **embedded JSON relationships**. The key design features are:
+Semcode uses LanceDB (Apache Arrow-based columnar database) with several key architectural features:
 
 - **Content Deduplication**: Large content (function bodies, type definitions, macro definitions) is stored once in sharded content tables, referenced by Blake3 hex hashes
 - **Content Sharding**: Content is distributed across 16 shard tables (content_0 through content_15) for optimal performance
 - **Embedded Relationships**: Call relationships and type dependencies are stored as JSON arrays within each entity's record
-- **Git Integration**: Git SHA-based tracking for incremental processing and content uniqueness
+- **Git Integration**: Git SHA-based tracking for incremental processing and multi-version support
+- **Symbol Lookup Cache**: Fast symbol→filename mapping table optimizes git-aware queries
 - **Hex String Storage**: All hashes are stored as hex strings for better compatibility and debuggability
-
-This design provides excellent performance, storage efficiency, and atomic data consistency.
-
-## Core Design Principles
-
-1. **Content Deduplication**: Large text content is deduplicated using Blake3 hashes in sharded content tables
-2. **Embedded Relationships**: Call relationships and type dependencies are stored as JSON arrays within entity records
-3. **Git SHA-based Tracking**: Each record includes git file hashes for content-based uniqueness and incremental processing
-4. **Comprehensive Indexing**: BTree indices on all key columns including names, file paths, git hashes, relationships, and line positions for optimal query performance
-5. **Storage Efficiency**: Content deduplication eliminates redundant storage of identical function bodies and definitions
-6. **Scalable Sharding**: Content is distributed across multiple tables to prevent single-table performance bottlenecks
 
 ## Database Technology
 
 - **Database Engine**: LanceDB (Apache Arrow-based columnar database)
-- **Vector Embeddings**: 256-dimensional float32 vectors (CodeBERT embeddings)
+- **Vector Embeddings**: 256-dimensional float32 vectors for semantic search
 - **Hash Algorithms**:
   - SHA-1 for git file content tracking (stored as hex strings)
   - Blake3 for content deduplication (faster, better collision resistance, stored as hex strings)
 - **Schema Format**: Apache Arrow schemas with strongly-typed columns
 - **Content Sharding**: 16-way sharding based on Blake3 hash prefix
 
-## Core Tables
+## Database Tables
 
 The database consists of the following tables:
 
-1. **functions** - Function definitions and declarations with call and type relationships
-2. **types** - Struct, union, enum, and typedef definitions with type dependencies
-3. **macros** - Function-like macro definitions with call and type relationships
-4. **vectors** - CodeBERT embeddings for semantic search
-5. **processed_files** - Tracks processed files for incremental indexing
-6. **commits** - Git commit metadata with unified diffs and changed symbols
-7. **content_0 through content_15** - Deduplicated content storage (16 shards)
+1. **functions** - Function definitions and declarations with embedded call and type relationships
+2. **types** - Struct, union, and enum definitions with embedded type dependencies
+3. **macros** - Function-like macro definitions with embedded call and type relationships
+4. **vectors** - CodeBERT embeddings for semantic search of functions/types/macros
+5. **commit_vectors** - Embeddings for git commit messages and diffs
+6. **processed_files** - Tracks processed files for incremental indexing
+7. **symbol_filename** - Fast lookup cache mapping symbols to file paths
+8. **git_commits** - Git commit metadata with unified diffs and changed symbols
+9. **content_0 through content_15** - Deduplicated content storage (16 shards)
+
+## Table Schemas
 
 ### 1. functions
 
@@ -216,7 +210,56 @@ git_file_sha        (Utf8, NOT NULL)     - SHA-1 hash of specific file content a
 - BTree on `git_file_sha` (content-based deduplication)
 - Composite on `(file, git_sha)` (efficient file + git_sha lookups)
 
-### 6. commits
+### 6. symbol_filename
+
+Fast lookup cache mapping symbol names to file paths. Optimizes git-aware queries by avoiding full table scans.
+
+**Schema:**
+```
+symbol              (Utf8, NOT NULL)     - Symbol name (function, macro, type, or typedef)
+filename            (Utf8, NOT NULL)     - File path where symbol is defined
+```
+
+**Purpose:**
+- Acts as an index cache for the question "which files contain symbol X?"
+- Dramatically speeds up git-aware lookups by providing candidate file paths without scanning entity tables
+- Populated automatically during indexing for all functions, types, typedefs, and macros
+- Duplicate symbol-filename pairs are automatically deduplicated using composite key
+
+**Performance Benefits:**
+- Converts O(n) full table scans into O(log n) indexed lookups
+- Essential for large codebases with millions of functions
+- Enables efficient 3-step git-aware lookup pattern:
+  1. Query symbol_filename cache → Get candidate file paths
+  2. Resolve git hashes → Convert file paths to blob hashes at target commit
+  3. Targeted entity lookup → Query only specific file/hash combinations
+
+**Indices:**
+- BTree on `symbol` (fast symbol name lookups)
+- BTree on `filename` (file-based lookups)
+- Composite on `(symbol, filename)` (fast deduplication)
+
+### 7. commit_vectors
+
+Stores embeddings for git commit messages and diffs, enabling semantic search across commits.
+
+**Schema:**
+```
+git_commit_sha      (Utf8, NOT NULL)                         - Git commit SHA
+vector              (FixedSizeList[Float32, 256], NOT NULL)  - Embedding vector for commit
+```
+
+**Notes:**
+- Vectors generated from commit subject, message, and diff content
+- Enables semantic search to find commits related to a concept or change pattern
+- Vector dimension: 256 (matching function vectors for consistency)
+- Generation is optional and controlled by indexing flags
+
+**Indices:**
+- BTree on `git_commit_sha` (fast commit lookups)
+- IVF-PQ vector index on `vector` column (for approximate nearest neighbor search)
+
+### 8. git_commits
 
 Stores git commit metadata including unified diffs and symbols changed in each commit. Enables commit-level analysis and tracking code evolution across git history.
 
@@ -279,7 +322,7 @@ symbols             (Utf8, NOT NULL)     - JSON array of changed symbols extract
 - BTree on `symbols` (find commits that modified specific symbols)
 - BTree on `parent_sha` (traverse commit history)
 
-### 7. content_0 through content_15 (Content Shards)
+### 9. content_0 through content_15 (Content Shards)
 
 Stores deduplicated content referenced by other tables, distributed across 16 shard tables for optimal performance.
 
@@ -371,9 +414,35 @@ Every record includes a `git_file_hash` field containing the SHA-1 hash of the f
 - **Git-aware queries**: Find entities from specific git commits
 - **Cross-commit consistency**: Same git hash ensures identical content across commits
 
+### Symbol Lookup Cache (symbol_filename)
+
+The symbol_filename table acts as a fast index cache that dramatically improves git-aware query performance:
+
+**Problem Solved:**
+- Without the cache, finding "which files contain function X?" requires scanning the entire functions table
+- For large codebases with millions of functions, this is prohibitively expensive
+- The same problem applies to types, typedefs, and macros
+
+**Solution:**
+- Maintain a simple (symbol, filename) mapping table with BTree indices
+- Automatically populated during indexing for all entities
+- Composite key (symbol, filename) prevents duplicates
+
+**Performance Impact:**
+- Converts O(n) full table scans into O(log n) indexed lookups
+- Essential for the efficient 3-step git-aware lookup pattern used throughout the codebase:
+  1. **Query cache**: `symbol_filename.get_filenames_for_symbol("malloc")` → `["mm/slab.c", "include/linux/slab.h"]`
+  2. **Resolve git hashes**: Convert file paths to blob SHAs at target commit
+  3. **Targeted lookup**: Query only the specific (name, file, hash) combinations
+
+**Usage:**
+- Used by all `*_git_aware()` lookup functions
+- Critical for operations like "find function at commit", "find callers at commit", etc.
+- Enables efficient call chain analysis and type relationship queries
+
 ### Commit Metadata with Symbol Extraction
 
-The commits table stores git commit history with enhanced metadata:
+The git_commits table stores git commit history with enhanced metadata:
 - **Unified Diffs**: Full git-style diffs with symbol context in hunk headers
 - **Walk-back Symbol Extraction**: Fast O(modified_lines × 50) algorithm identifies changed functions, types, and macros
 - **Dual-file Analysis**: Extracts symbols from both additions and deletions
@@ -470,32 +539,32 @@ FROM (
 ### Commit Metadata Queries
 ```sql
 -- Find commits by author
-SELECT git_sha, subject, author FROM commits
+SELECT git_sha, subject, author FROM git_commits
 WHERE author LIKE '%john@example.com%'
 
 -- Find commits that modified a specific function
-SELECT git_sha, subject, author FROM commits
+SELECT git_sha, subject, author FROM git_commits
 WHERE symbols LIKE '%"malloc_wrapper()"%'
 
 -- Find commits that modified any struct definitions
-SELECT git_sha, subject, author FROM commits
+SELECT git_sha, subject, author FROM git_commits
 WHERE symbols LIKE '%"struct %'
 
 -- Get full commit details including diff
-SELECT git_sha, subject, message, diff, symbols FROM commits
+SELECT git_sha, subject, message, diff, symbols FROM git_commits
 WHERE git_sha = 'abc123...'
 
 -- Find commits with multiple parents (merge commits)
-SELECT git_sha, subject, author FROM commits
+SELECT git_sha, subject, author FROM git_commits
 WHERE parent_sha LIKE '%,%'
 
 -- Find commits with specific tags (e.g., reviewed commits)
-SELECT git_sha, subject, author FROM commits
+SELECT git_sha, subject, author FROM git_commits
 WHERE tags LIKE '%"Reviewed-by"%'
 
 -- Traverse commit history by following parent relationships
 SELECT c1.git_sha, c1.subject, c2.git_sha as parent_sha, c2.subject as parent_subject
-FROM commits c1, commits c2
+FROM git_commits c1, git_commits c2
 WHERE c1.parent_sha LIKE '%"' || c2.git_sha || '"%'
 ```
 
