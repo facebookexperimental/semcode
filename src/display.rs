@@ -48,6 +48,30 @@ fn print_command_help() {
     println!(
         "                                   Requires vectors generated with 'semcode-index --vectors'"
     );
+    println!(
+        "  {} <query_text>         - Search commits similar to query text using vectors",
+        "vcommit".yellow()
+    );
+    println!(
+        "                                   Supports --git <range>, -r <regex>, -s <symbol>, --limit <N>"
+    );
+    println!(
+        "                                   Requires commit vectors generated with 'semcode-index --vectors'"
+    );
+
+    // Git Commit Commands
+    println!();
+    println!("{}", "Git Commit Commands:".bold().cyan());
+    println!(
+        "  {} [ref]                  - Show commit metadata for git reference",
+        "commit".yellow()
+    );
+    println!(
+        "                                   Supports -v (verbose), -r <regex>, -s <symbol>, --limit <N>"
+    );
+    println!(
+        "                                   Use --git <range> for commit ranges (e.g., HEAD~10..HEAD)"
+    );
 
     println!(
         "  {} ({}) [-i file]             - List functions from diff (no analysis)",
@@ -160,6 +184,16 @@ pub fn print_help() {
     println!(
         "  vgrep --limit 5 \"string ops\"      # Find top 5 functions similar to \"string ops\""
     );
+    println!("  commit HEAD                        # Show metadata for HEAD commit");
+    println!("  commit HEAD~5                      # Show metadata for HEAD~5 commit");
+    println!("  commit --git HEAD~10..HEAD         # Show all commits in range");
+    println!("  commit --git HEAD~10..HEAD -v      # Show commits with full diffs");
+    println!("  commit -r \"malloc\" -r \"free\"      # Show commits matching both \"malloc\" AND \"free\"");
+    println!("  commit -s \"kmalloc\"                # Show commits that modified kmalloc");
+    println!("  commit --git HEAD~100..HEAD -s \"struct.*\" --limit 20  # Show up to 20 commits modifying structs");
+    println!("  vcommit \"fix memory leak\"          # Find commits semantically similar to \"fix memory leak\"");
+    println!("  vcommit --git HEAD~50..HEAD \"performance\"  # Search commits in range");
+    println!("  vcommit -r \"malloc\" -r \"free\" --limit 10 \"memory\"  # Find memory-related commits with both malloc and free");
     println!();
 }
 
@@ -234,6 +268,14 @@ pub fn print_welcome_message_with_model(
     println!(
         "  {} <query>                         # Search similar functions with vectors",
         "vgrep".yellow()
+    );
+    println!(
+        "  {} <ref>                        # Show commit metadata",
+        "commit".yellow()
+    );
+    println!(
+        "  {} <query>                       # Search similar commits with vectors",
+        "vcommit".yellow()
     );
     println!(
         "  {} [-i file]                   # List diff functions",
