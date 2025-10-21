@@ -508,6 +508,7 @@ async fn mcp_show_commit_metadata(
     verbose: bool,
     regex_patterns: &[String],
     symbol_patterns: &[String],
+    path_patterns: &[String],
 ) -> Result<String> {
     use std::io::Write;
 
@@ -631,6 +632,41 @@ async fn mcp_show_commit_metadata(
         }
     }
 
+    // Step 3c: Apply path filters if provided (ANY must match - OR logic)
+    if !path_patterns.is_empty() {
+        // Compile all path regex patterns
+        let mut path_regexes = Vec::new();
+        for pattern in path_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => path_regexes.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid path regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+
+        // Check if commit files match ANY path pattern
+        let matches_any_pattern = path_regexes
+            .iter()
+            .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+
+        if !matches_any_pattern {
+            writeln!(
+                buffer,
+                "Info: Commit {} does not match any of {} path pattern(s): {}",
+                resolved_sha,
+                path_patterns.len(),
+                path_patterns.join(", ")
+            )?;
+            return Ok(String::from_utf8_lossy(&buffer).to_string());
+        }
+    }
+
     // Step 4: Display commit metadata
     writeln!(buffer, "\n=== Git Commit Metadata ===")?;
     writeln!(buffer, "Commit: {}", commit.git_sha)?;
@@ -698,6 +734,7 @@ async fn mcp_show_commit_range(
     verbose: bool,
     regex_patterns: &[String],
     symbol_patterns: &[String],
+    path_patterns: &[String],
 ) -> Result<String> {
     use std::io::Write;
 
@@ -850,6 +887,24 @@ async fn mcp_show_commit_range(
         }
     }
 
+    // Step 2c: Compile path filters if provided (ALL must match)
+    let mut path_filters = Vec::new();
+    if !path_patterns.is_empty() {
+        for pattern in path_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => path_filters.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid path regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+    }
+
     writeln!(
         buffer,
         "\nGit Range: Found {} commit(s) in range {}:",
@@ -883,8 +938,25 @@ async fn mcp_show_commit_range(
             .query_commits_chunk_filtered(chunk, &regex_filter_patterns, &symbol_filter_patterns)
             .await?;
 
+        // Apply path filtering to chunk results
+        let filtered_chunk_results: Vec<_> = chunk_results
+            .into_iter()
+            .filter(|commit| {
+                // Apply path filters (ANY must match - OR logic)
+                if !path_filters.is_empty() {
+                    let matches_any_pattern = path_filters
+                        .iter()
+                        .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+                    if !matches_any_pattern {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
         // Display results from this chunk
-        for commit in &chunk_results {
+        for commit in &filtered_chunk_results {
             matched_count += 1;
             displayed_count += 1;
 
@@ -942,7 +1014,7 @@ async fn mcp_show_commit_range(
     writeln!(buffer, "\n{}", "=".repeat(80))?;
 
     // Show summary with filtering info
-    if !regex_patterns.is_empty() || !symbol_patterns.is_empty() {
+    if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty() {
         writeln!(buffer, "Summary:")?;
         writeln!(buffer, "  Total commits in range: {}", range_commits.len())?;
         writeln!(buffer, "  Matched by filters: {}", matched_count)?;
@@ -970,6 +1042,13 @@ async fn mcp_show_commit_range(
                     symbol_patterns.len(),
                     symbol_patterns.join(", ")
                 )?;
+            } else if !path_patterns.is_empty() {
+                writeln!(
+                    buffer,
+                    "\nInfo: No commits matched ALL {} path pattern(s): {}",
+                    path_patterns.len(),
+                    path_patterns.join(", ")
+                )?;
             }
         }
     } else {
@@ -984,6 +1063,7 @@ async fn mcp_show_all_commits(
     verbose: bool,
     regex_patterns: &[String],
     symbol_patterns: &[String],
+    path_patterns: &[String],
 ) -> Result<String> {
     use std::io::Write;
 
@@ -1021,6 +1101,24 @@ async fn mcp_show_all_commits(
                     writeln!(
                         buffer,
                         "Error: Invalid symbol regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+    }
+
+    // Step 2c: Compile path filters if provided (ALL must match)
+    let mut path_filters = Vec::new();
+    if !path_patterns.is_empty() {
+        for pattern in path_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => path_filters.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid path regex pattern '{}': {}",
                         pattern, e
                     )?;
                     return Ok(String::from_utf8_lossy(&buffer).to_string());
@@ -1069,6 +1167,16 @@ async fn mcp_show_all_commits(
             }
             if !match_all {
                 continue; // Skip commits that don't match all symbol patterns
+            }
+        }
+
+        // Apply path filters if provided (ANY must match - OR logic)
+        if !path_filters.is_empty() {
+            let matches_any_pattern = path_filters
+                .iter()
+                .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+            if !matches_any_pattern {
+                continue; // Skip commits that don't match any path patterns
             }
         }
 
@@ -1128,7 +1236,7 @@ async fn mcp_show_all_commits(
     writeln!(buffer, "\n{}", "=".repeat(80))?;
 
     // Step 4: Show summary with filtering info
-    if !regex_patterns.is_empty() || !symbol_patterns.is_empty() {
+    if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty() {
         writeln!(buffer, "Summary:")?;
         writeln!(buffer, "  Total commits in database: {}", all_commits.len())?;
         writeln!(buffer, "  Matched by filters: {}", matched_count)?;
@@ -1155,6 +1263,13 @@ async fn mcp_show_all_commits(
                     "\nInfo: No commits matched ALL {} symbol pattern(s): {}",
                     symbol_patterns.len(),
                     symbol_patterns.join(", ")
+                )?;
+            } else if !path_patterns.is_empty() {
+                writeln!(
+                    buffer,
+                    "\nInfo: No commits matched ALL {} path pattern(s): {}",
+                    path_patterns.len(),
+                    path_patterns.join(", ")
                 )?;
             }
         }
@@ -1669,7 +1784,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_commit",
-                    "description": "Find and display metadata for a git commit or range of commits. Accepts flexible git references like SHA, short SHA, branch names, HEAD, or git ranges. Supports regex filtering on commit message and diff - multiple patterns can be provided and ALL must match. Also supports filtering on symbol list. Results can be paginated with 50 lines per page.",
+                    "description": "Find and display metadata for a git commit or range of commits. Accepts flexible git references like SHA, short SHA, branch names, HEAD, or git ranges. Supports regex filtering on commit message and diff - multiple patterns can be provided and ALL must match. Also supports filtering on symbol list and file paths. Results can be paginated with 50 lines per page.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1695,6 +1810,13 @@ impl McpServer {
                                 },
                                 "description": "Optional array of regex patterns to filter commits by symbols - ALL patterns must match at least one symbol in the commit. Equivalent to passing -s multiple times."
                             },
+                            "path_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter commits by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
+                            },
                             "verbose": {
                                 "type": "boolean",
                                 "description": "Show full diff in addition to metadata (default: false)",
@@ -1710,7 +1832,7 @@ impl McpServer {
                 },
                 {
                     "name": "vcommit_similar_commits",
-                    "description": "Search for commits similar to the provided text using semantic vector embeddings. Requires commit vectors to be generated first with 'semcode-index --vectors'. Supports multiple regex filters on message/diff and symbol filters - ALL must match. Results can be paginated with 50 lines per page.",
+                    "description": "Search for commits similar to the provided text using semantic vector embeddings. Requires commit vectors to be generated first with 'semcode-index --vectors'. Supports multiple regex filters on message/diff, symbol filters, and path filters - ALL must match. Results can be paginated with 50 lines per page.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1735,6 +1857,13 @@ impl McpServer {
                                     "type": "string"
                                 },
                                 "description": "Optional array of regex patterns to filter results by symbols - ALL patterns must match at least one symbol in the commit. Equivalent to passing -s multiple times."
+                            },
+                            "path_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter results by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
                             },
                             "limit": {
                                 "type": "integer",
@@ -1964,24 +2093,42 @@ impl McpServer {
             })
             .unwrap_or_default();
 
+        // Extract path_patterns array
+        let path_patterns: Vec<String> = args["path_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let verbose = args["verbose"].as_bool().unwrap_or(false);
         let page = args["page"].as_u64().map(|p| p as usize);
 
         // Generate a query key for caching
         let query_key = format!(
-            "commit:{}:{}:{}:{}:{}",
+            "commit:{}:{}:{}:{}:{}:{}",
             git_ref.unwrap_or(""),
             git_range.unwrap_or(""),
             regex_patterns.join("|"),
             symbol_patterns.join("|"),
+            path_patterns.join("|"),
             verbose
         );
 
         // Check if git_range is provided
         if let Some(range) = git_range {
             // Show commit range
-            match mcp_show_commit_range(&self.db, range, verbose, &regex_patterns, &symbol_patterns)
-                .await
+            match mcp_show_commit_range(
+                &self.db,
+                range,
+                verbose,
+                &regex_patterns,
+                &symbol_patterns,
+                &path_patterns,
+            )
+            .await
             {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
@@ -2002,6 +2149,7 @@ impl McpServer {
                 verbose,
                 &regex_patterns,
                 &symbol_patterns,
+                &path_patterns,
             )
             .await
             {
@@ -2018,7 +2166,15 @@ impl McpServer {
             }
         } else {
             // Neither git_ref nor git_range provided - show all commits from database
-            match mcp_show_all_commits(&self.db, verbose, &regex_patterns, &symbol_patterns).await {
+            match mcp_show_all_commits(
+                &self.db,
+                verbose,
+                &regex_patterns,
+                &symbol_patterns,
+                &path_patterns,
+            )
+            .await
+            {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -2057,16 +2213,27 @@ impl McpServer {
             })
             .unwrap_or_default();
 
+        // Extract path_patterns array
+        let path_patterns: Vec<String> = args["path_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
         let page = args["page"].as_u64().map(|p| p as usize);
 
         // Generate a query key for caching
         let query_key = format!(
-            "vcommit:{}:{}:{}:{}:{}",
+            "vcommit:{}:{}:{}:{}:{}:{}",
             query_text,
             git_range.unwrap_or(""),
             regex_patterns.join("|"),
             symbol_patterns.join("|"),
+            path_patterns.join("|"),
             limit
         );
 
@@ -2080,6 +2247,7 @@ impl McpServer {
             limit,
             &regex_patterns,
             &symbol_patterns,
+            &path_patterns,
             git_range,
             git_repo_path,
             &self.model_path,
@@ -2517,6 +2685,7 @@ async fn mcp_vcommit_similar_commits(
     limit: usize,
     regex_patterns: &[String],
     symbol_patterns: &[String],
+    path_patterns: &[String],
     git_range: Option<&str>,
     git_repo_path: &str,
     model_path: &Option<String>,
@@ -2527,23 +2696,21 @@ async fn mcp_vcommit_similar_commits(
     let mut buffer = Vec::new();
 
     // Show search parameters
-    let has_filters = !regex_patterns.is_empty() || !symbol_patterns.is_empty();
+    let has_filters =
+        !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty();
     match (git_range, has_filters) {
         (Some(range), true) => {
-            let filter_desc = match (!regex_patterns.is_empty(), !symbol_patterns.is_empty()) {
-                (true, true) => format!(
-                    "filtering with {} regex and {} symbol pattern(s)",
-                    regex_patterns.len(),
-                    symbol_patterns.len()
-                ),
-                (true, false) => {
-                    format!("filtering with {} regex pattern(s)", regex_patterns.len())
-                }
-                (false, true) => {
-                    format!("filtering with {} symbol pattern(s)", symbol_patterns.len())
-                }
-                (false, false) => String::new(),
-            };
+            let mut filter_parts = Vec::new();
+            if !regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            }
+            if !symbol_patterns.is_empty() {
+                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            }
+            if !path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            }
+            let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             writeln!(
                 buffer,
                 "Searching for commits similar to: {query_text} (git range: {range}, {filter_desc}, limit: {limit})"
@@ -2554,20 +2721,17 @@ async fn mcp_vcommit_similar_commits(
             "Searching for commits similar to: {query_text} (git range: {range}, limit: {limit})"
         )?,
         (None, true) => {
-            let filter_desc = match (!regex_patterns.is_empty(), !symbol_patterns.is_empty()) {
-                (true, true) => format!(
-                    "filtering with {} regex and {} symbol pattern(s)",
-                    regex_patterns.len(),
-                    symbol_patterns.len()
-                ),
-                (true, false) => {
-                    format!("filtering with {} regex pattern(s)", regex_patterns.len())
-                }
-                (false, true) => {
-                    format!("filtering with {} symbol pattern(s)", symbol_patterns.len())
-                }
-                (false, false) => String::new(),
-            };
+            let mut filter_parts = Vec::new();
+            if !regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            }
+            if !symbol_patterns.is_empty() {
+                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            }
+            if !path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            }
+            let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             writeln!(
                 buffer,
                 "Searching for commits similar to: {query_text} ({filter_desc}, limit: {limit})"
@@ -2711,14 +2875,17 @@ async fn mcp_vcommit_similar_commits(
     };
 
     // Search for similar commits with higher limit if filtering
-    let search_limit =
-        if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || git_range.is_some() {
-            // When filtering (regex, symbols, or git range), always fetch many results since we'll filter them down
-            // Use a large limit to ensure we find enough matches after filtering
-            500_000
-        } else {
-            limit
-        };
+    let search_limit = if !regex_patterns.is_empty()
+        || !symbol_patterns.is_empty()
+        || !path_patterns.is_empty()
+        || git_range.is_some()
+    {
+        // When filtering (regex, symbols, paths, or git range), always fetch many results since we'll filter them down
+        // Use a large limit to ensure we find enough matches after filtering
+        500_000
+    } else {
+        limit
+    };
 
     // Search for similar commits
     match db.search_similar_commits(&query_vector, search_limit).await {
@@ -2789,7 +2956,7 @@ async fn mcp_vcommit_similar_commits(
             };
 
             // Apply symbol filtering if provided (ALL patterns must match)
-            let final_results = if !symbol_patterns.is_empty() {
+            let filtered_by_symbol = if !symbol_patterns.is_empty() {
                 // Compile all symbol regex patterns
                 let mut symbol_regexes = Vec::new();
                 for pattern in symbol_patterns {
@@ -2815,7 +2982,6 @@ async fn mcp_vcommit_similar_commits(
                             .iter()
                             .all(|re| commit.symbols.iter().any(|symbol| re.is_match(symbol)))
                     })
-                    .take(limit) // Apply the original limit to filtered results
                     .collect();
 
                 writeln!(
@@ -2828,16 +2994,62 @@ async fn mcp_vcommit_similar_commits(
 
                 filtered
             } else {
-                filtered_by_regex.into_iter().take(limit).collect()
+                filtered_by_regex
+            };
+
+            // Apply path filtering if provided (ANY must match - OR logic)
+            let final_results = if !path_patterns.is_empty() {
+                // Compile all path regex patterns
+                let mut path_regexes = Vec::new();
+                for pattern in path_patterns {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => path_regexes.push(re),
+                        Err(e) => {
+                            writeln!(
+                                buffer,
+                                "Error: Invalid path regex pattern '{}': {}",
+                                pattern, e
+                            )?;
+                            return Ok(String::from_utf8_lossy(&buffer).to_string());
+                        }
+                    }
+                }
+
+                let original_count = filtered_by_symbol.len();
+                let filtered: Vec<_> = filtered_by_symbol
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        // Check if ANY path pattern matches any file (OR logic)
+                        path_regexes
+                            .iter()
+                            .any(|re| commit.files.iter().any(|file| re.is_match(file)))
+                    })
+                    .take(limit) // Apply the original limit to filtered results
+                    .collect();
+
+                writeln!(
+                    buffer,
+                    "Path filters ({} pattern(s)) reduced results from {} to {} commits",
+                    path_patterns.len(),
+                    original_count,
+                    filtered.len()
+                )?;
+
+                filtered
+            } else {
+                filtered_by_symbol.into_iter().take(limit).collect()
             };
 
             if final_results.is_empty() {
                 writeln!(buffer, "Info: No similar commits found")?;
-                if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || git_range.is_some()
+                if !regex_patterns.is_empty()
+                    || !symbol_patterns.is_empty()
+                    || !path_patterns.is_empty()
+                    || git_range.is_some()
                 {
                     writeln!(
                         buffer,
-                        "Try adjusting the filters or removing the -r/-s/--git options"
+                        "Try adjusting the filters or removing the -r/-s/-p/--git options"
                     )?;
                 } else {
                     writeln!(

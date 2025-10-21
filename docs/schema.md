@@ -273,6 +273,7 @@ message             (Utf8, NOT NULL)     - Full commit message
 tags                (Utf8, NOT NULL)     - JSON map of commit message tags (e.g., Signed-off-by, Reviewed-by)
 diff                (Utf8, NOT NULL)     - Full unified diff with symbol context in hunk headers
 symbols             (Utf8, NOT NULL)     - JSON array of changed symbols extracted via walk-back algorithm
+files               (Utf8, NOT NULL)     - JSON array of file paths that were added, removed, or changed
 ```
 
 **Symbol Extraction:**
@@ -295,6 +296,9 @@ symbols             (Utf8, NOT NULL)     - JSON array of changed symbols extract
 
 // symbols column
 ["mem_pool_alloc()", "struct kmemleak_object", "kmemleak_init()", "#KMEMLEAK_DEBUG"]
+
+// files column
+["mm/kmemleak.c", "include/linux/kmemleak.h", "Documentation/dev-tools/kmemleak.rst"]
 ```
 
 **Unified Diff Format:**
@@ -320,6 +324,7 @@ symbols             (Utf8, NOT NULL)     - JSON array of changed symbols extract
 - BTree on `author` (query commits by author)
 - BTree on `subject` (search commit messages)
 - BTree on `symbols` (find commits that modified specific symbols)
+- BTree on `files` (find commits that modified specific files)
 - BTree on `parent_sha` (traverse commit history)
 
 ### 9. content_0 through content_15 (Content Shards)
@@ -549,6 +554,14 @@ WHERE symbols LIKE '%"malloc_wrapper()"%'
 -- Find commits that modified any struct definitions
 SELECT git_sha, subject, author FROM git_commits
 WHERE symbols LIKE '%"struct %'
+
+-- Find commits that modified a specific file
+SELECT git_sha, subject, author FROM git_commits
+WHERE files LIKE '%"mm/kmemleak.c"%'
+
+-- Find commits that modified files in a directory
+SELECT git_sha, subject, author FROM git_commits
+WHERE files LIKE '%"mm/%'
 
 -- Get full commit details including diff
 SELECT git_sha, subject, message, diff, symbols FROM git_commits

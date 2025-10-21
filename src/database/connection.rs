@@ -3414,6 +3414,7 @@ impl DatabaseManager {
             Field::new("tags", DataType::Utf8, false),
             Field::new("diff", DataType::Utf8, false),
             Field::new("symbols", DataType::Utf8, false),
+            Field::new("files", DataType::Utf8, false),
         ]));
 
         tracing::info!(
@@ -3430,6 +3431,7 @@ impl DatabaseManager {
         let mut tags = Vec::new();
         let mut diffs = Vec::new();
         let mut symbols = Vec::new();
+        let mut files = Vec::new();
 
         for commit in commits {
             git_shas.push(commit.git_sha);
@@ -3440,6 +3442,7 @@ impl DatabaseManager {
             tags.push(serde_json::to_string(&commit.tags)?);
             diffs.push(commit.diff);
             symbols.push(serde_json::to_string(&commit.symbols)?);
+            files.push(serde_json::to_string(&commit.files)?);
         }
 
         tracing::info!(
@@ -3462,6 +3465,7 @@ impl DatabaseManager {
             Arc::new(StringArray::from(tags)),
             Arc::new(StringArray::from(diffs)),
             Arc::new(StringArray::from(symbols)),
+            Arc::new(StringArray::from(files)),
         ];
 
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
@@ -3568,6 +3572,11 @@ impl DatabaseManager {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
+            let files_array = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
 
             if batch.num_rows() > 0 {
                 let git_sha = git_sha_array.value(0).to_string();
@@ -3578,6 +3587,7 @@ impl DatabaseManager {
                 let tags = serde_json::from_str(tags_array.value(0))?;
                 let diff = diff_array.value(0).to_string();
                 let symbols: Vec<String> = serde_json::from_str(symbols_array.value(0))?;
+                let files: Vec<String> = serde_json::from_str(files_array.value(0))?;
 
                 return Ok(Some(crate::types::GitCommitInfo {
                     git_sha,
@@ -3588,6 +3598,7 @@ impl DatabaseManager {
                     tags,
                     diff,
                     symbols,
+                    files,
                 }));
             }
         }
@@ -3654,6 +3665,11 @@ impl DatabaseManager {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
+            let files_array = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
 
             for i in 0..batch.num_rows() {
                 let git_sha = git_sha_array.value(i).to_string();
@@ -3664,6 +3680,7 @@ impl DatabaseManager {
                 let tags = serde_json::from_str(tags_array.value(i))?;
                 let diff = diff_array.value(i).to_string();
                 let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+                let files: Vec<String> = serde_json::from_str(files_array.value(i))?;
 
                 commits.push(crate::types::GitCommitInfo {
                     git_sha,
@@ -3674,6 +3691,7 @@ impl DatabaseManager {
                     tags,
                     diff,
                     symbols,
+                    files,
                 });
             }
         }
@@ -3761,6 +3779,11 @@ impl DatabaseManager {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
+            let files_array = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
 
             for i in 0..batch.num_rows() {
                 let git_sha = git_sha_array.value(i).to_string();
@@ -3771,6 +3794,7 @@ impl DatabaseManager {
                 let tags = serde_json::from_str(tags_array.value(i))?;
                 let diff = diff_array.value(i).to_string();
                 let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+                let files: Vec<String> = serde_json::from_str(files_array.value(i))?;
 
                 commits.push(crate::types::GitCommitInfo {
                     git_sha,
@@ -3781,6 +3805,7 @@ impl DatabaseManager {
                     tags,
                     diff,
                     symbols,
+                    files,
                 });
             }
         }

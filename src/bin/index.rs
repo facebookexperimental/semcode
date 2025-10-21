@@ -1583,17 +1583,17 @@ fn extract_commit_metadata(
     let tags = parse_commit_message_tags(&message);
 
     // Generate unified diff for commits with exactly one parent
-    let (diff, symbols) = if parent_sha.len() == 1 {
+    let (diff, symbols, files) = if parent_sha.len() == 1 {
         match generate_commit_diff(repo, &parent_sha[0], &git_sha) {
-            Ok((d, s)) => (d, s),
+            Ok((d, s, f)) => (d, s, f),
             Err(e) => {
                 tracing::warn!("Failed to generate diff for commit {}: {}", git_sha, e);
-                (String::new(), Vec::new())
+                (String::new(), Vec::new(), Vec::new())
             }
         }
     } else {
         // Skip diff for merge commits (multiple parents) or root commits (no parents)
-        (String::new(), Vec::new())
+        (String::new(), Vec::new(), Vec::new())
     };
 
     Ok(semcode::GitCommitInfo {
@@ -1605,16 +1605,17 @@ fn extract_commit_metadata(
         tags,
         diff,
         symbols,
+        files,
     })
 }
 
 /// Generate a unified diff between two commits using gitoxide
-/// Returns the diff string and a vector of symbols (functions, types, macros) that were modified
+/// Returns the diff string, a vector of symbols (functions, types, macros) that were modified, and a vector of changed files
 fn generate_commit_diff(
     repo: &gix::Repository,
     from_sha: &str,
     to_sha: &str,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(String, Vec<String>, Vec<String>)> {
     use std::fmt::Write as _;
 
     tracing::info!(
@@ -1631,6 +1632,7 @@ fn generate_commit_diff(
 
     let mut diff_output = String::new();
     let mut all_symbols = Vec::new();
+    let mut changed_files = Vec::new();
 
     // Use gitoxide's diff functionality
     from_tree
@@ -1653,6 +1655,7 @@ fn generate_commit_diff(
                     }
 
                     let path = location.to_string();
+                    changed_files.push(path.clone());
 
                     // Write diff header
                     let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
@@ -1694,6 +1697,7 @@ fn generate_commit_diff(
                     }
 
                     let path = location.to_string();
+                    changed_files.push(path.clone());
                     let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
                     let _ = writeln!(diff_output, "--- /dev/null");
                     let _ = writeln!(diff_output, "+++ b/{}", path);
@@ -1722,6 +1726,7 @@ fn generate_commit_diff(
                     }
 
                     let path = location.to_string();
+                    changed_files.push(path.clone());
                     let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
                     let _ = writeln!(diff_output, "--- a/{}", path);
                     let _ = writeln!(diff_output, "+++ /dev/null");
@@ -1748,12 +1753,13 @@ fn generate_commit_diff(
         })?;
 
     tracing::info!(
-        "generate_commit_diff: generated {} bytes of diff with {} symbols",
+        "generate_commit_diff: generated {} bytes of diff with {} symbols and {} files",
         diff_output.len(),
-        all_symbols.len()
+        all_symbols.len(),
+        changed_files.len()
     );
 
-    Ok((diff_output, all_symbols))
+    Ok((diff_output, all_symbols, changed_files))
 }
 
 /// Write a unified diff and extract symbols from changed lines

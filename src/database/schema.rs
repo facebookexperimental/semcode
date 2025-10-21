@@ -231,6 +231,7 @@ impl SchemaManager {
             Field::new("tags", DataType::Utf8, false),    // JSON object of tags
             Field::new("diff", DataType::Utf8, false),    // Full unified diff
             Field::new("symbols", DataType::Utf8, false), // JSON array of changed symbols
+            Field::new("files", DataType::Utf8, false),   // JSON array of changed files
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -560,6 +561,10 @@ impl SchemaManager {
 
             // Index on symbols for symbol-based queries
             self.try_create_index(&table, &["symbols"], "BTree index on git_commits.symbols")
+                .await;
+
+            // Index on files for file-based queries
+            self.try_create_index(&table, &["files"], "BTree index on git_commits.files")
                 .await;
         }
 

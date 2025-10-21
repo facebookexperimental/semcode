@@ -3094,6 +3094,11 @@ impl VectorSearchManager {
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
+                let files_array = batch
+                    .column(8)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
 
                 for i in 0..batch.num_rows() {
                     let git_sha = git_sha_array.value(i).to_string();
@@ -3103,6 +3108,7 @@ impl VectorSearchManager {
                     let tags: std::collections::HashMap<String, Vec<String>> =
                         serde_json::from_str(tags_array.value(i))?;
                     let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+                    let files: Vec<String> = serde_json::from_str(files_array.value(i))?;
 
                     let commit_info = crate::types::GitCommitInfo {
                         git_sha,
@@ -3113,6 +3119,7 @@ impl VectorSearchManager {
                         tags,
                         diff: diff_array.value(i).to_string(),
                         symbols,
+                        files,
                     };
 
                     commit_results.push((commit_info, similarity_score));

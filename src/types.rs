@@ -85,6 +85,7 @@ pub struct GitCommitInfo {
     pub tags: HashMap<String, Vec<String>>, // Tags from commit message (Signed-off-by:, etc.)
     pub diff: String,                       // Full unified diff
     pub symbols: Vec<String>,               // Changed symbols (filename:symbol() format)
+    pub files: Vec<String>,                 // List of files changed by this commit
 }
 
 /// Global type registry for cross-file type resolution
