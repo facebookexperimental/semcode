@@ -70,11 +70,21 @@ async fn main() -> Result<()> {
                 // Add to history
                 let _ = rl.add_history_entry(line);
 
-                // Parse command
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.is_empty() {
+                // Parse command using shell-like parsing (handles quoted strings)
+                let parts_owned = match shlex::split(line) {
+                    Some(parts) => parts,
+                    None => {
+                        println!("Error: Invalid command syntax (unclosed quotes?)");
+                        continue;
+                    }
+                };
+
+                if parts_owned.is_empty() {
                     continue;
                 }
+
+                // Convert to Vec<&str> for handle_command
+                let parts: Vec<&str> = parts_owned.iter().map(|s| s.as_str()).collect();
 
                 // Handle command and check if we should exit
                 if handle_command(&parts, &db_manager, &args.git_repo, &args.model_path).await? {

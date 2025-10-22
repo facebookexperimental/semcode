@@ -275,13 +275,14 @@ pub async fn handle_command(
 ) -> Result<bool> {
     // Handle commit command first (before parse_git_sha) since it uses --git differently
     if parts[0] == "commit" {
-        // Parse -v, --git, -r, -s, -p, and --limit flags
+        // Parse -v, --git, -r, -s, -p, --limit, and --reachable flags
         let mut verbose = false;
         let mut git_range = None;
         let mut regex_patterns = Vec::new();
         let mut symbol_patterns = Vec::new();
         let mut path_patterns = Vec::new();
-        let mut limit = 50; // Default limit
+        let mut limit = 50; // Default display limit
+        let mut reachable_sha = None;
         let mut git_ref_parts = Vec::new();
         let mut i = 1;
 
@@ -312,6 +313,9 @@ pub async fn handle_command(
                         return Ok(false);
                     }
                 }
+            } else if parts[i] == "--reachable" && i + 1 < parts.len() {
+                reachable_sha = Some(parts[i + 1].to_string());
+                i += 2;
             } else {
                 git_ref_parts.extend_from_slice(&parts[i..]);
                 break;
@@ -327,6 +331,8 @@ pub async fn handle_command(
                 &symbol_patterns,
                 &path_patterns,
                 limit,
+                reachable_sha.as_deref(),
+                git_repo_path,
             )
             .await?;
         } else if let Some(range) = git_range {
@@ -338,6 +344,7 @@ pub async fn handle_command(
                 &symbol_patterns,
                 &path_patterns,
                 limit,
+                reachable_sha.as_deref(),
                 git_repo_path,
             )
             .await?;
@@ -350,6 +357,7 @@ pub async fn handle_command(
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
+                reachable_sha.as_deref(),
                 git_repo_path,
             )
             .await?;
@@ -556,7 +564,7 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] <query_text>".red()
+                    "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>".red()
                 );
                 println!(
                     "  Search for commits similar to the provided text using semantic vectors"
@@ -566,23 +574,26 @@ pub async fn handle_command(
                 println!("  -s <regex>: Filter results by regex pattern on symbol list (can be used multiple times for AND logic)");
                 println!("  -p <path_regex>: Filter results by regex pattern on file paths (can be used multiple times for OR logic)");
                 println!("  --limit <N>: Limit number of results (default: 200, max: 500)");
+                println!("  --reachable <sha>: Filter to commits reachable from the given SHA");
                 println!("  Example: vcommit \"fix memory leak\"");
                 println!("  Example: vcommit --limit 5 \"refactor parser\"");
                 println!("  Example: vcommit -r \"buffer.*overflow\" \"security fix\"");
                 println!("  Example: vcommit -s \"malloc\" -s \"free\" \"memory management\"  # Both symbols must be in commit");
                 println!("  Example: vcommit -p \"mm/.*\\\\.c\" \"memory subsystem changes\"  # Only commits touching mm/*.c files");
                 println!("  Example: vcommit --git HEAD~50..HEAD \"performance\"");
+                println!("  Example: vcommit --reachable HEAD \"performance\"  # Only commits reachable from HEAD");
                 println!("  Example: vcommit --git HEAD~100..HEAD -r \"malloc\" -r \"free\" --limit 20 \"memory management\"  # Both patterns must match");
                 println!(
                     "  Note: Requires commit vectors to be generated first with 'semcode-index --vectors'"
                 );
             } else {
-                // Parse --git, --limit, -r, -s, and -p flags
+                // Parse --git, --limit, -r, -s, -p, and --reachable flags
                 let mut limit = 200; // default
                 let mut regex_patterns = Vec::new();
                 let mut symbol_patterns = Vec::new();
                 let mut path_patterns = Vec::new();
                 let mut git_range = None;
+                let mut reachable_sha = None;
                 let mut query_parts = Vec::new();
                 let mut i = 1;
 
@@ -614,6 +625,9 @@ pub async fn handle_command(
                     } else if parts[i] == "--git" && i + 1 < parts.len() {
                         git_range = Some(parts[i + 1].to_string());
                         i += 2;
+                    } else if parts[i] == "--reachable" && i + 1 < parts.len() {
+                        reachable_sha = Some(parts[i + 1].to_string());
+                        i += 2;
                     } else {
                         query_parts.extend_from_slice(&parts[i..]);
                         break;
@@ -623,7 +637,7 @@ pub async fn handle_command(
                 if query_parts.is_empty() {
                     println!(
                         "{}",
-                        "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] <query_text>"
+                        "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>"
                             .red()
                     );
                 } else {
@@ -636,6 +650,7 @@ pub async fn handle_command(
                         &symbol_patterns,
                         &path_patterns,
                         git_range.as_deref(),
+                        reachable_sha.as_deref(),
                         git_repo_path,
                         model_path,
                     )
@@ -1411,6 +1426,7 @@ async fn vcommit_similar_commits(
     symbol_patterns: &[String],
     path_patterns: &[String],
     git_range: Option<&str>,
+    reachable_sha: Option<&str>,
     git_repo_path: &str,
     model_path: &Option<String>,
 ) -> Result<()> {
@@ -1612,10 +1628,12 @@ async fn vcommit_similar_commits(
         || !symbol_patterns.is_empty()
         || !path_patterns.is_empty()
         || git_range.is_some()
+        || reachable_sha.is_some()
     {
-        // When filtering (regex, symbols, paths, or git range), always fetch many results since we'll filter them down
+        // When filtering (regex, symbols, paths, git range, or reachability), always fetch many results since we'll filter them down
         // Use a large limit to ensure we find enough matches after filtering
-        500_000
+        // Increased to 2M to handle very large repositories like Linux kernel (~1.2M commits)
+        2_000_000
     } else {
         limit
     };
@@ -1731,7 +1749,7 @@ async fn vcommit_similar_commits(
             };
 
             // Apply path filtering if provided (ANY pattern must match - OR logic)
-            let final_results = if !path_patterns.is_empty() {
+            let filtered_by_path = if !path_patterns.is_empty() {
                 // Compile all path regex patterns
                 let mut path_regexes = Vec::new();
                 for pattern in path_patterns {
@@ -1758,7 +1776,6 @@ async fn vcommit_similar_commits(
                             .iter()
                             .any(|re| commit.files.iter().any(|file| re.is_match(file)))
                     })
-                    .take(limit) // Apply the original limit to filtered results
                     .collect();
 
                 tracing::info!(
@@ -1770,7 +1787,44 @@ async fn vcommit_similar_commits(
 
                 filtered
             } else {
-                filtered_by_symbol.into_iter().take(limit).collect()
+                filtered_by_symbol
+            };
+
+            // Apply reachability filtering if provided
+            let final_results = if let Some(reachable_from) = reachable_sha {
+                let original_count = filtered_by_path.len();
+                let filtered: Vec<_> = filtered_by_path
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        match git::is_commit_reachable(
+                            git_repo_path,
+                            reachable_from,
+                            &commit.git_sha,
+                        ) {
+                            Ok(true) => true,
+                            Ok(false) => false,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to check reachability for commit {}: {}",
+                                    commit.git_sha,
+                                    e
+                                );
+                                false
+                            }
+                        }
+                    })
+                    .take(limit) // Apply the original limit to filtered results
+                    .collect();
+
+                tracing::info!(
+                    "Reachability filter reduced results from {} to {} commits",
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                filtered_by_path.into_iter().take(limit).collect()
             };
 
             if final_results.is_empty() {
@@ -2125,6 +2179,8 @@ async fn show_all_commits(
     symbol_patterns: &[String],
     path_patterns: &[String],
     limit: usize,
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
 ) -> Result<()> {
     // Step 1: Get all commits from database
     let all_commits = db.get_all_git_commits().await?;
@@ -2170,6 +2226,28 @@ async fn show_all_commits(
             continue;
         }
 
+        // Apply reachability filter if provided
+        if let Some(reachable_from) = reachable_sha {
+            match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                Ok(true) => {
+                    // Commit is reachable, continue processing
+                }
+                Ok(false) => {
+                    // Commit is not reachable, skip it
+                    continue;
+                }
+                Err(e) => {
+                    println!(
+                        "{} Failed to check reachability for commit {}: {}",
+                        "Warning:".yellow(),
+                        commit.git_sha,
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+
         matched_count += 1;
 
         // Apply limit
@@ -2203,6 +2281,7 @@ async fn show_commit_metadata(
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
+    reachable_sha: Option<&str>,
     git_repo_path: &str,
 ) -> Result<()> {
     // Step 1: Resolve git reference to full SHA using gitoxide
@@ -2263,6 +2342,28 @@ async fn show_commit_metadata(
             return Ok(());
         }
     };
+
+    // Step 2b: Apply reachability filter if provided
+    if let Some(reachable_from) = reachable_sha {
+        match git::is_commit_reachable(git_repo_path, reachable_from, &resolved_sha) {
+            Ok(true) => {
+                // Commit is reachable, continue processing
+            }
+            Ok(false) => {
+                println!(
+                    "{} Commit {} is not reachable from {}",
+                    "Info:".yellow(),
+                    resolved_sha.bright_black(),
+                    reachable_from
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                println!("{} Failed to check reachability: {}", "Error:".red(), e);
+                return Ok(());
+            }
+        }
+    }
 
     // Step 3: Apply regex filters if provided (ALL must match)
     if !regex_patterns.is_empty() {
@@ -2451,6 +2552,7 @@ async fn show_commit_range(
     symbol_patterns: &[String],
     path_patterns: &[String],
     limit: usize,
+    reachable_sha: Option<&str>,
     git_repo_path: &str,
 ) -> Result<()> {
     // Step 1: Resolve git range using gitoxide
@@ -2660,6 +2762,28 @@ async fn show_commit_range(
 
         // Display results from this chunk
         for commit in &filtered_chunk_results {
+            // Apply reachability filter if provided
+            if let Some(reachable_from) = reachable_sha {
+                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                    Ok(true) => {
+                        // Commit is reachable, continue processing
+                    }
+                    Ok(false) => {
+                        // Commit is not reachable, skip it
+                        continue;
+                    }
+                    Err(e) => {
+                        println!(
+                            "{} Failed to check reachability for commit {}: {}",
+                            "Warning:".yellow(),
+                            commit.git_sha,
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+
             matched_count += 1;
 
             // Apply limit

@@ -509,15 +509,15 @@ async fn mcp_show_commit_metadata(
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
 ) -> Result<String> {
     use std::io::Write;
 
     let mut buffer = Vec::new();
 
     // Step 1: Resolve git reference to full SHA using gitoxide
-    // Note: We need git_repo_path, which we'll get from the database manager
-    // For now, we'll try to resolve using gix::discover on current directory
-    let resolved_sha = match gix::discover(".") {
+    let resolved_sha = match gix::discover(git_repo_path) {
         Ok(repo) => match git::resolve_to_commit(&repo, git_ref) {
             Ok(commit) => commit.id().to_string(),
             Err(e) => {
@@ -556,6 +556,27 @@ async fn mcp_show_commit_metadata(
             return Ok(String::from_utf8_lossy(&buffer).to_string());
         }
     };
+
+    // Step 2b: Apply reachability filter if provided
+    if let Some(reachable_from) = reachable_sha {
+        match git::is_commit_reachable(git_repo_path, reachable_from, &resolved_sha) {
+            Ok(true) => {
+                // Commit is reachable, continue processing
+            }
+            Ok(false) => {
+                writeln!(
+                    buffer,
+                    "Info: Commit {} is not reachable from {}",
+                    resolved_sha, reachable_from
+                )?;
+                return Ok(String::from_utf8_lossy(&buffer).to_string());
+            }
+            Err(e) => {
+                writeln!(buffer, "Error: Failed to check reachability: {}", e)?;
+                return Ok(String::from_utf8_lossy(&buffer).to_string());
+            }
+        }
+    }
 
     // Step 3: Apply regex filters if provided (ALL must match)
     if !regex_patterns.is_empty() {
@@ -735,13 +756,15 @@ async fn mcp_show_commit_range(
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
 ) -> Result<String> {
     use std::io::Write;
 
     let mut buffer = Vec::new();
 
     // Step 1: Resolve git range using gitoxide
-    let range_commits = match gix::discover(".") {
+    let range_commits = match gix::discover(git_repo_path) {
         Ok(repo) => {
             // Parse the range (FROM..TO)
             let range_parts: Vec<&str> = range.split("..").collect();
@@ -957,6 +980,27 @@ async fn mcp_show_commit_range(
 
         // Display results from this chunk
         for commit in &filtered_chunk_results {
+            // Apply reachability filter if provided
+            if let Some(reachable_from) = reachable_sha {
+                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                    Ok(true) => {
+                        // Commit is reachable, continue processing
+                    }
+                    Ok(false) => {
+                        // Commit is not reachable, skip it
+                        continue;
+                    }
+                    Err(e) => {
+                        writeln!(
+                            buffer,
+                            "Warning: Failed to check reachability for commit {}: {}",
+                            commit.git_sha, e
+                        )?;
+                        continue;
+                    }
+                }
+            }
+
             matched_count += 1;
             displayed_count += 1;
 
@@ -1064,6 +1108,8 @@ async fn mcp_show_all_commits(
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
 ) -> Result<String> {
     use std::io::Write;
 
@@ -1177,6 +1223,27 @@ async fn mcp_show_all_commits(
                 .any(|re| commit.files.iter().any(|file| re.is_match(file)));
             if !matches_any_pattern {
                 continue; // Skip commits that don't match any path patterns
+            }
+        }
+
+        // Apply reachability filter if provided
+        if let Some(reachable_from) = reachable_sha {
+            match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                Ok(true) => {
+                    // Commit is reachable, continue processing
+                }
+                Ok(false) => {
+                    // Commit is not reachable, skip it
+                    continue;
+                }
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Warning: Failed to check reachability for commit {}: {}",
+                        commit.git_sha, e
+                    )?;
+                    continue;
+                }
             }
         }
 
@@ -1817,6 +1884,10 @@ impl McpServer {
                                 },
                                 "description": "Optional array of regex patterns to filter commits by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
                             },
+                            "reachable_sha": {
+                                "type": "string",
+                                "description": "Optional git SHA to filter results to only commits reachable from (i.e., ancestors of) the specified commit. Equivalent to --reachable in the query tool."
+                            },
                             "verbose": {
                                 "type": "boolean",
                                 "description": "Show full diff in addition to metadata (default: false)",
@@ -1864,6 +1935,10 @@ impl McpServer {
                                     "type": "string"
                                 },
                                 "description": "Optional array of regex patterns to filter results by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
+                            },
+                            "reachable_sha": {
+                                "type": "string",
+                                "description": "Optional git SHA to filter results to only commits reachable from (i.e., ancestors of) the specified commit. Equivalent to --reachable in the query tool."
                             },
                             "limit": {
                                 "type": "integer",
@@ -2103,19 +2178,25 @@ impl McpServer {
             })
             .unwrap_or_default();
 
+        let reachable_sha = args["reachable_sha"].as_str();
         let verbose = args["verbose"].as_bool().unwrap_or(false);
         let page = args["page"].as_u64().map(|p| p as usize);
 
         // Generate a query key for caching
         let query_key = format!(
-            "commit:{}:{}:{}:{}:{}:{}",
+            "commit:{}:{}:{}:{}:{}:{}:{}",
             git_ref.unwrap_or(""),
             git_range.unwrap_or(""),
             regex_patterns.join("|"),
             symbol_patterns.join("|"),
             path_patterns.join("|"),
+            reachable_sha.unwrap_or(""),
             verbose
         );
+
+        // Note: We need git_repo_path for reachability checks
+        // Get it from the database manager or discover from current directory
+        let git_repo_path = "."; // MCP server typically runs in the repo directory
 
         // Check if git_range is provided
         if let Some(range) = git_range {
@@ -2127,6 +2208,8 @@ impl McpServer {
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
+                reachable_sha,
+                git_repo_path,
             )
             .await
             {
@@ -2150,6 +2233,8 @@ impl McpServer {
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
+                reachable_sha,
+                git_repo_path,
             )
             .await
             {
@@ -2172,6 +2257,8 @@ impl McpServer {
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
+                reachable_sha,
+                git_repo_path,
             )
             .await
             {
@@ -2223,21 +2310,23 @@ impl McpServer {
             })
             .unwrap_or_default();
 
+        let reachable_sha = args["reachable_sha"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
         let page = args["page"].as_u64().map(|p| p as usize);
 
         // Generate a query key for caching
         let query_key = format!(
-            "vcommit:{}:{}:{}:{}:{}:{}",
+            "vcommit:{}:{}:{}:{}:{}:{}:{}",
             query_text,
             git_range.unwrap_or(""),
             regex_patterns.join("|"),
             symbol_patterns.join("|"),
             path_patterns.join("|"),
+            reachable_sha.unwrap_or(""),
             limit
         );
 
-        // Note: We need git_repo_path for git range resolution
+        // Note: We need git_repo_path for git range resolution and reachability checks
         // Get it from the database manager or discover from current directory
         let git_repo_path = "."; // MCP server typically runs in the repo directory
 
@@ -2249,6 +2338,7 @@ impl McpServer {
             &symbol_patterns,
             &path_patterns,
             git_range,
+            reachable_sha,
             git_repo_path,
             &self.model_path,
         )
@@ -2687,6 +2777,7 @@ async fn mcp_vcommit_similar_commits(
     symbol_patterns: &[String],
     path_patterns: &[String],
     git_range: Option<&str>,
+    reachable_sha: Option<&str>,
     git_repo_path: &str,
     model_path: &Option<String>,
 ) -> Result<String> {
@@ -2998,7 +3089,7 @@ async fn mcp_vcommit_similar_commits(
             };
 
             // Apply path filtering if provided (ANY must match - OR logic)
-            let final_results = if !path_patterns.is_empty() {
+            let filtered_by_path = if !path_patterns.is_empty() {
                 // Compile all path regex patterns
                 let mut path_regexes = Vec::new();
                 for pattern in path_patterns {
@@ -3024,7 +3115,6 @@ async fn mcp_vcommit_similar_commits(
                             .iter()
                             .any(|re| commit.files.iter().any(|file| re.is_match(file)))
                     })
-                    .take(limit) // Apply the original limit to filtered results
                     .collect();
 
                 writeln!(
@@ -3037,7 +3127,46 @@ async fn mcp_vcommit_similar_commits(
 
                 filtered
             } else {
-                filtered_by_symbol.into_iter().take(limit).collect()
+                filtered_by_symbol
+            };
+
+            // Apply reachability filtering if provided
+            let final_results = if let Some(reachable_from) = reachable_sha {
+                let original_count = filtered_by_path.len();
+                let filtered: Vec<_> = filtered_by_path
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        match git::is_commit_reachable(
+                            git_repo_path,
+                            reachable_from,
+                            &commit.git_sha,
+                        ) {
+                            Ok(true) => true,
+                            Ok(false) => false,
+                            Err(e) => {
+                                writeln!(
+                                    buffer,
+                                    "Warning: Failed to check reachability for commit {}: {}",
+                                    commit.git_sha, e
+                                )
+                                .ok();
+                                false
+                            }
+                        }
+                    })
+                    .take(limit) // Apply the original limit to filtered results
+                    .collect();
+
+                writeln!(
+                    buffer,
+                    "Reachability filter reduced results from {} to {} commits",
+                    original_count,
+                    filtered.len()
+                )?;
+
+                filtered
+            } else {
+                filtered_by_path.into_iter().take(limit).collect()
             };
 
             if final_results.is_empty() {

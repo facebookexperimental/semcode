@@ -603,3 +603,46 @@ pub fn resolve_files_at_commit<P: AsRef<Path>>(
         )),
     }
 }
+
+/// Check if a commit is reachable from a given SHA
+/// Returns true if target_sha is an ancestor of from_sha (i.e., can be reached by walking backwards from from_sha)
+/// Uses git merge-base for efficient ancestry checking
+pub fn is_commit_reachable<P: AsRef<Path>>(
+    repo_path: P,
+    from_sha: &str,
+    target_sha: &str,
+) -> Result<bool> {
+    let repo_path = repo_path.as_ref();
+
+    match gix::discover(repo_path) {
+        Ok(repo) => {
+            // Parse both commit SHAs using revparse
+            let from_commit = resolve_to_commit(&repo, from_sha)?;
+            let target_commit = resolve_to_commit(&repo, target_sha)?;
+
+            let from_id = from_commit.id().detach();
+            let target_id = target_commit.id().detach();
+
+            // Quick check: if they're the same commit, it's reachable
+            if from_id == target_id {
+                return Ok(true);
+            }
+
+            // Use merge-base to efficiently check ancestry
+            // If target_sha is an ancestor of from_sha, then the merge-base will be target_sha itself
+            match repo.merge_bases_many(from_id, &[target_id]) {
+                Ok(merge_bases) => {
+                    // Check if target_id is one of the merge bases
+                    // If it is, then target_sha is an ancestor of from_sha (reachable)
+                    Ok(merge_bases.iter().any(|base| base.detach() == target_id))
+                }
+                Err(e) => Err(anyhow::anyhow!("Failed to compute merge base: {}", e)),
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to discover git repository from '{}': {}",
+            repo_path.display(),
+            e
+        )),
+    }
+}
