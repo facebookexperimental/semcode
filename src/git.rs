@@ -646,3 +646,368 @@ pub fn is_commit_reachable<P: AsRef<Path>>(
         )),
     }
 }
+
+/// Basic commit information extracted from git
+#[derive(Debug, Clone)]
+pub struct BasicCommitInfo {
+    pub git_sha: String,
+    pub parent_sha: Vec<String>,
+    pub author: String,
+    pub subject: String,
+    pub message: String,
+    pub diff: String,
+    pub symbols: Vec<String>,
+    pub files: Vec<String>,
+}
+
+/// Extract basic commit metadata directly from git (without indexing)
+/// This is used as a fallback when commit is not indexed in the database
+pub fn get_commit_info_from_git<P: AsRef<Path>>(
+    repo_path: P,
+    commit_ref: &str,
+) -> Result<BasicCommitInfo> {
+    let repo_path = repo_path.as_ref();
+
+    match gix::discover(repo_path) {
+        Ok(repo) => {
+            // Resolve commit
+            let commit = resolve_to_commit(&repo, commit_ref)?;
+
+            // Get commit metadata
+            let git_sha = commit.id().to_string();
+
+            // Get parent commits
+            let parent_sha: Vec<String> = commit.parent_ids().map(|id| id.to_string()).collect();
+
+            // Get author
+            let author_sig = commit.author()?;
+            let author = format!("{} <{}>", author_sig.name, author_sig.email);
+
+            // Get commit message
+            let message_bytes = commit.message_raw()?;
+            let message = String::from_utf8_lossy(&message_bytes).to_string();
+
+            // Extract subject (first line of message)
+            let subject = message.lines().next().unwrap_or("").to_string();
+
+            // Generate proper unified diff for commits with exactly one parent
+            let (diff, symbols, files) = if parent_sha.len() == 1 {
+                match generate_commit_diff_with_symbols(&repo, &parent_sha[0], &git_sha) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::warn!("Failed to generate diff for commit {}: {}", git_sha, e);
+                        (
+                            String::from("(diff generation failed)"),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    }
+                }
+            } else {
+                // Skip diff for merge commits (multiple parents) or root commits (no parents)
+                if parent_sha.is_empty() {
+                    (
+                        String::from("(root commit - no diff)"),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    (
+                        String::from("(merge commit - diff not shown)"),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                }
+            };
+
+            Ok(BasicCommitInfo {
+                git_sha,
+                parent_sha,
+                author,
+                subject,
+                message,
+                diff,
+                symbols,
+                files,
+            })
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to discover git repository from '{}': {}",
+            repo_path.display(),
+            e
+        )),
+    }
+}
+
+/// Generate a unified diff between two commits with proper hunk headers and symbol extraction
+/// Uses the same algorithm as during indexing for consistency
+fn generate_commit_diff_with_symbols(
+    repo: &gix::Repository,
+    from_sha: &str,
+    to_sha: &str,
+) -> Result<(String, Vec<String>, Vec<String>)> {
+    use std::fmt::Write as _;
+
+    let from_commit = resolve_to_commit(repo, from_sha)?;
+    let to_commit = resolve_to_commit(repo, to_sha)?;
+
+    let from_tree = from_commit.tree()?;
+    let to_tree = to_commit.tree()?;
+
+    let mut diff_output = String::new();
+    let mut all_symbols = Vec::new();
+    let mut changed_files = Vec::new();
+
+    // Use gitoxide's diff functionality
+    from_tree
+        .changes()?
+        .for_each_to_obtain_tree(&to_tree, |change| {
+            use gix::object::tree::diff::Action;
+
+            match change {
+                gix::object::tree::diff::Change::Modification {
+                    previous_entry_mode,
+                    previous_id,
+                    entry_mode,
+                    id,
+                    location,
+                    ..
+                } => {
+                    // Skip non-blob modifications
+                    if !previous_entry_mode.is_blob() || !entry_mode.is_blob() {
+                        return Ok::<_, anyhow::Error>(Action::Continue);
+                    }
+
+                    let path = location.to_string();
+                    changed_files.push(path.clone());
+
+                    // Write diff header
+                    let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
+                    let _ = writeln!(diff_output, "--- a/{}", path);
+                    let _ = writeln!(diff_output, "+++ b/{}", path);
+
+                    // Get file contents
+                    if let (Ok(old_obj), Ok(new_obj)) =
+                        (repo.find_object(previous_id), repo.find_object(id))
+                    {
+                        if let (Ok(old_blob), Ok(new_blob)) =
+                            (old_obj.try_into_blob(), new_obj.try_into_blob())
+                        {
+                            let old_content = String::from_utf8_lossy(old_blob.data.as_slice());
+                            let new_content = String::from_utf8_lossy(new_blob.data.as_slice());
+
+                            // Generate diff and extract symbols using the same algorithm as indexing
+                            let (write_result, file_symbols) = write_diff_and_extract_symbols(
+                                &mut diff_output,
+                                &old_content,
+                                &new_content,
+                                &path,
+                            );
+                            let _ = write_result;
+                            all_symbols.extend(file_symbols);
+                        }
+                    }
+
+                    Ok(Action::Continue)
+                }
+                gix::object::tree::diff::Change::Addition {
+                    entry_mode,
+                    id,
+                    location,
+                    ..
+                } => {
+                    if !entry_mode.is_blob() {
+                        return Ok(Action::Continue);
+                    }
+
+                    let path = location.to_string();
+                    changed_files.push(path.clone());
+                    let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
+                    let _ = writeln!(diff_output, "--- /dev/null");
+                    let _ = writeln!(diff_output, "+++ b/{}", path);
+
+                    if let Ok(obj) = repo.find_object(id) {
+                        if let Ok(blob) = obj.try_into_blob() {
+                            let content = String::from_utf8_lossy(blob.data.as_slice());
+                            let _ =
+                                writeln!(diff_output, "@@ -0,0 +1,{} @@", content.lines().count());
+                            for line in content.lines() {
+                                let _ = writeln!(diff_output, "+{}", line);
+                            }
+                        }
+                    }
+
+                    Ok(Action::Continue)
+                }
+                gix::object::tree::diff::Change::Deletion {
+                    entry_mode,
+                    id,
+                    location,
+                    ..
+                } => {
+                    if !entry_mode.is_blob() {
+                        return Ok(Action::Continue);
+                    }
+
+                    let path = location.to_string();
+                    changed_files.push(path.clone());
+                    let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
+                    let _ = writeln!(diff_output, "--- a/{}", path);
+                    let _ = writeln!(diff_output, "+++ /dev/null");
+
+                    if let Ok(obj) = repo.find_object(id) {
+                        if let Ok(blob) = obj.try_into_blob() {
+                            let content = String::from_utf8_lossy(blob.data.as_slice());
+                            let _ =
+                                writeln!(diff_output, "@@ -1,{} +0,0 @@", content.lines().count());
+                            for line in content.lines() {
+                                let _ = writeln!(diff_output, "-{}", line);
+                            }
+                        }
+                    }
+
+                    Ok(Action::Continue)
+                }
+                gix::object::tree::diff::Change::Rewrite { .. } => {
+                    // Rewrite represents a complete file replacement - rare in practice
+                    // Skip for now as it's complex to handle properly
+                    Ok::<_, anyhow::Error>(Action::Continue)
+                }
+            }
+        })?;
+
+    Ok((diff_output, all_symbols, changed_files))
+}
+
+/// Write a unified diff and extract symbols from changed lines
+/// This is the same logic used during indexing
+pub fn write_diff_and_extract_symbols(
+    output: &mut String,
+    old: &str,
+    new: &str,
+    file_path: &str,
+) -> (std::fmt::Result, Vec<String>) {
+    use similar::{ChangeTag, TextDiff};
+    use std::collections::HashSet;
+    use std::fmt::Write;
+
+    // Generate a proper diff using the Myers algorithm
+    let diff = TextDiff::from_lines(old, new);
+
+    let mut write_result = Ok(());
+
+    // Parse file into lines for symbol lookup
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // Generate unified diff format with 3 lines of context (like git default)
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        // Get the first line number from the hunk to find symbol context
+        let start_line = hunk
+            .iter_changes()
+            .find_map(|c| c.new_index())
+            .unwrap_or(1)
+            .saturating_sub(1); // Convert to 0-indexed
+
+        // Find the symbol at the start of this hunk using walk-back
+        let symbol_context = if file_path.ends_with(".c")
+            || file_path.ends_with(".h")
+            || file_path.ends_with(".cpp")
+            || file_path.ends_with(".cc")
+            || file_path.ends_with(".cxx")
+        {
+            crate::symbol_walkback::find_symbol_for_line(&new_lines, start_line).or_else(|| {
+                // If walk-back fails, try to find the first non-empty line in the hunk
+                hunk.iter_changes()
+                    .find(|c| !c.value().trim().is_empty())
+                    .and_then(|c| c.new_index())
+                    .and_then(|idx| {
+                        if idx > 0 {
+                            crate::symbol_walkback::find_symbol_for_line(&new_lines, idx - 1)
+                        } else {
+                            None
+                        }
+                    })
+            })
+        } else {
+            None
+        };
+
+        // Write hunk header with symbol context (like git does)
+        if write_result.is_ok() {
+            if let Some(ref symbol) = symbol_context {
+                // Format: @@ -old_start,old_count +new_start,new_count @@ symbol
+                // Convert header to string and append symbol
+                let header_str = format!("{}", hunk.header());
+                write_result = writeln!(output, "{} {}", header_str.trim_end(), symbol);
+            } else {
+                write_result = writeln!(output, "{}", hunk.header());
+            }
+        }
+
+        // Write the actual changes
+        for change in hunk.iter_changes() {
+            let sign = match change.tag() {
+                ChangeTag::Delete => "-",
+                ChangeTag::Insert => "+",
+                ChangeTag::Equal => " ",
+            };
+            if write_result.is_ok() {
+                write_result = write!(output, "{}{}", sign, change.value());
+            }
+        }
+    }
+
+    // Extract symbols for C/C++ files only using walk-back algorithm
+    let symbols = if file_path.ends_with(".c")
+        || file_path.ends_with(".h")
+        || file_path.ends_with(".cpp")
+        || file_path.ends_with(".cc")
+        || file_path.ends_with(".cxx")
+    {
+        // Collect modified line numbers from both old and new files
+        let mut new_modified_lines = HashSet::new();
+        let mut old_modified_lines = HashSet::new();
+
+        for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+            for change in hunk.iter_changes() {
+                use similar::ChangeTag;
+                match change.tag() {
+                    ChangeTag::Insert => {
+                        // Added lines - check in new file
+                        if let Some(line_num) = change.new_index() {
+                            if line_num > 0 {
+                                new_modified_lines.insert(line_num - 1);
+                            }
+                        }
+                    }
+                    ChangeTag::Delete => {
+                        // Deleted lines - check in old file
+                        if let Some(line_num) = change.old_index() {
+                            if line_num > 0 {
+                                old_modified_lines.insert(line_num - 1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Extract symbols from both old (deletions) and new (additions/modifications)
+        let mut all_symbols = HashSet::new();
+        all_symbols.extend(crate::symbol_walkback::extract_symbols_by_walkback(
+            new,
+            &new_modified_lines,
+        ));
+        all_symbols.extend(crate::symbol_walkback::extract_symbols_by_walkback(
+            old,
+            &old_modified_lines,
+        ));
+
+        all_symbols.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    (write_result, symbols)
+}

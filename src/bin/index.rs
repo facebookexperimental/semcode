@@ -3,6 +3,7 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use semcode::git;
 use semcode::git::resolve_to_commit;
 use semcode::{
     measure, process_database_path, CodeVectorizer, DatabaseManager, GitFileEntry,
@@ -1673,7 +1674,7 @@ fn generate_commit_diff(
                             let new_content = String::from_utf8_lossy(new_blob.data.as_slice());
 
                             // Generate diff and extract symbols using walk-back algorithm
-                            let (write_result, file_symbols) = write_diff_and_extract_symbols(
+                            let (write_result, file_symbols) = git::write_diff_and_extract_symbols(
                                 &mut diff_output,
                                 &old_content,
                                 &new_content,
@@ -1760,137 +1761,6 @@ fn generate_commit_diff(
     );
 
     Ok((diff_output, all_symbols, changed_files))
-}
-
-/// Write a unified diff and extract symbols from changed lines
-fn write_diff_and_extract_symbols(
-    output: &mut String,
-    old: &str,
-    new: &str,
-    file_path: &str,
-) -> (std::fmt::Result, Vec<String>) {
-    use similar::{ChangeTag, TextDiff};
-    use std::fmt::Write;
-
-    // Generate a proper diff using the Myers algorithm
-    let diff = TextDiff::from_lines(old, new);
-
-    let mut write_result = Ok(());
-
-    // Parse file into lines for symbol lookup
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    // Generate unified diff format with 3 lines of context (like git default)
-    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-        // Get the first line number from the hunk to find symbol context
-        let start_line = hunk
-            .iter_changes()
-            .find_map(|c| c.new_index())
-            .unwrap_or(1)
-            .saturating_sub(1); // Convert to 0-indexed
-
-        // Find the symbol at the start of this hunk using walk-back
-        let symbol_context = if file_path.ends_with(".c")
-            || file_path.ends_with(".h")
-            || file_path.ends_with(".cpp")
-            || file_path.ends_with(".cc")
-            || file_path.ends_with(".cxx")
-        {
-            semcode::symbol_walkback::find_symbol_for_line(&new_lines, start_line).or_else(|| {
-                // If walk-back fails, try to find the first non-empty line in the hunk
-                hunk.iter_changes()
-                    .find(|c| !c.value().trim().is_empty())
-                    .and_then(|c| c.new_index())
-                    .and_then(|idx| {
-                        if idx > 0 {
-                            semcode::symbol_walkback::find_symbol_for_line(&new_lines, idx - 1)
-                        } else {
-                            None
-                        }
-                    })
-            })
-        } else {
-            None
-        };
-
-        // Write hunk header with symbol context (like git does)
-        if write_result.is_ok() {
-            if let Some(ref symbol) = symbol_context {
-                // Format: @@ -old_start,old_count +new_start,new_count @@ symbol
-                // Convert header to string and append symbol
-                let header_str = format!("{}", hunk.header());
-                write_result = writeln!(output, "{} {}", header_str.trim_end(), symbol);
-            } else {
-                write_result = writeln!(output, "{}", hunk.header());
-            }
-        }
-
-        // Write the actual changes
-        for change in hunk.iter_changes() {
-            let sign = match change.tag() {
-                ChangeTag::Delete => "-",
-                ChangeTag::Insert => "+",
-                ChangeTag::Equal => " ",
-            };
-            if write_result.is_ok() {
-                write_result = write!(output, "{}{}", sign, change.value());
-            }
-        }
-    }
-
-    // Extract symbols for C/C++ files only using walk-back algorithm
-    let symbols = if file_path.ends_with(".c")
-        || file_path.ends_with(".h")
-        || file_path.ends_with(".cpp")
-        || file_path.ends_with(".cc")
-        || file_path.ends_with(".cxx")
-    {
-        // Collect modified line numbers from both old and new files
-        let mut new_modified_lines = HashSet::new();
-        let mut old_modified_lines = HashSet::new();
-
-        for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-            for change in hunk.iter_changes() {
-                use similar::ChangeTag;
-                match change.tag() {
-                    ChangeTag::Insert => {
-                        // Added lines - check in new file
-                        if let Some(line_num) = change.new_index() {
-                            if line_num > 0 {
-                                new_modified_lines.insert(line_num - 1);
-                            }
-                        }
-                    }
-                    ChangeTag::Delete => {
-                        // Deleted lines - check in old file
-                        if let Some(line_num) = change.old_index() {
-                            if line_num > 0 {
-                                old_modified_lines.insert(line_num - 1);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Extract symbols from both old (deletions) and new (additions/modifications)
-        let mut all_symbols = HashSet::new();
-        all_symbols.extend(semcode::symbol_walkback::extract_symbols_by_walkback(
-            new,
-            &new_modified_lines,
-        ));
-        all_symbols.extend(semcode::symbol_walkback::extract_symbols_by_walkback(
-            old,
-            &old_modified_lines,
-        ));
-
-        all_symbols.into_iter().collect()
-    } else {
-        Vec::new()
-    };
-
-    (write_result, symbols)
 }
 
 /// Process git range using streaming file tuple pipeline

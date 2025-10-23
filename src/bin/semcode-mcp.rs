@@ -544,16 +544,59 @@ async fn mcp_show_commit_metadata(
     // Step 2: Query database for commit metadata
     let commit_opt = db.get_git_commit_by_sha(&resolved_sha).await?;
 
-    let commit = match commit_opt {
-        Some(c) => c,
+    // Try to get from database, fall back to git if not indexed
+    let (
+        commit_sha,
+        commit_author,
+        commit_subject,
+        commit_message,
+        commit_parent_sha,
+        commit_symbols,
+        commit_files,
+        commit_tags,
+        commit_diff,
+        is_indexed,
+    ) = match commit_opt {
+        Some(c) => (
+            c.git_sha.clone(),
+            c.author.clone(),
+            c.subject.clone(),
+            c.message.clone(),
+            c.parent_sha.clone(),
+            c.symbols.clone(),
+            c.files.clone(),
+            c.tags.clone(),
+            c.diff.clone(),
+            true,
+        ),
         None => {
+            // Commit not indexed - fall back to reading from git
             writeln!(
                 buffer,
-                "Info: No metadata found for commit {} in database",
+                "⚠️ Warning: Commit {} not found in index - reading from git",
                 resolved_sha
             )?;
-            writeln!(buffer, "Hint: This commit may not have been indexed yet")?;
-            return Ok(String::from_utf8_lossy(&buffer).to_string());
+
+            match git::get_commit_info_from_git(git_repo_path, &resolved_sha) {
+                Ok(git_commit) => {
+                    (
+                        git_commit.git_sha,
+                        git_commit.author,
+                        git_commit.subject,
+                        git_commit.message,
+                        git_commit.parent_sha,
+                        git_commit.symbols, // Symbols extracted from diff
+                        git_commit.files,   // Files changed in commit
+                        std::collections::HashMap::new(), // No tags extracted from git
+                        git_commit.diff,
+                        false,
+                    )
+                }
+                Err(e) => {
+                    writeln!(buffer, "Error: Failed to read commit from git: {}", e)?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
         }
     };
 
@@ -593,7 +636,7 @@ async fn mcp_show_commit_metadata(
         }
 
         // Check if commit message or diff matches ALL regex patterns
-        let combined = format!("{}\n\n{}", commit.message, commit.diff);
+        let combined = format!("{}\n\n{}", commit_message, commit_diff);
         let mut failed_patterns = Vec::new();
         for (i, re) in regexes.iter().enumerate() {
             if !re.is_match(&combined) {
@@ -635,7 +678,7 @@ async fn mcp_show_commit_metadata(
         let mut failed_symbol_patterns = Vec::new();
         for (i, re) in symbol_regexes.iter().enumerate() {
             // Check if ANY symbol matches this pattern
-            let matches_any = commit.symbols.iter().any(|symbol| re.is_match(symbol));
+            let matches_any = commit_symbols.iter().any(|symbol| re.is_match(symbol));
             if !matches_any {
                 failed_symbol_patterns.push(symbol_patterns[i].as_str());
             }
@@ -674,7 +717,7 @@ async fn mcp_show_commit_metadata(
         // Check if commit files match ANY path pattern
         let matches_any_pattern = path_regexes
             .iter()
-            .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+            .any(|re| commit_files.iter().any(|file| re.is_match(file)));
 
         if !matches_any_pattern {
             writeln!(
@@ -689,23 +732,26 @@ async fn mcp_show_commit_metadata(
     }
 
     // Step 4: Display commit metadata
+    if !is_indexed {
+        writeln!(buffer, "\n⚠️  COMMIT NOT INDEXED - SHOWING GIT DATA")?;
+    }
     writeln!(buffer, "\n=== Git Commit Metadata ===")?;
-    writeln!(buffer, "Commit: {}", commit.git_sha)?;
-    writeln!(buffer, "Author: {}", commit.author)?;
-    writeln!(buffer, "Subject: {}", commit.subject)?;
+    writeln!(buffer, "Commit: {}", commit_sha)?;
+    writeln!(buffer, "Author: {}", commit_author)?;
+    writeln!(buffer, "Subject: {}", commit_subject)?;
 
     // Show parent commits if any
-    if !commit.parent_sha.is_empty() {
+    if !commit_parent_sha.is_empty() {
         writeln!(buffer, "\nParents:")?;
-        for parent in &commit.parent_sha {
+        for parent in &commit_parent_sha {
             writeln!(buffer, "  {}", parent)?;
         }
     }
 
     // Show tags if any
-    if !commit.tags.is_empty() {
+    if !commit_tags.is_empty() {
         writeln!(buffer, "\nTags:")?;
-        for (tag_name, tag_values) in &commit.tags {
+        for (tag_name, tag_values) in &commit_tags {
             for value in tag_values {
                 writeln!(buffer, "  {}: {}", tag_name, value)?;
             }
@@ -713,13 +759,13 @@ async fn mcp_show_commit_metadata(
     }
 
     // Show symbols if any
-    if !commit.symbols.is_empty() {
+    if !commit_symbols.is_empty() {
         writeln!(
             buffer,
             "\nModified Symbols: ({} symbols)",
-            commit.symbols.len()
+            commit_symbols.len()
         )?;
-        let mut sorted_symbols = commit.symbols.clone();
+        let mut sorted_symbols = commit_symbols.clone();
         sorted_symbols.sort();
         for symbol in &sorted_symbols {
             writeln!(buffer, "  {}", symbol)?;
@@ -727,19 +773,19 @@ async fn mcp_show_commit_metadata(
     }
 
     // Show full message
-    if !commit.message.is_empty() && commit.message != commit.subject {
+    if !commit_message.is_empty() && commit_message != commit_subject {
         writeln!(buffer, "\nMessage:")?;
         writeln!(buffer, "{}", "─".repeat(60))?;
-        writeln!(buffer, "{}", commit.message)?;
+        writeln!(buffer, "{}", commit_message)?;
         writeln!(buffer, "{}", "─".repeat(60))?;
     }
 
     // Show diff if verbose flag is set
     if verbose {
-        if !commit.diff.is_empty() {
+        if !commit_diff.is_empty() {
             writeln!(buffer, "\nDiff:")?;
             writeln!(buffer, "{}", "─".repeat(80))?;
-            writeln!(buffer, "{}", commit.diff)?;
+            writeln!(buffer, "{}", commit_diff)?;
             writeln!(buffer, "{}", "─".repeat(80))?;
         } else {
             writeln!(buffer, "\nInfo: No diff available for this commit")?;
