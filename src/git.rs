@@ -34,6 +34,7 @@ pub fn resolve_to_commit<'a>(repo: &'a gix::Repository, revspec: &str) -> Result
         .map_err(|_| anyhow::anyhow!("'{}' does not resolve to a commit", revspec))
 }
 use once_cell::sync::Lazy;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 // Global cache for git file hashes - lock-free concurrent access
@@ -638,6 +639,53 @@ pub fn is_commit_reachable<P: AsRef<Path>>(
                 }
                 Err(e) => Err(anyhow::anyhow!("Failed to compute merge base: {}", e)),
             }
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to discover git repository from '{}': {}",
+            repo_path.display(),
+            e
+        )),
+    }
+}
+
+/// Build a HashSet of all commits reachable from the given SHA
+/// This is more efficient than checking each commit individually when filtering many commits
+/// Uses git rev-walk to iterate all reachable commits
+pub fn get_reachable_commits<P: AsRef<Path>>(
+    repo_path: P,
+    from_sha: &str,
+) -> Result<HashSet<String>> {
+    let repo_path = repo_path.as_ref();
+
+    match gix::discover(repo_path) {
+        Ok(repo) => {
+            // Parse the from SHA using revparse
+            let from_commit = resolve_to_commit(&repo, from_sha)?;
+            let from_id = from_commit.id().detach();
+
+            // Use rev_walk to get all reachable commits
+            let walk = repo.rev_walk([from_id]).all()?;
+
+            let mut reachable = HashSet::new();
+            const MAX_COMMITS: usize = 10000000; // Safety limit
+
+            for info in walk {
+                let info = info?;
+
+                // Safety check to prevent runaway processing
+                if reachable.len() >= MAX_COMMITS {
+                    return Err(anyhow::anyhow!(
+                        "Too many commits reachable from {} (>{} commits). This may indicate a problem.",
+                        from_sha, MAX_COMMITS
+                    ));
+                }
+
+                let commit_id = info.id();
+                let commit_sha = commit_id.to_string();
+                reachable.insert(commit_sha);
+            }
+
+            Ok(reachable)
         }
         Err(e) => Err(anyhow::anyhow!(
             "Failed to discover git repository from '{}': {}",

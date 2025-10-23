@@ -983,8 +983,6 @@ async fn mcp_show_commit_range(
     writeln!(buffer, "{}", "=".repeat(80))?;
 
     // Step 3: Process commits in chunks of 256 with database-level filtering
-    let mut displayed_count = 0;
-    let mut matched_count = 0;
     const CHUNK_SIZE: usize = 256;
 
     // Convert regex and symbol patterns to strings for database filtering
@@ -997,7 +995,8 @@ async fn mcp_show_commit_range(
         .map(|re| re.as_str().to_string())
         .collect();
 
-    // Process commits in chunks
+    // Collect all filtered commits from all chunks first
+    let mut all_filtered_commits = Vec::new();
     for chunk_start in (0..range_commits.len()).step_by(CHUNK_SIZE) {
         let chunk_end = (chunk_start + CHUNK_SIZE).min(range_commits.len());
         let chunk = &range_commits[chunk_start..chunk_end];
@@ -1008,96 +1007,121 @@ async fn mcp_show_commit_range(
             .await?;
 
         // Apply path filtering to chunk results
-        let filtered_chunk_results: Vec<_> = chunk_results
-            .into_iter()
-            .filter(|commit| {
-                // Apply path filters (ANY must match - OR logic)
-                if !path_filters.is_empty() {
-                    let matches_any_pattern = path_filters
-                        .iter()
-                        .any(|re| commit.files.iter().any(|file| re.is_match(file)));
-                    if !matches_any_pattern {
-                        return false;
-                    }
+        for commit in chunk_results {
+            // Apply path filters (ANY must match - OR logic)
+            if !path_filters.is_empty() {
+                let matches_any_pattern = path_filters
+                    .iter()
+                    .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+                if !matches_any_pattern {
+                    continue;
                 }
-                true
-            })
-            .collect();
+            }
+            all_filtered_commits.push(commit);
+        }
+    }
 
-        // Display results from this chunk
-        for commit in &filtered_chunk_results {
-            // Apply reachability filter if provided
-            if let Some(reachable_from) = reachable_sha {
+    // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
+    let reachable_set = if let Some(reachable_from) = reachable_sha {
+        if all_filtered_commits.len() > 10 {
+            match git::get_reachable_commits(git_repo_path, reachable_from) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Warning: Failed to build reachable commits set: {}. Using individual checks",
+                        e
+                    )?;
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Step 5: Apply reachability filter and display commits
+    let mut displayed_count = 0;
+    let mut matched_count = 0;
+
+    for commit in &all_filtered_commits {
+        // Apply reachability filter if provided
+        if let Some(reachable_from) = reachable_sha {
+            // Use hashset if available, otherwise do individual check
+            let is_reachable = if let Some(ref set) = reachable_set {
+                set.contains(&commit.git_sha)
+            } else {
                 match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
-                    Ok(true) => {
-                        // Commit is reachable, continue processing
-                    }
-                    Ok(false) => {
-                        // Commit is not reachable, skip it
-                        continue;
-                    }
+                    Ok(true) => true,
+                    Ok(false) => false,
                     Err(e) => {
                         writeln!(
                             buffer,
                             "Warning: Failed to check reachability for commit {}: {}",
                             commit.git_sha, e
                         )?;
-                        continue;
+                        false
                     }
+                }
+            };
+
+            if !is_reachable {
+                continue;
+            }
+        }
+
+        matched_count += 1;
+        displayed_count += 1;
+
+        if verbose {
+            // Verbose mode: show full details for each commit
+            writeln!(buffer, "\n{}", "─".repeat(80))?;
+            writeln!(buffer, "{}. Commit: {}", displayed_count, commit.git_sha)?;
+            writeln!(buffer, "   Author: {}", commit.author)?;
+            writeln!(buffer, "   Subject: {}", commit.subject)?;
+
+            // Show modified symbols if any (limited to first 5)
+            if !commit.symbols.is_empty() {
+                let symbol_count = commit.symbols.len();
+                let display_symbols: Vec<_> = commit.symbols.iter().take(5).collect();
+                writeln!(buffer, "   Modified Symbols: ({})", symbol_count)?;
+                for symbol in display_symbols {
+                    writeln!(buffer, "     {}", symbol)?;
+                }
+                if symbol_count > 5 {
+                    writeln!(buffer, "     ... and {} more", symbol_count - 5)?;
                 }
             }
 
-            matched_count += 1;
-            displayed_count += 1;
-
-            if verbose {
-                // Verbose mode: show full details for each commit
-                writeln!(buffer, "\n{}", "─".repeat(80))?;
-                writeln!(buffer, "{}. Commit: {}", displayed_count, commit.git_sha)?;
-                writeln!(buffer, "   Author: {}", commit.author)?;
-                writeln!(buffer, "   Subject: {}", commit.subject)?;
-
-                // Show modified symbols if any (limited to first 5)
-                if !commit.symbols.is_empty() {
-                    let symbol_count = commit.symbols.len();
-                    let display_symbols: Vec<_> = commit.symbols.iter().take(5).collect();
-                    writeln!(buffer, "   Modified Symbols: ({})", symbol_count)?;
-                    for symbol in display_symbols {
-                        writeln!(buffer, "     {}", symbol)?;
-                    }
-                    if symbol_count > 5 {
-                        writeln!(buffer, "     ... and {} more", symbol_count - 5)?;
-                    }
+            // Show full message
+            if !commit.message.is_empty() && commit.message != commit.subject {
+                writeln!(buffer, "\n   Message:")?;
+                for line in commit.message.lines() {
+                    writeln!(buffer, "   {}", line)?;
                 }
-
-                // Show full message
-                if !commit.message.is_empty() && commit.message != commit.subject {
-                    writeln!(buffer, "\n   Message:")?;
-                    for line in commit.message.lines() {
-                        writeln!(buffer, "   {}", line)?;
-                    }
-                }
-
-                // Show diff if verbose
-                if !commit.diff.is_empty() {
-                    writeln!(buffer, "\n   Diff:")?;
-                    writeln!(buffer, "   {}", "─".repeat(76))?;
-                    for line in commit.diff.lines() {
-                        writeln!(buffer, "   {}", line)?;
-                    }
-                    writeln!(buffer, "   {}", "─".repeat(76))?;
-                }
-            } else {
-                // Default mode: show compact summary
-                writeln!(
-                    buffer,
-                    "{}. {} {} - {}",
-                    displayed_count,
-                    &commit.git_sha[..12],
-                    commit.author,
-                    commit.subject
-                )?;
             }
+
+            // Show diff if verbose
+            if !commit.diff.is_empty() {
+                writeln!(buffer, "\n   Diff:")?;
+                writeln!(buffer, "   {}", "─".repeat(76))?;
+                for line in commit.diff.lines() {
+                    writeln!(buffer, "   {}", line)?;
+                }
+                writeln!(buffer, "   {}", "─".repeat(76))?;
+            }
+        } else {
+            // Default mode: show compact summary
+            writeln!(
+                buffer,
+                "{}. {} {} - {}",
+                displayed_count,
+                &commit.git_sha[..12],
+                commit.author,
+                commit.subject
+            )?;
         }
     }
 
@@ -1226,70 +1250,103 @@ async fn mcp_show_all_commits(
     )?;
     writeln!(buffer, "{}", "=".repeat(80))?;
 
-    // Step 3: Filter and display commits
-    let mut displayed_count = 0;
-    let mut matched_count = 0;
-
-    for commit in &all_commits {
-        // Apply regex filters if provided (ALL must match)
-        if !regex_filters.is_empty() {
-            let combined = format!("{}\n\n{}", commit.message, commit.diff);
-            let mut match_all = true;
-            for re in &regex_filters {
-                if !re.is_match(&combined) {
-                    match_all = false;
-                    break;
+    // Step 3: Apply regex/symbol/path filters first
+    let filtered_commits: Vec<_> = all_commits
+        .iter()
+        .filter(|commit| {
+            // Apply regex filters if provided (ALL must match)
+            if !regex_filters.is_empty() {
+                let combined = format!("{}\n\n{}", commit.message, commit.diff);
+                let mut match_all = true;
+                for re in &regex_filters {
+                    if !re.is_match(&combined) {
+                        match_all = false;
+                        break;
+                    }
+                }
+                if !match_all {
+                    return false;
                 }
             }
-            if !match_all {
-                continue; // Skip commits that don't match all patterns
-            }
-        }
 
-        // Apply symbol filters if provided (ALL must match)
-        if !symbol_filters.is_empty() {
-            let mut match_all = true;
-            for re in &symbol_filters {
-                // Check if ANY symbol matches this pattern
-                let matches_any = commit.symbols.iter().any(|symbol| re.is_match(symbol));
-                if !matches_any {
-                    match_all = false;
-                    break;
+            // Apply symbol filters if provided (ALL must match)
+            if !symbol_filters.is_empty() {
+                let mut match_all = true;
+                for re in &symbol_filters {
+                    // Check if ANY symbol matches this pattern
+                    let matches_any = commit.symbols.iter().any(|symbol| re.is_match(symbol));
+                    if !matches_any {
+                        match_all = false;
+                        break;
+                    }
+                }
+                if !match_all {
+                    return false;
                 }
             }
-            if !match_all {
-                continue; // Skip commits that don't match all symbol patterns
-            }
-        }
 
-        // Apply path filters if provided (ANY must match - OR logic)
-        if !path_filters.is_empty() {
-            let matches_any_pattern = path_filters
-                .iter()
-                .any(|re| commit.files.iter().any(|file| re.is_match(file)));
-            if !matches_any_pattern {
-                continue; // Skip commits that don't match any path patterns
+            // Apply path filters if provided (ANY must match - OR logic)
+            if !path_filters.is_empty() {
+                let matches_any_pattern = path_filters
+                    .iter()
+                    .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+                if !matches_any_pattern {
+                    return false;
+                }
             }
-        }
 
-        // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
-            match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
-                Ok(true) => {
-                    // Commit is reachable, continue processing
-                }
-                Ok(false) => {
-                    // Commit is not reachable, skip it
-                    continue;
-                }
+            true
+        })
+        .collect();
+
+    // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
+    let reachable_set = if let Some(reachable_from) = reachable_sha {
+        if filtered_commits.len() > 10 {
+            match git::get_reachable_commits(git_repo_path, reachable_from) {
+                Ok(set) => Some(set),
                 Err(e) => {
                     writeln!(
                         buffer,
-                        "Warning: Failed to check reachability for commit {}: {}",
-                        commit.git_sha, e
+                        "Warning: Failed to build reachable commits set: {}. Using individual checks",
+                        e
                     )?;
-                    continue;
+                    None
                 }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Step 5: Apply reachability filter and display commits
+    let mut displayed_count = 0;
+    let mut matched_count = 0;
+
+    for commit in &filtered_commits {
+        // Apply reachability filter if provided
+        if let Some(reachable_from) = reachable_sha {
+            // Use hashset if available, otherwise do individual check
+            let is_reachable = if let Some(ref set) = reachable_set {
+                set.contains(&commit.git_sha)
+            } else {
+                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(e) => {
+                        writeln!(
+                            buffer,
+                            "Warning: Failed to check reachability for commit {}: {}",
+                            commit.git_sha, e
+                        )?;
+                        false
+                    }
+                }
+            };
+
+            if !is_reachable {
+                continue;
             }
         }
 
@@ -3179,29 +3236,73 @@ async fn mcp_vcommit_similar_commits(
             // Apply reachability filtering if provided
             let final_results = if let Some(reachable_from) = reachable_sha {
                 let original_count = filtered_by_path.len();
-                let filtered: Vec<_> = filtered_by_path
-                    .into_iter()
-                    .filter(|(commit, _)| {
-                        match git::is_commit_reachable(
-                            git_repo_path,
-                            reachable_from,
-                            &commit.git_sha,
-                        ) {
-                            Ok(true) => true,
-                            Ok(false) => false,
-                            Err(e) => {
-                                writeln!(
-                                    buffer,
-                                    "Warning: Failed to check reachability for commit {}: {}",
-                                    commit.git_sha, e
-                                )
-                                .ok();
-                                false
-                            }
+
+                // For > 10 commits, use hashset approach for better performance
+                let filtered: Vec<_> = if original_count > 10 {
+                    match git::get_reachable_commits(git_repo_path, reachable_from) {
+                        Ok(reachable_set) => filtered_by_path
+                            .into_iter()
+                            .filter(|(commit, _)| reachable_set.contains(&commit.git_sha))
+                            .take(limit)
+                            .collect(),
+                        Err(e) => {
+                            writeln!(
+                                buffer,
+                                "Warning: Failed to build reachable commits set: {}. Falling back to individual checks",
+                                e
+                            )?;
+                            // Fallback to individual checks
+                            filtered_by_path
+                                .into_iter()
+                                .filter(|(commit, _)| {
+                                    match git::is_commit_reachable(
+                                        git_repo_path,
+                                        reachable_from,
+                                        &commit.git_sha,
+                                    ) {
+                                        Ok(true) => true,
+                                        Ok(false) => false,
+                                        Err(e) => {
+                                            writeln!(
+                                                buffer,
+                                                "Warning: Failed to check reachability for commit {}: {}",
+                                                commit.git_sha, e
+                                            )
+                                            .ok();
+                                            false
+                                        }
+                                    }
+                                })
+                                .take(limit)
+                                .collect()
                         }
-                    })
-                    .take(limit) // Apply the original limit to filtered results
-                    .collect();
+                    }
+                } else {
+                    // For <= 10 commits, use individual checks
+                    filtered_by_path
+                        .into_iter()
+                        .filter(|(commit, _)| {
+                            match git::is_commit_reachable(
+                                git_repo_path,
+                                reachable_from,
+                                &commit.git_sha,
+                            ) {
+                                Ok(true) => true,
+                                Ok(false) => false,
+                                Err(e) => {
+                                    writeln!(
+                                        buffer,
+                                        "Warning: Failed to check reachability for commit {}: {}",
+                                        commit.git_sha, e
+                                    )
+                                    .ok();
+                                    false
+                                }
+                            }
+                        })
+                        .take(limit)
+                        .collect()
+                };
 
                 writeln!(
                     buffer,

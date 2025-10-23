@@ -1793,28 +1793,70 @@ async fn vcommit_similar_commits(
             // Apply reachability filtering if provided
             let final_results = if let Some(reachable_from) = reachable_sha {
                 let original_count = filtered_by_path.len();
-                let filtered: Vec<_> = filtered_by_path
-                    .into_iter()
-                    .filter(|(commit, _)| {
-                        match git::is_commit_reachable(
-                            git_repo_path,
-                            reachable_from,
-                            &commit.git_sha,
-                        ) {
-                            Ok(true) => true,
-                            Ok(false) => false,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to check reachability for commit {}: {}",
-                                    commit.git_sha,
-                                    e
-                                );
-                                false
-                            }
+
+                // For > 10 commits, use hashset approach for better performance
+                let filtered: Vec<_> = if original_count > 10 {
+                    match git::get_reachable_commits(git_repo_path, reachable_from) {
+                        Ok(reachable_set) => filtered_by_path
+                            .into_iter()
+                            .filter(|(commit, _)| reachable_set.contains(&commit.git_sha))
+                            .take(limit)
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to build reachable commits set: {}. Falling back to individual checks",
+                                e
+                            );
+                            // Fallback to individual checks
+                            filtered_by_path
+                                .into_iter()
+                                .filter(|(commit, _)| {
+                                    match git::is_commit_reachable(
+                                        git_repo_path,
+                                        reachable_from,
+                                        &commit.git_sha,
+                                    ) {
+                                        Ok(true) => true,
+                                        Ok(false) => false,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to check reachability for commit {}: {}",
+                                                commit.git_sha,
+                                                e
+                                            );
+                                            false
+                                        }
+                                    }
+                                })
+                                .take(limit)
+                                .collect()
                         }
-                    })
-                    .take(limit) // Apply the original limit to filtered results
-                    .collect();
+                    }
+                } else {
+                    // For <= 10 commits, use individual checks
+                    filtered_by_path
+                        .into_iter()
+                        .filter(|(commit, _)| {
+                            match git::is_commit_reachable(
+                                git_repo_path,
+                                reachable_from,
+                                &commit.git_sha,
+                            ) {
+                                Ok(true) => true,
+                                Ok(false) => false,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to check reachability for commit {}: {}",
+                                        commit.git_sha,
+                                        e
+                                    );
+                                    false
+                                }
+                            }
+                        })
+                        .take(limit)
+                        .collect()
+                };
 
                 tracing::info!(
                     "Reachability filter reduced results from {} to {} commits",
@@ -2216,35 +2258,63 @@ async fn show_all_commits(
     );
     println!("{}", "=".repeat(80));
 
-    // Step 3: Filter and display commits (with limit)
+    // Step 3: Apply regex/symbol/path filters first
+    let filtered_commits: Vec<_> = all_commits
+        .iter()
+        .filter(|commit| {
+            commit_matches_filters(commit, &regex_filters, &symbol_filters, &path_filters)
+        })
+        .collect();
+
+    // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
+    let reachable_set = if let Some(reachable_from) = reachable_sha {
+        if filtered_commits.len() > 10 {
+            match git::get_reachable_commits(git_repo_path, reachable_from) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    println!(
+                        "{} Failed to build reachable commits set: {}. Using individual checks",
+                        "Warning:".yellow(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Step 5: Apply reachability filter and display commits
     let mut displayed_count = 0;
     let mut matched_count = 0;
 
-    for commit in &all_commits {
-        // Apply filters
-        if !commit_matches_filters(commit, &regex_filters, &symbol_filters, &path_filters) {
-            continue;
-        }
-
+    for commit in &filtered_commits {
         // Apply reachability filter if provided
         if let Some(reachable_from) = reachable_sha {
-            match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
-                Ok(true) => {
-                    // Commit is reachable, continue processing
+            // Use hashset if available, otherwise do individual check
+            let is_reachable = if let Some(ref set) = reachable_set {
+                set.contains(&commit.git_sha)
+            } else {
+                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(e) => {
+                        println!(
+                            "{} Failed to check reachability for commit {}: {}",
+                            "Warning:".yellow(),
+                            commit.git_sha,
+                            e
+                        );
+                        false
+                    }
                 }
-                Ok(false) => {
-                    // Commit is not reachable, skip it
-                    continue;
-                }
-                Err(e) => {
-                    println!(
-                        "{} Failed to check reachability for commit {}: {}",
-                        "Warning:".yellow(),
-                        commit.git_sha,
-                        e
-                    );
-                    continue;
-                }
+            };
+
+            if !is_reachable {
+                continue;
             }
         }
 
@@ -2259,7 +2329,7 @@ async fn show_all_commits(
         display_commit(commit, displayed_count, verbose);
     }
 
-    // Step 4: Show summary
+    // Step 5: Show summary
     show_commit_summary(
         all_commits.len(),
         matched_count,
@@ -2765,8 +2835,6 @@ async fn show_commit_range(
     println!("{}", "=".repeat(80));
 
     // Step 3: Process commits in chunks of 256 with database-level filtering
-    let mut displayed_count = 0;
-    let mut matched_count = 0;
     const CHUNK_SIZE: usize = 256;
 
     // Convert regex and symbol patterns to strings for database filtering
@@ -2779,7 +2847,8 @@ async fn show_commit_range(
         .map(|re| re.as_str().to_string())
         .collect();
 
-    // Process commits in chunks
+    // Collect all filtered commits from all chunks first
+    let mut all_filtered_commits = Vec::new();
     for chunk_start in (0..range_commits.len()).step_by(CHUNK_SIZE) {
         let chunk_end = (chunk_start + CHUNK_SIZE).min(range_commits.len());
         let chunk = &range_commits[chunk_start..chunk_end];
@@ -2790,34 +2859,55 @@ async fn show_commit_range(
             .await?;
 
         // Apply path filtering to chunk results
-        let filtered_chunk_results: Vec<_> = chunk_results
-            .into_iter()
-            .filter(|commit| {
-                // Apply path filters (ANY must match - OR logic)
-                if !path_filters.is_empty() {
-                    let matches_any_pattern = path_filters
-                        .iter()
-                        .any(|re| commit.files.iter().any(|file| re.is_match(file)));
-                    if !matches_any_pattern {
-                        return false;
-                    }
+        for commit in chunk_results {
+            // Apply path filters (ANY must match - OR logic)
+            if !path_filters.is_empty() {
+                let matches_any_pattern = path_filters
+                    .iter()
+                    .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+                if !matches_any_pattern {
+                    continue;
                 }
-                true
-            })
-            .collect();
+            }
+            all_filtered_commits.push(commit);
+        }
+    }
 
-        // Display results from this chunk
-        for commit in &filtered_chunk_results {
-            // Apply reachability filter if provided
-            if let Some(reachable_from) = reachable_sha {
+    // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
+    let reachable_set = if let Some(reachable_from) = reachable_sha {
+        if all_filtered_commits.len() > 10 {
+            match git::get_reachable_commits(git_repo_path, reachable_from) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    println!(
+                        "{} Failed to build reachable commits set: {}. Using individual checks",
+                        "Warning:".yellow(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Step 5: Apply reachability filter and display commits
+    let mut displayed_count = 0;
+    let mut matched_count = 0;
+
+    for commit in &all_filtered_commits {
+        // Apply reachability filter if provided
+        if let Some(reachable_from) = reachable_sha {
+            // Use hashset if available, otherwise do individual check
+            let is_reachable = if let Some(ref set) = reachable_set {
+                set.contains(&commit.git_sha)
+            } else {
                 match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
-                    Ok(true) => {
-                        // Commit is reachable, continue processing
-                    }
-                    Ok(false) => {
-                        // Commit is not reachable, skip it
-                        continue;
-                    }
+                    Ok(true) => true,
+                    Ok(false) => false,
                     Err(e) => {
                         println!(
                             "{} Failed to check reachability for commit {}: {}",
@@ -2825,29 +2915,28 @@ async fn show_commit_range(
                             commit.git_sha,
                             e
                         );
-                        continue;
+                        false
                     }
                 }
-            }
+            };
 
-            matched_count += 1;
-
-            // Apply limit
-            if limit > 0 && displayed_count >= limit {
+            if !is_reachable {
                 continue;
             }
-
-            displayed_count += 1;
-            display_commit(commit, displayed_count, verbose);
         }
 
-        // Early exit if we've hit the display limit
+        matched_count += 1;
+
+        // Apply limit
         if limit > 0 && displayed_count >= limit {
-            break;
+            continue;
         }
+
+        displayed_count += 1;
+        display_commit(commit, displayed_count, verbose);
     }
 
-    // Step 4: Show summary
+    // Step 6: Show summary
     show_commit_summary(
         range_commits.len(),
         matched_count,
