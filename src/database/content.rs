@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use gxhash::{HashMap, HashMapExt};
 use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
@@ -76,16 +77,14 @@ impl ContentStore {
         }
 
         // Deduplicate content items by blake3_hash within the batch
-        let mut dedup_map: std::collections::HashMap<String, ContentInfo> =
-            std::collections::HashMap::new();
+        let mut dedup_map: HashMap<String, ContentInfo> = HashMap::new();
         for item in content_items {
             dedup_map.insert(item.blake3_hash.clone(), item);
         }
         let deduplicated_items: Vec<ContentInfo> = dedup_map.into_values().collect();
 
         // Group content items by shard
-        let mut shard_groups: std::collections::HashMap<u8, Vec<ContentInfo>> =
-            std::collections::HashMap::new();
+        let mut shard_groups: HashMap<u8, Vec<ContentInfo>> = HashMap::new();
         for item in deduplicated_items {
             let shard = Self::get_shard_number(&item.blake3_hash);
             shard_groups.entry(shard).or_default().push(item);
@@ -198,19 +197,15 @@ impl ContentStore {
     }
 
     /// Bulk fetch content for multiple hashes - uses indexed lookup
-    pub async fn get_content_bulk(
-        &self,
-        hashes: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    pub async fn get_content_bulk(&self, hashes: &[String]) -> Result<HashMap<String, String>> {
         if hashes.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
-        let mut content_map = std::collections::HashMap::new();
+        let mut content_map = HashMap::new();
 
         // Group hashes by shard
-        let mut shard_groups: std::collections::HashMap<u8, Vec<&String>> =
-            std::collections::HashMap::new();
+        let mut shard_groups: HashMap<u8, Vec<&String>> = HashMap::new();
         for hash in hashes {
             let shard = Self::get_shard_number(hash);
             shard_groups.entry(shard).or_default().push(hash);

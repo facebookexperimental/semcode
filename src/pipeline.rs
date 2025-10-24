@@ -149,7 +149,7 @@
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashSet;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -191,7 +191,7 @@ pub struct PipelineBuilder {
 
     // Tracking for incremental processing
     pub newly_processed_files: Arc<Mutex<HashSet<String>>>, // git_sha:filename pairs
-    pub git_sha: Option<String>,                            // Current git SHA for the source root
+    pub git_sha: Option<String>,                              // Current git SHA for the source root
 
     // Force reprocessing mode for incremental scans
     pub force_reprocess: bool,
@@ -284,7 +284,7 @@ impl PipelineBuilder {
     pub async fn build_and_run_with_git_files(
         self,
         _files: Vec<PathBuf>,
-        git_files: Option<std::collections::HashMap<PathBuf, GitFileEntry>>,
+        git_files: Option<HashMap<PathBuf, GitFileEntry>>,
     ) -> Result<()> {
         let num_threads = num_cpus::get();
         tracing::info!("=== PIPELINE START: {} threads available ===", num_threads);
@@ -805,7 +805,7 @@ impl PipelineBuilder {
     }
 
     /// Load git manifest of current commit - returns (file_path, git_file_sha) for all files
-    async fn load_git_manifest(&self) -> Result<std::collections::HashMap<PathBuf, String>> {
+    async fn load_git_manifest(&self) -> Result<HashMap<PathBuf, String>> {
         // Get current commit SHA
         let repo = gix::discover(&self.source_root)
             .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
@@ -818,7 +818,7 @@ impl PipelineBuilder {
             .tree()
             .map_err(|e| anyhow::anyhow!("Failed to get tree for HEAD commit: {}", e))?;
 
-        let mut manifest = std::collections::HashMap::new();
+        let mut manifest = HashMap::new();
 
         // Walk the entire git tree
         use gix::traverse::tree::Recorder;
@@ -841,7 +841,7 @@ impl PipelineBuilder {
     /// Filter manifest files against database - return files that need processing
     fn filter_files_by_manifest(
         &self,
-        git_manifest: &std::collections::HashMap<PathBuf, String>,
+        git_manifest: &HashMap<PathBuf, String>,
         processed_files_set: &HashSet<(String, String)>,
     ) -> Result<Vec<(PathBuf, String)>> {
         let mut files_to_process = Vec::new();

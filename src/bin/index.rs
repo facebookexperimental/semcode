@@ -13,8 +13,8 @@ use semcode::{FunctionInfo, MacroInfo, TypeInfo};
 // Temporary call relationships are now embedded in function JSON columns
 use dashmap::DashSet;
 use gix::revision::walk::Sorting;
+use gxhash::{HashMap, HashMapExt, HashSet};
 use semcode::perf_monitor::PERF_STATS;
-use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -582,7 +582,7 @@ async fn run_pipeline(args: Args) -> Result<()> {
     if !args.vectors {
         // Determine which files to process based on incremental mode
         let mut files_to_process = Vec::new();
-        let git_files_map: Option<std::collections::HashMap<PathBuf, GitFileEntry>> = None;
+        let git_files_map: Option<HashMap<PathBuf, GitFileEntry>> = None;
         let extensions: Vec<String> = args
             .extensions
             .iter()
@@ -1532,9 +1532,7 @@ async fn process_git_tuples_streaming(
 }
 
 /// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
-fn parse_commit_message_tags(message: &str) -> std::collections::HashMap<String, Vec<String>> {
-    use std::collections::HashMap;
-
+fn parse_commit_message_tags(message: &str) -> HashMap<String, Vec<String>> {
     let mut tags: HashMap<String, Vec<String>> = HashMap::new();
 
     for line in message.lines() {

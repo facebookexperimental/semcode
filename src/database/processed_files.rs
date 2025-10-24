@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use gxhash::{HashSet, HashSetExt};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -276,7 +277,7 @@ impl ProcessedFileStore {
     }
 
     /// Get only git file SHAs for efficient deduplication (much faster than loading full records)
-    pub async fn get_all_git_file_shas(&self) -> Result<std::collections::HashSet<String>> {
+    pub async fn get_all_git_file_shas(&self) -> Result<HashSet<String>> {
         use futures::TryStreamExt;
 
         let table = self
@@ -302,7 +303,7 @@ impl ProcessedFileStore {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut sha_set = std::collections::HashSet::new();
+        let mut sha_set = HashSet::new();
         let mut processed_count = 0;
 
         for batch in &results {
@@ -340,9 +341,7 @@ impl ProcessedFileStore {
     }
 
     /// Get file/git_file_sha pairs for pipeline deduplication (optimized for large datasets)
-    pub async fn get_all_file_git_sha_pairs(
-        &self,
-    ) -> Result<std::collections::HashSet<(String, String)>> {
+    pub async fn get_all_file_git_sha_pairs(&self) -> Result<HashSet<(String, String)>> {
         use futures::TryStreamExt;
 
         let table = self
@@ -369,7 +368,7 @@ impl ProcessedFileStore {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut pair_set = std::collections::HashSet::new();
+        let mut pair_set = HashSet::new();
         let mut processed_count = 0;
 
         for batch in &results {

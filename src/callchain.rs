@@ -3,7 +3,8 @@ use crate::{DatabaseManager, FunctionInfo, MacroInfo};
 use anstream::stdout;
 use anyhow::Result;
 use owo_colors::OwoColorize as _;
-use std::collections::{HashMap, HashSet, VecDeque};
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use std::collections::VecDeque;
 use std::io::Write;
 
 #[derive(Debug)]
@@ -972,7 +973,7 @@ pub async fn find_all_paths_to_writer(
 
     // Load only the functions we need for path analysis
     let all_path_functions = {
-        let mut functions_needed = std::collections::HashSet::new();
+        let mut functions_needed = HashSet::new();
         // Add entry points
         for entry in &entry_points {
             functions_needed.insert(entry.clone());

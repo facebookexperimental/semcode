@@ -3,6 +3,7 @@ use crate::{CodeVectorizer, DatabaseManager};
 use anstream::stdout;
 use anyhow::Result;
 use owo_colors::OwoColorize as _;
+use gxhash::{HashSet, HashSetExt};
 use std::fs::File;
 use std::io::Write;
 
@@ -806,7 +807,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     }
 
                     // Collect and display callers for all matched function definitions and macros
-                    let mut all_callers = std::collections::HashSet::new();
+                    let mut all_callers = HashSet::new();
                     for func in &regex_definitions {
                         let func_callers = get_function_callers(db, &func.name).await?;
                         all_callers.extend(func_callers);
@@ -863,7 +864,7 @@ async fn query_function_or_macro_to_writer_with_options(
 
                     // For regex results with multiple function definitions, collect unique function names and show consolidated callers
                     if regex_definitions.len() > 1 {
-                        let mut all_callers = std::collections::HashSet::new();
+                        let mut all_callers = HashSet::new();
                         for func in &regex_definitions {
                             let func_callers = get_function_callers(db, &func.name).await?;
                             all_callers.extend(func_callers);
@@ -930,7 +931,7 @@ async fn query_function_or_macro_to_writer_with_options(
 
                     // For regex results with multiple macros, collect unique callers and show consolidated callers
                     if regex_macros.len() > 1 {
-                        let mut all_callers = std::collections::HashSet::new();
+                        let mut all_callers = HashSet::new();
                         for macro_info in &regex_macros {
                             let macro_callers = get_function_callers(db, &macro_info.name).await?;
                             all_callers.extend(macro_callers);

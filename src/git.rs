@@ -3,6 +3,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use gix;
 use gix::bstr::ByteSlice;
+use gxhash::{HashMap, HashMapExt};
 
 /// Helper function to resolve a revspec (SHA, tag, etc.) to a commit object
 /// Ensures that tags are properly dereferenced to their target commits
@@ -34,7 +35,7 @@ pub fn resolve_to_commit<'a>(repo: &'a gix::Repository, revspec: &str) -> Result
         .map_err(|_| anyhow::anyhow!("'{}' does not resolve to a commit", revspec))
 }
 use once_cell::sync::Lazy;
-use std::collections::HashSet;
+use gxhash::{HashSet, HashSetExt};
 use std::path::{Path, PathBuf};
 
 // Global cache for git file hashes - lock-free concurrent access
@@ -552,9 +553,9 @@ pub fn resolve_files_at_commit<P: AsRef<Path>>(
     repo_path: P,
     commit_sha: &str,
     file_paths: &[String],
-) -> Result<std::collections::HashMap<String, String>> {
+) -> Result<HashMap<String, String>> {
     let repo_path = repo_path.as_ref();
-    let mut resolved_hashes = std::collections::HashMap::new();
+    let mut resolved_hashes = HashMap::new();
 
     tracing::debug!(
         "Resolving {} file paths at commit {}",
@@ -936,7 +937,6 @@ pub fn write_diff_and_extract_symbols(
     file_path: &str,
 ) -> (std::fmt::Result, Vec<String>) {
     use similar::{ChangeTag, TextDiff};
-    use std::collections::HashSet;
     use std::fmt::Write;
 
     // Generate a proper diff using the Myers algorithm

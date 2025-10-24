@@ -10,7 +10,7 @@ use lancedb::DistanceType;
 use crate::database::content::ContentStore;
 use crate::types::{FieldInfo, FunctionInfo, MacroInfo, ParameterInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
-use std::collections::HashMap;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 #[derive(Debug)]
 pub struct FunctionMatch {
@@ -232,7 +232,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -507,7 +507,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -961,7 +961,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1028,7 +1028,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1361,7 +1361,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1605,7 +1605,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1853,7 +1853,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -2123,7 +2123,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -2795,7 +2795,7 @@ impl VectorSearchManager {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut existing_commit_shas = std::collections::HashSet::new();
+        let mut existing_commit_shas = HashSet::new();
         for batch in &existing_vector_results {
             let sha_array = batch
                 .column(0)
@@ -3101,7 +3101,7 @@ impl VectorSearchManager {
                     let similarity_score = score_map.get(&git_sha).copied().unwrap_or(0.0);
 
                     let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(i))?;
-                    let tags: std::collections::HashMap<String, Vec<String>> =
+                    let tags: HashMap<String, Vec<String>> =
                         serde_json::from_str(tags_array.value(i))?;
                     let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
                     let files: Vec<String> = serde_json::from_str(files_array.value(i))?;

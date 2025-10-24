@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use std::collections::HashMap;
+use gxhash::{HashMap, HashMapExt};
 use std::sync::Mutex;
 
 const LINES_PER_PAGE: usize = 50;

@@ -6,7 +6,7 @@ use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use std::collections::HashMap;
+use gxhash::{HashMap, HashMapExt};
 use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;

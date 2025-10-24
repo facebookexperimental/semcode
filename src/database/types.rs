@@ -8,6 +8,7 @@ use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
@@ -391,7 +392,7 @@ impl TypeStore {
     pub async fn get_all_bulk_optimized(&self) -> Result<Vec<TypeInfo>> {
         let table = self.connection.open_table("types").execute().await?;
         let mut all_type_data = Vec::new();
-        let mut all_definition_hashes = std::collections::HashSet::new();
+        let mut all_definition_hashes = HashSet::new();
         let batch_size = 10000;
         let mut offset = 0;
 
@@ -434,7 +435,7 @@ impl TypeStore {
             let hash_vec: Vec<String> = all_definition_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct TypeInfo objects with content
@@ -548,25 +549,19 @@ impl TypeStore {
     }
 
     /// Bulk fetch content for multiple hashes
-    async fn bulk_get_content(
-        &self,
-        hashes: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    async fn bulk_get_content(&self, hashes: &[String]) -> Result<HashMap<String, String>> {
         self.content_store.get_content_bulk(hashes).await
     }
 
     /// Get types by a list of names (batch lookup) - optimized to minimize content queries
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, TypeInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, TypeInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("types").execute().await?;
         let mut all_type_data = Vec::new();
-        let mut all_definition_hashes = std::collections::HashSet::new();
+        let mut all_definition_hashes = HashSet::new();
 
         // Step 1: Fetch all type metadata and collect unique definition hashes
         for chunk in names.chunks(100) {
@@ -604,11 +599,11 @@ impl TypeStore {
             let hash_vec: Vec<String> = all_definition_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct TypeInfo objects with content
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
         for type_data in all_type_data {
             let definition = match type_data.definition_hash {
                 Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),
@@ -921,16 +916,13 @@ impl TypedefStore {
     }
 
     /// Get typedefs by a list of names (batch lookup)
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, TypedefInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, TypedefInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("types").execute().await?;
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
 
         // Process in smaller batches to avoid query size limits
         for chunk in names.chunks(100) {
@@ -1543,16 +1535,13 @@ impl MacroStore {
     }
 
     /// Get macros by a list of names (batch lookup)
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, MacroInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, MacroInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("macros").execute().await?;
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
 
         // Process in smaller batches to avoid query size limits
         for chunk in names.chunks(100) {

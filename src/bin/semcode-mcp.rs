@@ -2,6 +2,7 @@
 use anstream::stdout;
 use anyhow::Result;
 use clap::Parser;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use semcode::{git, pages::PageCache, process_database_path, DatabaseManager};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -585,9 +586,9 @@ async fn mcp_show_commit_metadata(
                         git_commit.subject,
                         git_commit.message,
                         git_commit.parent_sha,
-                        git_commit.symbols, // Symbols extracted from diff
-                        git_commit.files,   // Files changed in commit
-                        std::collections::HashMap::new(), // No tags extracted from git
+                        git_commit.symbols,   // Symbols extracted from diff
+                        git_commit.files,     // Files changed in commit
+                        HashMap::new(), // No tags extracted from git
                         git_commit.diff,
                         false,
                     )
@@ -3004,7 +3005,7 @@ async fn mcp_vcommit_similar_commits(
                 };
 
                 // Get all commits in the range using gitoxide
-                let mut range_commits = std::collections::HashSet::new();
+                let mut range_commits = HashSet::new();
 
                 // Walk from to_commit back to from_commit
                 let to_id = to_commit.id().detach();

@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use gxhash::{HashSet, HashSetExt};
 use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
@@ -47,8 +48,6 @@ impl SymbolFilenameStore {
     ) -> Result<()> {
         // Deduplicate pairs in memory before sending to database
         // This significantly reduces the workload on LanceDB's merge_insert
-        use std::collections::HashSet;
-
         let mut seen_keys = HashSet::new();
         let mut unique_pairs = Vec::new();
 
@@ -138,7 +137,7 @@ impl SymbolFilenameStore {
         // Deduplicate filenames (same symbol may appear multiple times if indexed at different git commits)
         let unique_filenames: Vec<String> = filenames
             .into_iter()
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
 

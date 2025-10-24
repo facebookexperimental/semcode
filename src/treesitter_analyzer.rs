@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashMap;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::path::Path;
 use std::sync::LazyLock;
 use streaming_iterator::StreamingIterator;
@@ -471,7 +471,7 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = function_name {
                 // Track which capture patterns were matched to determine if function has body
-                let mut matched_patterns = std::collections::HashSet::new();
+                let mut matched_patterns = HashSet::new();
                 for capture in m.captures {
                     let capture_name = self.function_query.capture_names()[capture.index as usize];
                     matched_patterns.insert(capture_name);
@@ -2041,9 +2041,7 @@ impl TreeSitterAnalyzer {
         &self,
         raw_functions: Vec<FunctionInfo>,
     ) -> Vec<FunctionInfo> {
-        use std::collections::HashMap;
-
-        let mut seen_functions = HashMap::<String, FunctionInfo>::new();
+        let mut seen_functions = HashMap::<String, FunctionInfo>::default();
 
         for func in raw_functions {
             let key = func.name.clone();
@@ -2090,9 +2088,7 @@ impl TreeSitterAnalyzer {
     /// Deduplicate types within a single file
     /// Simple deduplication by (name, kind) - types should be unique within a file anyway
     fn deduplicate_types_within_file(&self, raw_types: Vec<TypeInfo>) -> Vec<TypeInfo> {
-        use std::collections::HashMap;
-
-        let mut seen_types = HashMap::<(String, String), TypeInfo>::new();
+        let mut seen_types = HashMap::<(String, String), TypeInfo>::default();
 
         for type_info in raw_types {
             let key = (type_info.name.clone(), type_info.kind.clone());
@@ -2122,9 +2118,7 @@ impl TreeSitterAnalyzer {
     /// Deduplicate macros within a single file  
     /// Simple deduplication by name - macros should be unique within a file anyway
     fn deduplicate_macros_within_file(&self, raw_macros: Vec<MacroInfo>) -> Vec<MacroInfo> {
-        use std::collections::HashMap;
-
-        let mut seen_macros = HashMap::<String, MacroInfo>::new();
+        let mut seen_macros = HashMap::<String, MacroInfo>::default();
 
         for macro_info in raw_macros {
             let key = macro_info.name.clone();

@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
@@ -490,7 +491,7 @@ impl FunctionStore {
     pub async fn get_all_bulk_optimized(&self) -> Result<Vec<FunctionInfo>> {
         let table = self.connection.open_table("functions").execute().await?;
         let mut all_function_data = Vec::new();
-        let mut all_body_hashes = std::collections::HashSet::new();
+        let mut all_body_hashes = HashSet::new();
         let batch_size = 10000;
         let mut offset = 0;
 
@@ -534,7 +535,7 @@ impl FunctionStore {
             let hash_vec: Vec<String> = all_body_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct FunctionInfo objects with content
@@ -657,25 +658,19 @@ impl FunctionStore {
     }
 
     /// Bulk fetch content for multiple hashes
-    async fn bulk_get_content(
-        &self,
-        hashes: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    async fn bulk_get_content(&self, hashes: &[String]) -> Result<HashMap<String, String>> {
         self.content_store.get_content_bulk(hashes).await
     }
 
     /// Get functions by a list of names (batch lookup) - optimized to minimize content queries
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, FunctionInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("functions").execute().await?;
         let mut all_function_data = Vec::new();
-        let mut all_body_hashes = std::collections::HashSet::new();
+        let mut all_body_hashes = HashSet::new();
 
         // Step 1: Fetch all function metadata and collect unique body hashes
         for chunk in names.chunks(100) {
@@ -714,11 +709,11 @@ impl FunctionStore {
             let hash_vec: Vec<String> = all_body_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct FunctionInfo objects with content
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
         for func_data in all_function_data {
             let body = match func_data.body_hash {
                 Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),

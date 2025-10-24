@@ -1,0 +1,4 @@
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "use gxhash::HashMap instead for better performance" },
+    { path = "std::collections::HashSet", reason = "use gxhash::HashSet instead for better performance" },
+]
