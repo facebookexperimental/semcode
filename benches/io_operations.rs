@@ -8,11 +8,12 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use semcode::search::{dump_functions, dump_macros, dump_types};
 use semcode::types::{FunctionInfo, MacroInfo, TypeInfo};
 use semcode::DatabaseManager;
+use smallvec::SmallVec;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
 // Helper to create test data matching real-world function patterns
-// Parameters: Most functions have 0-5 params
+// Parameters: Most functions have 0-5 params (SmallVec stays on stack)
 // Bodies: Realistic length for C functions (~50-200 chars)
 fn create_test_functions(count: usize) -> Vec<FunctionInfo> {
     (0..count)
@@ -23,7 +24,7 @@ fn create_test_functions(count: usize) -> Vec<FunctionInfo> {
             line_start: i as u32,
             line_end: (i + 10) as u32,
             return_type: "int".to_string(),
-            parameters: vec![],
+            parameters: SmallVec::new(),
             body: format!("void test_function_{}() {{ return {}; }}", i, i),
             calls: None,
             types: None,
@@ -40,7 +41,7 @@ fn create_test_types(count: usize) -> Vec<TypeInfo> {
             line_start: i as u32,
             kind: "struct".to_string(),
             size: None,
-            members: vec![],
+            members: SmallVec::new(),
             definition: format!("struct test_type_{} {{ int field; }};", i),
             types: None,
         })

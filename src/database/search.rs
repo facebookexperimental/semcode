@@ -6,7 +6,9 @@ use lancedb::connection::Connection;
 use lancedb::index::{vector::IvfPqIndexBuilder, Index as LanceIndex};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
+use smallvec::SmallVec;
 
+use crate::consts::{SMALLVEC_FIELD_SIZE, SMALLVEC_PARAM_SIZE};
 use crate::database::content::ContentStore;
 use crate::types::{FieldInfo, FunctionInfo, MacroInfo, ParameterInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
@@ -159,7 +161,7 @@ impl SearchManager {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                let parameters: Vec<ParameterInfo> =
+                let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                     serde_json::from_str(parameters_array.value(i))?;
 
                 // Get function body from content table using hash (if not null)
@@ -337,7 +339,7 @@ impl SearchManager {
                     .unwrap();
 
                 for i in 0..batch.num_rows() {
-                    let parameters: Vec<ParameterInfo> =
+                    let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                         serde_json::from_str(parameters_array.value(i))?;
 
                     // Get function body from content table using hash (if not null)
@@ -445,7 +447,8 @@ impl SearchManager {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                    serde_json::from_str(fields_array.value(i))?;
                 let size = if size_array.is_null(i) {
                     None
                 } else {
@@ -617,7 +620,8 @@ impl SearchManager {
                     .unwrap();
 
                 for i in 0..batch.num_rows() {
-                    let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                    let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                        serde_json::from_str(fields_array.value(i))?;
                     let size = if size_array.is_null(i) {
                         None
                     } else {
@@ -702,7 +706,8 @@ impl SearchManager {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                    serde_json::from_str(fields_array.value(i))?;
                 let size = if size_array.is_null(i) {
                     None
                 } else {
@@ -1311,7 +1316,8 @@ impl SearchManager {
                     continue;
                 }
 
-                let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                    serde_json::from_str(fields_array.value(i))?;
                 let size = if size_array.is_null(i) {
                     None
                 } else {
@@ -1466,7 +1472,8 @@ impl SearchManager {
                         continue;
                     }
 
-                    let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                    let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                        serde_json::from_str(fields_array.value(i))?;
                     let size = if size_array.is_null(i) {
                         None
                     } else {
@@ -1792,7 +1799,7 @@ impl SearchManager {
                     continue;
                 }
 
-                let parameters: Vec<ParameterInfo> =
+                let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                     serde_json::from_str(parameters_array.value(i))?;
 
                 // Get function body from content table using hash (if not null)
@@ -1953,7 +1960,7 @@ impl SearchManager {
                         continue;
                     }
 
-                    let parameters: Vec<ParameterInfo> =
+                    let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                         serde_json::from_str(parameters_array.value(i))?;
 
                     // Get function body from content table using hash (if not null)
@@ -2514,7 +2521,8 @@ impl VectorSearchManager {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let parameters: Vec<ParameterInfo> = serde_json::from_str(parameters_array.value(row))?;
+        let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
+            serde_json::from_str(parameters_array.value(row))?;
 
         // Get function body from content table using hash (if not null)
         let body = if body_hash_array.is_null(row) {

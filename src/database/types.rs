@@ -9,8 +9,10 @@ use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
+use crate::consts::SMALLVEC_FIELD_SIZE;
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::content::ContentStore;
 use crate::types::{FieldInfo, MacroInfo, TypeInfo, TypedefInfo};
@@ -23,7 +25,7 @@ struct TypeMetadata {
     pub line_start: u32,
     pub kind: String,
     pub size: Option<u64>,
-    pub members: Vec<FieldInfo>,
+    pub members: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]>,
     pub definition_hash: Option<String>,
     pub types: Option<Vec<String>>,
 }
@@ -514,7 +516,8 @@ impl TypeStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
+        let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+            serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
             None
         } else {
@@ -725,7 +728,8 @@ impl TypeStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
+        let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+            serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
             None
         } else {
@@ -814,7 +818,7 @@ impl TypedefStore {
                     line_start: typedef.line_start,
                     kind: "typedef".to_string(),
                     size: None,
-                    members: Vec::new(),
+                    members: SmallVec::new(),
                     definition: full_definition,
                     types: None, // Typedefs don't reference other types directly
                 }

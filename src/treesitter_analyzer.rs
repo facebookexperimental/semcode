@@ -2,11 +2,13 @@
 use anyhow::Result;
 use regex::Regex;
 use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use smallvec::SmallVec;
 use std::path::Path;
 use std::sync::LazyLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
+use crate::consts::SMALLVEC_PARAM_SIZE;
 use crate::types::{
     FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroInfo, ParameterInfo, TypeInfo,
 };
@@ -544,7 +546,7 @@ impl TreeSitterAnalyzer {
                     line_start,
                     line_end,
                     return_type: return_type.unwrap_or_else(|| "void".to_string()),
-                    parameters: parameters.clone(),
+                    parameters: parameters.clone().into(),
                     body: complete_body,
                     calls: if unique_calls.is_empty() {
                         None
@@ -777,7 +779,7 @@ impl TreeSitterAnalyzer {
                     line_start,
                     kind,
                     size: None, // Tree-sitter can't calculate size
-                    members,
+                    members: members.into(),
                     definition: complete_definition,
                     types: if referenced_types.is_empty() {
                         None
@@ -870,8 +872,8 @@ impl TreeSitterAnalyzer {
                     git_file_hash: git_hash.to_string(),
                     line_start,
                     kind: "typedef".to_string(),
-                    size: None,          // Typedefs don't have intrinsic size
-                    members: Vec::new(), // Typedefs don't have members
+                    size: None,               // Typedefs don't have intrinsic size
+                    members: SmallVec::new(), // Typedefs don't have members
                     definition: full_definition,
                     types: if referenced_types.is_empty() {
                         None
@@ -1726,7 +1728,7 @@ impl TreeSitterAnalyzer {
         parameters: &[ParameterInfo],
         local_types: &HashMap<String, (String, String)>,
         global_types: &GlobalTypeRegistry,
-    ) -> Vec<ParameterInfo> {
+    ) -> SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> {
         parameters
             .iter()
             .map(|param| {

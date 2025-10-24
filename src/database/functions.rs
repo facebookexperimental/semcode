@@ -7,8 +7,10 @@ use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
+use crate::consts::SMALLVEC_PARAM_SIZE;
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::content::ContentStore;
 use crate::types::{FunctionInfo, ParameterInfo};
@@ -21,7 +23,7 @@ struct FunctionMetadata {
     pub line_start: u32,
     pub line_end: u32,
     pub return_type: String,
-    pub parameters: Vec<ParameterInfo>,
+    pub parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]>,
     pub body_hash: Option<String>,
     pub calls: Option<Vec<String>>,
     pub types: Option<Vec<String>>,
@@ -620,8 +622,8 @@ impl FunctionStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let parameters: Vec<ParameterInfo> =
-            serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
+        let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
+            serde_json::from_str(parameters_array.value(row))?;
 
         // Get body hash if not null
         let body_hash = if body_hash_array.is_null(row) {
@@ -795,8 +797,8 @@ impl FunctionStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let parameters: Vec<ParameterInfo> =
-            serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
+        let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
+            serde_json::from_str(parameters_array.value(row))?;
 
         // Get function body from content table using hash (if not null)
         let body = if body_hash_array.is_null(row) {

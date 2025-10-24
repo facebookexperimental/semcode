@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use gxhash::{HashMap, HashMapExt};
+use crate::consts::{SMALLVEC_FIELD_SIZE, SMALLVEC_PARAM_SIZE};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionInfo {
@@ -10,7 +12,7 @@ pub struct FunctionInfo {
     pub line_start: u32,
     pub line_end: u32,
     pub return_type: String,
-    pub parameters: Vec<ParameterInfo>,
+    pub parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]>, // Most functions have <=10 parameters
     pub body: String,
     #[serde(default)]
     pub calls: Option<Vec<String>>, // Function names called by this function
@@ -36,7 +38,7 @@ pub struct TypeInfo {
     pub line_start: u32,
     pub kind: String,
     pub size: Option<u64>,
-    pub members: Vec<FieldInfo>,
+    pub members: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]>, // Most structs have <=20 fields
     pub definition: String, // Added to store raw type definition with comments
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names referenced by this type

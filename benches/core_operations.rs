@@ -6,6 +6,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use semcode::text_utils::preprocess_code;
+use smallvec::SmallVec;
 
 // Sample C code snippets of various sizes
 const SMALL_CODE: &str = r#"
@@ -187,7 +188,7 @@ fn bench_regex_search(c: &mut Criterion) {
                 line_start: 10,
                 line_end: 20,
                 return_type: "int".to_string(),
-                parameters: vec![],
+                parameters: SmallVec::new(),
                 body: "int process_user_data(struct user *u) { return validate_user(u); }"
                     .to_string(),
                 calls: None,
@@ -200,7 +201,7 @@ fn bench_regex_search(c: &mut Criterion) {
                 line_start: 30,
                 line_end: 40,
                 return_type: "void".to_string(),
-                parameters: vec![],
+                parameters: SmallVec::new(),
                 body: "void process_system_data(int flags) { handle_flags(flags); }".to_string(),
                 calls: None,
                 types: None,
@@ -212,7 +213,7 @@ fn bench_regex_search(c: &mut Criterion) {
                 line_start: 50,
                 line_end: 60,
                 return_type: "void".to_string(),
-                parameters: vec![],
+                parameters: SmallVec::new(),
                 body: "void handle_request(void) { parse_request(); }".to_string(),
                 calls: None,
                 types: None,
@@ -300,16 +301,17 @@ fn bench_hashmap_operations(c: &mut Criterion) {
     group.finish();
 }
 
-// Benchmark Vec allocation patterns (baseline before SmallVec optimization)
+// Benchmark SmallVec allocation patterns (stack-allocated for small sizes)
 fn bench_vec_operations(c: &mut Criterion) {
     use semcode::types::ParameterInfo;
+    use smallvec::SmallVec;
 
     let mut group = c.benchmark_group("vec_operations");
 
-    // Benchmark Vec allocation (common case: <=10 params, 99.9% of functions)
+    // Benchmark SmallVec allocation (common case: <=10 params, 99.9% of functions fit on stack)
     group.bench_function("vec_params_small", |b| {
         b.iter(|| {
-            let mut params: Vec<ParameterInfo> = Vec::new();
+            let mut params: SmallVec<[ParameterInfo; 10]> = SmallVec::new();
             for i in 0..5 {
                 params.push(ParameterInfo {
                     name: format!("param{}", i),
@@ -322,10 +324,10 @@ fn bench_vec_operations(c: &mut Criterion) {
         })
     });
 
-    // Benchmark Vec allocation at typical capacity (10 params)
+    // Benchmark SmallVec allocation at edge of stack capacity (10 params, fits exactly)
     group.bench_function("vec_params_medium", |b| {
         b.iter(|| {
-            let mut params: Vec<ParameterInfo> = Vec::new();
+            let mut params: SmallVec<[ParameterInfo; 10]> = SmallVec::new();
             for i in 0..10 {
                 params.push(ParameterInfo {
                     name: format!("param{}", i),
@@ -338,10 +340,10 @@ fn bench_vec_operations(c: &mut Criterion) {
         })
     });
 
-    // Benchmark Vec allocation for larger case (>10 params, 0.1% of functions)
+    // Benchmark SmallVec allocation spilling to heap (>10 params, 0.1% of functions)
     group.bench_function("vec_params_large", |b| {
         b.iter(|| {
-            let mut params: Vec<ParameterInfo> = Vec::new();
+            let mut params: SmallVec<[ParameterInfo; 10]> = SmallVec::new();
             for i in 0..15 {
                 params.push(ParameterInfo {
                     name: format!("param{}", i),
@@ -354,10 +356,10 @@ fn bench_vec_operations(c: &mut Criterion) {
         })
     });
 
-    // Benchmark Vec for struct fields (typical: 15 fields)
+    // Benchmark SmallVec for struct fields (typical: 15 fields, fits in 22-element stack allocation)
     group.bench_function("vec_fields_medium", |b| {
         b.iter(|| {
-            let mut fields: Vec<String> = Vec::new();
+            let mut fields: SmallVec<[String; 22]> = SmallVec::new();
             for i in 0..15 {
                 fields.push(format!("field_{}", i));
             }
