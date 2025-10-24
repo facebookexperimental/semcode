@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+
+// Use mimalloc as the global allocator for better performance (10-20% faster)
+// Works on both Linux and macOS (including M1/M2)
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Module declarations
 pub mod database;
 pub mod database_utils;
