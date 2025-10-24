@@ -5,7 +5,7 @@ use anyhow::Result;
 use owo_colors::OwoColorize as _;
 use gxhash::{HashSet, HashSetExt};
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 use crate::display::{
     display_function_to_writer_with_options, display_macro_to_writer, display_type_to_writer,
@@ -253,7 +253,7 @@ pub async fn dump_functions(db: &DatabaseManager, output_file: &str) -> Result<(
     let functions = db.get_all_functions_metadata_only().await?;
     let json = serde_json::to_string_pretty(&functions)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -272,7 +272,7 @@ pub async fn dump_types(db: &DatabaseManager, output_file: &str) -> Result<()> {
     let types = db.get_all_types_metadata_only().await?;
     let json = serde_json::to_string_pretty(&types)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -291,7 +291,7 @@ pub async fn dump_typedefs(db: &DatabaseManager, output_file: &str) -> Result<()
     let typedefs = db.get_all_typedefs().await?;
     let json = serde_json::to_string_pretty(&typedefs)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -310,7 +310,7 @@ pub async fn dump_macros(db: &DatabaseManager, output_file: &str) -> Result<()> 
     let macros = db.get_all_macros_metadata_only().await?;
     let json = serde_json::to_string_pretty(&macros)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -352,7 +352,7 @@ pub async fn dump_calls(db: &DatabaseManager, output_file: &str) -> Result<()> {
 
     let json = serde_json::to_string_pretty(&json_calls)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -379,7 +379,7 @@ pub async fn dump_processed_files(db: &DatabaseManager, output_file: &str) -> Re
 
     let json = serde_json::to_string_pretty(&json_records)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -405,7 +405,7 @@ pub async fn dump_content(db: &DatabaseManager, output_file: &str) -> Result<()>
 
     let json = serde_json::to_string_pretty(&json_records)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -440,7 +440,7 @@ pub async fn dump_symbol_filename(db: &DatabaseManager, output_file: &str) -> Re
 
     let json = serde_json::to_string_pretty(&json_records)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -459,7 +459,7 @@ pub async fn dump_git_commits(db: &DatabaseManager, output_file: &str) -> Result
     let commits = db.get_all_git_commits().await?;
     let json = serde_json::to_string_pretty(&commits)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
