@@ -3,6 +3,7 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use semcode::git;
 use semcode::git::resolve_to_commit;
 use semcode::{
     measure, process_database_path, CodeVectorizer, DatabaseManager, GitFileEntry,
@@ -10,6 +11,7 @@ use semcode::{
 };
 use semcode::{FunctionInfo, MacroInfo, TypeInfo};
 // Temporary call relationships are now embedded in function JSON columns
+use dashmap::DashSet;
 use gix::revision::walk::Sorting;
 use semcode::perf_monitor::PERF_STATS;
 use std::collections::HashSet;
@@ -94,16 +96,17 @@ struct Args {
     #[arg(long)]
     perf: bool,
 
-    /// Index a specific git commit. When provided, indexes the specified git SHA by reading files directly from git blobs.
-    /// Uses the same algorithm as default indexing but sources files from git instead of working directory.
-    #[arg(long, value_name = "GIT_SHA")]
-    inc: Option<String>,
-
     /// Index files modified in git commit range without checking them out.
     /// Accepts range format only (SHA1..SHA2). Reads files directly from git blobs.
     /// Uses incremental processing and deduplication with parallel streaming pipeline.
     #[arg(long, value_name = "GIT_RANGE")]
     git: Option<String>,
+
+    /// Index only git commit metadata for the specified revision range.
+    /// Accepts range format only (SHA1..SHA2), parsed the same way as --git.
+    /// Populates only the commits table without indexing any source files.
+    #[arg(long, value_name = "COMMIT_RANGE")]
+    commits: Option<String>,
 }
 
 #[tokio::main]
@@ -178,9 +181,22 @@ async fn main() -> Result<()> {
     // Initialize tracing with SEMCODE_DEBUG environment variable support
     semcode::logging::init_tracing();
 
+    // Validate mutually exclusive options
+    if args.git.is_some() && args.commits.is_some() {
+        return Err(anyhow::anyhow!(
+            "--git and --commits are mutually exclusive. Use --git to index files in a commit range, or --commits to index only commit metadata."
+        ));
+    }
+
     info!("Starting semantic code indexing");
     if let Some(ref git_range) = args.git {
         info!("Git commit indexing mode: {}", git_range);
+        info!(
+            "Source directory: {} (for git repository detection)",
+            args.source.display()
+        );
+    } else if let Some(ref commit_range) = args.commits {
+        info!("Commit metadata indexing mode: {}", commit_range);
         info!(
             "Source directory: {} (for git repository detection)",
             args.source.display()
@@ -205,10 +221,336 @@ async fn main() -> Result<()> {
         info!("Comment extraction: enabled");
     }
 
+    // Handle commits-only mode
+    if args.commits.is_some() {
+        info!("Running commits-only indexing mode");
+        return run_commits_only(args).await;
+    }
+
     // Run TreeSitter pipeline processing (the only option now)
     info!("Using Tree-sitter for code analysis");
     info!("Using pipeline processing for better CPU utilization");
     run_pipeline(args).await
+}
+
+async fn run_commits_only(args: Args) -> Result<()> {
+    info!("Starting commits-only indexing mode");
+
+    let commit_range = args.commits.as_ref().unwrap();
+
+    // Validate range format
+    if !commit_range.contains("..") {
+        return Err(anyhow::anyhow!(
+            "Commits indexing requires a range format (e.g., 'HEAD~10..HEAD'). Got: '{}'",
+            commit_range
+        ));
+    }
+
+    // Process database path
+    let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
+
+    // Create database manager and tables
+    let db_manager =
+        DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
+    db_manager.create_tables().await?;
+
+    if args.clear {
+        println!("Clearing existing data...");
+        db_manager.clear_all_data().await?;
+        println!("Existing data cleared.");
+    }
+
+    // Open repository and get list of commits in range
+    let repo = gix::discover(&args.source)
+        .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+    let commit_shas = list_shas_in_range(&repo, commit_range)?;
+    let commit_count = commit_shas.len();
+
+    if commit_shas.is_empty() {
+        println!("No commits found in range: {}", commit_range);
+        return Ok(());
+    }
+
+    println!(
+        "Checking for {} commits already in database...",
+        commit_count
+    );
+
+    // Get existing commits from database to avoid reprocessing
+    let existing_commits: HashSet<String> = {
+        let all_commits = db_manager.get_all_git_commits().await?;
+        all_commits.into_iter().map(|c| c.git_sha).collect()
+    };
+
+    // Filter out commits that are already in the database
+    let new_commit_shas: Vec<String> = commit_shas
+        .into_iter()
+        .filter(|sha| !existing_commits.contains(sha))
+        .collect();
+
+    let already_indexed = commit_count - new_commit_shas.len();
+    if already_indexed > 0 {
+        println!(
+            "{} commits already indexed, processing {} new commits",
+            already_indexed,
+            new_commit_shas.len()
+        );
+    } else {
+        println!("Processing all {} new commits", new_commit_shas.len());
+    }
+
+    if new_commit_shas.is_empty() {
+        println!("All commits in range are already indexed!");
+        return Ok(());
+    }
+
+    let start_time = std::time::Instant::now();
+
+    // Process commits using streaming pipeline
+    let batch_size = 100;
+    let num_workers = num_cpus::get();
+
+    process_commits_pipeline(
+        &args.source,
+        new_commit_shas,
+        Arc::new(db_manager),
+        batch_size,
+        num_workers,
+        existing_commits,
+    )
+    .await?;
+
+    let total_time = start_time.elapsed();
+
+    println!("\n=== Commits-Only Indexing Complete ===");
+    println!("Total time: {:.1}s", total_time.as_secs_f64());
+    println!("Commits indexed: {}", commit_count);
+    println!("To query this database, run:");
+    println!("  semcode --database {}", database_path);
+
+    Ok(())
+}
+
+/// Process commits using a streaming pipeline
+async fn process_commits_pipeline(
+    repo_path: &std::path::Path,
+    commit_shas: Vec<String>,
+    db_manager: Arc<DatabaseManager>,
+    batch_size: usize,
+    num_workers: usize,
+    existing_commits: HashSet<String>,
+) -> Result<()> {
+    use std::sync::Mutex;
+
+    // Create progress bar
+    let pb = ProgressBar::new(commit_shas.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} commits ({per_sec}) - {msg}"
+        )
+        .unwrap()
+        .progress_chars("█▓▒░  ")
+    );
+
+    // Create channels for streaming
+    // Use unbounded channel for commit SHAs (small strings, no memory concern)
+    let (commit_tx, commit_rx) = mpsc::channel::<String>();
+    // Use bounded channel for commit metadata (large diffs) to prevent memory explosion
+    // Bound of 10 batches = max ~1000 commits in memory = ~50-100MB instead of 170GB
+    let (result_tx, result_rx) = mpsc::sync_channel::<Vec<semcode::GitCommitInfo>>(10);
+
+    // Wrap receiver for shared access
+    let shared_commit_rx = Arc::new(Mutex::new(commit_rx));
+
+    // Shared counters
+    let processed_count = Arc::new(AtomicUsize::new(0));
+    let inserted_count = Arc::new(AtomicUsize::new(0));
+
+    // Spawn progress updater thread
+    let pb_clone = pb.clone();
+    let processed_clone = processed_count.clone();
+    let progress_thread = std::thread::spawn(move || loop {
+        let count = processed_clone.load(Ordering::Relaxed);
+        pb_clone.set_position(count as u64);
+        if pb_clone.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+
+    // Spawn worker threads to extract commit metadata
+    let mut worker_handles = Vec::new();
+    for worker_id in 0..num_workers {
+        let worker_commit_rx = shared_commit_rx.clone();
+        let worker_result_tx = result_tx.clone();
+        let worker_repo_path = repo_path.to_path_buf();
+        let worker_processed = processed_count.clone();
+
+        let handle = thread::spawn(move || {
+            // Open repository ONCE per worker thread, reuse for all commits
+            let thread_repo = match gix::discover(&worker_repo_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
+                    return;
+                }
+            };
+
+            let mut batch = Vec::new();
+
+            loop {
+                // Get next commit SHA
+                let commit_sha = {
+                    match worker_commit_rx.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(e) => {
+                            tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
+                            break;
+                        }
+                    }
+                };
+
+                match commit_sha {
+                    Ok(sha) => {
+                        match extract_commit_metadata(&thread_repo, &sha) {
+                            Ok(metadata) => {
+                                batch.push(metadata);
+                                worker_processed.fetch_add(1, Ordering::Relaxed);
+
+                                // Send batch when it reaches batch_size
+                                if batch.len() >= batch_size {
+                                    if worker_result_tx.send(batch.clone()).is_err() {
+                                        break;
+                                    }
+                                    batch.clear();
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Worker {} failed to extract metadata for {}: {}",
+                                    worker_id, sha, e
+                                );
+                                worker_processed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Channel closed, send remaining batch
+                        if !batch.is_empty() {
+                            let _ = worker_result_tx.send(batch);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        worker_handles.push(handle);
+    }
+
+    // Spawn producer thread to feed commit SHAs
+    let producer_handle = thread::spawn(move || {
+        for commit_sha in commit_shas {
+            if commit_tx.send(commit_sha).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Close original senders
+    drop(result_tx);
+
+    // Wrap result receiver for shared access across multiple inserter tasks
+    let shared_result_rx = Arc::new(Mutex::new(result_rx));
+
+    // Spawn multiple database inserter tasks for parallel insertion
+    // Initialize with existing commits from database and track new inserts
+    let seen_commits = Arc::new(Mutex::new(existing_commits));
+
+    // Use 8 inserter tasks for parallel database insertion
+    // Balance between parallelism (faster insertion) and lock contention
+    let num_inserters = 16;
+    let mut inserter_handles = Vec::new();
+
+    for inserter_id in 0..num_inserters {
+        let db_manager_clone = Arc::clone(&db_manager);
+        let inserted_clone = inserted_count.clone();
+        let pb_clone = pb.clone();
+        let seen_commits_clone = seen_commits.clone();
+        let result_rx_clone = shared_result_rx.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Get next batch from shared receiver
+                let batch = {
+                    let rx = result_rx_clone.lock().unwrap();
+                    rx.recv()
+                };
+
+                match batch {
+                    Ok(batch) => {
+                        // Filter out commits we've already seen (in DB or inserted this run)
+                        let filtered_batch: Vec<_> = {
+                            let mut seen = seen_commits_clone.lock().unwrap();
+                            batch
+                                .into_iter()
+                                .filter(|commit| {
+                                    // Try to insert the git_sha; if it's already present, filter it out
+                                    seen.insert(commit.git_sha.clone())
+                                })
+                                .collect()
+                        };
+
+                        if !filtered_batch.is_empty() {
+                            let batch_len = filtered_batch.len();
+                            if let Err(e) =
+                                db_manager_clone.insert_git_commits(filtered_batch).await
+                            {
+                                error!(
+                                    "Inserter {} failed to insert commit batch: {}",
+                                    inserter_id, e
+                                );
+                            } else {
+                                let total = inserted_clone.fetch_add(batch_len, Ordering::Relaxed)
+                                    + batch_len;
+                                pb_clone.set_message(format!("{} inserted", total));
+                            }
+                        }
+                    }
+                    Err(_) => break, // Channel closed, exit task
+                }
+            }
+        });
+
+        inserter_handles.push(handle);
+    }
+
+    // Wait for producer to finish
+    if let Err(e) = producer_handle.join() {
+        tracing::error!("Producer thread panicked: {:?}", e);
+    }
+
+    // Wait for workers to finish
+    for (worker_id, handle) in worker_handles.into_iter().enumerate() {
+        if let Err(e) = handle.join() {
+            tracing::error!("Worker {} thread panicked: {:?}", worker_id, e);
+        }
+    }
+
+    // Wait for all inserter tasks to finish
+    for (inserter_id, handle) in inserter_handles.into_iter().enumerate() {
+        if let Err(e) = handle.await {
+            tracing::error!("Inserter {} task failed: {:?}", inserter_id, e);
+        }
+    }
+
+    // Finish progress bar
+    pb.finish_with_message(format!(
+        "Complete: {} commits processed",
+        processed_count.load(Ordering::Relaxed)
+    ));
+    progress_thread.join().unwrap();
+
+    Ok(())
 }
 
 async fn run_pipeline(args: Args) -> Result<()> {
@@ -271,6 +613,43 @@ async fn run_pipeline(args: Args) -> Result<()> {
             }
 
             info!("Found {} files to process", files_to_process.len());
+
+            // Extract and store git commit metadata for current commit
+            info!("Extracting git commit metadata for current commit");
+            match gix::discover(&args.source) {
+                Ok(repo) => {
+                    // Get current HEAD commit
+                    match repo.head_commit() {
+                        Ok(commit) => {
+                            let commit_sha = commit.id().to_string();
+                            info!("Current commit: {}", commit_sha);
+
+                            match extract_commit_metadata(&repo, &commit_sha) {
+                                Ok(metadata) => {
+                                    info!("Inserting commit metadata for {}", commit_sha);
+                                    if let Err(e) =
+                                        db_manager.insert_git_commits(vec![metadata]).await
+                                    {
+                                        warn!("Failed to insert commit metadata: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to extract commit metadata: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get HEAD commit: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Not in a git repository ({}), skipping commit metadata extraction",
+                        e
+                    );
+                }
+            }
         }
 
         // Build and run pipeline (TreeSitter-only now)
@@ -421,6 +800,16 @@ async fn run_pipeline(args: Args) -> Result<()> {
                 }) {
                     Ok(_) => {
                         println!("Vector generation completed successfully");
+
+                        // Generate vectors for git commits
+                        println!("Generating vectors for git commits...");
+                        match measure!("commit_vector_generation", {
+                            db_manager.update_commit_vectors(&vectorizer).await
+                        }) {
+                            Ok(_) => println!("Commit vector generation completed successfully"),
+                            Err(e) => error!("Failed to generate commit vectors: {}", e),
+                        }
+
                         println!("Creating vector index...");
                         match measure!("vector_index_creation", {
                             db_manager.create_vector_index().await
@@ -498,8 +887,8 @@ struct GitFileTuple {
     object_id: gix::ObjectId,
 }
 
-/// Results from processing git file tuples
-#[derive(Debug, Default)]
+/// Results from processing git file tuples (for database insertion batches)
+#[derive(Debug, Default, Clone)]
 struct GitTupleResults {
     functions: Vec<FunctionInfo>,
     types: Vec<TypeInfo>,
@@ -516,43 +905,37 @@ impl GitTupleResults {
     }
 }
 
-/// Get manifest of files from a specific git commit (just paths and object IDs, no content)
-fn get_git_commit_manifest(
-    repo_path: &std::path::Path,
+/// Statistics from processing git file tuples (lightweight, no accumulated data)
+#[derive(Debug, Default, Clone)]
+struct GitTupleStats {
+    files_processed: usize,
+    functions_count: usize,
+    types_count: usize,
+    macros_count: usize,
+}
+
+/// Get manifest of files from a specific git commit with a reused repository reference
+/// This version avoids repeated repository discovery for better performance
+fn get_git_commit_manifest_with_repo(
+    repo: &gix::Repository,
     git_sha: &str,
     extensions: &[String],
 ) -> Result<Vec<GitFileManifestEntry>> {
-    let repo =
-        gix::discover(repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
-
-    let commit = resolve_to_commit(&repo, git_sha)?;
-
-    let tree = commit
-        .tree()
-        .map_err(|e| anyhow::anyhow!("Failed to get tree for commit '{}': {}", git_sha, e))?;
-
     let mut manifest = Vec::new();
 
-    // Walk the entire git tree
-    use gix::traverse::tree::Recorder;
-    let mut recorder = Recorder::default();
-    tree.traverse().breadthfirst(&mut recorder)?;
-
-    for entry in recorder.records {
-        if entry.mode.is_blob() {
-            let relative_path = entry.filepath.to_string();
-
-            // Check if file has one of the target extensions
-            if let Some(ext) = std::path::Path::new(&relative_path).extension() {
-                if extensions.contains(&ext.to_string_lossy().to_string()) {
-                    manifest.push(GitFileManifestEntry {
-                        relative_path: relative_path.into(),
-                        object_id: entry.oid,
-                    });
-                }
+    // Use shared tree traversal utility with extension filtering (with repo reuse)
+    semcode::git::walk_tree_at_commit_with_repo(repo, git_sha, |relative_path, object_id| {
+        // Check if file has one of the target extensions
+        if let Some(ext) = std::path::Path::new(relative_path).extension() {
+            if extensions.contains(&ext.to_string_lossy().to_string()) {
+                manifest.push(GitFileManifestEntry {
+                    relative_path: relative_path.into(),
+                    object_id: *object_id,
+                });
             }
         }
-    }
+        Ok(())
+    })?;
 
     Ok(manifest)
 }
@@ -616,7 +999,7 @@ fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>
 
     let mut shas = Vec::new();
     let mut commit_count = 0;
-    const MAX_COMMITS: usize = 100000; // Safety limit
+    const MAX_COMMITS: usize = 10000000; // Safety limit
 
     // Iterate commits in the set "reachable from B but not from A"
     for info in walk {
@@ -639,32 +1022,25 @@ fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>
     // Reverse to get chronological order (oldest first)
     shas.reverse();
 
-    // Validate result count is reasonable
-    if shas.len() > 10000 {
-        eprintln!(
-            "WARNING: Range {} produced {} commits, which seems very large",
-            range,
-            shas.len()
-        );
-        eprintln!("WARNING: Please verify this range is correct. Use 'git rev-list --count {}' to double-check.", range);
-    }
-
     Ok(shas)
 }
 
 /// Stream git file tuples to a channel from a subset of commits (producer)
 fn stream_git_file_tuples_batch(
-    generator_id: usize,
+    _generator_id: usize,
     repo_path: PathBuf,
     commit_batch: Vec<String>,
     extensions: Vec<String>,
     tuple_tx: mpsc::Sender<GitFileTuple>,
     processed_files: Arc<HashSet<String>>,
-    sent_in_this_run: Arc<std::sync::Mutex<HashSet<String>>>,
+    sent_in_this_run: Arc<DashSet<String>>,
 ) -> Result<()> {
+    // Open repository ONCE per generator thread and reuse for all commits
+    let repo = gix::discover(&repo_path)?;
+
     for commit_sha in commit_batch.iter() {
-        // Get all files from this commit
-        let manifest = get_git_commit_manifest(&repo_path, commit_sha, &extensions)?;
+        // Get all files from this commit using reused repo handle
+        let manifest = get_git_commit_manifest_with_repo(&repo, commit_sha, &extensions)?;
 
         for manifest_entry in manifest {
             let file_sha = manifest_entry.object_id.to_string();
@@ -674,26 +1050,10 @@ fn stream_git_file_tuples_batch(
                 continue;
             }
 
-            // Filter out files already sent in this run (shared across all generators)
-            {
-                let mut sent_set = match sent_in_this_run.lock() {
-                    Ok(set) => set,
-                    Err(e) => {
-                        tracing::error!(
-                            "Generator {} failed to lock sent_in_this_run: {}",
-                            generator_id,
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                if sent_set.contains(&file_sha) {
-                    continue;
-                }
-
-                // Mark as sent and create tuple
-                sent_set.insert(file_sha.clone());
+            // Filter out files already sent in this run (lock-free with DashSet)
+            if !sent_in_this_run.insert(file_sha.clone()) {
+                // File already sent by another generator
+                continue;
             }
 
             let tuple = GitFileTuple {
@@ -714,25 +1074,21 @@ fn stream_git_file_tuples_batch(
 
 // Mapping extraction functions removed - now using embedded calls/types columns
 
-/// Process a single git file tuple and extract functions/types/macros
-fn process_git_file_tuple(
+/// Process a single git file tuple and extract functions/types/macros (with repo reuse)
+fn process_git_file_tuple_with_repo(
     tuple: &GitFileTuple,
-    repo_path: &std::path::Path,
+    repo: &gix::Repository,
     source_root: &std::path::Path,
     no_macros: bool,
 ) -> Result<GitTupleResults> {
-    // Each thread needs its own repository connection
-    let repo =
-        gix::discover(repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
-
-    // Load git file content to temp file
+    // Load git file content to temp file using the reused repo
     let file_stem = tuple
         .file_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("gitfile");
 
-    let temp_path = load_git_file_to_temp(&repo, tuple.object_id, file_stem)?;
+    let temp_path = load_git_file_to_temp(repo, tuple.object_id, file_stem)?;
 
     // Create temp GitFileEntry for cleanup
     let git_file = GitFileEntry {
@@ -786,63 +1142,105 @@ fn process_git_file_tuple(
     Ok(results)
 }
 
-/// Worker function that processes tuples from a shared channel (Arc<Mutex<Receiver>>)
+/// Worker function that processes tuples from a shared channel and sends batches to inserters
 fn tuple_worker_shared(
     worker_id: usize,
     shared_tuple_rx: Arc<std::sync::Mutex<mpsc::Receiver<GitFileTuple>>>,
-    result_tx: mpsc::Sender<GitTupleResults>,
+    result_tx: mpsc::SyncSender<GitTupleResults>,
     repo_path: PathBuf,
     source_root: PathBuf,
     no_macros: bool,
     processed_count: Arc<AtomicUsize>,
+    batches_sent: Arc<AtomicUsize>,
 ) {
-    let mut worker_results = GitTupleResults::default();
+    // Open repository ONCE per worker thread and reuse for all tuples
+    let thread_repo = match gix::discover(&repo_path) {
+        Ok(repo) => repo,
+        Err(e) => {
+            tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
+            return;
+        }
+    };
 
-    // Process tuples until channel is closed
+    // Accumulate results into a batch for sending to inserters
+    let mut batch = GitTupleResults::default();
+    const DB_BATCH_SIZE: usize = 2048; // Send to inserters after this many files
+
+    // Process tuples in batches to reduce channel lock overhead
+    const TUPLE_BATCH_SIZE: usize = 8;
     loop {
-        // Lock the receiver to get the next tuple
-        let tuple = {
-            match shared_tuple_rx.lock() {
-                Ok(rx) => rx.recv(),
+        // Collect a batch of tuples (reduces lock contention)
+        let mut tuple_batch = Vec::with_capacity(TUPLE_BATCH_SIZE);
+        {
+            let rx = match shared_tuple_rx.lock() {
+                Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
                     break;
                 }
-            }
-        };
+            };
 
-        match tuple {
-            Ok(tuple) => {
-                match process_git_file_tuple(&tuple, &repo_path, &source_root, no_macros) {
-                    Ok(tuple_result) => {
-                        worker_results.merge(tuple_result);
-                        processed_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Worker {} failed to process tuple {}: {}",
-                            worker_id,
-                            tuple.file_path.display(),
-                            e
-                        );
-                    }
+            // Try to get a batch of tuples without blocking
+            for _ in 0..TUPLE_BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(tuple) => tuple_batch.push(tuple),
+                    Err(mpsc::TryRecvError::Empty) => break, // No more tuples available now
+                    Err(mpsc::TryRecvError::Disconnected) => break, // Channel closed
                 }
             }
-            Err(_) => {
-                // Channel closed, exit worker loop
-                break;
+
+            // If we got nothing with try_recv, do a blocking recv for at least one
+            if tuple_batch.is_empty() {
+                match rx.recv() {
+                    Ok(tuple) => tuple_batch.push(tuple),
+                    Err(_) => break, // Channel closed
+                }
+            }
+        }
+
+        // Process the batch
+        for tuple in tuple_batch {
+            match process_git_file_tuple_with_repo(&tuple, &thread_repo, &source_root, no_macros) {
+                Ok(tuple_result) => {
+                    batch.merge(tuple_result);
+                    processed_count.fetch_add(1, Ordering::Relaxed);
+
+                    // Send batch to inserters when it reaches DB_BATCH_SIZE
+                    if batch.files_processed >= DB_BATCH_SIZE {
+                        batches_sent.fetch_add(1, Ordering::Relaxed);
+                        if result_tx.send(batch.clone()).is_err() {
+                            tracing::warn!(
+                                "Worker {} failed to send batch (channel closed)",
+                                worker_id
+                            );
+                            return;
+                        }
+                        batch = GitTupleResults::default(); // Reset for next batch
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Worker {} failed to process tuple {}: {}",
+                        worker_id,
+                        tuple.file_path.display(),
+                        e
+                    );
+                }
             }
         }
     }
 
-    // Send worker results back
-    if let Err(e) = result_tx.send(worker_results) {
-        tracing::warn!("Worker {} failed to send results: {}", worker_id, e);
+    // Send remaining batch if not empty
+    if batch.files_processed > 0 {
+        batches_sent.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = result_tx.send(batch) {
+            tracing::warn!("Worker {} failed to send final batch: {}", worker_id, e);
+        }
     }
 }
 
-/// Process git file tuples using streaming pipeline with multiple generator and worker threads
-fn process_git_tuples_streaming(
+/// Process git file tuples using streaming pipeline with database inserters
+async fn process_git_tuples_streaming(
     repo_path: PathBuf,
     git_range: String,
     extensions: Vec<String>,
@@ -850,7 +1248,8 @@ fn process_git_tuples_streaming(
     no_macros: bool,
     processed_files: Arc<HashSet<String>>,
     num_workers: usize,
-) -> Result<GitTupleResults> {
+    db_manager: Arc<DatabaseManager>,
+) -> Result<GitTupleStats> {
     use std::sync::Mutex;
 
     // First, get all commits in the range
@@ -858,13 +1257,13 @@ fn process_git_tuples_streaming(
         gix::discover(&repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
     let commit_shas = list_shas_in_range(&repo, &git_range)?;
 
-    // Handle empty commit range early - return empty results
+    // Handle empty commit range early - return empty stats
     if commit_shas.is_empty() {
-        return Ok(GitTupleResults {
-            functions: Vec::new(),
-            types: Vec::new(),
-            macros: Vec::new(),
+        return Ok(GitTupleStats {
             files_processed: 0,
+            functions_count: 0,
+            types_count: 0,
+            macros_count: 0,
         });
     }
 
@@ -894,29 +1293,53 @@ fn process_git_tuples_streaming(
         num_workers
     ));
 
-    // Create channels
+    // Create channels with backpressure
     let (tuple_tx, tuple_rx) = mpsc::channel::<GitFileTuple>();
-    let (result_tx, result_rx) = mpsc::channel::<GitTupleResults>();
+    // Bounded channel for results to prevent memory explosion (3 batches in flight max)
+    // Each batch = 10000 files, so max 30000 files in memory at inserters
+    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(3);
 
-    // Wrap receiver in Arc<Mutex<>> so multiple workers can share it
+    // Wrap receivers for shared access
     let shared_tuple_rx = Arc::new(Mutex::new(tuple_rx));
+    let shared_result_rx = Arc::new(Mutex::new(result_rx));
 
-    // Shared progress counter
+    // Shared progress counters
     let processed_count = Arc::new(AtomicUsize::new(0));
+    let inserted_functions = Arc::new(AtomicUsize::new(0));
+    let inserted_types = Arc::new(AtomicUsize::new(0));
+    let inserted_macros = Arc::new(AtomicUsize::new(0));
+    let batches_sent = Arc::new(AtomicUsize::new(0));
+    let batches_inserted = Arc::new(AtomicUsize::new(0));
 
-    // Shared deduplication set across all generators
-    let sent_in_this_run = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    // Shared deduplication set across all generators (lock-free)
+    let sent_in_this_run = Arc::new(DashSet::new());
 
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
+    let functions_clone = inserted_functions.clone();
+    let types_clone = inserted_types.clone();
+    let macros_clone = inserted_macros.clone();
+    let batches_sent_clone = batches_sent.clone();
+    let batches_inserted_clone = batches_inserted.clone();
     let progress_thread = std::thread::spawn(move || {
         loop {
-            let count = processed_clone.load(Ordering::Relaxed);
-            pb_clone.set_position(count as u64);
+            let files = processed_clone.load(Ordering::Relaxed);
+            let funcs = functions_clone.load(Ordering::Relaxed);
+            let types = types_clone.load(Ordering::Relaxed);
+            let macros = macros_clone.load(Ordering::Relaxed);
+            let sent = batches_sent_clone.load(Ordering::Relaxed);
+            let inserted = batches_inserted_clone.load(Ordering::Relaxed);
+            let pending = sent.saturating_sub(inserted);
 
-            // Check if we should exit (rough heuristic)
-            if count > 0 && pb_clone.is_finished() {
+            pb_clone.set_position(files as u64);
+            pb_clone.set_message(format!(
+                "{} funcs, {} types, {} macros | {} batches pending",
+                funcs, types, macros, pending
+            ));
+
+            // Check if we should exit
+            if pb_clone.is_finished() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -959,6 +1382,7 @@ fn process_git_tuples_streaming(
         let worker_repo_path = repo_path.clone();
         let worker_source_root = source_root.clone();
         let worker_processed_count = processed_count.clone();
+        let worker_batches_sent = batches_sent.clone();
 
         let handle = thread::spawn(move || {
             tuple_worker_shared(
@@ -969,6 +1393,7 @@ fn process_git_tuples_streaming(
                 worker_source_root,
                 no_macros,
                 worker_processed_count,
+                worker_batches_sent,
             );
         });
         worker_handles.push(handle);
@@ -976,6 +1401,91 @@ fn process_git_tuples_streaming(
 
     // Close the original result sender (workers have clones)
     drop(result_tx);
+
+    // Spawn database inserter tasks (use 4 for better parallelism without too much contention)
+    let num_inserters = 4;
+    let mut inserter_handles = Vec::new();
+
+    for inserter_id in 0..num_inserters {
+        let db_manager_clone = Arc::clone(&db_manager);
+        let result_rx_clone = shared_result_rx.clone();
+        let functions_counter = inserted_functions.clone();
+        let types_counter = inserted_types.clone();
+        let macros_counter = inserted_macros.clone();
+        let batches_inserted_counter = batches_inserted.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Get next batch from shared receiver
+                let batch = {
+                    let rx = result_rx_clone.lock().unwrap();
+                    rx.recv()
+                };
+
+                match batch {
+                    Ok(batch) => {
+                        let func_count = batch.functions.len();
+                        let type_count = batch.types.len();
+                        let macro_count = batch.macros.len();
+
+                        // Insert all three types in parallel
+                        let (func_result, type_result, macro_result) = tokio::join!(
+                            async {
+                                if !batch.functions.is_empty() {
+                                    db_manager_clone.insert_functions(batch.functions).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.types.is_empty() {
+                                    db_manager_clone.insert_types(batch.types).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.macros.is_empty() {
+                                    db_manager_clone.insert_macros(batch.macros).await
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        );
+
+                        // Check results and update counters
+                        let mut insertion_successful = true;
+                        if let Err(e) = func_result {
+                            error!("Inserter {} failed to insert functions: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            functions_counter.fetch_add(func_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = type_result {
+                            error!("Inserter {} failed to insert types: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            types_counter.fetch_add(type_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = macro_result {
+                            error!("Inserter {} failed to insert macros: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            macros_counter.fetch_add(macro_count, Ordering::Relaxed);
+                        }
+
+                        // Only increment batches_inserted if insertion was successful
+                        if insertion_successful {
+                            batches_inserted_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => break, // Channel closed, exit task
+                }
+            }
+        });
+
+        inserter_handles.push(handle);
+    }
 
     // Wait for all generators to complete
     for (generator_id, handle) in generator_handles.into_iter().enumerate() {
@@ -991,21 +1501,266 @@ fn process_git_tuples_streaming(
         }
     }
 
-    // Collect results from all workers
-    let mut final_results = GitTupleResults::default();
-    while let Ok(worker_result) = result_rx.try_recv() {
-        final_results.merge(worker_result);
+    // Wait for all inserter tasks to finish
+    for (inserter_id, handle) in inserter_handles.into_iter().enumerate() {
+        if let Err(e) = handle.await {
+            tracing::error!("Inserter {} task failed: {:?}", inserter_id, e);
+        }
     }
 
-    let total_processed = processed_count.load(Ordering::Relaxed);
+    // Collect final statistics
+    let stats = GitTupleStats {
+        files_processed: processed_count.load(Ordering::Relaxed),
+        functions_count: inserted_functions.load(Ordering::Relaxed),
+        types_count: inserted_types.load(Ordering::Relaxed),
+        macros_count: inserted_macros.load(Ordering::Relaxed),
+    };
 
     // Finish progress bar
     pb.finish_with_message(format!(
-        "Git processing complete: {total_processed} files processed"
+        "Complete: {} files, {} functions, {} types, {} macros",
+        stats.files_processed, stats.functions_count, stats.types_count, stats.macros_count
     ));
     progress_thread.join().unwrap();
 
-    Ok(final_results)
+    Ok(stats)
+}
+
+/// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
+fn parse_commit_message_tags(message: &str) -> std::collections::HashMap<String, Vec<String>> {
+    use std::collections::HashMap;
+
+    let mut tags: HashMap<String, Vec<String>> = HashMap::new();
+
+    for line in message.lines() {
+        let line = line.trim();
+
+        // Look for tag pattern: "Tag-Name: value"
+        if let Some(colon_pos) = line.find(':') {
+            let tag_name = line[..colon_pos].trim();
+            let tag_value = line[colon_pos + 1..].trim();
+
+            // Check if this looks like a tag (capitalized words with dashes)
+            if tag_name.chars().all(|c| c.is_alphanumeric() || c == '-')
+                && tag_name.contains(|c: char| c.is_uppercase())
+                && !tag_value.is_empty()
+            {
+                tags.entry(tag_name.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(tag_value.to_string());
+            }
+        }
+    }
+
+    tags
+}
+
+/// Extract commit metadata from git repository
+fn extract_commit_metadata(
+    repo: &gix::Repository,
+    commit_sha: &str,
+) -> Result<semcode::GitCommitInfo> {
+    // Resolve commit
+    let commit = resolve_to_commit(repo, commit_sha)?;
+
+    // Get commit metadata
+    let git_sha = commit.id().to_string();
+
+    // Get parent commits
+    let parent_sha: Vec<String> = commit.parent_ids().map(|id| id.to_string()).collect();
+
+    // Get author
+    let author_sig = commit.author()?;
+    let author = format!("{} <{}>", author_sig.name, author_sig.email);
+
+    // Get commit message
+    let message_bytes = commit.message_raw()?;
+    let message = String::from_utf8_lossy(&message_bytes).to_string();
+
+    // Extract subject (first line of message)
+    let subject = message.lines().next().unwrap_or("").to_string();
+
+    // Parse tags from message
+    let tags = parse_commit_message_tags(&message);
+
+    // Generate unified diff for commits with exactly one parent
+    let (diff, symbols, files) = if parent_sha.len() == 1 {
+        match generate_commit_diff(repo, &parent_sha[0], &git_sha) {
+            Ok((d, s, f)) => (d, s, f),
+            Err(e) => {
+                tracing::warn!("Failed to generate diff for commit {}: {}", git_sha, e);
+                (String::new(), Vec::new(), Vec::new())
+            }
+        }
+    } else {
+        // Skip diff for merge commits (multiple parents) or root commits (no parents)
+        (String::new(), Vec::new(), Vec::new())
+    };
+
+    Ok(semcode::GitCommitInfo {
+        git_sha,
+        parent_sha,
+        author,
+        subject,
+        message,
+        tags,
+        diff,
+        symbols,
+        files,
+    })
+}
+
+/// Generate a unified diff between two commits using gitoxide
+/// Returns the diff string, a vector of symbols (functions, types, macros) that were modified, and a vector of changed files
+fn generate_commit_diff(
+    repo: &gix::Repository,
+    from_sha: &str,
+    to_sha: &str,
+) -> Result<(String, Vec<String>, Vec<String>)> {
+    use std::fmt::Write as _;
+
+    tracing::info!(
+        "generate_commit_diff: generating diff {} -> {} using gitoxide",
+        from_sha,
+        to_sha
+    );
+
+    let from_commit = resolve_to_commit(repo, from_sha)?;
+    let to_commit = resolve_to_commit(repo, to_sha)?;
+
+    let from_tree = from_commit.tree()?;
+    let to_tree = to_commit.tree()?;
+
+    let mut diff_output = String::new();
+    let mut all_symbols = Vec::new();
+    let mut changed_files = Vec::new();
+
+    // Use gitoxide's diff functionality
+    from_tree
+        .changes()?
+        .for_each_to_obtain_tree(&to_tree, |change| {
+            use gix::object::tree::diff::Action;
+
+            match change {
+                gix::object::tree::diff::Change::Modification {
+                    previous_entry_mode,
+                    previous_id,
+                    entry_mode,
+                    id,
+                    location,
+                    ..
+                } => {
+                    // Skip non-blob modifications
+                    if !previous_entry_mode.is_blob() || !entry_mode.is_blob() {
+                        return Ok::<_, anyhow::Error>(Action::Continue);
+                    }
+
+                    let path = location.to_string();
+                    changed_files.push(path.clone());
+
+                    // Write diff header
+                    let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
+                    let _ = writeln!(diff_output, "--- a/{}", path);
+                    let _ = writeln!(diff_output, "+++ b/{}", path);
+
+                    // Get file contents
+                    if let (Ok(old_obj), Ok(new_obj)) =
+                        (repo.find_object(previous_id), repo.find_object(id))
+                    {
+                        if let (Ok(old_blob), Ok(new_blob)) =
+                            (old_obj.try_into_blob(), new_obj.try_into_blob())
+                        {
+                            let old_content = String::from_utf8_lossy(old_blob.data.as_slice());
+                            let new_content = String::from_utf8_lossy(new_blob.data.as_slice());
+
+                            // Generate diff and extract symbols using walk-back algorithm
+                            let (write_result, file_symbols) = git::write_diff_and_extract_symbols(
+                                &mut diff_output,
+                                &old_content,
+                                &new_content,
+                                &path,
+                            );
+                            let _ = write_result;
+                            all_symbols.extend(file_symbols);
+                        }
+                    }
+
+                    Ok(Action::Continue)
+                }
+                gix::object::tree::diff::Change::Addition {
+                    entry_mode,
+                    id,
+                    location,
+                    ..
+                } => {
+                    if !entry_mode.is_blob() {
+                        return Ok(Action::Continue);
+                    }
+
+                    let path = location.to_string();
+                    changed_files.push(path.clone());
+                    let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
+                    let _ = writeln!(diff_output, "--- /dev/null");
+                    let _ = writeln!(diff_output, "+++ b/{}", path);
+
+                    if let Ok(obj) = repo.find_object(id) {
+                        if let Ok(blob) = obj.try_into_blob() {
+                            let content = String::from_utf8_lossy(blob.data.as_slice());
+                            let _ =
+                                writeln!(diff_output, "@@ -0,0 +1,{} @@", content.lines().count());
+                            for line in content.lines() {
+                                let _ = writeln!(diff_output, "+{}", line);
+                            }
+                        }
+                    }
+
+                    Ok(Action::Continue)
+                }
+                gix::object::tree::diff::Change::Deletion {
+                    entry_mode,
+                    id,
+                    location,
+                    ..
+                } => {
+                    if !entry_mode.is_blob() {
+                        return Ok(Action::Continue);
+                    }
+
+                    let path = location.to_string();
+                    changed_files.push(path.clone());
+                    let _ = writeln!(diff_output, "diff --git a/{} b/{}", path, path);
+                    let _ = writeln!(diff_output, "--- a/{}", path);
+                    let _ = writeln!(diff_output, "+++ /dev/null");
+
+                    if let Ok(obj) = repo.find_object(id) {
+                        if let Ok(blob) = obj.try_into_blob() {
+                            let content = String::from_utf8_lossy(blob.data.as_slice());
+                            let _ =
+                                writeln!(diff_output, "@@ -1,{} +0,0 @@", content.lines().count());
+                            for line in content.lines() {
+                                let _ = writeln!(diff_output, "-{}", line);
+                            }
+                        }
+                    }
+
+                    Ok(Action::Continue)
+                }
+                gix::object::tree::diff::Change::Rewrite { .. } => {
+                    // Rewrite represents a complete file replacement - rare in practice
+                    // Skip for now as it's complex to handle properly
+                    Ok::<_, anyhow::Error>(Action::Continue)
+                }
+            }
+        })?;
+
+    tracing::info!(
+        "generate_commit_diff: generated {} bytes of diff with {} symbols and {} files",
+        diff_output.len(),
+        all_symbols.len(),
+        changed_files.len()
+    );
+
+    Ok((diff_output, all_symbols, changed_files))
 }
 
 /// Process git range using streaming file tuple pipeline
@@ -1036,6 +1791,72 @@ async fn process_git_range(
     );
     let processed_files = Arc::new(processed_files);
 
+    // Step 1.5: Extract and store git commit metadata using optimized streaming pipeline
+    info!("Extracting git commit metadata for range: {}", git_range);
+    let commit_extraction_start = std::time::Instant::now();
+
+    // Open repository and get list of commits in range
+    let repo = gix::discover(&args.source)
+        .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+    let commit_shas = list_shas_in_range(&repo, git_range)?;
+    let commit_count = commit_shas.len();
+
+    if !commit_shas.is_empty() {
+        println!(
+            "Checking for {} commits already in database...",
+            commit_count
+        );
+
+        // Get existing commits from database to avoid reprocessing
+        let existing_commits: HashSet<String> = {
+            let all_commits = db_manager.get_all_git_commits().await?;
+            all_commits.into_iter().map(|c| c.git_sha).collect()
+        };
+
+        // Filter out commits that are already in the database
+        let new_commit_shas: Vec<String> = commit_shas
+            .into_iter()
+            .filter(|sha| !existing_commits.contains(sha))
+            .collect();
+
+        let already_indexed = commit_count - new_commit_shas.len();
+        if already_indexed > 0 {
+            println!(
+                "{} commits already indexed, processing {} new commits",
+                already_indexed,
+                new_commit_shas.len()
+            );
+        } else {
+            println!("Processing all {} new commits", new_commit_shas.len());
+        }
+
+        if !new_commit_shas.is_empty() {
+            // Use the optimized streaming pipeline from --commits mode
+            // This provides: pre-filtering, streaming, parallel workers, parallel DB insertion
+            let batch_size = 100;
+            let num_workers = num_cpus::get();
+
+            process_commits_pipeline(
+                &args.source,
+                new_commit_shas,
+                db_manager.clone(),
+                batch_size,
+                num_workers,
+                existing_commits,
+            )
+            .await?;
+
+            info!(
+                "Total commit metadata extraction time: {:.1}s",
+                commit_extraction_start.elapsed().as_secs_f64()
+            );
+        } else {
+            println!("All commits in range are already indexed!");
+        }
+    } else {
+        info!("No commits found in range");
+    }
+
     // Step 2: Determine number of workers
     // Since generators are I/O bound and workers are CPU bound, use a balanced approach
     let num_workers = (num_cpus::get() / 2).max(1);
@@ -1044,9 +1865,9 @@ async fn process_git_range(
         num_workers
     );
 
-    // Step 3: Process tuples using streaming pipeline
+    // Step 3: Process tuples using streaming pipeline with database inserters
     let processing_start = std::time::Instant::now();
-    let results = process_git_tuples_streaming(
+    let stats = process_git_tuples_streaming(
         args.source.clone(),
         git_range.to_string(),
         extensions.to_vec(),
@@ -1054,92 +1875,34 @@ async fn process_git_range(
         args.no_macros,
         processed_files,
         num_workers,
-    )?;
+        db_manager.clone(),
+    )
+    .await?;
 
     let processing_time = processing_start.elapsed();
 
-    let function_count = results.functions.len();
-    let type_count = results.types.len();
-    let macro_count = results.macros.len();
-
     info!(
-        "Streaming pipeline completed in {:.1}s: {} files, {} functions, {} types, {} macros",
+        "Streaming pipeline completed in {:.1}s: {} files, {} functions, {} types, {} macros (inserted throughout processing)",
         processing_time.as_secs_f64(),
-        results.files_processed,
-        function_count,
-        type_count,
-        macro_count
+        stats.files_processed,
+        stats.functions_count,
+        stats.types_count,
+        stats.macros_count
     );
 
-    // Step 4: Insert results into database in parallel (including call relationships and type mappings originating from processed files)
-    if results.files_processed > 0 {
-        info!("Inserting results into database using parallel insertion");
-        let db_insert_start = std::time::Instant::now();
-
-        // Run all insertions in parallel using tokio::join!
-        let (functions_result, types_result, macros_result) = tokio::join!(
-            async {
-                if !results.functions.is_empty() {
-                    info!(
-                        "Starting parallel function insertion ({} functions)",
-                        results.functions.len()
-                    );
-                    db_manager.insert_functions(results.functions).await
-                } else {
-                    Ok(())
-                }
-            },
-            async {
-                if !results.types.is_empty() {
-                    info!(
-                        "Starting parallel type insertion ({} types)",
-                        results.types.len()
-                    );
-                    db_manager.insert_types(results.types).await
-                } else {
-                    Ok(())
-                }
-            },
-            async {
-                if !results.macros.is_empty() {
-                    info!(
-                        "Starting parallel macro insertion ({} macros)",
-                        results.macros.len()
-                    );
-                    db_manager.insert_macros(results.macros).await
-                } else {
-                    Ok(())
-                }
-            }
-        );
-
-        // Check results and propagate any errors
-        functions_result?;
-        types_result?;
-        macros_result?;
-
-        // Call relationships are now embedded in function/macro JSON columns
-
-        // Function-type and type-type mapping insertion removed - now using embedded columns
-
-        let db_insert_time = db_insert_start.elapsed();
-        info!(
-            "Parallel database insertion completed in {:.1}s",
-            db_insert_time.as_secs_f64()
-        );
-    }
-
-    // Call relationships are now embedded in function/macro JSON columns
+    // Database insertion happened throughout processing via streaming inserters
+    // No batch insertion needed here!
 
     let total_time = start_time.elapsed();
 
     println!("\n=== Git Range Pipeline Complete ===");
     println!("Total time: {:.1}s", total_time.as_secs_f64());
-    println!("Files processed: {}", results.files_processed);
-    println!("Functions indexed: {function_count}");
-    println!("Types indexed: {type_count}");
+    println!("Commits indexed: {commit_count}");
+    println!("Files processed: {}", stats.files_processed);
+    println!("Functions indexed: {}", stats.functions_count);
+    println!("Types indexed: {}", stats.types_count);
     if !args.no_macros {
-        println!("Macros indexed: {macro_count}");
+        println!("Macros indexed: {}", stats.macros_count);
     }
 
     Ok(())

@@ -42,6 +42,18 @@ impl SchemaManager {
             self.create_processed_files_table().await?;
         }
 
+        if !table_names.iter().any(|n| n == "symbol_filename") {
+            self.create_symbol_filename_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "git_commits") {
+            self.create_git_commits_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "commit_vectors") {
+            self.create_commit_vectors_table().await?;
+        }
+
         // Check and create content shard tables (content_0 through content_15)
         self.create_content_shard_tables().await?;
 
@@ -148,6 +160,30 @@ impl SchemaManager {
         Ok(())
     }
 
+    async fn create_commit_vectors_table(&self) -> Result<()> {
+        // Create commit_vectors table with 256 dimensions
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false), // Git commit SHA
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 256),
+                false, // Non-nullable - we only store entries that have vectors
+            ),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("commit_vectors", batch_iterator)
+            .execute()
+            .await?;
+
+        tracing::info!("Created commit_vectors table with 256 dimensions");
+        Ok(())
+    }
+
     async fn create_processed_files_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("file", DataType::Utf8, false),   // File path
@@ -161,6 +197,49 @@ impl SchemaManager {
 
         self.connection
             .create_table("processed_files", batch_iterator)
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    async fn create_symbol_filename_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false), // Symbol name (function, macro, type, or typedef)
+            Field::new("filename", DataType::Utf8, false), // File path where symbol is defined
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("symbol_filename", batch_iterator)
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    async fn create_git_commits_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_sha", DataType::Utf8, false), // Commit SHA
+            Field::new("parent_sha", DataType::Utf8, false), // Parent commit SHAs (JSON array)
+            Field::new("author", DataType::Utf8, false),  // Author name and email
+            Field::new("subject", DataType::Utf8, false), // Single line commit title
+            Field::new("message", DataType::Utf8, false), // Full commit message
+            Field::new("tags", DataType::Utf8, false),    // JSON object of tags
+            Field::new("diff", DataType::Utf8, false),    // Full unified diff
+            Field::new("symbols", DataType::Utf8, false), // JSON array of changed symbols
+            Field::new("files", DataType::Utf8, false),   // JSON array of changed files
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("git_commits", batch_iterator)
             .execute()
             .await?;
 
@@ -361,6 +440,23 @@ impl SchemaManager {
             .await;
         }
 
+        // Create indices for commit_vectors table
+        if table_names.iter().any(|n| n == "commit_vectors") {
+            let table = self
+                .connection
+                .open_table("commit_vectors")
+                .execute()
+                .await?;
+
+            // Primary index on git_commit_sha for fast lookups
+            self.try_create_index(
+                &table,
+                &["git_commit_sha"],
+                "BTree index on commit_vectors.git_commit_sha",
+            )
+            .await;
+        }
+
         // Create indices for processed_files table
         if table_names.iter().any(|n| n == "processed_files") {
             let table = self
@@ -396,6 +492,80 @@ impl SchemaManager {
                 "Composite index on processed_files.(file,git_sha)",
             )
             .await;
+        }
+
+        // Create indices for symbol_filename table
+        if table_names.iter().any(|n| n == "symbol_filename") {
+            let table = self
+                .connection
+                .open_table("symbol_filename")
+                .execute()
+                .await?;
+
+            // Index on symbol for symbol name-based lookups
+            self.try_create_index(&table, &["symbol"], "BTree index on symbol_filename.symbol")
+                .await;
+
+            // Index on filename for file-based lookups
+            self.try_create_index(
+                &table,
+                &["filename"],
+                "BTree index on symbol_filename.filename",
+            )
+            .await;
+
+            // Composite index on (symbol, filename) for fast deduplication
+            self.try_create_index(
+                &table,
+                &["symbol", "filename"],
+                "Composite index on symbol_filename.(symbol,filename)",
+            )
+            .await;
+        }
+
+        // Create indices for git_commits table
+        if table_names.iter().any(|n| n == "git_commits") {
+            let table = self.connection.open_table("git_commits").execute().await?;
+
+            // Index on git_sha for commit lookups
+            self.try_create_index(&table, &["git_sha"], "BTree index on git_commits.git_sha")
+                .await;
+
+            // Index on parent_sha for parent commit lookups
+            self.try_create_index(
+                &table,
+                &["parent_sha"],
+                "BTree index on git_commits.parent_sha",
+            )
+            .await;
+
+            // Index on author for author-based queries
+            self.try_create_index(&table, &["author"], "BTree index on git_commits.author")
+                .await;
+
+            // Index on subject for subject searches
+            self.try_create_index(&table, &["subject"], "BTree index on git_commits.subject")
+                .await;
+
+            // Index on message for message searches
+            self.try_create_index(&table, &["message"], "BTree index on git_commits.message")
+                .await;
+
+            // Index on tags for tag-based queries
+            self.try_create_index(&table, &["tags"], "BTree index on git_commits.tags")
+                .await;
+
+            // Index on diff for diff searches
+            self.try_create_index(&table, &["diff"], "BTree index on git_commits.diff")
+                .await;
+
+            // Index on symbols for symbol-based queries
+            self.try_create_index(&table, &["symbols"], "BTree index on git_commits.symbols")
+                .await;
+
+            // Index on files for file-based queries
+            self.try_create_index(&table, &["files"], "BTree index on git_commits.files")
+                .await;
         }
 
         // Create indices for all content shard tables
@@ -487,8 +657,16 @@ impl SchemaManager {
         // For each table, run compaction
         let table_names = self.connection.table_names().execute().await?;
 
-        let mut tables_to_compact =
-            vec!["functions", "types", "macros", "vectors", "processed_files"];
+        let mut tables_to_compact = vec![
+            "functions",
+            "types",
+            "macros",
+            "vectors",
+            "commit_vectors",
+            "processed_files",
+            "symbol_filename",
+            "git_commits",
+        ];
 
         // Add all content shard tables
         for shard in 0..16u8 {
@@ -585,8 +763,16 @@ impl SchemaManager {
 
         let table_names = self.connection.table_names().execute().await?;
 
-        let mut tables_to_recreate =
-            vec!["functions", "types", "macros", "vectors", "processed_files"];
+        let mut tables_to_recreate = vec![
+            "functions",
+            "types",
+            "macros",
+            "vectors",
+            "commit_vectors",
+            "processed_files",
+            "symbol_filename",
+            "git_commits",
+        ];
 
         // Add all content shard tables
         for shard in 0..16u8 {
@@ -628,6 +814,18 @@ impl SchemaManager {
                         }
                         Err(e) => {
                             tracing::error!("Failed to recreate vectors table: {}", e);
+                            return Err(e);
+                        }
+                    }
+                } else if *table_name == "commit_vectors" {
+                    // Always create commit_vectors table with 256 dimensions
+                    tracing::info!("Recreating commit_vectors table with 256 dimensions");
+                    match self.create_commit_vectors_table().await {
+                        Ok(_) => {
+                            tracing::info!("Successfully recreated commit_vectors table");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to recreate commit_vectors table: {}", e);
                             return Err(e);
                         }
                     }
@@ -720,7 +918,10 @@ impl SchemaManager {
             "types" => self.create_types_table().await,
             "macros" => self.create_macros_table().await,
             "vectors" => self.create_vectors_table().await,
+            "commit_vectors" => self.create_commit_vectors_table().await,
             "processed_files" => self.create_processed_files_table().await,
+            "symbol_filename" => self.create_symbol_filename_table().await,
+            "git_commits" => self.create_git_commits_table().await,
             "content" => self.create_content_table().await,
             name if name.starts_with("content_") => {
                 // Handle content shard tables
@@ -779,6 +980,11 @@ impl SchemaManager {
             tracing::info!("Recreating vectors table with 256 dimensions");
             self.create_vectors_table().await?;
             tracing::info!("Recreated vectors table");
+        } else if table_name == "commit_vectors" {
+            // Always create commit_vectors table with 256 dimensions
+            tracing::info!("Recreating commit_vectors table with 256 dimensions");
+            self.create_commit_vectors_table().await?;
+            tracing::info!("Recreated commit_vectors table");
         } else {
             // Normal table recreation
             self.create_table_by_name(table_name).await?;

@@ -542,9 +542,14 @@ impl PipelineBuilder {
             })
             .collect();
 
+        // Clone parsed_rx for batch thread, then drop original immediately
+        // (crossbeam MPMC channels distribute messages round-robin between receivers)
+        let parsed_rx_batch = parsed_rx.clone();
+        drop(parsed_rx);
+
         // Stage 3: Simple batching (no deduplication needed since git SHA pre-filtering ensures uniqueness)
         let batch_thread = {
-            let parsed_rx = parsed_rx.clone();
+            let parsed_rx = parsed_rx_batch;
             let processed_tx = processed_tx.clone();
             let new_functions = self.new_functions.clone();
             let new_types = self.new_types.clone();
@@ -679,9 +684,14 @@ impl PipelineBuilder {
                 .expect("Failed to spawn batch processor thread")
         };
 
+        // Clone processed_rx for DB thread, then drop original immediately
+        // (crossbeam MPMC channels distribute messages round-robin between receivers)
+        let processed_rx_db = processed_rx.clone();
+        drop(processed_rx);
+
         // Stage 4: Database insertion (async in tokio runtime)
         let db_thread = {
-            let processed_rx = processed_rx.clone();
+            let processed_rx = processed_rx_db;
             let db_manager = self.db_manager.clone();
 
             thread::Builder::new()
@@ -763,6 +773,9 @@ impl PipelineBuilder {
         drop(file_tx);
         drop(parsed_tx);
         drop(processed_tx);
+
+        // Note: Original receivers (parsed_rx, processed_rx) were already dropped immediately
+        // after cloning to prevent MPMC round-robin message distribution
 
         // Wait for all stages to complete
         file_feeder.join().unwrap();

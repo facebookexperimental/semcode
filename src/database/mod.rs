@@ -6,6 +6,7 @@ mod functions;
 pub mod processed_files;
 mod schema;
 pub mod search;
+mod symbol_filename;
 mod types;
 mod vectors;
 

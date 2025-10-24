@@ -9,8 +9,9 @@ use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use semcode::display::print_help;
 use semcode::search::{
-    dump_calls, dump_content, dump_functions, dump_macros, dump_processed_files, dump_typedefs,
-    dump_types, query_function_or_macro_verbose, query_type_or_typedef, show_tables,
+    dump_calls, dump_content, dump_functions, dump_git_commits, dump_macros, dump_processed_files,
+    dump_symbol_filename, dump_typedefs, dump_types, query_function_or_macro_verbose,
+    query_type_or_typedef, show_tables,
 };
 
 /// Parse a potential git SHA from command arguments or default to current HEAD
@@ -272,7 +273,100 @@ pub async fn handle_command(
     git_repo_path: &str,
     model_path: &Option<String>,
 ) -> Result<bool> {
-    // Parse potential git SHA first
+    // Handle commit command first (before parse_git_sha) since it uses --git differently
+    if parts[0] == "commit" {
+        // Parse -v, --git, -r, -s, -p, --limit, and --reachable flags
+        let mut verbose = false;
+        let mut git_range = None;
+        let mut regex_patterns = Vec::new();
+        let mut symbol_patterns = Vec::new();
+        let mut path_patterns = Vec::new();
+        let mut limit = 50; // Default display limit
+        let mut reachable_sha = None;
+        let mut git_ref_parts = Vec::new();
+        let mut i = 1;
+
+        while i < parts.len() {
+            if parts[i] == "-v" {
+                verbose = true;
+                i += 1;
+            } else if parts[i] == "--git" && i + 1 < parts.len() {
+                git_range = Some(parts[i + 1].to_string());
+                i += 2;
+            } else if parts[i] == "-r" && i + 1 < parts.len() {
+                regex_patterns.push(parts[i + 1].to_string());
+                i += 2;
+            } else if parts[i] == "-s" && i + 1 < parts.len() {
+                symbol_patterns.push(parts[i + 1].to_string());
+                i += 2;
+            } else if parts[i] == "-p" && i + 1 < parts.len() {
+                path_patterns.push(parts[i + 1].to_string());
+                i += 2;
+            } else if parts[i] == "--limit" && i + 1 < parts.len() {
+                match parts[i + 1].parse::<usize>() {
+                    Ok(n) => {
+                        limit = n;
+                        i += 2;
+                    }
+                    Err(_) => {
+                        println!("{} Invalid limit value: {}", "Error:".red(), parts[i + 1]);
+                        return Ok(false);
+                    }
+                }
+            } else if parts[i] == "--reachable" && i + 1 < parts.len() {
+                reachable_sha = Some(parts[i + 1].to_string());
+                i += 2;
+            } else {
+                git_ref_parts.extend_from_slice(&parts[i..]);
+                break;
+            }
+        }
+
+        if git_ref_parts.is_empty() && git_range.is_none() {
+            // No arguments provided - show all commits from database
+            show_all_commits(
+                db,
+                verbose,
+                &regex_patterns,
+                &symbol_patterns,
+                &path_patterns,
+                limit,
+                reachable_sha.as_deref(),
+                git_repo_path,
+            )
+            .await?;
+        } else if let Some(range) = git_range {
+            show_commit_range(
+                db,
+                &range,
+                verbose,
+                &regex_patterns,
+                &symbol_patterns,
+                &path_patterns,
+                limit,
+                reachable_sha.as_deref(),
+                git_repo_path,
+            )
+            .await?;
+        } else {
+            let git_ref = git_ref_parts.join(" ");
+            show_commit_metadata(
+                db,
+                &git_ref,
+                verbose,
+                &regex_patterns,
+                &symbol_patterns,
+                &path_patterns,
+                reachable_sha.as_deref(),
+                git_repo_path,
+            )
+            .await?;
+        }
+
+        return Ok(false); // Continue the loop
+    }
+
+    // Parse potential git SHA first (for all other commands)
     let (parts, git_sha) = parse_git_sha(parts, git_repo_path)?;
 
     match parts[0] {
@@ -460,6 +554,104 @@ pub async fn handle_command(
                         &query_text,
                         limit,
                         file_pattern.as_deref(),
+                        model_path,
+                    )
+                    .await?;
+                }
+            }
+        }
+        "vcommit" => {
+            if parts.len() < 2 {
+                println!(
+                    "{}",
+                    "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>".red()
+                );
+                println!(
+                    "  Search for commits similar to the provided text using semantic vectors"
+                );
+                println!("  --git <range>: Filter to commits in git range (e.g., HEAD~100..HEAD)");
+                println!("  -r <regex>: Filter results by regex pattern on message + diff (can be used multiple times for AND logic)");
+                println!("  -s <regex>: Filter results by regex pattern on symbol list (can be used multiple times for AND logic)");
+                println!("  -p <path_regex>: Filter results by regex pattern on file paths (can be used multiple times for OR logic)");
+                println!("  --limit <N>: Limit number of results (default: 200, max: 500)");
+                println!("  --reachable <sha>: Filter to commits reachable from the given SHA");
+                println!("  Example: vcommit \"fix memory leak\"");
+                println!("  Example: vcommit --limit 5 \"refactor parser\"");
+                println!("  Example: vcommit -r \"buffer.*overflow\" \"security fix\"");
+                println!("  Example: vcommit -s \"malloc\" -s \"free\" \"memory management\"  # Both symbols must be in commit");
+                println!("  Example: vcommit -p \"mm/.*\\\\.c\" \"memory subsystem changes\"  # Only commits touching mm/*.c files");
+                println!("  Example: vcommit --git HEAD~50..HEAD \"performance\"");
+                println!("  Example: vcommit --reachable HEAD \"performance\"  # Only commits reachable from HEAD");
+                println!("  Example: vcommit --git HEAD~100..HEAD -r \"malloc\" -r \"free\" --limit 20 \"memory management\"  # Both patterns must match");
+                println!(
+                    "  Note: Requires commit vectors to be generated first with 'semcode-index --vectors'"
+                );
+            } else {
+                // Parse --git, --limit, -r, -s, -p, and --reachable flags
+                let mut limit = 200; // default
+                let mut regex_patterns = Vec::new();
+                let mut symbol_patterns = Vec::new();
+                let mut path_patterns = Vec::new();
+                let mut git_range = None;
+                let mut reachable_sha = None;
+                let mut query_parts = Vec::new();
+                let mut i = 1;
+
+                while i < parts.len() {
+                    if parts[i] == "--limit" && i + 1 < parts.len() {
+                        match parts[i + 1].parse::<usize>() {
+                            Ok(n) => {
+                                limit = n.min(500); // Cap at 500
+                                i += 2;
+                            }
+                            Err(_) => {
+                                println!(
+                                    "{} Invalid limit value: {}",
+                                    "Error:".red(),
+                                    parts[i + 1]
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    } else if parts[i] == "-r" && i + 1 < parts.len() {
+                        regex_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "-s" && i + 1 < parts.len() {
+                        symbol_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "-p" && i + 1 < parts.len() {
+                        path_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "--git" && i + 1 < parts.len() {
+                        git_range = Some(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "--reachable" && i + 1 < parts.len() {
+                        reachable_sha = Some(parts[i + 1].to_string());
+                        i += 2;
+                    } else {
+                        query_parts.extend_from_slice(&parts[i..]);
+                        break;
+                    }
+                }
+
+                if query_parts.is_empty() {
+                    println!(
+                        "{}",
+                        "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>"
+                            .red()
+                    );
+                } else {
+                    let query_text = query_parts.join(" ");
+                    vcommit_similar_commits(
+                        db,
+                        &query_text,
+                        limit,
+                        &regex_patterns,
+                        &symbol_patterns,
+                        &path_patterns,
+                        git_range.as_deref(),
+                        reachable_sha.as_deref(),
+                        git_repo_path,
                         model_path,
                     )
                     .await?;
@@ -663,6 +855,24 @@ pub async fn handle_command(
             } else {
                 let output_file = parts[1..].join(" ");
                 dump_content(db, &output_file).await?;
+            }
+        }
+        "dump-symbol-filename" | "dsf" => {
+            if parts.len() < 2 {
+                println!("{}", "Usage: dump-symbol-filename <output_file>".red());
+                println!("  Export all symbol-filename pairs to JSON");
+            } else {
+                let output_file = parts[1..].join(" ");
+                dump_symbol_filename(db, &output_file).await?;
+            }
+        }
+        "dump-git-commits" | "dgc" => {
+            if parts.len() < 2 {
+                println!("{}", "Usage: dump-git-commits <output_file>".red());
+                println!("  Export all git commit metadata to JSON");
+            } else {
+                let output_file = parts[1..].join(" ");
+                dump_git_commits(db, &output_file).await?;
             }
         }
         "diffinfo" | "di" => {
@@ -1203,6 +1413,1539 @@ async fn vgrep_similar_functions(
             println!("Make sure vectors have been generated with 'semcode-index --vectors'");
         }
     }
+
+    Ok(())
+}
+
+/// Search for commits similar to given query text using vector embeddings
+async fn vcommit_similar_commits(
+    db: &DatabaseManager,
+    query_text: &str,
+    limit: usize,
+    regex_patterns: &[String],
+    symbol_patterns: &[String],
+    path_patterns: &[String],
+    git_range: Option<&str>,
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
+    model_path: &Option<String>,
+) -> Result<()> {
+    use semcode::CodeVectorizer;
+
+    let has_filters =
+        !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty();
+    match (git_range, has_filters) {
+        (Some(range), true) => {
+            let mut filter_parts = Vec::new();
+            if !regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            }
+            if !symbol_patterns.is_empty() {
+                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            }
+            if !path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            }
+            let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
+            println!(
+                "Searching for commits similar to: {} (git range: {}, {}, limit: {})",
+                query_text.yellow(),
+                range.cyan(),
+                filter_desc,
+                limit
+            );
+        }
+        (Some(range), false) => println!(
+            "Searching for commits similar to: {} (git range: {}, limit: {})",
+            query_text.yellow(),
+            range.cyan(),
+            limit
+        ),
+        (None, true) => {
+            let mut filter_parts = Vec::new();
+            if !regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            }
+            if !symbol_patterns.is_empty() {
+                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            }
+            if !path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            }
+            let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
+            println!(
+                "Searching for commits similar to: {} ({}, limit: {})",
+                query_text.yellow(),
+                filter_desc,
+                limit
+            );
+        }
+        (None, false) => println!(
+            "Searching for commits similar to: {} (limit: {})",
+            query_text.yellow(),
+            limit
+        ),
+    }
+
+    // Initialize vectorizer
+    println!("Initializing vectorizer...");
+    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("{} Failed to initialize vectorizer: {}", "Error:".red(), e);
+            println!(
+                "Make sure you have a model available. Use --model-path to specify a custom model."
+            );
+            return Ok(());
+        }
+    };
+
+    // Generate vector for query text
+    println!("Generating query vector...");
+    let query_vector = match vectorizer.vectorize_code(query_text) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "{} Failed to generate vector for query: {}",
+                "Error:".red(),
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    // Resolve git range to a set of commit SHAs if provided
+    let git_range_shas = if let Some(range) = git_range {
+        match gix::discover(git_repo_path) {
+            Ok(repo) => {
+                // Resolve the git range using gitoxide
+                let range_parts: Vec<&str> = range.split("..").collect();
+                if range_parts.len() != 2 {
+                    println!(
+                        "{} Invalid git range format: '{}'. Expected format: FROM..TO (e.g., HEAD~100..HEAD)",
+                        "Error:".red(),
+                        range
+                    );
+                    return Ok(());
+                }
+
+                let from_ref = range_parts[0];
+                let to_ref = range_parts[1];
+
+                let from_commit = match git::resolve_to_commit(&repo, from_ref) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!(
+                            "{} Failed to resolve git reference '{}': {}",
+                            "Error:".red(),
+                            from_ref,
+                            e
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let to_commit = match git::resolve_to_commit(&repo, to_ref) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!(
+                            "{} Failed to resolve git reference '{}': {}",
+                            "Error:".red(),
+                            to_ref,
+                            e
+                        );
+                        return Ok(());
+                    }
+                };
+
+                // Get all commits in the range using gitoxide
+                let mut range_commits = std::collections::HashSet::new();
+
+                // Walk from to_commit back to from_commit
+                let to_id = to_commit.id().detach();
+                let from_id = from_commit.id().detach();
+
+                // Use rev_walk with proper include/exclude (same as in index.rs)
+                match repo
+                    .rev_walk([to_id])
+                    .with_hidden([from_id])
+                    .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                        Default::default(),
+                    ))
+                    .all()
+                {
+                    Ok(walk) => {
+                        let mut commit_count = 0;
+                        const MAX_COMMITS: usize = 1000000; // Safety limit
+
+                        for commit_result in walk {
+                            match commit_result {
+                                Ok(commit_info) => {
+                                    commit_count += 1;
+                                    if commit_count > MAX_COMMITS {
+                                        println!(
+                                            "{} Git range {} is too large (>{} commits)",
+                                            "Error:".red(),
+                                            range,
+                                            MAX_COMMITS
+                                        );
+                                        return Ok(());
+                                    }
+
+                                    let commit_id = commit_info.id();
+                                    range_commits.insert(commit_id.to_string());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Error walking commits: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            "Git range {} resolved to {} commits",
+                            range,
+                            range_commits.len()
+                        );
+                        Some(range_commits)
+                    }
+                    Err(e) => {
+                        println!("{} Failed to walk git history: {}", "Error:".red(), e);
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                println!("{} Not in a git repository: {}", "Error:".red(), e);
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Search for similar commits with higher limit if filtering
+    let search_limit = if !regex_patterns.is_empty()
+        || !symbol_patterns.is_empty()
+        || !path_patterns.is_empty()
+        || git_range.is_some()
+        || reachable_sha.is_some()
+    {
+        // When filtering (regex, symbols, paths, git range, or reachability), always fetch many results since we'll filter them down
+        // Use a large limit to ensure we find enough matches after filtering
+        // Increased to 2M to handle very large repositories like Linux kernel (~1.2M commits)
+        2_000_000
+    } else {
+        limit
+    };
+
+    // Search for similar commits
+    match db.search_similar_commits(&query_vector, search_limit).await {
+        Ok(results) if results.is_empty() => {
+            println!("{} No similar commits found", "Info:".yellow());
+            println!("Make sure commit vectors have been generated with 'semcode-index --vectors'");
+        }
+        Ok(results) => {
+            // Apply git range filtering if provided
+            let filtered_by_range = if let Some(ref range_shas) = git_range_shas {
+                let original_count = results.len();
+                let filtered: Vec<_> = results
+                    .into_iter()
+                    .filter(|(commit, _)| range_shas.contains(&commit.git_sha))
+                    .collect();
+
+                tracing::info!(
+                    "Git range filter reduced results from {} to {} commits",
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                results
+            };
+
+            // Apply regex filtering if provided (ALL patterns must match)
+            let filtered_by_regex = if !regex_patterns.is_empty() {
+                // Compile all regex patterns
+                let mut regexes = Vec::new();
+                for pattern in regex_patterns {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => regexes.push(re),
+                        Err(e) => {
+                            println!(
+                                "{} Invalid regex pattern '{}': {}",
+                                "Error:".red(),
+                                pattern,
+                                e
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
+                let original_count = filtered_by_range.len();
+                let filtered: Vec<_> = filtered_by_range
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        // Combine message and diff for regex matching
+                        let combined = format!("{}\n\n{}", commit.message, commit.diff);
+                        // Check if ALL patterns match
+                        regexes.iter().all(|re| re.is_match(&combined))
+                    })
+                    .collect();
+
+                tracing::info!(
+                    "Regex filters ({} pattern(s)) reduced results from {} to {} commits",
+                    regex_patterns.len(),
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                filtered_by_range
+            };
+
+            // Apply symbol filtering if provided (ALL patterns must match)
+            let filtered_by_symbol = if !symbol_patterns.is_empty() {
+                // Compile all symbol regex patterns
+                let mut symbol_regexes = Vec::new();
+                for pattern in symbol_patterns {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => symbol_regexes.push(re),
+                        Err(e) => {
+                            println!(
+                                "{} Invalid symbol regex pattern '{}': {}",
+                                "Error:".red(),
+                                pattern,
+                                e
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
+                let original_count = filtered_by_regex.len();
+                let filtered: Vec<_> = filtered_by_regex
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        // Check if ALL symbol patterns match (at least one symbol matches each pattern)
+                        symbol_regexes
+                            .iter()
+                            .all(|re| commit.symbols.iter().any(|symbol| re.is_match(symbol)))
+                    })
+                    .collect();
+
+                tracing::info!(
+                    "Symbol filters ({} pattern(s)) reduced results from {} to {} commits",
+                    symbol_patterns.len(),
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                filtered_by_regex
+            };
+
+            // Apply path filtering if provided (ANY pattern must match - OR logic)
+            let filtered_by_path = if !path_patterns.is_empty() {
+                // Compile all path regex patterns
+                let mut path_regexes = Vec::new();
+                for pattern in path_patterns {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => path_regexes.push(re),
+                        Err(e) => {
+                            println!(
+                                "{} Invalid path regex pattern '{}': {}",
+                                "Error:".red(),
+                                pattern,
+                                e
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
+                let original_count = filtered_by_symbol.len();
+                let filtered: Vec<_> = filtered_by_symbol
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        // Check if ANY path pattern matches any file (OR logic)
+                        path_regexes
+                            .iter()
+                            .any(|re| commit.files.iter().any(|file| re.is_match(file)))
+                    })
+                    .collect();
+
+                tracing::info!(
+                    "Path filters ({} pattern(s)) reduced results from {} to {} commits",
+                    path_patterns.len(),
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                filtered_by_symbol
+            };
+
+            // Apply reachability filtering if provided
+            let final_results = if let Some(reachable_from) = reachable_sha {
+                let original_count = filtered_by_path.len();
+
+                // For > 10 commits, use hashset approach for better performance
+                let filtered: Vec<_> = if original_count > 10 {
+                    match git::get_reachable_commits(git_repo_path, reachable_from) {
+                        Ok(reachable_set) => filtered_by_path
+                            .into_iter()
+                            .filter(|(commit, _)| reachable_set.contains(&commit.git_sha))
+                            .take(limit)
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to build reachable commits set: {}. Falling back to individual checks",
+                                e
+                            );
+                            // Fallback to individual checks
+                            filtered_by_path
+                                .into_iter()
+                                .filter(|(commit, _)| {
+                                    match git::is_commit_reachable(
+                                        git_repo_path,
+                                        reachable_from,
+                                        &commit.git_sha,
+                                    ) {
+                                        Ok(true) => true,
+                                        Ok(false) => false,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to check reachability for commit {}: {}",
+                                                commit.git_sha,
+                                                e
+                                            );
+                                            false
+                                        }
+                                    }
+                                })
+                                .take(limit)
+                                .collect()
+                        }
+                    }
+                } else {
+                    // For <= 10 commits, use individual checks
+                    filtered_by_path
+                        .into_iter()
+                        .filter(|(commit, _)| {
+                            match git::is_commit_reachable(
+                                git_repo_path,
+                                reachable_from,
+                                &commit.git_sha,
+                            ) {
+                                Ok(true) => true,
+                                Ok(false) => false,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to check reachability for commit {}: {}",
+                                        commit.git_sha,
+                                        e
+                                    );
+                                    false
+                                }
+                            }
+                        })
+                        .take(limit)
+                        .collect()
+                };
+
+                tracing::info!(
+                    "Reachability filter reduced results from {} to {} commits",
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                filtered_by_path.into_iter().take(limit).collect()
+            };
+
+            if final_results.is_empty() {
+                println!("{} No similar commits found", "Info:".yellow());
+                if !regex_patterns.is_empty()
+                    || !symbol_patterns.is_empty()
+                    || !path_patterns.is_empty()
+                    || git_range.is_some()
+                {
+                    println!("Try adjusting the filters or removing the -r/-s/-p/--git options");
+                } else {
+                    println!(
+                        "Make sure commit vectors have been generated with 'semcode-index --vectors'"
+                    );
+                }
+                return Ok(());
+            }
+
+            println!(
+                "\n{} Found {} similar commit(s):",
+                "Results:".bold().green(),
+                final_results.len()
+            );
+            println!("{}", "=".repeat(80));
+
+            for (i, (commit, similarity)) in final_results.iter().enumerate() {
+                println!(
+                    "\n{}. {} {} {}%",
+                    (i + 1).to_string().yellow(),
+                    "Similarity:".bold(),
+                    format!("{:.1}", similarity * 100.0).bright_green(),
+                    ""
+                );
+                println!(
+                    "   {} {}",
+                    "Commit:".bold(),
+                    commit.git_sha[..12].to_string().bright_black()
+                );
+                println!("   {} {}", "Author:".bold(), commit.author.cyan());
+                println!("   {} {}", "Subject:".bold(), commit.subject);
+
+                // Show modified symbols if any (limited to first 5)
+                if !commit.symbols.is_empty() {
+                    let symbol_count = commit.symbols.len();
+                    let display_symbols: Vec<_> = commit.symbols.iter().take(5).collect();
+                    println!(
+                        "   {} ({})",
+                        "Modified Symbols:".bold(),
+                        symbol_count.to_string().bright_black()
+                    );
+                    for symbol in display_symbols {
+                        println!("     {}", symbol.yellow());
+                    }
+                    if symbol_count > 5 {
+                        println!(
+                            "     {} ... and {} more",
+                            "".bright_black(),
+                            symbol_count - 5
+                        );
+                    }
+                }
+
+                // Show preview of commit message (first 10 lines beyond subject)
+                if !commit.message.is_empty() {
+                    let message_lines: Vec<&str> = commit
+                        .message
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .take(11)
+                        .collect();
+                    if !message_lines.is_empty() && message_lines.len() > 1 {
+                        // Only show if there's more than the subject
+                        println!("   {} ", "Message Preview:".bold());
+                        for line in message_lines.iter().skip(1) {
+                            // Skip subject line
+                            println!("     {}", line.trim().bright_black());
+                        }
+                        if commit.message.lines().count() > 11 {
+                            println!("     {}", "...".bright_black());
+                        }
+                    }
+                }
+            }
+
+            println!("\n{}", "=".repeat(80));
+            println!(
+                "{} Use 'commit <sha>' to see full details of a specific commit",
+                "Tip:".bold().blue()
+            );
+        }
+        Err(e) => {
+            println!("{} Commit vector search failed: {}", "Error:".red(), e);
+            println!("Make sure commit vectors have been generated with 'semcode-index --vectors'");
+        }
+    }
+
+    Ok(())
+}
+
+/// Compile regex filters from patterns
+fn compile_regex_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
+    let mut filters = Vec::new();
+    for pattern in patterns {
+        match regex::Regex::new(pattern) {
+            Ok(re) => filters.push(re),
+            Err(e) => {
+                println!(
+                    "{} Invalid regex pattern '{}': {}",
+                    "Error:".red(),
+                    pattern,
+                    e
+                );
+                anyhow::bail!("Invalid regex pattern");
+            }
+        }
+    }
+    Ok(filters)
+}
+
+/// Compile symbol regex filters from patterns
+fn compile_symbol_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
+    let mut filters = Vec::new();
+    for pattern in patterns {
+        match regex::Regex::new(pattern) {
+            Ok(re) => filters.push(re),
+            Err(e) => {
+                println!(
+                    "{} Invalid symbol regex pattern '{}': {}",
+                    "Error:".red(),
+                    pattern,
+                    e
+                );
+                anyhow::bail!("Invalid symbol regex pattern");
+            }
+        }
+    }
+    Ok(filters)
+}
+
+/// Compile path regex filters from patterns
+fn compile_path_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
+    let mut filters = Vec::new();
+    for pattern in patterns {
+        match regex::Regex::new(pattern) {
+            Ok(re) => filters.push(re),
+            Err(e) => {
+                println!(
+                    "{} Invalid path regex pattern '{}': {}",
+                    "Error:".red(),
+                    pattern,
+                    e
+                );
+                anyhow::bail!("Invalid path regex pattern");
+            }
+        }
+    }
+    Ok(filters)
+}
+
+/// Check if a commit matches all regex, symbol, and path filters
+fn commit_matches_filters(
+    commit: &semcode::GitCommitInfo,
+    regex_filters: &[regex::Regex],
+    symbol_filters: &[regex::Regex],
+    path_filters: &[regex::Regex],
+) -> bool {
+    // Apply regex filters (ALL must match)
+    if !regex_filters.is_empty() {
+        let combined = format!("{}\n\n{}", commit.message, commit.diff);
+        for re in regex_filters {
+            if !re.is_match(&combined) {
+                return false;
+            }
+        }
+    }
+
+    // Apply symbol filters (ALL must match)
+    if !symbol_filters.is_empty() {
+        for re in symbol_filters {
+            // Check if ANY symbol matches this pattern
+            let matches_any = commit.symbols.iter().any(|symbol| re.is_match(symbol));
+            if !matches_any {
+                return false;
+            }
+        }
+    }
+
+    // Apply path filters (ANY must match - OR logic)
+    if !path_filters.is_empty() {
+        let matches_any_pattern = path_filters
+            .iter()
+            .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+        if !matches_any_pattern {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Display a single commit (verbose or compact mode)
+fn display_commit(commit: &semcode::GitCommitInfo, index: usize, verbose: bool) {
+    if verbose {
+        // Verbose mode: show full details for each commit
+        println!("\n{}", "─".repeat(80).bright_black());
+        println!(
+            "{}. {} {}",
+            index.to_string().yellow(),
+            "Commit:".bold(),
+            commit.git_sha.yellow()
+        );
+        println!("   {} {}", "Author:".bold(), commit.author.cyan());
+        println!("   {} {}", "Subject:".bold(), commit.subject);
+
+        // Show modified symbols if any (limited to first 5)
+        if !commit.symbols.is_empty() {
+            let symbol_count = commit.symbols.len();
+            let display_symbols: Vec<_> = commit.symbols.iter().take(5).collect();
+            println!(
+                "   {} ({})",
+                "Modified Symbols:".bold().cyan(),
+                symbol_count
+            );
+            for symbol in display_symbols {
+                println!("     {}", symbol.yellow());
+            }
+            if symbol_count > 5 {
+                println!("     ... and {} more", symbol_count - 5);
+            }
+        }
+
+        // Show full message
+        if !commit.message.is_empty() && commit.message != commit.subject {
+            println!("\n   {}", "Message:".bold());
+            for line in commit.message.lines() {
+                println!("   {}", line);
+            }
+        }
+
+        // Show diff if verbose
+        if !commit.diff.is_empty() {
+            println!("\n   {}", "Diff:".bold().blue());
+            println!("   {}", "─".repeat(76).bright_black());
+            for line in commit.diff.lines() {
+                println!("   {}", line);
+            }
+            println!("   {}", "─".repeat(76).bright_black());
+        }
+    } else {
+        // Default mode: show compact summary
+        println!(
+            "{}. {} {} - {}",
+            index.to_string().yellow(),
+            commit.git_sha[..12].to_string().bright_black(),
+            commit.author.cyan(),
+            commit.subject
+        );
+    }
+}
+
+/// Show summary statistics for commit display
+fn show_commit_summary(
+    total_commits: usize,
+    matched_count: usize,
+    displayed_count: usize,
+    limit: usize,
+    regex_patterns: &[String],
+    symbol_patterns: &[String],
+    path_patterns: &[String],
+) {
+    println!("\n{}", "=".repeat(80));
+
+    // Show summary with filtering/limiting info
+    if !regex_patterns.is_empty()
+        || !symbol_patterns.is_empty()
+        || !path_patterns.is_empty()
+        || limit > 0
+    {
+        println!("{} ", "Summary:".bold().green());
+        println!("  Total commits: {}", total_commits);
+        if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty() {
+            println!("  Matched by filters: {}", matched_count);
+        }
+        println!("  Displayed: {}", displayed_count);
+        if limit > 0 && matched_count > limit {
+            println!(
+                "  {} {} additional matching commits not shown (limited to {})",
+                "Note:".yellow(),
+                matched_count - displayed_count,
+                limit
+            );
+        }
+    } else {
+        println!(
+            "{} Total: {} commits",
+            "Summary:".bold().green(),
+            displayed_count
+        );
+    }
+
+    if displayed_count == 0 {
+        let filter_count = (!regex_patterns.is_empty() as usize)
+            + (!symbol_patterns.is_empty() as usize)
+            + (!path_patterns.is_empty() as usize);
+
+        if filter_count >= 2 {
+            let mut filter_types = Vec::new();
+            if !regex_patterns.is_empty() {
+                filter_types.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            }
+            if !symbol_patterns.is_empty() {
+                filter_types.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            }
+            if !path_patterns.is_empty() {
+                filter_types.push(format!("{} path pattern(s)", path_patterns.len()));
+            }
+            println!(
+                "\n{} No commits matched ALL {}",
+                "Info:".yellow(),
+                filter_types.join(" and ")
+            );
+        } else if !regex_patterns.is_empty() {
+            println!(
+                "\n{} No commits matched ALL {} regex pattern(s): {}",
+                "Info:".yellow(),
+                regex_patterns.len(),
+                regex_patterns.join(", ")
+            );
+        } else if !symbol_patterns.is_empty() {
+            println!(
+                "\n{} No commits matched ALL {} symbol pattern(s): {}",
+                "Info:".yellow(),
+                symbol_patterns.len(),
+                symbol_patterns.join(", ")
+            );
+        } else if !path_patterns.is_empty() {
+            println!(
+                "\n{} No commits matched ALL {} path pattern(s): {}",
+                "Info:".yellow(),
+                path_patterns.len(),
+                path_patterns.join(", ")
+            );
+        }
+    }
+}
+
+/// Show all commits from database with optional filters
+async fn show_all_commits(
+    db: &DatabaseManager,
+    verbose: bool,
+    regex_patterns: &[String],
+    symbol_patterns: &[String],
+    path_patterns: &[String],
+    limit: usize,
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
+) -> Result<()> {
+    // Step 1: Get all commits from database
+    let all_commits = db.get_all_git_commits().await?;
+
+    if all_commits.is_empty() {
+        println!("{} No commits found in database", "Info:".yellow());
+        return Ok(());
+    }
+
+    // Step 2: Compile filters
+    let regex_filters = if !regex_patterns.is_empty() {
+        compile_regex_filters(regex_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    let symbol_filters = if !symbol_patterns.is_empty() {
+        compile_symbol_filters(symbol_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    let path_filters = if !path_patterns.is_empty() {
+        compile_path_filters(path_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    println!(
+        "\n{} Found {} commit(s) in database:",
+        "All Commits:".bold().green(),
+        all_commits.len()
+    );
+    println!("{}", "=".repeat(80));
+
+    // Step 3: Apply regex/symbol/path filters first
+    let filtered_commits: Vec<_> = all_commits
+        .iter()
+        .filter(|commit| {
+            commit_matches_filters(commit, &regex_filters, &symbol_filters, &path_filters)
+        })
+        .collect();
+
+    // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
+    let reachable_set = if let Some(reachable_from) = reachable_sha {
+        if filtered_commits.len() > 10 {
+            match git::get_reachable_commits(git_repo_path, reachable_from) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    println!(
+                        "{} Failed to build reachable commits set: {}. Using individual checks",
+                        "Warning:".yellow(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Step 5: Apply reachability filter and display commits
+    let mut displayed_count = 0;
+    let mut matched_count = 0;
+
+    for commit in &filtered_commits {
+        // Apply reachability filter if provided
+        if let Some(reachable_from) = reachable_sha {
+            // Use hashset if available, otherwise do individual check
+            let is_reachable = if let Some(ref set) = reachable_set {
+                set.contains(&commit.git_sha)
+            } else {
+                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(e) => {
+                        println!(
+                            "{} Failed to check reachability for commit {}: {}",
+                            "Warning:".yellow(),
+                            commit.git_sha,
+                            e
+                        );
+                        false
+                    }
+                }
+            };
+
+            if !is_reachable {
+                continue;
+            }
+        }
+
+        matched_count += 1;
+
+        // Apply limit
+        if limit > 0 && displayed_count >= limit {
+            continue;
+        }
+
+        displayed_count += 1;
+        display_commit(commit, displayed_count, verbose);
+    }
+
+    // Step 5: Show summary
+    show_commit_summary(
+        all_commits.len(),
+        matched_count,
+        displayed_count,
+        limit,
+        regex_patterns,
+        symbol_patterns,
+        path_patterns,
+    );
+
+    Ok(())
+}
+
+/// Show metadata for a git commit
+async fn show_commit_metadata(
+    db: &DatabaseManager,
+    git_ref: &str,
+    verbose: bool,
+    regex_patterns: &[String],
+    symbol_patterns: &[String],
+    path_patterns: &[String],
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
+) -> Result<()> {
+    // Step 1: Resolve git reference to full SHA using gitoxide
+    let resolved_sha = match gix::discover(git_repo_path) {
+        Ok(repo) => match git::resolve_to_commit(&repo, git_ref) {
+            Ok(commit) => commit.id().to_string(),
+            Err(e) => {
+                let err_msg = e.to_string();
+                println!(
+                    "{} Failed to resolve git reference '{}': {}",
+                    "Error:".red(),
+                    git_ref,
+                    err_msg
+                );
+
+                // Provide helpful hint for common errors
+                if err_msg.contains("0 ancestors") || err_msg.contains("out of range") {
+                    println!(
+                        "{} The reference points to a root commit (no parents). Cannot go back further in history.",
+                        "Hint:".yellow()
+                    );
+                } else {
+                    println!(
+                        "{} Make sure the reference exists in the repository",
+                        "Hint:".yellow()
+                    );
+                }
+                return Ok(());
+            }
+        },
+        Err(e) => {
+            println!("{} Not in a git repository: {}", "Error:".red(), e);
+            return Ok(());
+        }
+    };
+
+    println!(
+        "Resolved '{}' to commit: {}",
+        git_ref.cyan(),
+        resolved_sha.bright_black()
+    );
+
+    // Step 2: Query database for commit metadata
+    let commit_opt = db.get_git_commit_by_sha(&resolved_sha).await?;
+
+    // Try to get from database, fall back to git if not indexed
+    let (
+        commit_sha,
+        commit_author,
+        commit_subject,
+        commit_message,
+        commit_parent_sha,
+        commit_symbols,
+        commit_files,
+        commit_tags,
+        commit_diff,
+        is_indexed,
+    ) = match commit_opt {
+        Some(c) => (
+            c.git_sha.clone(),
+            c.author.clone(),
+            c.subject.clone(),
+            c.message.clone(),
+            c.parent_sha.clone(),
+            c.symbols.clone(),
+            c.files.clone(),
+            c.tags.clone(),
+            c.diff.clone(),
+            true,
+        ),
+        None => {
+            // Commit not indexed - fall back to reading from git
+            println!(
+                "{} Commit {} not found in index - reading from git",
+                "⚠️ Warning:".yellow(),
+                resolved_sha.bright_black()
+            );
+
+            match git::get_commit_info_from_git(git_repo_path, &resolved_sha) {
+                Ok(git_commit) => {
+                    (
+                        git_commit.git_sha,
+                        git_commit.author,
+                        git_commit.subject,
+                        git_commit.message,
+                        git_commit.parent_sha,
+                        git_commit.symbols, // Symbols extracted from diff
+                        git_commit.files,   // Files changed in commit
+                        std::collections::HashMap::new(), // No tags extracted from git
+                        git_commit.diff,
+                        false,
+                    )
+                }
+                Err(e) => {
+                    println!("{} Failed to read commit from git: {}", "Error:".red(), e);
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    // Step 2b: Apply reachability filter if provided
+    if let Some(reachable_from) = reachable_sha {
+        match git::is_commit_reachable(git_repo_path, reachable_from, &resolved_sha) {
+            Ok(true) => {
+                // Commit is reachable, continue processing
+            }
+            Ok(false) => {
+                println!(
+                    "{} Commit {} is not reachable from {}",
+                    "Info:".yellow(),
+                    resolved_sha.bright_black(),
+                    reachable_from
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                println!("{} Failed to check reachability: {}", "Error:".red(), e);
+                return Ok(());
+            }
+        }
+    }
+
+    // Step 3: Apply regex filters if provided (ALL must match)
+    if !regex_patterns.is_empty() {
+        // Compile all regex patterns
+        let mut regexes = Vec::new();
+        for pattern in regex_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => regexes.push(re),
+                Err(e) => {
+                    println!(
+                        "{} Invalid regex pattern '{}': {}",
+                        "Error:".red(),
+                        pattern,
+                        e
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Check if commit message or diff matches ALL regex patterns
+        let combined = format!("{}\n\n{}", commit_message, commit_diff);
+        let mut failed_patterns = Vec::new();
+        for (i, re) in regexes.iter().enumerate() {
+            if !re.is_match(&combined) {
+                failed_patterns.push(regex_patterns[i].as_str());
+            }
+        }
+
+        if !failed_patterns.is_empty() {
+            println!(
+                "{} Commit {} does not match {} regex pattern(s): {}",
+                "Info:".yellow(),
+                resolved_sha.bright_black(),
+                failed_patterns.len(),
+                failed_patterns.join(", ")
+            );
+            return Ok(());
+        }
+    }
+
+    // Step 3b: Apply symbol filters if provided (ALL must match)
+    if !symbol_patterns.is_empty() {
+        // Compile all symbol regex patterns
+        let mut symbol_regexes = Vec::new();
+        for pattern in symbol_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => symbol_regexes.push(re),
+                Err(e) => {
+                    println!(
+                        "{} Invalid symbol regex pattern '{}': {}",
+                        "Error:".red(),
+                        pattern,
+                        e
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Check if commit symbols match ALL symbol patterns
+        let mut failed_symbol_patterns = Vec::new();
+        for (i, re) in symbol_regexes.iter().enumerate() {
+            // Check if ANY symbol matches this pattern
+            let matches_any = commit_symbols.iter().any(|symbol| re.is_match(symbol));
+            if !matches_any {
+                failed_symbol_patterns.push(symbol_patterns[i].as_str());
+            }
+        }
+
+        if !failed_symbol_patterns.is_empty() {
+            println!(
+                "{} Commit {} does not match {} symbol pattern(s): {}",
+                "Info:".yellow(),
+                resolved_sha.bright_black(),
+                failed_symbol_patterns.len(),
+                failed_symbol_patterns.join(", ")
+            );
+            return Ok(());
+        }
+    }
+
+    // Step 3c: Apply path filters if provided (ANY must match - OR logic)
+    if !path_patterns.is_empty() {
+        // Compile all path regex patterns
+        let mut path_regexes = Vec::new();
+        for pattern in path_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => path_regexes.push(re),
+                Err(e) => {
+                    println!(
+                        "{} Invalid path regex pattern '{}': {}",
+                        "Error:".red(),
+                        pattern,
+                        e
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Check if commit files match ANY path pattern
+        let matches_any_pattern = path_regexes
+            .iter()
+            .any(|re| commit_files.iter().any(|file| re.is_match(file)));
+
+        if !matches_any_pattern {
+            println!(
+                "{} Commit {} does not match any of {} path pattern(s): {}",
+                "Info:".yellow(),
+                resolved_sha.bright_black(),
+                path_patterns.len(),
+                path_patterns.join(", ")
+            );
+            return Ok(());
+        }
+    }
+
+    // Step 4: Display commit metadata
+    if !is_indexed {
+        println!(
+            "\n{}",
+            "⚠️  COMMIT NOT INDEXED - SHOWING GIT DATA".bold().yellow()
+        );
+    }
+    println!("\n{}", "=== Git Commit Metadata ===".bold().green());
+    println!("{} {}", "Commit:".bold(), commit_sha.yellow());
+    println!("{} {}", "Author:".bold(), commit_author.cyan());
+    println!("{} {}", "Subject:".bold(), commit_subject);
+
+    // Show parent commits if any
+    if !commit_parent_sha.is_empty() {
+        println!("\n{}", "Parents:".bold());
+        for parent in &commit_parent_sha {
+            println!("  {}", parent.bright_black());
+        }
+    }
+
+    // Show tags if any
+    if !commit_tags.is_empty() {
+        println!("\n{}", "Tags:".bold());
+        for (tag_name, tag_values) in &commit_tags {
+            for value in tag_values {
+                println!("  {}: {}", tag_name.magenta(), value);
+            }
+        }
+    }
+
+    // Show symbols if any
+    if !commit_symbols.is_empty() {
+        println!(
+            "\n{} ({} symbols)",
+            "Modified Symbols:".bold().cyan(),
+            commit_symbols.len()
+        );
+        let mut sorted_symbols = commit_symbols.clone();
+        sorted_symbols.sort();
+        for symbol in &sorted_symbols {
+            println!("  {}", symbol.yellow());
+        }
+    }
+
+    // Show full message
+    if !commit_message.is_empty() && commit_message != commit_subject {
+        println!("\n{}", "Message:".bold());
+        println!("{}", "─".repeat(60).bright_black());
+        println!("{}", commit_message);
+        println!("{}", "─".repeat(60).bright_black());
+    }
+
+    // Show diff if verbose flag is set
+    if verbose {
+        if !commit_diff.is_empty() {
+            println!("\n{}", "Diff:".bold().blue());
+            println!("{}", "─".repeat(80).bright_black());
+            println!("{}", commit_diff);
+            println!("{}", "─".repeat(80).bright_black());
+        } else {
+            println!("\n{} No diff available for this commit", "Info:".yellow());
+        }
+    }
+
+    Ok(())
+}
+
+/// Show metadata for commits in a git range
+async fn show_commit_range(
+    db: &DatabaseManager,
+    range: &str,
+    verbose: bool,
+    regex_patterns: &[String],
+    symbol_patterns: &[String],
+    path_patterns: &[String],
+    limit: usize,
+    reachable_sha: Option<&str>,
+    git_repo_path: &str,
+) -> Result<()> {
+    // Step 1: Resolve git range using gitoxide
+    let range_commits = match gix::discover(git_repo_path) {
+        Ok(repo) => {
+            // Parse the range (FROM..TO)
+            let range_parts: Vec<&str> = range.split("..").collect();
+            if range_parts.len() != 2 {
+                println!(
+                    "{} Invalid git range format: '{}'. Expected format: FROM..TO (e.g., HEAD~10..HEAD)",
+                    "Error:".red(),
+                    range
+                );
+                return Ok(());
+            }
+
+            let from_ref = range_parts[0];
+            let to_ref = range_parts[1];
+
+            // Resolve both references
+            let from_commit = match git::resolve_to_commit(&repo, from_ref) {
+                Ok(c) => c,
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    println!(
+                        "{} Failed to resolve git reference '{}': {}",
+                        "Error:".red(),
+                        from_ref,
+                        err_msg
+                    );
+
+                    // Provide helpful hint for common errors
+                    if err_msg.contains("0 ancestors") || err_msg.contains("out of range") {
+                        println!(
+                            "{} The reference points to a root commit (no parents). Cannot go back further in history.",
+                            "Hint:".yellow()
+                        );
+                    }
+                    return Ok(());
+                }
+            };
+
+            let to_commit = match git::resolve_to_commit(&repo, to_ref) {
+                Ok(c) => c,
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    println!(
+                        "{} Failed to resolve git reference '{}': {}",
+                        "Error:".red(),
+                        to_ref,
+                        err_msg
+                    );
+
+                    // Provide helpful hint for common errors
+                    if err_msg.contains("0 ancestors") || err_msg.contains("out of range") {
+                        println!(
+                            "{} The reference points to a root commit (no parents). Cannot go back further in history.",
+                            "Hint:".yellow()
+                        );
+                    }
+                    return Ok(());
+                }
+            };
+
+            // Walk the commit history
+            let to_id = to_commit.id().detach();
+            let from_id = from_commit.id().detach();
+
+            match repo
+                .rev_walk([to_id])
+                .with_hidden([from_id])
+                .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                    Default::default(),
+                ))
+                .all()
+            {
+                Ok(walk) => {
+                    let mut commits = Vec::new();
+                    // Higher limit when regex or symbol filtering is active, since results will be filtered down
+                    let max_commits = if !regex_patterns.is_empty() || !symbol_patterns.is_empty() {
+                        1_000_000 // Allow larger ranges when filtering
+                    } else {
+                        10_000 // Standard safety limit
+                    };
+
+                    for commit_result in walk {
+                        match commit_result {
+                            Ok(commit_info) => {
+                                if commits.len() >= max_commits {
+                                    println!(
+                                        "{} Git range {} is too large (>{} commits)",
+                                        "Error:".red(),
+                                        range,
+                                        max_commits
+                                    );
+                                    if regex_patterns.is_empty() && symbol_patterns.is_empty() {
+                                        println!(
+                                            "{} Try using -r <regex> or -s <regex> to filter results, or use a smaller range",
+                                            "Hint:".yellow()
+                                        );
+                                    } else {
+                                        println!(
+                                            "{} Try using a smaller range or more specific filter patterns",
+                                            "Hint:".yellow()
+                                        );
+                                    }
+                                    return Ok(());
+                                }
+
+                                let commit_id = commit_info.id().to_string();
+                                commits.push(commit_id);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Error walking commits: {}", e);
+                                break;
+                            }
+                        }
+                    }
+
+                    commits
+                }
+                Err(e) => {
+                    println!("{} Failed to walk git history: {}", "Error:".red(), e);
+                    return Ok(());
+                }
+            }
+        }
+        Err(e) => {
+            println!("{} Not in a git repository: {}", "Error:".red(), e);
+            return Ok(());
+        }
+    };
+
+    if range_commits.is_empty() {
+        println!("{} No commits found in range {}", "Info:".yellow(), range);
+        return Ok(());
+    }
+
+    // Step 2: Compile filters
+    let regex_filters = if !regex_patterns.is_empty() {
+        compile_regex_filters(regex_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    let symbol_filters = if !symbol_patterns.is_empty() {
+        compile_symbol_filters(symbol_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    let path_filters = if !path_patterns.is_empty() {
+        compile_path_filters(path_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    println!(
+        "\n{} Found {} commit(s) in range {}:",
+        "Git Range:".bold().green(),
+        range_commits.len(),
+        range.cyan()
+    );
+    println!("{}", "=".repeat(80));
+
+    // Step 3: Process commits in chunks of 256 with database-level filtering
+    const CHUNK_SIZE: usize = 256;
+
+    // Convert regex and symbol patterns to strings for database filtering
+    let regex_filter_patterns: Vec<String> = regex_filters
+        .iter()
+        .map(|re| re.as_str().to_string())
+        .collect();
+    let symbol_filter_patterns: Vec<String> = symbol_filters
+        .iter()
+        .map(|re| re.as_str().to_string())
+        .collect();
+
+    // Collect all filtered commits from all chunks first
+    let mut all_filtered_commits = Vec::new();
+    for chunk_start in (0..range_commits.len()).step_by(CHUNK_SIZE) {
+        let chunk_end = (chunk_start + CHUNK_SIZE).min(range_commits.len());
+        let chunk = &range_commits[chunk_start..chunk_end];
+
+        // Query this chunk with database-level filtering
+        let chunk_results = db
+            .query_commits_chunk_filtered(chunk, &regex_filter_patterns, &symbol_filter_patterns)
+            .await?;
+
+        // Apply path filtering to chunk results
+        for commit in chunk_results {
+            // Apply path filters (ANY must match - OR logic)
+            if !path_filters.is_empty() {
+                let matches_any_pattern = path_filters
+                    .iter()
+                    .any(|re| commit.files.iter().any(|file| re.is_match(file)));
+                if !matches_any_pattern {
+                    continue;
+                }
+            }
+            all_filtered_commits.push(commit);
+        }
+    }
+
+    // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
+    let reachable_set = if let Some(reachable_from) = reachable_sha {
+        if all_filtered_commits.len() > 10 {
+            match git::get_reachable_commits(git_repo_path, reachable_from) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    println!(
+                        "{} Failed to build reachable commits set: {}. Using individual checks",
+                        "Warning:".yellow(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Step 5: Apply reachability filter and display commits
+    let mut displayed_count = 0;
+    let mut matched_count = 0;
+
+    for commit in &all_filtered_commits {
+        // Apply reachability filter if provided
+        if let Some(reachable_from) = reachable_sha {
+            // Use hashset if available, otherwise do individual check
+            let is_reachable = if let Some(ref set) = reachable_set {
+                set.contains(&commit.git_sha)
+            } else {
+                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(e) => {
+                        println!(
+                            "{} Failed to check reachability for commit {}: {}",
+                            "Warning:".yellow(),
+                            commit.git_sha,
+                            e
+                        );
+                        false
+                    }
+                }
+            };
+
+            if !is_reachable {
+                continue;
+            }
+        }
+
+        matched_count += 1;
+
+        // Apply limit
+        if limit > 0 && displayed_count >= limit {
+            continue;
+        }
+
+        displayed_count += 1;
+        display_commit(commit, displayed_count, verbose);
+    }
+
+    // Step 6: Show summary
+    show_commit_summary(
+        range_commits.len(),
+        matched_count,
+        displayed_count,
+        limit,
+        regex_patterns,
+        symbol_patterns,
+        path_patterns,
+    );
 
     Ok(())
 }

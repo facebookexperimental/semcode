@@ -34,6 +34,8 @@ cargo build --release
 ./build.sh --with-test
 ```
 
+- Always use cargo fmt after making changes to properly format the files
+
 ### Database Location
 
 Semcode uses the following search order to locate the `.semcode.db` database directory:
@@ -281,6 +283,7 @@ Semcode uses **Tree-sitter** for C/C++ code analysis:
 - Error handling via `anyhow::Result`
 - Parallel processing with `rayon` crate
 - Progress reporting with `indicatif`
+- Use gitoxide (gix) for all git access, never command line git
 
 ### Color Output System
 Semcode uses **anstream** + **owo-colors** for automatic color handling:

@@ -74,12 +74,26 @@ pub struct MacroInfo {
     pub types: Option<Vec<String>>, // Type names used by this macro
 }
 
+/// Git commit metadata with changed symbols
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitCommitInfo {
+    pub git_sha: String,                    // The commit SHA
+    pub parent_sha: Vec<String>,            // Parent commit SHAs (multiple for merges)
+    pub author: String,                     // Author name and email
+    pub subject: String,                    // Single line commit title
+    pub message: String,                    // Full commit message
+    pub tags: HashMap<String, Vec<String>>, // Tags from commit message (Signed-off-by:, etc.)
+    pub diff: String,                       // Full unified diff
+    pub symbols: Vec<String>,               // Changed symbols (filename:symbol() format)
+    pub files: Vec<String>,                 // List of files changed by this commit
+}
+
 /// Global type registry for cross-file type resolution
 #[derive(Debug, Clone)]
 pub struct GlobalTypeRegistry {
     /// Map from type name to type information
     pub types: HashMap<String, TypeInfo>,
-    /// Map from typedef name to typedef information  
+    /// Map from typedef name to typedef information
     pub typedefs: HashMap<String, TypedefInfo>,
 }
 

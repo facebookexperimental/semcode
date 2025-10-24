@@ -6,6 +6,7 @@ pub mod git;
 pub mod hash;
 pub mod perf_monitor;
 pub mod pipeline;
+pub mod symbol_walkback;
 pub mod text_utils;
 mod treesitter_analyzer;
 mod types;
@@ -15,6 +16,7 @@ mod vectorizer;
 pub mod callchain;
 pub mod diffdump;
 pub mod display;
+pub mod pages;
 pub mod search;
 
 // Re-export the main types and structs
@@ -25,8 +27,8 @@ pub use hash::{compute_content_hash, compute_file_hash};
 pub use text_utils::preprocess_code;
 pub use treesitter_analyzer::TreeSitterAnalyzer;
 pub use types::{
-    FieldInfo, FunctionInfo, GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry, MacroInfo,
-    ParameterInfo, TypeInfo, TypedefInfo,
+    FieldInfo, FunctionInfo, GitCommitInfo, GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry,
+    MacroInfo, ParameterInfo, TypeInfo, TypedefInfo,
 };
 pub use vectorizer::CodeVectorizer;
 

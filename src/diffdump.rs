@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use crate::TreeSitterAnalyzer;
 use anyhow::Result;
 use colored::*;
 use std::collections::HashSet;
@@ -10,6 +9,8 @@ use std::path::Path;
 pub struct DiffParseResult {
     pub modified_functions: HashSet<String>, // Functions that are actually modified (from hunk headers and definitions)
     pub called_functions: HashSet<String>,   // Functions that are called in added/removed lines
+    pub modified_types: HashSet<String>,     // Types that are modified
+    pub modified_macros: HashSet<String>,    // Macros that are modified
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -57,14 +58,22 @@ fn resolve_path(path: &str) -> Result<String> {
 pub fn parse_unified_diff(diff_content: &str) -> Result<DiffParseResult> {
     let mut modified_functions = HashSet::new();
     let mut called_functions = HashSet::new();
+    let mut modified_types = HashSet::new();
+    let mut modified_macros = HashSet::new();
     let lines: Vec<&str> = diff_content.lines().collect();
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
 
-        // Look for file headers: --- a/path/to/file.c or +++ b/path/to/file.c
-        if line.starts_with("+++") && line.contains(".c") {
+        // Look for file headers for C/C++ files
+        if line.starts_with("+++")
+            && (line.contains(".c")
+                || line.contains(".h")
+                || line.contains(".cpp")
+                || line.contains(".cc")
+                || line.contains(".cxx"))
+        {
             // Parse the file being modified
             let file_path = extract_file_path(line);
 
@@ -74,10 +83,12 @@ pub fn parse_unified_diff(diff_content: &str) -> Result<DiffParseResult> {
                 let hunk_line = lines[i];
 
                 if hunk_line.starts_with("@@") {
-                    // Parse the hunk to find function context and modifications using tree-sitter
-                    let hunk_result = parse_hunk_with_treesitter(&lines, &mut i, &file_path)?;
+                    // Parse the hunk to find function context and modifications using walk-back algorithm
+                    let hunk_result = parse_hunk_with_walkback(&lines, &mut i, &file_path)?;
                     modified_functions.extend(hunk_result.modified_functions);
                     called_functions.extend(hunk_result.called_functions);
+                    modified_types.extend(hunk_result.modified_types);
+                    modified_macros.extend(hunk_result.modified_macros);
                 } else if hunk_line.starts_with("---") || hunk_line.starts_with("+++") {
                     // Start of next file
                     break;
@@ -93,6 +104,8 @@ pub fn parse_unified_diff(diff_content: &str) -> Result<DiffParseResult> {
     Ok(DiffParseResult {
         modified_functions,
         called_functions,
+        modified_types,
+        modified_macros,
     })
 }
 
@@ -155,13 +168,15 @@ fn extract_function_from_hunk_header(hunk_header: &str) -> Option<String> {
     None
 }
 
-fn parse_hunk_with_treesitter(
+fn parse_hunk_with_walkback(
     lines: &[&str],
     i: &mut usize,
     _file_path: &str,
 ) -> Result<DiffParseResult> {
     let mut modified_functions = HashSet::new();
     let mut called_functions = HashSet::new();
+    let mut modified_types = HashSet::new();
+    let mut modified_macros = HashSet::new();
 
     // Collect all lines from the hunk (context + modified)
     let mut hunk_lines = Vec::new();
@@ -214,26 +229,33 @@ fn parse_hunk_with_treesitter(
         *i += 1;
     }
 
-    // Reconstruct the code snippet and parse with tree-sitter
+    // Use walk-back algorithm to find modified symbols
     if !hunk_lines.is_empty() {
         let reconstructed_code = hunk_lines.join("\n");
 
-        if let Ok(mut analyzer) = TreeSitterAnalyzer::new() {
-            // Parse the reconstructed code to find function definitions
-            if let Ok(functions) = analyzer.analyze_code_snippet(&reconstructed_code) {
-                for func_info in functions {
-                    // Check if this function definition intersects with modified lines
-                    let func_start_line = func_info.line_start as usize;
-                    let func_end_line = func_info.line_end as usize;
+        // Use walk-back algorithm to extract symbols from modified lines
+        let symbols = crate::symbol_walkback::extract_symbols_by_walkback(
+            &reconstructed_code,
+            &modified_line_numbers,
+        );
 
-                    // If any line in the function's range was modified, include it
-                    for line_num in func_start_line..=func_end_line {
-                        if modified_line_numbers.contains(&line_num) {
-                            modified_functions.insert(func_info.name.clone());
-                            break;
-                        }
-                    }
-                }
+        // Parse symbols and categorize them
+        for symbol in symbols {
+            if symbol.starts_with('#') {
+                // Macro: "#MACRO_NAME"
+                modified_macros.insert(symbol[1..].to_string());
+            } else if symbol.contains("()") {
+                // Function: "function_name()"
+                modified_functions.insert(symbol.trim_end_matches("()").to_string());
+            } else if symbol.starts_with("struct ")
+                || symbol.starts_with("union ")
+                || symbol.starts_with("enum ")
+            {
+                // Type: "struct foo", "union bar", "enum baz"
+                modified_types.insert(symbol);
+            } else if symbol.starts_with("typedef ") {
+                // Typedef: "typedef foo"
+                modified_types.insert(symbol);
             }
         }
     }
@@ -241,6 +263,8 @@ fn parse_hunk_with_treesitter(
     Ok(DiffParseResult {
         modified_functions,
         called_functions,
+        modified_types,
+        modified_macros,
     })
 }
 
@@ -431,14 +455,15 @@ pub async fn diffinfo(input_file: Option<&str>) -> Result<()> {
     let parse_result = parse_unified_diff(&diff_content)?;
 
     println!("\n{}", "=".repeat(60));
-    println!("{}", "DIFF FUNCTION ANALYSIS".bold().cyan());
+    println!("{}", "DIFF ANALYSIS".bold().cyan());
     println!("{}", "=".repeat(60));
 
-    if parse_result.modified_functions.is_empty() && parse_result.called_functions.is_empty() {
-        println!(
-            "{} No function modifications found in diff",
-            "Result:".yellow()
-        );
+    if parse_result.modified_functions.is_empty()
+        && parse_result.called_functions.is_empty()
+        && parse_result.modified_types.is_empty()
+        && parse_result.modified_macros.is_empty()
+    {
+        println!("{} No modifications found in diff", "Result:".yellow());
         return Ok(());
     }
 
@@ -446,7 +471,7 @@ pub async fn diffinfo(input_file: Option<&str>) -> Result<()> {
     if !parse_result.modified_functions.is_empty() {
         println!(
             "\n{} {} functions:",
-            "MODIFIED:".bold().red(),
+            "MODIFIED FUNCTIONS:".bold().red(),
             parse_result.modified_functions.len()
         );
         let mut sorted_modified: Vec<_> = parse_result.modified_functions.iter().collect();
@@ -456,11 +481,39 @@ pub async fn diffinfo(input_file: Option<&str>) -> Result<()> {
         }
     }
 
+    // Display modified types
+    if !parse_result.modified_types.is_empty() {
+        println!(
+            "\n{} {} types:",
+            "MODIFIED TYPES:".bold().magenta(),
+            parse_result.modified_types.len()
+        );
+        let mut sorted_types: Vec<_> = parse_result.modified_types.iter().collect();
+        sorted_types.sort();
+        for type_name in sorted_types {
+            println!("  {} {}", "●".magenta(), type_name.bold());
+        }
+    }
+
+    // Display modified macros
+    if !parse_result.modified_macros.is_empty() {
+        println!(
+            "\n{} {} macros:",
+            "MODIFIED MACROS:".bold().yellow(),
+            parse_result.modified_macros.len()
+        );
+        let mut sorted_macros: Vec<_> = parse_result.modified_macros.iter().collect();
+        sorted_macros.sort();
+        for macro_name in sorted_macros {
+            println!("  {} {}", "●".yellow(), macro_name.bold());
+        }
+    }
+
     // Display called functions
     if !parse_result.called_functions.is_empty() {
         println!(
             "\n{} {} functions:",
-            "CALLED:".bold().cyan(),
+            "CALLED FUNCTIONS:".bold().cyan(),
             parse_result.called_functions.len()
         );
         let mut sorted_called: Vec<_> = parse_result.called_functions.iter().collect();
@@ -474,21 +527,28 @@ pub async fn diffinfo(input_file: Option<&str>) -> Result<()> {
     }
 
     // Summary
-    let total_unique = parse_result.modified_functions.len()
-        + parse_result
-            .called_functions
-            .iter()
-            .filter(|f| !parse_result.modified_functions.contains(*f))
-            .count();
+    let total_modified = parse_result.modified_functions.len()
+        + parse_result.modified_types.len()
+        + parse_result.modified_macros.len();
+    let unique_called = parse_result
+        .called_functions
+        .iter()
+        .filter(|f| !parse_result.modified_functions.contains(*f))
+        .count();
 
     println!("\n{}", "=".repeat(60));
     println!(
-        "{} {} modified, {} called, {} total unique functions",
+        "{} Modified: {} functions, {} types, {} macros",
         "SUMMARY:".bold(),
         parse_result.modified_functions.len(),
-        parse_result.called_functions.len(),
-        total_unique
+        parse_result.modified_types.len(),
+        parse_result.modified_macros.len()
     );
+    println!(
+        "         Called: {} functions (excluding modified)",
+        unique_called
+    );
+    println!("         Total: {} modified symbols", total_modified);
     println!("{}", "=".repeat(60));
 
     Ok(())

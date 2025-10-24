@@ -4,6 +4,12 @@ Semcode is a semantic code search tool for C/C++ codebases that indexes your
 codebase and allows you to search for functions, types, and code patterns using
 both exact matches and semantic similarity.
 
+## News
+
+Recent commits introduced indexes for git commit history, as well as
+performance improvements.  Unfortunately, these are a schema change and
+you'll need to reindex your database.
+
 ## Features
 
 - **Fast indexing** of C/C++ codebases using Tree-sitter
@@ -24,8 +30,6 @@ The MCP server can also be used by
 
 ## Future features
 
-- **Semantic search** -- exists today but largely untested
-- **Git commit history indexing** for finding future and past versions of functions/types
 - **lore.kernel.org index** via git for searching mailing list archives
 
 ## Quick Start
@@ -102,6 +106,29 @@ These functions all have -v to show you paths and git file shas
 semcode> callers mutex_lock               # Show what calls mutex_lock
 semcode> calls schedule                 # Show what schedule calls
 semcode> callchain kmalloc                # Show complete call graph
+```
+
+**Commit searching**:
+
+You can search through all the commits, or through commit ranges.  There
+are options for path regex (-p), symbol regex (-s) and verbose dumping of
+the commit diff (-v).
+
+```
+semcode> commit HEAD                      # show the HEAD commit
+semcode> commit --git v6.16..v6.17 -s kmalloc # search for kmalloc in range
+semcode> commit -p fs.btrfs -r filemap        # search fs/btrfs for commits mentioning filemap
+```
+
+**Semantic Commit searching (requires vectors)**:
+All the same options as commit searching, but uses the embedded vectors.  You
+can optionally add regex on top to filter the results.
+
+Semantic searches are better for topics that aren't well suited to regex, such
+as find all the interface changes, or all the performance fixes.
+
+```
+semcode> vcommit -p fs.btrfs "all the interface changes"
 ```
 
 **Semantic Search (requires vectors):**
