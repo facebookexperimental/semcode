@@ -107,6 +107,10 @@ struct Args {
     /// Populates only the commits table without indexing any source files.
     #[arg(long, value_name = "COMMIT_RANGE")]
     commits: Option<String>,
+
+    /// Number of parallel database inserter threads for git range and commit indexing modes
+    #[arg(long, default_value = "4")]
+    db_threads: usize,
 }
 
 #[tokio::main]
@@ -317,6 +321,7 @@ async fn run_commits_only(args: Args) -> Result<()> {
         batch_size,
         num_workers,
         existing_commits,
+        args.db_threads,
     )
     .await?;
 
@@ -339,6 +344,7 @@ async fn process_commits_pipeline(
     batch_size: usize,
     num_workers: usize,
     existing_commits: HashSet<String>,
+    num_inserters: usize,
 ) -> Result<()> {
     use std::sync::Mutex;
 
@@ -466,9 +472,8 @@ async fn process_commits_pipeline(
     // Initialize with existing commits from database and track new inserts
     let seen_commits = Arc::new(Mutex::new(existing_commits));
 
-    // Use 8 inserter tasks for parallel database insertion
+    // Use specified number of inserter tasks for parallel database insertion
     // Balance between parallelism (faster insertion) and lock contention
-    let num_inserters = 16;
     let mut inserter_handles = Vec::new();
 
     for inserter_id in 0..num_inserters {
@@ -1249,6 +1254,7 @@ async fn process_git_tuples_streaming(
     processed_files: Arc<HashSet<String>>,
     num_workers: usize,
     db_manager: Arc<DatabaseManager>,
+    num_inserters: usize,
 ) -> Result<GitTupleStats> {
     use std::sync::Mutex;
 
@@ -1402,8 +1408,7 @@ async fn process_git_tuples_streaming(
     // Close the original result sender (workers have clones)
     drop(result_tx);
 
-    // Spawn database inserter tasks (use 4 for better parallelism without too much contention)
-    let num_inserters = 4;
+    // Spawn database inserter tasks (configurable via --db-threads)
     let mut inserter_handles = Vec::new();
 
     for inserter_id in 0..num_inserters {
@@ -1843,6 +1848,7 @@ async fn process_git_range(
                 batch_size,
                 num_workers,
                 existing_commits,
+                args.db_threads,
             )
             .await?;
 
@@ -1876,6 +1882,7 @@ async fn process_git_range(
         processed_files,
         num_workers,
         db_manager.clone(),
+        args.db_threads,
     )
     .await?;
 
