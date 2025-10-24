@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Module declarations
-mod database;
+pub mod database;
 pub mod database_utils;
 pub mod git;
 pub mod hash;
@@ -8,9 +8,9 @@ pub mod perf_monitor;
 pub mod pipeline;
 pub mod symbol_walkback;
 pub mod text_utils;
-mod treesitter_analyzer;
-mod types;
-mod vectorizer;
+pub mod treesitter_analyzer;
+pub mod types;
+pub mod vectorizer;
 
 // Query functionality modules
 pub mod callchain;
