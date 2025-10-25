@@ -7,6 +7,7 @@ mod functions;
 pub mod processed_files;
 mod schema;
 pub mod search;
+pub mod sql_utils;
 mod symbol_filename;
 mod types;
 mod vectors;

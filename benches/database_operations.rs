@@ -320,11 +320,58 @@ fn bench_batch_processing(c: &mut Criterion) {
     group.finish();
 }
 
+// Benchmark SQL string formatting
+fn bench_sql_string_formatting(c: &mut Criterion) {
+    use semcode::database::sql_utils::format_sql_strings;
+
+    let mut group = c.benchmark_group("sql_string_formatting");
+
+    // Small batch (10 items)
+    let small_items: Vec<String> = (0..10).map(|i| format!("hash_{}", i)).collect();
+    group.throughput(Throughput::Elements(10));
+    group.bench_function("format_10_strings", |b| {
+        b.iter(|| format_sql_strings(black_box(&small_items)))
+    });
+
+    // Medium batch (100 items) - typical chunk size
+    let medium_items: Vec<String> = (0..100).map(|i| format!("hash_{}", i)).collect();
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("format_100_strings", |b| {
+        b.iter(|| format_sql_strings(black_box(&medium_items)))
+    });
+
+    // Large batch (1000 items)
+    let large_items: Vec<String> = (0..1000).map(|i| format!("hash_{}", i)).collect();
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("format_1000_strings", |b| {
+        b.iter(|| format_sql_strings(black_box(&large_items)))
+    });
+
+    // Very large batch (5000 items)
+    let very_large_items: Vec<String> = (0..5000).map(|i| format!("hash_{}", i)).collect();
+    group.throughput(Throughput::Elements(5000));
+    group.bench_function("format_5000_strings", |b| {
+        b.iter(|| format_sql_strings(black_box(&very_large_items)))
+    });
+
+    // Test with strings requiring escaping
+    let items_with_quotes: Vec<String> = (0..1000)
+        .map(|i| format!("test'{}'{}'data", i, i))
+        .collect();
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("format_1000_strings_with_escaping", |b| {
+        b.iter(|| format_sql_strings(black_box(&items_with_quotes)))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_batch_insertion,
     bench_search_operations,
     bench_content_deduplication,
     bench_batch_processing,
+    bench_sql_string_formatting,
 );
 criterion_main!(benches);
