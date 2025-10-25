@@ -366,6 +366,153 @@ fn bench_sql_string_formatting(c: &mut Criterion) {
     group.finish();
 }
 
+// Benchmark map building from batches
+fn bench_map_building(c: &mut Criterion) {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use semcode::database::batch_processing::build_map_from_batches;
+    use std::sync::Arc;
+
+    let mut group = c.benchmark_group("map_building");
+
+    // Small batch (100 rows)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("hash", DataType::Utf8, false),
+        Field::new("content", DataType::Utf8, false),
+    ]));
+
+    let small_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                (0..100).map(|i| format!("hash_{}", i)).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..100)
+                    .map(|i| format!("content_{}", i))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("build_map_100_rows", |b| {
+        b.iter(|| {
+            build_map_from_batches(
+                black_box(&[small_batch.clone()]),
+                |batch, i| {
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Some(array.value(i).to_string())
+                },
+                |batch, i| {
+                    let array = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Some(array.value(i).to_string())
+                },
+            )
+        })
+    });
+
+    // Large batch (1000 rows)
+    let large_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                (0..1000).map(|i| format!("hash_{}", i)).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..1000)
+                    .map(|i| format!("content_{}", i))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("build_map_1000_rows", |b| {
+        b.iter(|| {
+            build_map_from_batches(
+                black_box(&[large_batch.clone()]),
+                |batch, i| {
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Some(array.value(i).to_string())
+                },
+                |batch, i| {
+                    let array = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Some(array.value(i).to_string())
+                },
+            )
+        })
+    });
+
+    // Multiple batches (10 batches of 100 rows each = 1000 total)
+    let multi_batches: Vec<RecordBatch> = (0..10)
+        .map(|batch_idx| {
+            let start = batch_idx * 100;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(
+                        (start..start + 100)
+                            .map(|i| format!("hash_{}", i))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (start..start + 100)
+                            .map(|i| format!("content_{}", i))
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("build_map_10_batches_1000_rows", |b| {
+        b.iter(|| {
+            build_map_from_batches(
+                black_box(&multi_batches),
+                |batch, i| {
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Some(array.value(i).to_string())
+                },
+                |batch, i| {
+                    let array = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Some(array.value(i).to_string())
+                },
+            )
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_batch_insertion,
@@ -373,5 +520,6 @@ criterion_group!(
     bench_content_deduplication,
     bench_batch_processing,
     bench_sql_string_formatting,
+    bench_map_building,
 );
 criterion_main!(benches);
