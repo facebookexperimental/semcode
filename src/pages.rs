@@ -118,7 +118,8 @@ impl PageCache {
                 paged_query.unrelated_query_count += 1;
             }
 
-            // Remove queries that have exceeded the unrelated query limit
+            // Remove queries that have reached or exceeded the unrelated query limit
+            // After incrementing, queries with count >= MAX_UNRELATED_QUERIES should be removed
             cache
                 .retain(|_, paged_query| paged_query.unrelated_query_count < MAX_UNRELATED_QUERIES);
 
@@ -149,6 +150,13 @@ impl PageCache {
     pub fn cache_size(&self) -> usize {
         let cache = self.cache.lock().unwrap();
         cache.len()
+    }
+
+    /// Check if a specific query is cached (useful for testing)
+    #[allow(dead_code)]
+    pub fn has_query(&self, query_key: &str) -> bool {
+        let cache = self.cache.lock().unwrap();
+        cache.contains_key(query_key)
     }
 }
 
@@ -236,9 +244,16 @@ mod tests {
             cache.get_page(&format!("query{}", i), &content, Some(1));
         }
 
-        // query1 should have been removed (5 unrelated queries)
-        // query6 should still be cached
-        assert_eq!(cache.cache_size(), 1);
+        // query1 should have been removed after seeing 5 unrelated queries
+        assert!(
+            !cache.has_query("query1"),
+            "query1 should have been evicted"
+        );
+
+        // query2-6 should still be cached (haven't reached the limit yet)
+        assert!(cache.has_query("query2"), "query2 should still be cached");
+        assert!(cache.has_query("query6"), "query6 should still be cached");
+        assert_eq!(cache.cache_size(), 5);
     }
 
     #[test]
