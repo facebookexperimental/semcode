@@ -1035,7 +1035,7 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Vec<ParameterInfo> {
-        let mut parameters = Vec::new();
+        let mut parameters = Vec::with_capacity(8); // Most functions have <8 parameters
 
         // Walk through the parameter_list node to find parameter_declaration children
         let mut cursor = node.walk();
@@ -1072,7 +1072,7 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Vec<ParameterInfo> {
-        let mut parameters = Vec::new();
+        let mut parameters = Vec::with_capacity(8); // Most functions have <8 parameters
         let text = &source[node.byte_range()];
 
         // Remove newlines and normalize whitespace for easier parsing
@@ -1803,7 +1803,7 @@ impl TreeSitterAnalyzer {
 
     /// Generate common variations of type names for lookup
     fn generate_type_name_variants(&self, base_name: &str) -> Vec<String> {
-        let mut variants = Vec::new();
+        let mut variants = Vec::with_capacity(6); // Max 6 variants (struct/union/enum + with/without prefix)
 
         // Add struct prefix if not present
         if !base_name.starts_with("struct ")
