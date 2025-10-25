@@ -586,13 +586,10 @@ impl PipelineBuilder {
                                 batch.macros.extend(parsed.macros);
 
                                 // Create processed file record
-                                let file_path_str = {
-                                    let raw_path = parsed.path.to_string_lossy().to_string();
-                                    if raw_path.starts_with("./") {
-                                        raw_path.strip_prefix("./").unwrap().to_string()
-                                    } else {
-                                        raw_path
-                                    }
+                                let file_path_str = match parsed.path.to_str() {
+                                    Some(s) if s.starts_with("./") => s[2..].to_owned(),
+                                    Some(s) => s.to_owned(),
+                                    None => parsed.path.to_string_lossy().into_owned(),
                                 };
 
                                 batch.processed_files.push(
@@ -849,13 +846,10 @@ impl PipelineBuilder {
 
         for (file_path, git_file_sha) in git_manifest {
             // Normalize path for lookup (same as database storage)
-            let file_path_str = {
-                let raw_path = file_path.to_string_lossy().to_string();
-                if raw_path.starts_with("./") {
-                    raw_path.strip_prefix("./").unwrap().to_string()
-                } else {
-                    raw_path
-                }
+            let file_path_str = match file_path.to_str() {
+                Some(s) if s.starts_with("./") => s[2..].to_owned(),
+                Some(s) => s.to_owned(),
+                None => file_path.to_string_lossy().into_owned(),
             };
 
             let lookup_key = (file_path_str, git_file_sha.clone());
