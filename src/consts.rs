@@ -12,3 +12,7 @@ pub const SMALLVEC_PARAM_SIZE: usize = 10;
 /// SmallVec size for struct/union/enum fields.
 /// Based on kernel analysis: 94.92% of types have 20 or fewer fields.
 pub const SMALLVEC_FIELD_SIZE: usize = 22;
+
+/// Threshold for switching to parallel processing in batch operations.
+/// Below this threshold, sequential processing provides better cache locality.
+pub const BATCH_PARALLEL_THRESHOLD: usize = 1000;

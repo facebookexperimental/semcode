@@ -2,16 +2,20 @@
 //
 // Batch processing utilities for database result extraction
 //
-// This module provides sequential batch processing functions that can later
-// be optimized with parallel processing. The functions are designed to be
-// pure and testable.
+// This module provides parallel batch processing functions for efficient
+// extraction of data from Arrow RecordBatch results. The functions use
+// rayon for parallelism with adaptive thresholds.
 
 use arrow_array::RecordBatch;
+use rayon::prelude::*;
+
+use crate::consts::BATCH_PARALLEL_THRESHOLD;
 
 /// Process batches by applying an extractor function to each row
 ///
-/// This function iterates through all batches and applies the extractor function
-/// to each row, collecting successful extractions into a Vec.
+/// This function processes all batches and applies the extractor function to each row,
+/// collecting successful extractions into a Vec. Automatically uses parallel processing
+/// for large result sets (>= 1000 rows) and sequential processing for smaller sets.
 ///
 /// # Arguments
 /// * `batches` - Slice of RecordBatch to process
@@ -21,19 +25,28 @@ use arrow_array::RecordBatch;
 /// Vec of successfully extracted items
 pub fn process_batches<T, F>(batches: &[RecordBatch], extractor: F) -> Vec<T>
 where
-    F: Fn(&RecordBatch, usize) -> Option<T>,
+    F: Fn(&RecordBatch, usize) -> Option<T> + Sync + Send,
+    T: Send,
 {
-    let mut results = Vec::new();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-    for batch in batches {
-        for i in 0..batch.num_rows() {
-            if let Some(item) = extractor(batch, i) {
-                results.push(item);
-            }
-        }
+    if total_rows < BATCH_PARALLEL_THRESHOLD {
+        // Sequential processing for small result sets (better cache locality)
+        batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).filter_map(|i| extractor(batch, i)))
+            .collect()
+    } else {
+        // Parallel processing for large result sets
+        batches
+            .par_iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows())
+                    .into_par_iter()
+                    .filter_map(|i| extractor(batch, i))
+            })
+            .collect()
     }
-
-    results
 }
 
 #[cfg(test)]
