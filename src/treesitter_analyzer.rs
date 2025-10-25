@@ -202,9 +202,14 @@ impl TreeSitterAnalyzer {
         // Compute git hash of the file
         let git_hash = compute_file_hash(file_path)?.unwrap_or_default();
 
-        let mut raw_functions = Vec::new();
-        let mut raw_types = Vec::new();
-        let mut raw_macros = Vec::new();
+        // Pre-allocate based on file size estimates from kernel analysis
+        let estimated_functions = source_code.len() / crate::consts::BYTES_PER_FUNCTION;
+        let estimated_types = source_code.len() / crate::consts::BYTES_PER_TYPE;
+        let estimated_macros = source_code.len() / crate::consts::BYTES_PER_MACRO;
+
+        let mut raw_functions = Vec::with_capacity(estimated_functions);
+        let mut raw_types = Vec::with_capacity(estimated_types);
+        let mut raw_macros = Vec::with_capacity(estimated_macros);
 
         // Extract functions
         raw_functions.extend(self.extract_functions(
@@ -351,7 +356,10 @@ impl TreeSitterAnalyzer {
         tree: &Tree,
         source_code: &str,
     ) -> Result<Vec<(String, usize, usize)>> {
-        let mut calls = Vec::new();
+        // Estimate: mean 2.65 calls per function, multiplier of 3 from analysis
+        let estimated_calls = (source_code.len() / crate::consts::BYTES_PER_FUNCTION)
+            * crate::consts::CALLS_PER_FUNCTION_MULTIPLIER;
+        let mut calls = Vec::with_capacity(estimated_calls);
         let mut cursor = QueryCursor::new();
         let mut captures =
             cursor.captures(&self.call_query, tree.root_node(), source_code.as_bytes());
@@ -391,15 +399,21 @@ impl TreeSitterAnalyzer {
         let mut cursor = QueryCursor::new();
         let mut captures =
             cursor.captures(&self.function_query, tree.root_node(), source.as_bytes());
-        let mut functions = Vec::new();
+        // Estimate based on file size: ~327 bytes per function (from kernel analysis)
+        let estimated_functions = source.len() / crate::consts::BYTES_PER_FUNCTION;
+        let mut functions = Vec::with_capacity(estimated_functions);
 
         // Extract all comments once (used by extract_function_with_comments)
         let comments = self.extract_comments(tree, source)?;
 
+        // Reusable HashSet for tracking matched capture patterns
+        let mut matched_patterns =
+            HashSet::with_capacity(crate::consts::FUNCTION_QUERY_CAPTURE_NAMES);
+
         while let Some((m, _)) = captures.next() {
             let mut function_name = None;
             let mut return_type = None;
-            let mut parameters = Vec::new();
+            let mut parameters = Vec::with_capacity(crate::consts::TEMP_PARAM_PARSE_CAPACITY);
             let mut line_start = 0;
             let mut line_end = 0;
             let mut function_start_byte = 0;
@@ -473,7 +487,7 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = function_name {
                 // Track which capture patterns were matched to determine if function has body
-                let mut matched_patterns = HashSet::new();
+                matched_patterns.clear();
                 for capture in m.captures {
                     let capture_name = self.function_query.capture_names()[capture.index as usize];
                     matched_patterns.insert(capture_name);
@@ -546,7 +560,7 @@ impl TreeSitterAnalyzer {
                     line_start,
                     line_end,
                     return_type: return_type.unwrap_or_else(|| "void".to_string()),
-                    parameters: parameters.clone().into(),
+                    parameters: parameters.into(),
                     body: complete_body,
                     calls: if unique_calls.is_empty() {
                         None
@@ -614,7 +628,10 @@ impl TreeSitterAnalyzer {
         let mut cursor = QueryCursor::new();
         let mut captures =
             cursor.captures(&self.comment_query, tree.root_node(), source.as_bytes());
-        let mut comments = Vec::new();
+        // Estimate based on function count (analysis shows 0.43 comments per function)
+        let estimated_functions = source.len() / crate::consts::BYTES_PER_FUNCTION;
+        let estimated_comments = estimated_functions / crate::consts::COMMENTS_PER_FUNCTION_DIVISOR;
+        let mut comments = Vec::with_capacity(estimated_comments);
 
         while let Some((m, _)) = captures.next() {
             for capture in m.captures {
@@ -640,7 +657,8 @@ impl TreeSitterAnalyzer {
         comments: &[(u32, u32, String)],
     ) -> String {
         // Find top-of-function comments (comments immediately before the function)
-        let mut top_comments = Vec::new();
+        // Most functions have 0-1 comments (93.05% from analysis)
+        let mut top_comments = Vec::with_capacity(crate::consts::VEC_COMMENTS_CAPACITY);
         let mut current_line = function_start_line.saturating_sub(1);
 
         // Work backwards to find contiguous comments before the function
@@ -705,7 +723,9 @@ impl TreeSitterAnalyzer {
     ) -> Result<Vec<TypeInfo>> {
         let mut cursor = QueryCursor::new();
         let mut captures = cursor.captures(&self.type_query, tree.root_node(), source.as_bytes());
-        let mut types = Vec::new();
+        // Estimate based on file size: ~123 bytes per type (from kernel analysis)
+        let estimated_types = source.len() / crate::consts::BYTES_PER_TYPE;
+        let mut types = Vec::with_capacity(estimated_types);
 
         // Extract all comments with their positions
         let comments = self.extract_comments(tree, source)?;
@@ -713,7 +733,8 @@ impl TreeSitterAnalyzer {
         while let Some((m, _)) = captures.next() {
             let mut type_name = None;
             let mut kind = String::new();
-            let mut members = Vec::new();
+            // 90th percentile from kernel analysis: 15 fields
+            let mut members = Vec::with_capacity(crate::consts::SMALLVEC_FIELD_SIZE);
             let mut line_start = 0;
             let mut type_start_byte = 0;
             let mut type_end_byte = 0;
@@ -805,7 +826,9 @@ impl TreeSitterAnalyzer {
         let mut cursor = QueryCursor::new();
         let mut captures =
             cursor.captures(&self.typedef_query, tree.root_node(), source.as_bytes());
-        let mut typedef_types = Vec::new();
+        // Typedefs are less common (~3x less than regular types)
+        let estimated_typedefs = source.len() / (crate::consts::BYTES_PER_TYPE * 3);
+        let mut typedef_types = Vec::with_capacity(estimated_typedefs);
 
         while let Some((m, _)) = captures.next() {
             let mut typedef_name = None;
@@ -897,7 +920,8 @@ impl TreeSitterAnalyzer {
         comments: &[(u32, u32, String)],
     ) -> String {
         // Find top-of-type comments (comments immediately before the type definition)
-        let mut top_comments = Vec::new();
+        // Types typically have fewer comments than functions
+        let mut top_comments = Vec::with_capacity(crate::consts::VEC_COMMENTS_CAPACITY);
         let mut current_line = type_start_line.saturating_sub(1);
 
         // Work backwards to find contiguous comments before the type
@@ -962,7 +986,9 @@ impl TreeSitterAnalyzer {
     ) -> Result<Vec<MacroInfo>> {
         let mut cursor = QueryCursor::new();
         let mut captures = cursor.captures(&self.macro_query, tree.root_node(), source.as_bytes());
-        let mut macros = Vec::new();
+        // Estimate based on file size: ~105 bytes per macro (from kernel analysis)
+        let estimated_macros = source.len() / crate::consts::BYTES_PER_MACRO;
+        let mut macros = Vec::with_capacity(estimated_macros);
 
         while let Some((m, _)) = captures.next() {
             let mut macro_name = None;
@@ -1037,7 +1063,8 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Vec<ParameterInfo> {
-        let mut parameters = Vec::with_capacity(8); // Most functions have <8 parameters
+        // 95th percentile is 5 parameters (from kernel analysis)
+        let mut parameters = Vec::with_capacity(crate::consts::TEMP_PARAM_PARSE_CAPACITY);
 
         // Walk through the parameter_list node to find parameter_declaration children
         let mut cursor = node.walk();
@@ -1074,7 +1101,8 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Vec<ParameterInfo> {
-        let mut parameters = Vec::with_capacity(8); // Most functions have <8 parameters
+        // 95th percentile is 5 parameters (from kernel analysis)
+        let mut parameters = Vec::with_capacity(crate::consts::TEMP_PARAM_PARSE_CAPACITY);
         let text = &source[node.byte_range()];
 
         // Remove newlines and normalize whitespace for easier parsing
@@ -1106,7 +1134,8 @@ impl TreeSitterAnalyzer {
 
     /// Split parameter list by commas, being careful about nested structures
     fn split_parameters(&self, text: &str) -> Vec<String> {
-        let mut parts = Vec::new();
+        // 95th percentile is 5 parameters (from kernel analysis)
+        let mut parts = Vec::with_capacity(crate::consts::TEMP_PARAM_PARSE_CAPACITY);
         let mut current = String::new();
         let mut paren_depth = 0;
         let mut in_params = false;
@@ -1391,7 +1420,8 @@ impl TreeSitterAnalyzer {
         body_node: tree_sitter::Node,
         source: &str,
     ) -> Vec<FieldInfo> {
-        let mut members = Vec::new();
+        // 90th percentile from kernel analysis: 15 fields
+        let mut members = Vec::with_capacity(crate::consts::SMALLVEC_FIELD_SIZE);
 
         // Walk through all child nodes of the struct/union body
         let mut cursor = body_node.walk();
@@ -1594,7 +1624,8 @@ impl TreeSitterAnalyzer {
     }
 
     fn parse_struct_members_string_fallback(&self, body_text: &str) -> Vec<FieldInfo> {
-        let mut members = Vec::new();
+        // 90th percentile from kernel analysis: 15 fields
+        let mut members = Vec::with_capacity(crate::consts::SMALLVEC_FIELD_SIZE);
 
         // Basic field parsing - look for declarations ending with semicolon
         for line in body_text.lines() {
@@ -1689,7 +1720,8 @@ impl TreeSitterAnalyzer {
         global_types: &GlobalTypeRegistry,
     ) -> Vec<FunctionInfo> {
         // Build local type map from current file - typedefs are now included in types with kind="typedef"
-        let mut local_types = HashMap::new();
+        let mut local_types: HashMap<String, (String, String)> =
+            HashMap::with_capacity(types.len());
         for type_info in types {
             local_types.insert(
                 type_info.name.clone(),
@@ -1805,7 +1837,9 @@ impl TreeSitterAnalyzer {
 
     /// Generate common variations of type names for lookup
     fn generate_type_name_variants(&self, base_name: &str) -> Vec<String> {
-        let mut variants = Vec::with_capacity(6); // Max 6 variants (struct/union/enum + with/without prefix)
+        // Max variants: 3 prefixes (struct/union/enum) + 3 without prefix
+        const MAX_VARIANTS: usize = 6;
+        let mut variants = Vec::with_capacity(MAX_VARIANTS);
 
         // Add struct prefix if not present
         if !base_name.starts_with("struct ")
@@ -1831,7 +1865,8 @@ impl TreeSitterAnalyzer {
 
     /// Build a local type map from current file's types (typedefs are included as types with kind="typedef")
     pub fn build_local_type_map(&self, types: &[TypeInfo]) -> HashMap<String, (String, String)> {
-        let mut local_types = HashMap::new();
+        let mut local_types: HashMap<String, (String, String)> =
+            HashMap::with_capacity(types.len());
 
         for type_info in types {
             local_types.insert(
@@ -1849,7 +1884,8 @@ impl TreeSitterAnalyzer {
         return_type: &str,
         parameters: &[ParameterInfo],
     ) -> Vec<String> {
-        let mut types = Vec::new();
+        // Typical: return type + parameter types (small vec)
+        let mut types = Vec::with_capacity(parameters.len() + 1);
 
         // Extract from return type
         if let Some(cleaned_type) = self.extract_type_name_from_declaration(return_type) {
@@ -1875,7 +1911,8 @@ impl TreeSitterAnalyzer {
 
     /// Extract types referenced by a type's members
     fn extract_type_referenced_types(&self, members: &[FieldInfo]) -> Vec<String> {
-        let mut types = Vec::new();
+        // Upper bound: one type per member
+        let mut types = Vec::with_capacity(members.len());
 
         for member in members {
             if let Some(cleaned_type) = self.extract_type_name_from_declaration(&member.type_name) {
@@ -1994,8 +2031,9 @@ impl TreeSitterAnalyzer {
 
     /// Extract calls and types from macro definition (simple text-based analysis)
     fn extract_macro_calls_and_types(&self, definition: &str) -> (Vec<String>, Vec<String>) {
-        let mut calls = Vec::new();
-        let mut types = Vec::new();
+        // Based on analysis: most macros have 0-2 calls/types
+        let mut calls = Vec::with_capacity(crate::consts::VEC_CALLS_CAPACITY);
+        let mut types = Vec::with_capacity(crate::consts::VEC_CALLS_CAPACITY);
 
         // Simple regex-like patterns for function calls: word followed by '('
         let definition_text = definition.trim();
@@ -2043,7 +2081,8 @@ impl TreeSitterAnalyzer {
         &self,
         raw_functions: Vec<FunctionInfo>,
     ) -> Vec<FunctionInfo> {
-        let mut seen_functions = HashMap::<String, FunctionInfo>::default();
+        let mut seen_functions: HashMap<String, FunctionInfo> =
+            HashMap::with_capacity(raw_functions.len());
 
         for func in raw_functions {
             let key = func.name.clone();
@@ -2090,7 +2129,8 @@ impl TreeSitterAnalyzer {
     /// Deduplicate types within a single file
     /// Simple deduplication by (name, kind) - types should be unique within a file anyway
     fn deduplicate_types_within_file(&self, raw_types: Vec<TypeInfo>) -> Vec<TypeInfo> {
-        let mut seen_types = HashMap::<(String, String), TypeInfo>::default();
+        let mut seen_types: HashMap<(String, String), TypeInfo> =
+            HashMap::with_capacity(raw_types.len());
 
         for type_info in raw_types {
             let key = (type_info.name.clone(), type_info.kind.clone());
@@ -2117,10 +2157,10 @@ impl TreeSitterAnalyzer {
         seen_types.into_values().collect()
     }
 
-    /// Deduplicate macros within a single file  
+    /// Deduplicate macros within a single file
     /// Simple deduplication by name - macros should be unique within a file anyway
     fn deduplicate_macros_within_file(&self, raw_macros: Vec<MacroInfo>) -> Vec<MacroInfo> {
-        let mut seen_macros = HashMap::<String, MacroInfo>::default();
+        let mut seen_macros: HashMap<String, MacroInfo> = HashMap::with_capacity(raw_macros.len());
 
         for macro_info in raw_macros {
             let key = macro_info.name.clone();
@@ -2170,5 +2210,170 @@ impl TreeSitterAnalyzer {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test basic function analysis with parameters
+    #[test]
+    fn test_function_analysis_with_parameters() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+
+        let test_code = r#"
+            int func1(int x, int y) {
+                return x + y;
+            }
+
+            int func2(int a, int b, int c) {
+                int result = func1(a, b);
+                result += c;
+                return result;
+            }
+        "#;
+
+        let result = analyzer.analyze_code_snippet(test_code);
+        assert!(result.is_ok(), "Analysis should succeed");
+
+        let functions = result.unwrap();
+        assert!(functions.len() >= 2, "Should extract at least 2 functions");
+
+        // Find the functions we care about
+        let func1 = functions.iter().find(|f| f.name == "func1");
+        let func2 = functions.iter().find(|f| f.name == "func2");
+
+        assert!(func1.is_some(), "Should find func1");
+        assert!(func2.is_some(), "Should find func2");
+
+        // Verify parameters are extracted correctly
+        assert_eq!(func1.unwrap().parameters.len(), 2);
+        assert_eq!(func2.unwrap().parameters.len(), 3);
+    }
+
+    /// Test struct/type analysis
+    #[test]
+    fn test_type_analysis() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+
+        let test_code = r#"
+            struct point {
+                int x;
+                int y;
+            };
+
+            struct rect {
+                struct point top_left;
+                struct point bottom_right;
+                int color;
+            };
+        "#;
+
+        let functions = analyzer.analyze_code_snippet(test_code).unwrap();
+        // Functions analysis only - types would need analyze_file_with_source_root
+        assert_eq!(functions.len(), 0, "No functions should be extracted");
+    }
+
+    /// Test function call tracking
+    #[test]
+    fn test_function_call_tracking() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+
+        let test_code = r#"
+            int add(int a, int b) {
+                return a + b;
+            }
+
+            int compute(int x, int y) {
+                int result = add(x, y);
+                return add(result, 1);
+            }
+        "#;
+
+        let functions = analyzer.analyze_code_snippet(test_code).unwrap();
+        assert!(functions.len() >= 2, "Should extract at least 2 functions");
+
+        // Find compute function and verify it tracked calls to add
+        let compute_func = functions.iter().find(|f| f.name == "compute");
+        assert!(compute_func.is_some(), "Should find compute function");
+
+        let compute_func = compute_func.unwrap();
+        assert!(
+            compute_func.calls.is_some(),
+            "compute should have calls recorded"
+        );
+        let calls = compute_func.calls.as_ref().unwrap();
+        assert!(
+            calls.contains(&"add".to_string()),
+            "Should record calls to add"
+        );
+    }
+
+    /// Test that hoisted matched_patterns HashSet is properly cleared between iterations
+    /// This verifies that function definitions and declarations don't contaminate each other
+    #[test]
+    fn test_matched_patterns_clearing() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+
+        // Test code with mixed declarations and definitions
+        let test_code = r#"
+            // Function declaration (no body)
+            int declare_only(int x);
+
+            // Function definition with body
+            int with_body(int x) {
+                return x + 1;
+            }
+
+            // Another declaration
+            void another_decl(void);
+
+            // Another definition
+            void another_def(void) {
+                int y = 5;
+            }
+        "#;
+
+        let functions = analyzer.analyze_code_snippet(test_code).unwrap();
+
+        // Should extract all 4 functions (both declarations and definitions)
+        assert!(functions.len() >= 4, "Should extract at least 4 functions");
+
+        // Find each function
+        let declare_only = functions.iter().find(|f| f.name == "declare_only");
+        let with_body = functions.iter().find(|f| f.name == "with_body");
+        let another_decl = functions.iter().find(|f| f.name == "another_decl");
+        let another_def = functions.iter().find(|f| f.name == "another_def");
+
+        assert!(declare_only.is_some(), "Should find declare_only");
+        assert!(with_body.is_some(), "Should find with_body");
+        assert!(another_decl.is_some(), "Should find another_decl");
+        assert!(another_def.is_some(), "Should find another_def");
+
+        // If matched_patterns wasn't cleared properly, we'd see incorrect
+        // body detection or cross-contamination between functions
+        let with_body_func = with_body.unwrap();
+        let another_def_func = another_def.unwrap();
+
+        // Functions with bodies should have actual body content
+        assert!(
+            !with_body_func.body.trim().is_empty(),
+            "with_body should have non-empty body content"
+        );
+        assert!(
+            !another_def_func.body.trim().is_empty(),
+            "another_def should have non-empty body content"
+        );
+
+        // Verify the body contains expected content (not contaminated)
+        assert!(
+            with_body_func.body.contains("return x + 1"),
+            "with_body should contain its actual body code"
+        );
+        assert!(
+            another_def_func.body.contains("int y = 5"),
+            "another_def should contain its actual body code"
+        );
     }
 }

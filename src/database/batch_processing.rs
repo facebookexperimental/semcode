@@ -7,8 +7,8 @@
 // rayon for parallelism with adaptive thresholds.
 
 use arrow_array::RecordBatch;
-use rayon::prelude::*;
 use gxhash::{HashMap, HashMapExt};
+use rayon::prelude::*;
 
 use crate::consts::BATCH_PARALLEL_THRESHOLD;
 

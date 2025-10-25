@@ -7,11 +7,16 @@
 # ]
 # ///
 """
-Analyze Linux kernel C code to determine optimal SmallVec sizes.
+Analyze Linux kernel C code to determine optimal SmallVec sizes and Vec allocation patterns.
 
 This script parses C files using tree-sitter and collects statistics on:
-1. Number of parameters per function
-2. Number of fields per struct/union/enum
+1. Number of parameters per function (for SmallVec<[ParameterInfo; N]>)
+2. Number of fields per struct/union/enum (for SmallVec<[FieldInfo; N]>)
+3. Number of function calls per function (for calls Vec)
+4. Number of types per function (for types Vec)
+5. Number of member types per struct (for type references)
+6. Number of comments per file section (for comment Vec)
+7. Macro parameter counts (for macro parameter Vec)
 
 Usage:
     uv run analyze_kernel_stats.py /path/to/linux
@@ -24,7 +29,7 @@ Usage:
 import sys
 import os
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 import tree_sitter_c as tsc
 from tree_sitter import Language, Parser, Query
 
@@ -67,6 +72,50 @@ def count_fields(node, source_code):
 
     return count
 
+def count_function_calls(node, source_code):
+    """Count call_expression nodes within a function."""
+    count = 0
+    def walk(n):
+        nonlocal count
+        if n.type == 'call_expression':
+            count += 1
+        for child in n.children:
+            walk(child)
+    walk(node)
+    return count
+
+def count_type_references(node, source_code):
+    """Count struct/union/enum type references in a function or type definition."""
+    type_refs = set()
+
+    def walk(n):
+        if n.type in ['struct_specifier', 'union_specifier', 'enum_specifier', 'type_identifier']:
+            text = source_code[n.start_byte:n.end_byte]
+            if text and not text.startswith('__'):  # Skip compiler built-ins
+                type_refs.add(text)
+        for child in n.children:
+            walk(child)
+
+    walk(node)
+    # Filter out primitives
+    primitives = {'void', 'char', 'short', 'int', 'long', 'float', 'double',
+                  'unsigned', 'signed', 'bool', '_Bool'}
+    return len([t for t in type_refs if t not in primitives])
+
+def count_comments_before(node, all_comments, source_code):
+    """Count comments immediately before a function/type (for top_comments Vec)."""
+    function_line = node.start_point[0] + 1
+    comment_count = 0
+
+    # Count contiguous comments before the function
+    for comment_line, _ in sorted(all_comments, reverse=True):
+        if comment_line < function_line and comment_line >= function_line - 10:  # Within 10 lines
+            comment_count += 1
+        elif comment_line < function_line - 10:
+            break
+
+    return comment_count
+
 def analyze_file(file_path, parser):
     """Analyze a single C file and return statistics."""
     try:
@@ -76,19 +125,62 @@ def analyze_file(file_path, parser):
         tree = parser.parse(source_code)
         root_node = tree.root_node
 
+        # Statistics collectors
         param_counts = []
         field_counts = []
+        call_counts = []
+        function_type_counts = []
+        struct_type_counts = []
+        comment_counts = []
+        macro_param_counts = []
 
-        # Walk the tree to find functions and types
+        # Size tracking (bytes)
+        function_sizes = []  # Bytes per function definition
+        type_sizes = []      # Bytes per type definition
+        macro_sizes = []     # Bytes per macro definition
+
+        # Collect all comments first
+        all_comments = []
+        def find_comments(node):
+            if node.type == 'comment':
+                line = node.start_point[0] + 1
+                all_comments.append((line, node))
+            for child in node.children:
+                find_comments(child)
+        find_comments(root_node)
+
+        # Walk the tree to find functions, types, and macros
         def walk_tree(node):
-            # Function definitions
+            # Function definitions with bodies
             if node.type == 'function_definition':
+                # Track function size
+                function_size = node.end_byte - node.start_byte
+                function_sizes.append(function_size)
+
+                # Count parameters
                 for child in node.children:
-                    if child.type == 'function_declarator':
+                    if child.type == 'function_declarator' or child.type == 'pointer_declarator':
                         for subchild in child.children:
                             if subchild.type == 'parameter_list':
                                 count = count_parameters(subchild, source_code)
                                 param_counts.append(count)
+                            elif subchild.type == 'function_declarator':
+                                for subsubchild in subchild.children:
+                                    if subsubchild.type == 'parameter_list':
+                                        count = count_parameters(subsubchild, source_code)
+                                        param_counts.append(count)
+
+                # Count function calls in body
+                call_count = count_function_calls(node, source_code)
+                call_counts.append(call_count)
+
+                # Count type references
+                type_count = count_type_references(node, source_code)
+                function_type_counts.append(type_count)
+
+                # Count top comments
+                comment_count = count_comments_before(node, all_comments, source_code)
+                comment_counts.append(comment_count)
 
             # Function declarations (prototypes)
             elif node.type == 'declaration':
@@ -101,28 +193,74 @@ def analyze_file(file_path, parser):
 
             # Struct/union definitions
             elif node.type in ['struct_specifier', 'union_specifier']:
+                # Track type size
+                type_size = node.end_byte - node.start_byte
+                type_sizes.append(type_size)
+
                 for child in node.children:
                     if child.type == 'field_declaration_list':
                         count = count_fields(child, source_code)
                         field_counts.append(count)
 
+                        # Count type references in struct
+                        type_count = count_type_references(child, source_code)
+                        struct_type_counts.append(type_count)
+
             # Enum definitions
             elif node.type == 'enum_specifier':
+                # Track enum size
+                type_size = node.end_byte - node.start_byte
+                type_sizes.append(type_size)
+
                 for child in node.children:
                     if child.type == 'enumerator_list':
                         count = count_fields(child, source_code)
                         field_counts.append(count)
+
+            # Macro definitions (function-like)
+            elif node.type == 'preproc_function_def':
+                # Track macro size
+                macro_size = node.end_byte - node.start_byte
+                macro_sizes.append(macro_size)
+
+                for child in node.children:
+                    if child.type == 'preproc_params':
+                        # Count parameters in macro
+                        param_count = len([c for c in child.children if c.type == 'identifier'])
+                        macro_param_counts.append(param_count)
 
             # Recurse
             for child in node.children:
                 walk_tree(child)
 
         walk_tree(root_node)
-        return param_counts, field_counts
+        return {
+            'params': param_counts,
+            'fields': field_counts,
+            'calls': call_counts,
+            'function_types': function_type_counts,
+            'struct_types': struct_type_counts,
+            'comments': comment_counts,
+            'macro_params': macro_param_counts,
+            'function_sizes': function_sizes,
+            'type_sizes': type_sizes,
+            'macro_sizes': macro_sizes,
+        }
 
     except Exception as e:
         # Skip files that can't be parsed
-        return [], []
+        return {
+            'params': [],
+            'fields': [],
+            'calls': [],
+            'function_types': [],
+            'struct_types': [],
+            'comments': [],
+            'macro_params': [],
+            'function_sizes': [],
+            'type_sizes': [],
+            'macro_sizes': [],
+        }
 
 def calculate_percentiles(data, percentiles=[50, 75, 90, 95, 99]):
     """Calculate percentiles from a sorted list."""
@@ -141,6 +279,38 @@ def calculate_percentiles(data, percentiles=[50, 75, 90, 95, 99]):
 
     return result
 
+def print_statistics(name, data, smallvec_sizes, unit="items"):
+    """Print detailed statistics for a dataset."""
+    if not data:
+        print(f"  No data collected")
+        return
+
+    counter = Counter(data)
+    mean = sum(data) / len(data)
+    max_val = max(data)
+
+    print(f"  Mean: {mean:.2f} {unit}")
+    print(f"  Max: {max_val} {unit}")
+    print(f"  Total samples: {len(data)}")
+
+    print(f"\n  Distribution (most common):")
+    for count, freq in counter.most_common(15):
+        percentage = (freq / len(data)) * 100
+        bar = '█' * min(int(percentage), 50)
+        print(f"    {count:2d} {unit}: {freq:7d} ({percentage:5.2f}%) {bar}")
+
+    print(f"\n  Percentiles:")
+    percentiles = calculate_percentiles(data)
+    for p, value in percentiles.items():
+        print(f"    {p:3d}th percentile: {value} {unit}")
+
+    print(f"\n  SmallVec Coverage Analysis:")
+    for size in smallvec_sizes:
+        covered = sum(1 for c in data if c <= size)
+        percentage = (covered / len(data)) * 100
+        heap_allocs = len(data) - covered
+        print(f"    Size {size:2d}: {percentage:5.2f}% on stack, {heap_allocs:7d} heap allocations")
+
 def main():
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <path-to-linux-kernel>")
@@ -158,95 +328,167 @@ def main():
     C_LANGUAGE = Language(tsc.language())
     parser = Parser(C_LANGUAGE)
 
-    all_param_counts = []
-    all_field_counts = []
+    # Aggregate statistics
+    all_stats = {
+        'params': [],
+        'fields': [],
+        'calls': [],
+        'function_types': [],
+        'struct_types': [],
+        'comments': [],
+        'macro_params': [],
+        'function_sizes': [],
+        'type_sizes': [],
+        'macro_sizes': [],
+    }
 
     files_processed = 0
     for file_path in get_c_files(kernel_path):
-        param_counts, field_counts = analyze_file(file_path, parser)
-        all_param_counts.extend(param_counts)
-        all_field_counts.extend(field_counts)
+        stats = analyze_file(file_path, parser)
+        for key in all_stats:
+            all_stats[key].extend(stats[key])
 
         files_processed += 1
         if files_processed % 1000 == 0:
             print(f"Processed {files_processed} files... "
-                  f"({len(all_param_counts)} functions, {len(all_field_counts)} types)")
+                  f"({len(all_stats['params'])} functions, "
+                  f"{len(all_stats['fields'])} types)")
 
     print(f"\n{'='*70}")
     print(f"Total files processed: {files_processed}")
-    print(f"Total functions found: {len(all_param_counts)}")
-    print(f"Total types found: {len(all_field_counts)}")
     print(f"{'='*70}\n")
 
-    # Parameter statistics
-    print("FUNCTION PARAMETER COUNTS:")
-    print("-" * 70)
-    if all_param_counts:
-        param_counter = Counter(all_param_counts)
-        print(f"Mean: {sum(all_param_counts) / len(all_param_counts):.2f}")
-        print(f"Max: {max(all_param_counts)}")
+    # Print detailed statistics for each category
+    print("=" * 70)
+    print("1. FUNCTION PARAMETER COUNTS")
+    print("   (for SmallVec<[ParameterInfo; N]>)")
+    print("=" * 70)
+    print_statistics("Parameters", all_stats['params'], [2, 3, 4, 5, 6, 8, 10, 12], "params")
 
-        print("\nDistribution (most common):")
-        for count, freq in param_counter.most_common(15):
-            percentage = (freq / len(all_param_counts)) * 100
-            bar = '█' * int(percentage)
-            print(f"  {count:2d} params: {freq:7d} ({percentage:5.2f}%) {bar}")
+    print(f"\n{'='*70}")
+    print("2. STRUCT/UNION/ENUM FIELD COUNTS")
+    print("   (for SmallVec<[FieldInfo; N]>)")
+    print("=" * 70)
+    print_statistics("Fields", all_stats['fields'], [4, 6, 8, 10, 12, 16, 20, 24], "fields")
 
-        print("\nPercentiles:")
-        percentiles = calculate_percentiles(all_param_counts)
-        for p, value in percentiles.items():
-            print(f"  {p:3d}th percentile: {value}")
+    print(f"\n{'='*70}")
+    print("3. FUNCTION CALL COUNTS PER FUNCTION")
+    print("   (for calls: Vec<String> in extract_functions_with_calls)")
+    print("=" * 70)
+    print_statistics("Function Calls", all_stats['calls'], [4, 8, 12, 16, 20, 24, 32], "calls")
 
-        # Calculate coverage for different SmallVec sizes
-        print("\nCoverage by SmallVec size:")
-        for size in [2, 3, 4, 5, 6, 8, 10]:
-            covered = sum(1 for c in all_param_counts if c <= size)
-            percentage = (covered / len(all_param_counts)) * 100
-            print(f"  Size {size:2d}: {percentage:5.2f}% of functions fit on stack")
+    print(f"\n{'='*70}")
+    print("4. TYPE REFERENCES PER FUNCTION")
+    print("   (for types: Vec<String> in extract_function_types)")
+    print("=" * 70)
+    print_statistics("Type References", all_stats['function_types'], [2, 4, 6, 8, 10, 12], "types")
 
-    print(f"\n{'='*70}\n")
+    print(f"\n{'='*70}")
+    print("5. TYPE REFERENCES PER STRUCT")
+    print("   (for types: Vec<String> in extract_type_referenced_types)")
+    print("=" * 70)
+    print_statistics("Struct Type Refs", all_stats['struct_types'], [2, 4, 6, 8, 10, 12, 16], "types")
 
-    # Field statistics
-    print("STRUCT/UNION/ENUM FIELD COUNTS:")
-    print("-" * 70)
-    if all_field_counts:
-        field_counter = Counter(all_field_counts)
-        print(f"Mean: {sum(all_field_counts) / len(all_field_counts):.2f}")
-        print(f"Max: {max(all_field_counts)}")
+    print(f"\n{'='*70}")
+    print("6. TOP COMMENTS PER FUNCTION/TYPE")
+    print("   (for top_comments: Vec<String> in extract_function_with_comments)")
+    print("=" * 70)
+    print_statistics("Comments", all_stats['comments'], [1, 2, 3, 4, 5, 6, 8], "comments")
 
-        print("\nDistribution (most common):")
-        for count, freq in field_counter.most_common(15):
-            percentage = (freq / len(all_field_counts)) * 100
-            bar = '█' * int(percentage)
-            print(f"  {count:2d} fields: {freq:7d} ({percentage:5.2f}%) {bar}")
+    print(f"\n{'='*70}")
+    print("7. MACRO PARAMETER COUNTS")
+    print("   (for parameters: Vec<String> in parse_macro_parameters)")
+    print("=" * 70)
+    print_statistics("Macro Parameters", all_stats['macro_params'], [1, 2, 3, 4, 5, 6, 8], "params")
 
-        print("\nPercentiles:")
-        percentiles = calculate_percentiles(all_field_counts)
-        for p, value in percentiles.items():
-            print(f"  {p:3d}th percentile: {value}")
+    print(f"\n{'='*70}")
+    print("8. FUNCTION DEFINITION SIZES")
+    print("   (for estimating Vec pre-allocation based on file size)")
+    print("=" * 70)
+    if all_stats['function_sizes']:
+        mean_func_size = sum(all_stats['function_sizes']) / len(all_stats['function_sizes'])
+        median_func_size = calculate_percentiles(all_stats['function_sizes'], [50])[50]
+        print(f"  Mean function size: {mean_func_size:.0f} bytes")
+        print(f"  Median function size: {median_func_size} bytes")
+        print(f"  Total functions: {len(all_stats['function_sizes'])}")
 
-        # Calculate coverage for different SmallVec sizes
-        print("\nCoverage by SmallVec size:")
-        for size in [4, 6, 8, 10, 12, 16, 20]:
-            covered = sum(1 for c in all_field_counts if c <= size)
-            percentage = (covered / len(all_field_counts)) * 100
-            print(f"  Size {size:2d}: {percentage:5.2f}% of types fit on stack")
+    print(f"\n{'='*70}")
+    print("9. TYPE DEFINITION SIZES")
+    print("   (for estimating Vec pre-allocation based on file size)")
+    print("=" * 70)
+    if all_stats['type_sizes']:
+        mean_type_size = sum(all_stats['type_sizes']) / len(all_stats['type_sizes'])
+        median_type_size = calculate_percentiles(all_stats['type_sizes'], [50])[50]
+        print(f"  Mean type size: {mean_type_size:.0f} bytes")
+        print(f"  Median type size: {median_type_size} bytes")
+        print(f"  Total types: {len(all_stats['type_sizes'])}")
 
-    print(f"\n{'='*70}\n")
+    print(f"\n{'='*70}")
+    print("10. MACRO DEFINITION SIZES")
+    print("   (for estimating Vec pre-allocation based on file size)")
+    print("=" * 70)
+    if all_stats['macro_sizes']:
+        mean_macro_size = sum(all_stats['macro_sizes']) / len(all_stats['macro_sizes'])
+        median_macro_size = calculate_percentiles(all_stats['macro_sizes'], [50])[50]
+        print(f"  Mean macro size: {mean_macro_size:.0f} bytes")
+        print(f"  Median macro size: {median_macro_size} bytes")
+        print(f"  Total macros: {len(all_stats['macro_sizes'])}")
 
-    # Recommendations
-    print("RECOMMENDATIONS:")
-    print("-" * 70)
+    print(f"\n{'='*70}")
+    print("FINAL RECOMMENDATIONS")
+    print("=" * 70)
 
-    if all_param_counts:
-        p90 = calculate_percentiles(all_param_counts, [90])[90]
-        print(f"Function parameters: SmallVec<[ParameterInfo; {p90}]>")
-        print(f"  (covers 90% of functions)")
+    recommendations = []
 
-    if all_field_counts:
-        p90 = calculate_percentiles(all_field_counts, [90])[90]
-        print(f"Struct/union/enum fields: SmallVec<[FieldInfo; {p90}]>")
-        print(f"  (covers 90% of types)")
+    if all_stats['params']:
+        p90 = calculate_percentiles(all_stats['params'], [90])[90]
+        p95 = calculate_percentiles(all_stats['params'], [95])[95]
+        recommendations.append(f"Function parameters: SmallVec<[ParameterInfo; {p90}]> (90% coverage, {p95} for 95%)")
+
+    if all_stats['fields']:
+        p90 = calculate_percentiles(all_stats['fields'], [90])[90]
+        p95 = calculate_percentiles(all_stats['fields'], [95])[95]
+        recommendations.append(f"Struct/union/enum fields: SmallVec<[FieldInfo; {p90}]> (90% coverage, {p95} for 95%)")
+
+    if all_stats['calls']:
+        p75 = calculate_percentiles(all_stats['calls'], [75])[75]
+        p90 = calculate_percentiles(all_stats['calls'], [90])[90]
+        recommendations.append(f"Function calls: Vec::with_capacity({p75}) for 75% coverage ({p90} for 90%)")
+
+    if all_stats['function_types']:
+        p75 = calculate_percentiles(all_stats['function_types'], [75])[75]
+        p90 = calculate_percentiles(all_stats['function_types'], [90])[90]
+        recommendations.append(f"Function type refs: Vec::with_capacity({p75}) for 75% coverage ({p90} for 90%)")
+
+    if all_stats['struct_types']:
+        p75 = calculate_percentiles(all_stats['struct_types'], [75])[75]
+        p90 = calculate_percentiles(all_stats['struct_types'], [90])[90]
+        recommendations.append(f"Struct type refs: Vec::with_capacity({p75}) for 75% coverage ({p90} for 90%)")
+
+    if all_stats['comments']:
+        p75 = calculate_percentiles(all_stats['comments'], [75])[75]
+        p90 = calculate_percentiles(all_stats['comments'], [90])[90]
+        recommendations.append(f"Top comments: Vec::with_capacity({p75}) for 75% coverage ({p90} for 90%)")
+
+    if all_stats['macro_params']:
+        p90 = calculate_percentiles(all_stats['macro_params'], [90])[90]
+        recommendations.append(f"Macro parameters: Vec::with_capacity({p90}) (90% coverage)")
+
+    # Add size-based recommendations
+    if all_stats['function_sizes']:
+        mean_func_size = sum(all_stats['function_sizes']) / len(all_stats['function_sizes'])
+        recommendations.append(f"Function sizes: ~{mean_func_size:.0f} bytes average (use for file_size / BYTES_PER_FUNCTION)")
+
+    if all_stats['type_sizes']:
+        mean_type_size = sum(all_stats['type_sizes']) / len(all_stats['type_sizes'])
+        recommendations.append(f"Type sizes: ~{mean_type_size:.0f} bytes average (use for file_size / BYTES_PER_TYPE)")
+
+    if all_stats['macro_sizes']:
+        mean_macro_size = sum(all_stats['macro_sizes']) / len(all_stats['macro_sizes'])
+        recommendations.append(f"Macro sizes: ~{mean_macro_size:.0f} bytes average (use for file_size / BYTES_PER_MACRO)")
+
+    for rec in recommendations:
+        print(f"  • {rec}")
 
     print()
 

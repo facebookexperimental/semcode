@@ -14,7 +14,7 @@ use crate::consts::{COLLECTION_PARALLEL_THRESHOLD, FILTER_PARALLEL_THRESHOLD};
 ///
 /// Takes a collection of items that can provide String paths via a closure,
 /// and collects them into a HashSet. This is a generic utility for path
-/// collection operations. Automatically uses parallel processing for 
+/// collection operations. Automatically uses parallel processing for
 /// collections over COLLECTION_PARALLEL_THRESHOLD.
 ///
 /// # Arguments

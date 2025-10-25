@@ -151,7 +151,12 @@ async fn show_callchain_with_limits(
         };
 
         for (i, caller) in limited_callers.iter().enumerate() {
-            writeln!(handle, "{}. {}", (i + 1).to_string().yellow(), caller.cyan())?;
+            writeln!(
+                handle,
+                "{}. {}",
+                (i + 1).to_string().yellow(),
+                caller.cyan()
+            )?;
 
             // Show caller details if available
             if let Ok(Some(caller_func)) = db.find_function_git_aware(caller, git_sha).await {
@@ -219,7 +224,12 @@ async fn show_callchain_with_limits(
         };
 
         for (i, callee) in limited_callees.iter().enumerate() {
-            writeln!(handle, "{}. {}", (i + 1).to_string().yellow(), callee.cyan())?;
+            writeln!(
+                handle,
+                "{}. {}",
+                (i + 1).to_string().yellow(),
+                callee.cyan()
+            )?;
 
             // Show callee details if available
             if let Ok(Some(callee_func)) = db.find_function_git_aware(callee, git_sha).await {
