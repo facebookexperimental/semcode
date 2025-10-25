@@ -207,10 +207,124 @@ fn bench_content_deduplication(c: &mut Criterion) {
     group.finish();
 }
 
+// Benchmark batch result processing
+fn bench_batch_processing(c: &mut Criterion) {
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use semcode::database::batch_processing::process_batches;
+    use std::sync::Arc;
+
+    let mut group = c.benchmark_group("batch_processing");
+
+    // Create test batches with varying sizes
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+
+    // Small batches (100 rows each, 10 batches = 1000 rows)
+    let small_batches: Vec<RecordBatch> = (0..10)
+        .map(|batch_idx| {
+            let start = batch_idx * 100;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from((start..start + 100).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(
+                        (start..start + 100)
+                            .map(|i| format!("item_{}", i))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        (start..start + 100).map(|i| i * 2).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    // Large batches (1000 rows each, 10 batches = 10000 rows)
+    let large_batches: Vec<RecordBatch> = (0..10)
+        .map(|batch_idx| {
+            let start = batch_idx * 1000;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from((start..start + 1000).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(
+                        (start..start + 1000)
+                            .map(|i| format!("item_{}", i))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int32Array::from(
+                        (start..start + 1000).map(|i| i * 2).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    // Benchmark small batches (1000 rows total)
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("small_batches_1000_rows", |b| {
+        b.iter(|| {
+            process_batches(black_box(&small_batches), |batch, i| {
+                let id_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                Some(id_array.value(i))
+            })
+        })
+    });
+
+    // Benchmark large batches (10000 rows total)
+    group.throughput(Throughput::Elements(10000));
+    group.bench_function("large_batches_10000_rows", |b| {
+        b.iter(|| {
+            process_batches(black_box(&large_batches), |batch, i| {
+                let id_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                Some(id_array.value(i))
+            })
+        })
+    });
+
+    // Benchmark with filtering (only even IDs)
+    group.throughput(Throughput::Elements(10000));
+    group.bench_function("large_batches_with_filter", |b| {
+        b.iter(|| {
+            process_batches(black_box(&large_batches), |batch, i| {
+                let id_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let id = id_array.value(i);
+                if id % 2 == 0 {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_batch_insertion,
     bench_search_operations,
     bench_content_deduplication,
+    bench_batch_processing,
 );
 criterion_main!(benches);
