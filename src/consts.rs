@@ -24,3 +24,7 @@ pub const SQL_FORMAT_PARALLEL_THRESHOLD: usize = 100;
 /// Threshold for switching to parallel processing in collection transformations.
 /// Below this threshold, sequential processing provides better cache locality.
 pub const COLLECTION_PARALLEL_THRESHOLD: usize = 1000;
+
+/// Threshold for switching to parallel processing in filter operations.
+/// Below this threshold, sequential processing provides better cache locality.
+pub const FILTER_PARALLEL_THRESHOLD: usize = 500;

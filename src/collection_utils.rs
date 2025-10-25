@@ -8,7 +8,7 @@
 use gxhash::HashSet;
 use rayon::prelude::*;
 
-use crate::consts::COLLECTION_PARALLEL_THRESHOLD;
+use crate::consts::{COLLECTION_PARALLEL_THRESHOLD, FILTER_PARALLEL_THRESHOLD};
 
 /// Extract paths from collection and collect into a HashSet
 ///
@@ -55,7 +55,8 @@ where
 ///
 /// Filters a collection of items using a predicate function and optionally
 /// limits the number of results. Returns the filtered items and whether the
-/// limit was hit.
+/// limit was hit. Automatically uses parallel processing for large collections
+/// (>= 500 items) when no limit is specified or limit is large.
 ///
 /// # Arguments
 /// * `items` - Vector of items to filter (consumed)
@@ -64,25 +65,50 @@ where
 ///
 /// # Returns
 /// Tuple of (filtered items, limit_hit flag)
+///
+/// # Note
+/// When using parallel processing (large collections), result order may differ
+/// from sequential processing, but all matching items will be included.
 pub fn filter_with_limit<T, F>(items: Vec<T>, predicate: F, limit: usize) -> (Vec<T>, bool)
 where
-    F: Fn(&T) -> bool,
+    F: Fn(&T) -> bool + Sync + Send,
     T: Send,
 {
-    let mut filtered = Vec::new();
-    let mut limit_hit = false;
+    let use_parallel = items.len() >= FILTER_PARALLEL_THRESHOLD
+        && (limit == 0 || limit > FILTER_PARALLEL_THRESHOLD / 2);
 
-    for item in items {
-        if predicate(&item) {
-            if limit > 0 && filtered.len() >= limit {
-                limit_hit = true;
-                break;
+    if !use_parallel {
+        // Sequential for small collections or when early termination is beneficial
+        let mut filtered = Vec::new();
+        let mut limit_hit = false;
+
+        for item in items {
+            if predicate(&item) {
+                if limit > 0 && filtered.len() >= limit {
+                    limit_hit = true;
+                    break;
+                }
+                filtered.push(item);
             }
-            filtered.push(item);
         }
-    }
 
-    (filtered, limit_hit)
+        (filtered, limit_hit)
+    } else {
+        // Parallel for large collections with no/large limits
+        let filtered: Vec<T> = items
+            .into_par_iter()
+            .filter(|item| predicate(item))
+            .collect();
+
+        let limit_hit = limit > 0 && filtered.len() > limit;
+        let final_filtered = if limit > 0 && filtered.len() > limit {
+            filtered.into_iter().take(limit).collect()
+        } else {
+            filtered
+        };
+
+        (final_filtered, limit_hit)
+    }
 }
 
 #[cfg(test)]
