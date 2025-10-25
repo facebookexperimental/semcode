@@ -51,6 +51,40 @@ where
     }
 }
 
+/// Filter items by a predicate with optional limit
+///
+/// Filters a collection of items using a predicate function and optionally
+/// limits the number of results. Returns the filtered items and whether the
+/// limit was hit.
+///
+/// # Arguments
+/// * `items` - Vector of items to filter (consumed)
+/// * `predicate` - Function that returns true for items to keep
+/// * `limit` - Maximum number of items to return (0 = unlimited)
+///
+/// # Returns
+/// Tuple of (filtered items, limit_hit flag)
+pub fn filter_with_limit<T, F>(items: Vec<T>, predicate: F, limit: usize) -> (Vec<T>, bool)
+where
+    F: Fn(&T) -> bool,
+    T: Send,
+{
+    let mut filtered = Vec::new();
+    let mut limit_hit = false;
+
+    for item in items {
+        if predicate(&item) {
+            if limit > 0 && filtered.len() >= limit {
+                limit_hit = true;
+                break;
+            }
+            filtered.push(item);
+        }
+    }
+
+    (filtered, limit_hit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +243,95 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains("id_1"));
         assert!(result.contains("id_2"));
+    }
+
+    // Tests for filter_with_limit
+
+    #[test]
+    fn test_filter_with_limit_empty() {
+        let items: Vec<i32> = vec![];
+        let (filtered, limit_hit) = filter_with_limit(items, |_| true, 10);
+        assert_eq!(filtered.len(), 0);
+        assert!(!limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_no_limit() {
+        let items = vec![1, 2, 3, 4, 5];
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 2 == 0, 0);
+        assert_eq!(filtered, vec![2, 4]);
+        assert!(!limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_under_limit() {
+        let items = vec![1, 2, 3, 4, 5];
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 2 == 0, 10);
+        assert_eq!(filtered, vec![2, 4]);
+        assert!(!limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_at_limit() {
+        let items = vec![2, 4, 6, 8, 10];
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 2 == 0, 3);
+        assert_eq!(filtered, vec![2, 4, 6]);
+        assert!(limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_over_limit() {
+        let items = vec![2, 4, 6, 8, 10, 12];
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 2 == 0, 2);
+        assert_eq!(filtered, vec![2, 4]);
+        assert!(limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_all_filtered_out() {
+        let items = vec![1, 3, 5, 7, 9];
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 2 == 0, 10);
+        assert_eq!(filtered.len(), 0);
+        assert!(!limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_strings() {
+        let items = vec![
+            "test.rs".to_string(),
+            "main.rs".to_string(),
+            "lib.rs".to_string(),
+            "test_helper.rs".to_string(),
+        ];
+        let (filtered, limit_hit) = filter_with_limit(items, |s| s.contains("test"), 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0], "test.rs");
+        assert!(limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_large_collection() {
+        let items: Vec<i32> = (0..1000).collect();
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 2 == 0, 100);
+        assert_eq!(filtered.len(), 100);
+        assert!(limit_hit);
+        assert_eq!(filtered[0], 0);
+        assert_eq!(filtered[99], 198);
+    }
+
+    #[test]
+    fn test_filter_with_limit_complex_predicate() {
+        let items: Vec<i32> = (0..50).collect();
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 3 == 0 && x % 5 == 0, 2);
+        assert_eq!(filtered, vec![0, 15]);
+        assert!(limit_hit);
+    }
+
+    #[test]
+    fn test_filter_with_limit_preserve_order() {
+        let items = vec![10, 5, 20, 15, 30, 25];
+        let (filtered, limit_hit) = filter_with_limit(items, |x| x % 5 == 0, 3);
+        assert_eq!(filtered, vec![10, 5, 20]);
+        assert!(limit_hit);
     }
 }

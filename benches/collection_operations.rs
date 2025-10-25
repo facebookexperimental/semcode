@@ -74,5 +74,62 @@ fn bench_collect_paths(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_collect_paths);
+// Benchmark filter with limit
+fn bench_filter_with_limit(c: &mut Criterion) {
+    use semcode::collection_utils::filter_with_limit;
+
+    let mut group = c.benchmark_group("filter_with_limit");
+
+    // Small collection (100 items)
+    let small_items: Vec<i32> = (0..100).collect();
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("filter_100_items_no_limit", |b| {
+        b.iter(|| filter_with_limit(black_box(small_items.clone()), |x| x % 2 == 0, 0))
+    });
+
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("filter_100_items_with_limit", |b| {
+        b.iter(|| filter_with_limit(black_box(small_items.clone()), |x| x % 2 == 0, 10))
+    });
+
+    // Large collection (1000 items) - typical threshold
+    let large_items: Vec<i32> = (0..1000).collect();
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("filter_1000_items_no_limit", |b| {
+        b.iter(|| filter_with_limit(black_box(large_items.clone()), |x| x % 2 == 0, 0))
+    });
+
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("filter_1000_items_with_limit", |b| {
+        b.iter(|| filter_with_limit(black_box(large_items.clone()), |x| x % 2 == 0, 50))
+    });
+
+    // Very large collection (5000 items)
+    let very_large_items: Vec<i32> = (0..5000).collect();
+    group.throughput(Throughput::Elements(5000));
+    group.bench_function("filter_5000_items_no_limit", |b| {
+        b.iter(|| filter_with_limit(black_box(very_large_items.clone()), |x| x % 2 == 0, 0))
+    });
+
+    group.throughput(Throughput::Elements(5000));
+    group.bench_function("filter_5000_items_with_limit", |b| {
+        b.iter(|| filter_with_limit(black_box(very_large_items.clone()), |x| x % 2 == 0, 100))
+    });
+
+    // Test with complex predicate (simulating regex-like complexity)
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("filter_1000_items_complex_predicate", |b| {
+        b.iter(|| {
+            filter_with_limit(
+                black_box(large_items.clone()),
+                |x| x % 3 == 0 && x % 5 == 0,
+                20,
+            )
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_collect_paths, bench_filter_with_limit);
 criterion_main!(benches);
