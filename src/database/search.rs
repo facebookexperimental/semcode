@@ -3034,9 +3034,11 @@ impl VectorSearchManager {
             return Ok(Vec::new());
         }
 
-        // Create a map from git_sha to similarity score
-        let score_map: HashMap<String, f32> = sha_scores.iter().cloned().collect();
-        let shas: Vec<String> = sha_scores.into_iter().map(|(sha, _)| sha).collect();
+        // Create a map from git_sha to similarity score and collect SHAs in one pass
+        let (shas, score_map): (Vec<String>, HashMap<String, f32>) = sha_scores
+            .into_iter()
+            .map(|(sha, score)| (sha.clone(), (sha, score)))
+            .unzip();
 
         // Query git_commits table for these commit SHAs
         let commits_table = self.connection.open_table("git_commits").execute().await?;
