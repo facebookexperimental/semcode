@@ -3,12 +3,17 @@
 // SQL utility functions for database operations
 //
 // This module provides utilities for building SQL queries, particularly
-// for formatting large IN clauses efficiently.
+// for formatting large IN clauses efficiently with parallel processing.
+
+use rayon::prelude::*;
+
+use crate::consts::SQL_FORMAT_PARALLEL_THRESHOLD;
 
 /// Format strings for use in SQL IN clauses
 ///
 /// Takes a slice of strings and formats them as SQL-escaped strings
 /// wrapped in single quotes. This is commonly used for building WHERE IN clauses.
+/// Automatically uses parallel processing for large collections (>= 100 items).
 ///
 /// # Arguments
 /// * `items` - Slice of strings to format
@@ -24,11 +29,20 @@
 /// let formatted = format_sql_strings(&hashes);
 /// assert_eq!(formatted, vec!["'abc123'", "'def456'"]);
 /// ```
-pub fn format_sql_strings(items: &[impl AsRef<str>]) -> Vec<String> {
-    items
-        .iter()
-        .map(|item| format!("'{}'", item.as_ref().replace("'", "''")))
-        .collect()
+pub fn format_sql_strings(items: &[impl AsRef<str> + Sync]) -> Vec<String> {
+    if items.len() < SQL_FORMAT_PARALLEL_THRESHOLD {
+        // Sequential for small collections (better cache locality)
+        items
+            .iter()
+            .map(|item| format!("'{}'", item.as_ref().replace("'", "''")))
+            .collect()
+    } else {
+        // Parallel for large collections (reduces formatting overhead)
+        items
+            .par_iter()
+            .map(|item| format!("'{}'", item.as_ref().replace("'", "''")))
+            .collect()
+    }
 }
 
 #[cfg(test)]
