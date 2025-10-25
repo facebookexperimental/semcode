@@ -3,15 +3,19 @@
 // Collection transformation utilities
 //
 // This module provides utilities for transforming and collecting data
-// from collections efficiently.
+// from collections efficiently with parallel processing.
 
 use gxhash::HashSet;
+use rayon::prelude::*;
+
+use crate::consts::COLLECTION_PARALLEL_THRESHOLD;
 
 /// Extract paths from collection and collect into a HashSet
 ///
 /// Takes a collection of items that can provide String paths via a closure,
 /// and collects them into a HashSet. This is a generic utility for path
-/// collection operations.
+/// collection operations. Automatically uses parallel processing for 
+/// collections over COLLECTION_PARALLEL_THRESHOLD.
 ///
 /// # Arguments
 /// * `items` - Slice of items to extract paths from
@@ -35,9 +39,16 @@ use gxhash::HashSet;
 /// ```
 pub fn collect_paths<T, F>(items: &[T], extractor: F) -> HashSet<String>
 where
-    F: Fn(&T) -> String,
+    F: Fn(&T) -> String + Sync + Send,
+    T: Sync,
 {
-    items.iter().map(extractor).collect()
+    if items.len() < COLLECTION_PARALLEL_THRESHOLD {
+        // Sequential for small collections (better cache locality)
+        items.iter().map(extractor).collect()
+    } else {
+        // Parallel for large collections
+        items.par_iter().map(extractor).collect()
+    }
 }
 
 #[cfg(test)]
