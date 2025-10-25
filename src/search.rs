@@ -588,10 +588,10 @@ async fn query_function_or_macro_to_writer_with_options(
             writeln!(writer, "\n{} Macro:", "==>".bold().blue())?;
             display_macro_to_writer(&macro_info, writer)?;
             // Get and display call relationships for the macro too (use macro's calls field directly)
-            let macro_calls = macro_info.calls.clone().unwrap_or_default();
+            let macro_calls = macro_info.calls.as_deref().unwrap_or(&[]);
             display_call_relationships_with_options(
                 &macro_info.name,
-                &macro_calls,
+                macro_calls,
                 &[],
                 writer,
                 true,
@@ -735,13 +735,13 @@ async fn query_function_or_macro_to_writer_with_options(
             // Found macro only
             display_macro_to_writer(&macro_info, writer)?;
             // Get and display call relationships for macros too (use macro's calls field directly)
-            let calls = macro_info.calls.clone().unwrap_or_default();
+            let calls = macro_info.calls.as_deref().unwrap_or(&[]);
             let called_by = db
                 .get_function_callers_git_aware(&macro_info.name, git_sha)
                 .await?;
             display_call_relationships_with_truncation(
                 &macro_info.name,
-                &calls,
+                calls,
                 &called_by,
                 writer,
                 true,
