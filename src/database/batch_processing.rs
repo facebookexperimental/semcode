@@ -54,7 +54,8 @@ where
 ///
 /// This function processes all batches and extracts key-value pairs from two columns,
 /// collecting them into a HashMap. The key and value are extracted using provided
-/// closures.
+/// closures. Automatically uses parallel processing for large result sets >=
+/// BATCH_PARALLEL_THRESHOLD.
 ///
 /// # Arguments
 /// * `batches` - Slice of RecordBatch to process
@@ -69,21 +70,50 @@ pub fn build_map_from_batches<K, V, FK, FV>(
     value_extractor: FV,
 ) -> HashMap<K, V>
 where
-    FK: Fn(&RecordBatch, usize) -> Option<K>,
-    FV: Fn(&RecordBatch, usize) -> Option<V>,
-    K: std::hash::Hash + Eq,
+    FK: Fn(&RecordBatch, usize) -> Option<K> + Sync + Send,
+    FV: Fn(&RecordBatch, usize) -> Option<V> + Sync + Send,
+    K: std::hash::Hash + Eq + Send,
+    V: Send,
 {
-    let mut map = HashMap::new();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-    for batch in batches {
-        for i in 0..batch.num_rows() {
-            if let (Some(key), Some(value)) = (key_extractor(batch, i), value_extractor(batch, i)) {
-                map.insert(key, value);
+    if total_rows < BATCH_PARALLEL_THRESHOLD {
+        // Sequential processing for small result sets (better cache locality)
+        let mut map = HashMap::new();
+        for batch in batches {
+            for i in 0..batch.num_rows() {
+                if let (Some(key), Some(value)) =
+                    (key_extractor(batch, i), value_extractor(batch, i))
+                {
+                    map.insert(key, value);
+                }
             }
         }
-    }
+        map
+    } else {
+        // Parallel processing for large result sets: build partial maps, then merge
+        let partial_maps: Vec<HashMap<K, V>> = batches
+            .par_iter()
+            .map(|batch| {
+                let mut local_map = HashMap::new();
+                for i in 0..batch.num_rows() {
+                    if let (Some(key), Some(value)) =
+                        (key_extractor(batch, i), value_extractor(batch, i))
+                    {
+                        local_map.insert(key, value);
+                    }
+                }
+                local_map
+            })
+            .collect();
 
-    map
+        // Merge partial maps (sequential)
+        let mut final_map = HashMap::new();
+        for partial_map in partial_maps {
+            final_map.extend(partial_map);
+        }
+        final_map
+    }
 }
 
 #[cfg(test)]
