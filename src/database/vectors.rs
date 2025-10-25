@@ -4,16 +4,16 @@ use arrow::array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, StringArray
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
+use gxhash::{HashMap, HashMapExt};
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use gxhash::{HashMap, HashMapExt};
 use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 
 #[derive(Debug, Clone)]
 pub struct VectorEntry {
-    pub content_hash: String, // Blake3 hash of the content
+    pub content_hash: String, // gxhash128 hash of the content
     pub vector: Vec<f32>,     // Variable-dimensional vector
 }
 
@@ -176,7 +176,7 @@ impl VectorStore {
 
     fn get_schema(&self, vector_dim: usize) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("content_hash", DataType::Utf8, false), // Blake3 content hash as hex string
+            Field::new("content_hash", DataType::Utf8, false), // gxhash128 content hash as hex string
             Field::new(
                 "vector",
                 DataType::FixedSizeList(

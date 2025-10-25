@@ -2,8 +2,8 @@
 use crate::{DatabaseManager, FunctionInfo, MacroInfo};
 use anstream::stdout;
 use anyhow::Result;
-use owo_colors::OwoColorize as _;
 use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use owo_colors::OwoColorize as _;
 use std::collections::VecDeque;
 use std::io::Write;
 

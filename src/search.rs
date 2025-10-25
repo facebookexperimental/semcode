@@ -2,8 +2,8 @@
 use crate::{CodeVectorizer, DatabaseManager};
 use anstream::stdout;
 use anyhow::Result;
-use owo_colors::OwoColorize as _;
 use gxhash::{HashSet, HashSetExt};
+use owo_colors::OwoColorize as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 

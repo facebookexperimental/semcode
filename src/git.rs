@@ -34,8 +34,8 @@ pub fn resolve_to_commit<'a>(repo: &'a gix::Repository, revspec: &str) -> Result
         .try_into_commit()
         .map_err(|_| anyhow::anyhow!("'{}' does not resolve to a commit", revspec))
 }
-use once_cell::sync::Lazy;
 use gxhash::{HashSet, HashSetExt};
+use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 
 // Global cache for git file hashes - lock-free concurrent access

@@ -373,7 +373,7 @@ Honors standard proxy environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY) 
 ### Implementation Details
 
 The search leverages Semcode's content deduplication system:
-- Function bodies are stored in a separate `content` table with Blake3 hashes
+- Function bodies are stored in a separate `content` table with gxhash128 hashes
 - Regex search first finds matching content entries
 - Content hashes are then used to locate corresponding functions
 - Path filtering is applied as a post-processing step for refined results

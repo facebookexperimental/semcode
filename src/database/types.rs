@@ -6,9 +6,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -96,7 +96,7 @@ impl TypeStore {
         for type_info in types {
             if !type_info.definition.is_empty() {
                 content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&type_info.definition),
+                    gxhash: crate::hash::compute_gxhash(&type_info.definition),
                     content: type_info.definition.clone(),
                 });
             }
@@ -145,7 +145,7 @@ impl TypeStore {
                 if type_info.definition.is_empty() {
                     None
                 } else {
-                    Some(crate::hash::compute_blake3_hash(&type_info.definition))
+                    Some(crate::hash::compute_gxhash(&type_info.definition))
                 }
             })
             .collect();
@@ -155,8 +155,7 @@ impl TypeStore {
             if item.definition.is_empty() {
                 definition_hash_builder.append_null();
             } else {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             }
         }
         let definition_hash_array = definition_hash_builder.finish();
@@ -237,8 +236,7 @@ impl TypeStore {
         let mut definition_hash_builder = StringBuilder::new();
         for item in types {
             if !item.definition.is_empty() {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             } else {
                 definition_hash_builder.append_value(""); // Empty hash for empty definition
             }
@@ -355,7 +353,7 @@ impl TypeStore {
                     if let Ok(Some(type_data)) = self.extract_type_metadata_from_batch(batch, i) {
                         // Create TypeInfo with hash placeholder instead of resolving content
                         let definition = match type_data.definition_hash {
-                            Some(ref hash) => format!("[blake3:{}]", hex::encode(hash)),
+                            Some(ref hash) => format!("[gxhash:{}]", hex::encode(hash)),
                             None => String::new(),
                         };
 
@@ -782,7 +780,7 @@ impl TypeStore {
             Field::new("kind", DataType::Utf8, false),
             Field::new("size", DataType::Int64, true),
             Field::new("fields", DataType::Utf8, false),
-            Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
+            Field::new("definition_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
         ]))
     }
@@ -1149,7 +1147,7 @@ impl MacroStore {
         for macro_info in macros {
             if !macro_info.definition.is_empty() {
                 content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&macro_info.definition),
+                    gxhash: crate::hash::compute_gxhash(&macro_info.definition),
                     content: macro_info.definition.clone(),
                 });
             }
@@ -1203,7 +1201,7 @@ impl MacroStore {
                 if macro_info.definition.is_empty() {
                     None
                 } else {
-                    Some(crate::hash::compute_blake3_hash(&macro_info.definition))
+                    Some(crate::hash::compute_gxhash(&macro_info.definition))
                 }
             })
             .collect();
@@ -1213,8 +1211,7 @@ impl MacroStore {
             if item.definition.is_empty() {
                 definition_hash_builder.append_null();
             } else {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             }
         }
         let definition_hash_array = definition_hash_builder.finish();
@@ -1310,7 +1307,7 @@ impl MacroStore {
             .iter()
             .map(|macro_info| {
                 if !macro_info.definition.is_empty() {
-                    crate::hash::compute_blake3_hash(&macro_info.definition)
+                    crate::hash::compute_gxhash(&macro_info.definition)
                 } else {
                     String::new() // Empty hash for empty definition
                 }
@@ -1319,8 +1316,7 @@ impl MacroStore {
         let mut definition_hash_builder = StringBuilder::new();
         for item in macros {
             if !item.definition.is_empty() {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             } else {
                 definition_hash_builder.append_value(""); // Empty hash for empty definition
             }
@@ -1509,7 +1505,7 @@ impl MacroStore {
                     if let Ok(Some(macro_data)) = self.extract_macro_metadata_from_batch(batch, i) {
                         // Create MacroInfo with hash placeholder instead of resolving content
                         let definition = match macro_data.definition_hash {
-                            Some(ref hash) => format!("[blake3:{}]", hex::encode(hash)),
+                            Some(ref hash) => format!("[gxhash:{}]", hex::encode(hash)),
                             None => String::new(),
                         };
 
@@ -1778,7 +1774,7 @@ impl MacroStore {
             Field::new("line", DataType::Int64, false),
             Field::new("is_function_like", DataType::Boolean, false),
             Field::new("parameters", DataType::Utf8, true),
-            Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
+            Field::new("definition_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this macro
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this macro
         ]))

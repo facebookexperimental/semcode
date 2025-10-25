@@ -4,9 +4,9 @@ use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
+use gxhash::{HashSet, HashSetExt};
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use gxhash::{HashSet, HashSetExt};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]

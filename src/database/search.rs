@@ -2653,7 +2653,7 @@ impl VectorSearchManager {
                         // Extract content from database results
                         let mut chunk_content = Vec::new();
                         for batch in &results {
-                            let blake3_hash_array = batch
+                            let gxhash_array = batch
                                 .column(0)
                                 .as_any()
                                 .downcast_ref::<arrow::array::StringArray>()
@@ -2665,7 +2665,7 @@ impl VectorSearchManager {
                                 .unwrap();
 
                             for i in 0..batch.num_rows() {
-                                let content_hash = blake3_hash_array.value(i).to_string();
+                                let content_hash = gxhash_array.value(i).to_string();
                                 let content = content_array.value(i).to_string();
 
                                 if !content.trim().is_empty() {

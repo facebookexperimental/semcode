@@ -2,8 +2,8 @@
 use anstream::stdout;
 use anyhow::Result;
 use colored::*;
-use regex;
 use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use regex;
 use semcode::{git, DatabaseManager};
 
 use owo_colors::OwoColorize as _;
@@ -2439,9 +2439,9 @@ async fn show_commit_metadata(
                         git_commit.subject,
                         git_commit.message,
                         git_commit.parent_sha,
-                        git_commit.symbols,   // Symbols extracted from diff
-                        git_commit.files,     // Files changed in commit
-                        HashMap::new(), // No tags extracted from git
+                        git_commit.symbols, // Symbols extracted from diff
+                        git_commit.files,   // Files changed in commit
+                        HashMap::new(),     // No tags extracted from git
                         git_commit.diff,
                         false,
                     )

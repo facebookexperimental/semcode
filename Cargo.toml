@@ -36,7 +36,6 @@ streaming-iterator = "0.1"
 once_cell = "1.20"
 crossbeam-channel = "0.5"
 sha1 = "0.10"
-blake3 = "1.8.2"
 hex = "0.4"
 dashmap = "6.1"
 tempfile = "3.14"
@@ -51,7 +50,7 @@ tower-lsp = "0.20"      # Language Server Protocol framework for LSP server
 url = "2.5"             # URL parsing for file URIs in LSP
 similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for commit diffs
 shlex = "1.3"           # Shell-like parsing for quoted strings in CLI
-gxhash = {version = "3.4", features =["deterministic"]}          # Fast HashMap/HashSet with SIMD acceleration
+gxhash = { version = "3.4", features = ["deterministic"] }  # Fast HashMap/HashSet with SIMD acceleration (deterministic for reproducible hashing)
 mimalloc = "0.1"        # Fast allocator (10-20% faster than system malloc, works on Linux and macOS)
 smallvec = { version = "1.13", features = ["serde", "union"] }  # Stack-allocated vectors for small collections (avoids heap allocation)
 

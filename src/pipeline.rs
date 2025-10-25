@@ -148,8 +148,8 @@
 // ==============================================================================
 use anyhow::Result;
 use crossbeam_channel::bounded;
-use indicatif::{ProgressBar, ProgressStyle};
 use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -191,7 +191,7 @@ pub struct PipelineBuilder {
 
     // Tracking for incremental processing
     pub newly_processed_files: Arc<Mutex<HashSet<String>>>, // git_sha:filename pairs
-    pub git_sha: Option<String>,                              // Current git SHA for the source root
+    pub git_sha: Option<String>,                            // Current git SHA for the source root
 
     // Force reprocessing mode for incremental scans
     pub force_reprocess: bool,

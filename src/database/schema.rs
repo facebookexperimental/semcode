@@ -69,7 +69,7 @@ impl SchemaManager {
             Field::new("line_end", DataType::Int64, false),
             Field::new("return_type", DataType::Utf8, false),
             Field::new("parameters", DataType::Utf8, false),
-            Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
+            Field::new("body_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty bodies)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this function
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this function
         ]));
@@ -95,7 +95,7 @@ impl SchemaManager {
             Field::new("kind", DataType::Utf8, false),
             Field::new("size", DataType::Int64, true),
             Field::new("fields", DataType::Utf8, false),
-            Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
+            Field::new("definition_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
         ]));
 
@@ -119,7 +119,7 @@ impl SchemaManager {
             Field::new("line", DataType::Int64, false),
             Field::new("is_function_like", DataType::Boolean, false),
             Field::new("parameters", DataType::Utf8, true),
-            Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
+            Field::new("definition_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this macro
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this macro
         ]));
@@ -139,7 +139,7 @@ impl SchemaManager {
     async fn create_vectors_table(&self) -> Result<()> {
         // Create vectors table with 256 dimensions
         let schema = Arc::new(Schema::new(vec![
-            Field::new("content_hash", DataType::Utf8, false), // Blake3 content hash as hex string
+            Field::new("content_hash", DataType::Utf8, false), // gxhash128 content hash as hex string
             Field::new(
                 "vector",
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 256),
@@ -248,7 +248,7 @@ impl SchemaManager {
 
     async fn create_content_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("blake3_hash", DataType::Utf8, false), // Blake3 hash of content as hex string
+            Field::new("gxhash", DataType::Utf8, false), // gxhash128 hash of content as hex string
             Field::new("content", DataType::Utf8, false), // The actual content (function body, etc.)
         ]));
 
@@ -268,7 +268,7 @@ impl SchemaManager {
     async fn create_content_shard_tables(&self) -> Result<()> {
         let table_names = self.connection.table_names().execute().await?;
         let schema = Arc::new(Schema::new(vec![
-            Field::new("blake3_hash", DataType::Utf8, false), // Blake3 hash of content as hex string
+            Field::new("gxhash", DataType::Utf8, false), // gxhash128 hash of content as hex string
             Field::new("content", DataType::Utf8, false), // The actual content (function body, etc.)
         ]));
 
@@ -574,11 +574,11 @@ impl SchemaManager {
             if table_names.iter().any(|n| n == &table_name) {
                 let table = self.connection.open_table(&table_name).execute().await?;
 
-                // Primary index on blake3_hash for deduplication and fast lookups
+                // Primary index on gxhash for deduplication and fast lookups
                 self.try_create_index(
                     &table,
-                    &["blake3_hash"],
-                    &format!("BTree index on {table_name}.blake3_hash"),
+                    &["gxhash"],
+                    &format!("BTree index on {table_name}.gxhash"),
                 )
                 .await;
 
@@ -934,7 +934,7 @@ impl SchemaManager {
     /// Create a single content shard table
     async fn create_single_content_shard_table(&self, table_name: &str) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("blake3_hash", DataType::Utf8, false), // Blake3 hash of content as hex string
+            Field::new("gxhash", DataType::Utf8, false), // gxhash128 hash of content as hex string
             Field::new("content", DataType::Utf8, false), // The actual content (function body, etc.)
         ]));
 

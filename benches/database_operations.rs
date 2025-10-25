@@ -185,7 +185,7 @@ fn bench_search_operations(c: &mut Criterion) {
 
 // Benchmark content deduplication overhead
 fn bench_content_deduplication(c: &mut Criterion) {
-    use semcode::hash::compute_blake3_hash;
+    use semcode::hash::compute_gxhash;
 
     let mut group = c.benchmark_group("content_deduplication");
 
@@ -199,7 +199,7 @@ fn bench_content_deduplication(c: &mut Criterion) {
         b.iter(|| {
             bodies
                 .iter()
-                .map(|body| compute_blake3_hash(black_box(body)))
+                .map(|body| compute_gxhash(black_box(body)))
                 .collect::<Vec<_>>()
         })
     });

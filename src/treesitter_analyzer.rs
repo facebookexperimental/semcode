@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
-use regex::Regex;
 use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use regex::Regex;
 use smallvec::SmallVec;
 use std::path::Path;
 use std::sync::LazyLock;
