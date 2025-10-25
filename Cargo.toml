@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
+cargo-features = ["profile-rustflags"]  # Not needed past Rust 1.80 stable, kept for compatibility
+
 [package]
 name = "semcode"
 version = "0.1.0"
@@ -86,4 +88,20 @@ name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
 
 [profile.release]
-debug = false
+debug = false          # no debug
+opt-level = 3          # max performance (O3)
+# painfully slow, but better.
+# lto = "fat"            # full link-time optimization across crates
+# codegen-units = 1      # single codegen unit for better optimization
+# incremental = false    # always fully optimize
+# not as good, but tolerable build times.
+lto = "thin"
+incremental = true     # implicitly set codegen units to 256
+#
+panic = "abort"        # remove unwinding runtime
+strip = "symbols"      # remove debug symbols
+overflow-checks = false # no runtime overflow checks
+rpath = false          # omit runtime search paths
+rustflags = [
+  "-C", "target-cpu=native",             # tune for your CPU; enables all supported instructions
+]
