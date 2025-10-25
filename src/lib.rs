@@ -6,6 +6,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Module declarations
+pub mod collection_utils;
 pub mod consts;
 pub mod database;
 pub mod database_utils;

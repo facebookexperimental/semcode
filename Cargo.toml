@@ -73,6 +73,10 @@ harness = false
 name = "io_operations"
 harness = false
 
+[[bench]]
+name = "collection_operations"
+harness = false
+
 [[bin]]
 name = "semcode-index"
 path = "src/bin/index.rs"
