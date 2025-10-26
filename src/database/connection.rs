@@ -4,6 +4,7 @@ use anyhow::Result;
 use arrow::array::{Array, StringArray};
 use colored::*;
 use futures::TryStreamExt;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use lancedb::connection::Connection;
 use lancedb::query::ExecutableQuery;
 use lancedb::query::QueryBase;
@@ -64,7 +65,8 @@ impl DatabaseManager {
 
     pub async fn create_tables(&self) -> Result<()> {
         self.schema_manager.create_all_tables().await?;
-        self.schema_manager.create_scalar_indices().await?;
+        // NOTE: Indexes are NOT created here! They should be built AFTER bulk inserts
+        // for optimal performance. Call rebuild_indices() after all inserts are complete.
         Ok(())
     }
 
@@ -220,7 +222,6 @@ impl DatabaseManager {
         table: &lancedb::Table,
     ) -> Result<(usize, usize, usize, Vec<Vec<String>>)> {
         use futures::TryStreamExt;
-        use std::collections::HashMap;
 
         let results = table
             .query()
@@ -502,7 +503,7 @@ impl DatabaseManager {
         for func in &functions {
             if !func.body.is_empty() {
                 all_content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&func.body),
+                    gxhash: crate::hash::compute_gxhash(&func.body),
                     content: func.body.clone(),
                 });
             }
@@ -512,7 +513,7 @@ impl DatabaseManager {
         for type_info in &types {
             if !type_info.definition.is_empty() {
                 all_content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&type_info.definition),
+                    gxhash: crate::hash::compute_gxhash(&type_info.definition),
                     content: type_info.definition.clone(),
                 });
             }
@@ -522,7 +523,7 @@ impl DatabaseManager {
         for macro_info in &macros {
             if !macro_info.definition.is_empty() {
                 all_content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&macro_info.definition),
+                    gxhash: crate::hash::compute_gxhash(&macro_info.definition),
                     content: macro_info.definition.clone(),
                 });
             }
@@ -966,7 +967,7 @@ impl DatabaseManager {
     // Type operations
     pub async fn insert_types(&self, types: Vec<TypeInfo>) -> Result<()> {
         // Extract unique type definitions and store them in content table for deduplication
-        let mut unique_definitions = std::collections::HashSet::new();
+        let mut unique_definitions = HashSet::new();
         for type_info in &types {
             if !type_info.definition.is_empty() {
                 unique_definitions.insert(type_info.definition.clone());
@@ -979,7 +980,7 @@ impl DatabaseManager {
             let content_items: Vec<crate::database::content::ContentInfo> = unique_definitions
                 .into_iter()
                 .map(|definition| crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&definition),
+                    gxhash: crate::hash::compute_gxhash(&definition),
                     content: definition,
                 })
                 .collect();
@@ -1142,7 +1143,7 @@ impl DatabaseManager {
     // Typedef operations
     pub async fn insert_typedefs(&self, typedefs: Vec<TypedefInfo>) -> Result<()> {
         // Extract unique typedef definitions and store them in content table for deduplication
-        let mut unique_definitions = std::collections::HashSet::new();
+        let mut unique_definitions = HashSet::new();
         for typedef_info in &typedefs {
             if !typedef_info.definition.is_empty() {
                 unique_definitions.insert(typedef_info.definition.clone());
@@ -1155,7 +1156,7 @@ impl DatabaseManager {
             let content_items: Vec<crate::database::content::ContentInfo> = unique_definitions
                 .into_iter()
                 .map(|definition| crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&definition),
+                    gxhash: crate::hash::compute_gxhash(&definition),
                     content: definition,
                 })
                 .collect();
@@ -1349,7 +1350,7 @@ impl DatabaseManager {
     // Macro operations
     pub async fn insert_macros(&self, macros: Vec<MacroInfo>) -> Result<()> {
         // Extract unique macro definitions and expansions and store them in content table for deduplication
-        let mut unique_content = std::collections::HashSet::new();
+        let mut unique_content = HashSet::new();
         for macro_info in &macros {
             if !macro_info.definition.is_empty() {
                 unique_content.insert(macro_info.definition.clone());
@@ -1362,7 +1363,7 @@ impl DatabaseManager {
             let content_items: Vec<crate::database::content::ContentInfo> = unique_content
                 .into_iter()
                 .map(|content| crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&content),
+                    gxhash: crate::hash::compute_gxhash(&content),
                     content,
                 })
                 .collect();
@@ -1594,7 +1595,7 @@ impl DatabaseManager {
         );
 
         let process_start = std::time::Instant::now();
-        let mut callers = std::collections::HashSet::new();
+        let mut callers = HashSet::new();
         for batch in results {
             if batch.num_rows() > 0 {
                 let name_array = batch
@@ -1665,8 +1666,7 @@ impl DatabaseManager {
 
         // Step 2: Build HashSet of valid git file hashes for O(1) lookup
         let step2_start = std::time::Instant::now();
-        let valid_hashes: std::collections::HashSet<String> =
-            git_manifest.values().cloned().collect();
+        let valid_hashes: HashSet<String> = git_manifest.values().cloned().collect();
         tracing::info!(
             "get_function_callers_git_aware: Step 2 (build hash set) took {:?}, {} hashes",
             step2_start.elapsed(),
@@ -1772,8 +1772,8 @@ impl DatabaseManager {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut functions_with_calls = std::collections::HashSet::new();
-        let mut functions_that_are_called = std::collections::HashSet::new();
+        let mut functions_with_calls = HashSet::new();
+        let mut functions_that_are_called = HashSet::new();
 
         for batch in results {
             if batch.num_rows() > 0 {
@@ -1829,7 +1829,7 @@ impl DatabaseManager {
     pub async fn get_functions_by_names(
         &self,
         names: &[String],
-    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+    ) -> Result<HashMap<String, FunctionInfo>> {
         self.function_store.get_by_names(names).await
     }
 
@@ -1837,15 +1837,12 @@ impl DatabaseManager {
     pub async fn get_macros_by_names(
         &self,
         names: &[String],
-    ) -> Result<std::collections::HashMap<String, MacroInfo>> {
+    ) -> Result<HashMap<String, MacroInfo>> {
         self.macro_store.get_by_names(names).await
     }
 
     /// Get types by a list of names (batch lookup)
-    pub async fn get_types_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, TypeInfo>> {
+    pub async fn get_types_by_names(&self, names: &[String]) -> Result<HashMap<String, TypeInfo>> {
         self.type_store.get_by_names(names).await
     }
 
@@ -1853,7 +1850,7 @@ impl DatabaseManager {
     pub async fn get_typedefs_by_names(
         &self,
         names: &[String],
-    ) -> Result<std::collections::HashMap<String, TypedefInfo>> {
+    ) -> Result<HashMap<String, TypedefInfo>> {
         self.typedef_store.get_by_names(names).await
     }
 
@@ -1866,7 +1863,7 @@ impl DatabaseManager {
         include_forward: bool,
         include_reverse: bool,
         git_sha: Option<&str>,
-    ) -> Result<std::collections::HashSet<String>> {
+    ) -> Result<HashSet<String>> {
         // For small databases (< 1000 functions), use the old full-scan approach
         // For large databases, use targeted queries
         let function_count = self.get_function_count().await?;
@@ -1908,7 +1905,7 @@ impl DatabaseManager {
         include_forward: bool,
         include_reverse: bool,
         git_sha: Option<&str>,
-    ) -> Result<std::collections::HashSet<String>> {
+    ) -> Result<HashSet<String>> {
         // For small databases, we'll still use the targeted approach with call store
         // since the embedded call fields have been removed
         self.collect_callchain_functions_targeted(
@@ -1929,7 +1926,7 @@ impl DatabaseManager {
         include_forward: bool,
         include_reverse: bool,
         git_sha: Option<&str>,
-    ) -> Result<std::collections::HashSet<String>> {
+    ) -> Result<HashSet<String>> {
         // Optimize git-aware operations by generating manifest once
         let git_manifest = if let Some(sha) = git_sha {
             tracing::info!(
@@ -1941,9 +1938,9 @@ impl DatabaseManager {
             None
         };
 
-        let mut result = std::collections::HashSet::new();
+        let mut result = HashSet::new();
         let mut to_visit = std::collections::VecDeque::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = HashSet::new();
 
         to_visit.push_back((start_function.to_string(), 0));
         result.insert(start_function.to_string());
@@ -2378,7 +2375,7 @@ impl DatabaseManager {
         &self,
         file_paths: &[String],
         git_sha: &str,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<HashMap<String, String>> {
         match crate::git::resolve_files_at_commit(&self.git_repo_path, git_sha, file_paths) {
             Ok(resolved_hashes) => {
                 // If no files were resolved, log this as a warning
@@ -2396,7 +2393,7 @@ impl DatabaseManager {
                 tracing::error!("DatabaseManager::resolve_git_file_hashes: Failed to resolve git files at commit {}: {}", git_sha, e);
                 tracing::error!("Repository path: {}", self.git_repo_path);
                 tracing::error!("Requested file paths: {:?}", file_paths);
-                Ok(std::collections::HashMap::new()) // Return empty map instead of failing, let caller handle
+                Ok(HashMap::new()) // Return empty map instead of failing, let caller handle
             }
         }
     }
@@ -2471,20 +2468,18 @@ impl DatabaseManager {
     }
 
     /// Get all existing git file SHAs from processed files for deduplication (optimized streaming version)
-    pub async fn get_existing_git_file_shas(&self) -> Result<std::collections::HashSet<String>> {
+    pub async fn get_existing_git_file_shas(&self) -> Result<HashSet<String>> {
         // Use the optimized method that only loads git_file_sha column
         self.processed_file_store.get_all_git_file_shas().await
     }
 
     /// Get file/git_file_sha pairs for pipeline deduplication (optimized for large datasets)
-    pub async fn get_processed_file_pairs(
-        &self,
-    ) -> Result<std::collections::HashSet<(String, String)>> {
+    pub async fn get_processed_file_pairs(&self) -> Result<HashSet<(String, String)>> {
         // Use the optimized method that only loads the two needed columns
         self.processed_file_store.get_all_file_git_sha_pairs().await
     }
 
-    pub async fn get_existing_function_names(&self) -> Result<std::collections::HashSet<String>> {
+    pub async fn get_existing_function_names(&self) -> Result<HashSet<String>> {
         use futures::TryStreamExt;
 
         let table = self.connection.open_table("functions").execute().await?;
@@ -2495,7 +2490,7 @@ impl DatabaseManager {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut function_names = std::collections::HashSet::new();
+        let mut function_names = HashSet::new();
 
         for batch in results {
             if batch.num_rows() == 0 {
@@ -2529,7 +2524,7 @@ impl DatabaseManager {
         &self,
         commit_a: &str,
         commit_b: &str,
-    ) -> Result<std::collections::HashSet<String>> {
+    ) -> Result<HashSet<String>> {
         use crate::git::{get_changed_files, ChangeType};
 
         tracing::info!(
@@ -2540,7 +2535,7 @@ impl DatabaseManager {
 
         // Step 1: Get directly changed files between commits
         let changed_files = get_changed_files(&self.git_repo_path, commit_a, commit_b)?;
-        let mut files_to_scan = std::collections::HashSet::new();
+        let mut files_to_scan = HashSet::new();
 
         // Add all directly changed files (except deleted ones)
         for changed_file in &changed_files {
@@ -2564,11 +2559,11 @@ impl DatabaseManager {
     async fn find_files_connected_to_changes(
         &self,
         changed_files: &[crate::git::ChangedFile],
-    ) -> Result<std::collections::HashSet<String>> {
-        let mut connected_files = std::collections::HashSet::new();
+    ) -> Result<HashSet<String>> {
+        let mut connected_files = HashSet::new();
 
         // Collect all file paths that changed
-        let changed_file_paths: std::collections::HashSet<String> =
+        let changed_file_paths: HashSet<String> =
             changed_files.iter().map(|cf| cf.path.clone()).collect();
 
         tracing::debug!(
@@ -2611,7 +2606,7 @@ impl DatabaseManager {
     async fn find_files_connected_via_calls(
         &self,
         changed_files: &[crate::git::ChangedFile],
-    ) -> Result<std::collections::HashSet<String>> {
+    ) -> Result<HashSet<String>> {
         // TODO: Reimplement this method using embedded JSON calls columns instead of the old calls table
         // The calls table no longer exists - call relationships are now embedded in function JSON columns
         // This method should:
@@ -2619,7 +2614,7 @@ impl DatabaseManager {
         // 2. Parse the JSON arrays to find call relationships
         // 3. Find files connected to changed files via these relationships
 
-        let _changed_file_paths: std::collections::HashSet<String> =
+        let _changed_file_paths: HashSet<String> =
             changed_files.iter().map(|cf| cf.path.clone()).collect();
 
         tracing::debug!("Call connection analysis disabled - calls table removed, embedded JSON approach not yet implemented");
@@ -2629,7 +2624,7 @@ impl DatabaseManager {
         );
 
         // Return empty set until reimplemented
-        Ok(std::collections::HashSet::new())
+        Ok(HashSet::new())
     }
 
     /// Search function bodies using regex patterns via LanceDB - searches sharded content tables
@@ -2647,7 +2642,7 @@ impl DatabaseManager {
 
         let where_clause = format!("regexp_match(content, '{escaped_pattern}')");
 
-        // Collect matching blake3 hashes from all content shards (content_0 through content_15)
+        // Collect matching gxhash128 hashes from all content shards (content_0 through content_15)
         let mut matching_hashes: Vec<String> = Vec::new();
 
         // Query all 16 content shard tables
@@ -2664,14 +2659,14 @@ impl DatabaseManager {
 
             // Collect matching hashes from this shard
             for batch in &content_results {
-                let blake3_hash_array = batch
+                let gxhash_array = batch
                     .column(0)
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .unwrap();
 
                 for i in 0..batch.num_rows() {
-                    matching_hashes.push(blake3_hash_array.value(i).to_string());
+                    matching_hashes.push(gxhash_array.value(i).to_string());
                 }
             }
         }
@@ -2894,7 +2889,7 @@ impl DatabaseManager {
         let unique_file_paths: Vec<String> = all_matching_functions
             .iter()
             .map(|f| f.file_path.clone())
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
 
@@ -3121,11 +3116,8 @@ impl DatabaseManager {
 
     /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
     /// Uses the shared git tree traversal utility for consistency
-    async fn generate_git_manifest(
-        &self,
-        git_sha: &str,
-    ) -> Result<std::collections::HashMap<String, String>> {
-        let mut manifest = std::collections::HashMap::new();
+    async fn generate_git_manifest(&self, git_sha: &str) -> Result<HashMap<String, String>> {
+        let mut manifest = HashMap::new();
 
         // Use shared tree traversal utility
         crate::git::walk_tree_at_commit(
@@ -3167,7 +3159,7 @@ impl DatabaseManager {
 
     // Content operations for deduplication
 
-    /// Store content and return the blake3 hash
+    /// Store content and return the gxhash128 hash (stored in gxhash field for compatibility)
     pub async fn store_content(&self, content: &str) -> Result<String> {
         self.content_store.store_content(content).await
     }
@@ -3179,27 +3171,24 @@ impl DatabaseManager {
             .await
     }
 
-    /// Get content by blake3 hash
-    pub async fn get_content(&self, blake3_hash: &str) -> Result<Option<String>> {
-        self.content_store.get_content(blake3_hash).await
+    /// Get content by gxhash128 hash (gxhash parameter name kept for compatibility)
+    pub async fn get_content(&self, gxhash: &str) -> Result<Option<String>> {
+        self.content_store.get_content(gxhash).await
     }
 
-    /// Get content by blake3 hash hex string
-    pub async fn get_content_by_hex(&self, blake3_hash_hex: &str) -> Result<Option<String>> {
-        self.content_store.get_content_by_hex(blake3_hash_hex).await
+    /// Get content by gxhash128 hash hex string (gxhash parameter name kept for compatibility)
+    pub async fn get_content_by_hex(&self, gxhash_hex: &str) -> Result<Option<String>> {
+        self.content_store.get_content_by_hex(gxhash_hex).await
     }
 
     /// Bulk fetch content for multiple hashes - optimized for dump operations
-    pub async fn get_content_bulk(
-        &self,
-        hashes: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    pub async fn get_content_bulk(&self, hashes: &[String]) -> Result<HashMap<String, String>> {
         self.content_store.get_content_bulk(hashes).await
     }
 
     /// Check if content exists by hash
-    pub async fn content_exists(&self, blake3_hash: &str) -> Result<bool> {
-        self.content_store.content_exists(blake3_hash).await
+    pub async fn content_exists(&self, gxhash: &str) -> Result<bool> {
+        self.content_store.content_exists(gxhash).await
     }
 
     /// Insert a batch of content items
@@ -3225,7 +3214,7 @@ impl DatabaseManager {
     async fn function_exists_in_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &HashMap<String, String>,
     ) -> Result<bool> {
         // Get all functions with this name (non-git-aware, fast database query)
         let all_functions = self
@@ -3249,7 +3238,7 @@ impl DatabaseManager {
     async fn macro_exists_in_manifest(
         &self,
         macro_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &HashMap<String, String>,
     ) -> Result<bool> {
         // Get all macros with this name (non-git-aware, fast database query)
         let all_macros = self.macro_store.find_all_by_name(macro_name).await?;
@@ -3270,7 +3259,7 @@ impl DatabaseManager {
     async fn get_function_callees_with_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &HashMap<String, String>,
     ) -> Result<Vec<String>> {
         // Get all functions with this name (non-git-aware, fast database query)
         let all_matches = self
@@ -3307,7 +3296,7 @@ impl DatabaseManager {
     async fn get_function_callers_with_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &HashMap<String, String>,
     ) -> Result<Vec<String>> {
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape

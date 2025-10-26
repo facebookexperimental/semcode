@@ -6,10 +6,13 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
+use crate::consts::SMALLVEC_FIELD_SIZE;
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::content::ContentStore;
 use crate::types::{FieldInfo, MacroInfo, TypeInfo, TypedefInfo};
@@ -22,7 +25,7 @@ struct TypeMetadata {
     pub line_start: u32,
     pub kind: String,
     pub size: Option<u64>,
-    pub members: Vec<FieldInfo>,
+    pub members: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]>,
     pub definition_hash: Option<String>,
     pub types: Option<Vec<String>>,
 }
@@ -93,7 +96,7 @@ impl TypeStore {
         for type_info in types {
             if !type_info.definition.is_empty() {
                 content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&type_info.definition),
+                    gxhash: crate::hash::compute_gxhash(&type_info.definition),
                     content: type_info.definition.clone(),
                 });
             }
@@ -142,7 +145,7 @@ impl TypeStore {
                 if type_info.definition.is_empty() {
                     None
                 } else {
-                    Some(crate::hash::compute_blake3_hash(&type_info.definition))
+                    Some(crate::hash::compute_gxhash(&type_info.definition))
                 }
             })
             .collect();
@@ -152,8 +155,7 @@ impl TypeStore {
             if item.definition.is_empty() {
                 definition_hash_builder.append_null();
             } else {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             }
         }
         let definition_hash_array = definition_hash_builder.finish();
@@ -234,8 +236,7 @@ impl TypeStore {
         let mut definition_hash_builder = StringBuilder::new();
         for item in types {
             if !item.definition.is_empty() {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             } else {
                 definition_hash_builder.append_value(""); // Empty hash for empty definition
             }
@@ -352,7 +353,7 @@ impl TypeStore {
                     if let Ok(Some(type_data)) = self.extract_type_metadata_from_batch(batch, i) {
                         // Create TypeInfo with hash placeholder instead of resolving content
                         let definition = match type_data.definition_hash {
-                            Some(ref hash) => format!("[blake3:{}]", hex::encode(hash)),
+                            Some(ref hash) => format!("[gxhash:{}]", hex::encode(hash)),
                             None => String::new(),
                         };
 
@@ -391,7 +392,7 @@ impl TypeStore {
     pub async fn get_all_bulk_optimized(&self) -> Result<Vec<TypeInfo>> {
         let table = self.connection.open_table("types").execute().await?;
         let mut all_type_data = Vec::new();
-        let mut all_definition_hashes = std::collections::HashSet::new();
+        let mut all_definition_hashes = HashSet::new();
         let batch_size = 10000;
         let mut offset = 0;
 
@@ -434,7 +435,7 @@ impl TypeStore {
             let hash_vec: Vec<String> = all_definition_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct TypeInfo objects with content
@@ -513,7 +514,8 @@ impl TypeStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
+        let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+            serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
             None
         } else {
@@ -548,25 +550,19 @@ impl TypeStore {
     }
 
     /// Bulk fetch content for multiple hashes
-    async fn bulk_get_content(
-        &self,
-        hashes: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    async fn bulk_get_content(&self, hashes: &[String]) -> Result<HashMap<String, String>> {
         self.content_store.get_content_bulk(hashes).await
     }
 
     /// Get types by a list of names (batch lookup) - optimized to minimize content queries
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, TypeInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, TypeInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("types").execute().await?;
         let mut all_type_data = Vec::new();
-        let mut all_definition_hashes = std::collections::HashSet::new();
+        let mut all_definition_hashes = HashSet::new();
 
         // Step 1: Fetch all type metadata and collect unique definition hashes
         for chunk in names.chunks(100) {
@@ -604,11 +600,11 @@ impl TypeStore {
             let hash_vec: Vec<String> = all_definition_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct TypeInfo objects with content
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
         for type_data in all_type_data {
             let definition = match type_data.definition_hash {
                 Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),
@@ -730,7 +726,8 @@ impl TypeStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
+        let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+            serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
             None
         } else {
@@ -783,7 +780,7 @@ impl TypeStore {
             Field::new("kind", DataType::Utf8, false),
             Field::new("size", DataType::Int64, true),
             Field::new("fields", DataType::Utf8, false),
-            Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
+            Field::new("definition_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
         ]))
     }
@@ -819,7 +816,7 @@ impl TypedefStore {
                     line_start: typedef.line_start,
                     kind: "typedef".to_string(),
                     size: None,
-                    members: Vec::new(),
+                    members: SmallVec::new(),
                     definition: full_definition,
                     types: None, // Typedefs don't reference other types directly
                 }
@@ -921,16 +918,13 @@ impl TypedefStore {
     }
 
     /// Get typedefs by a list of names (batch lookup)
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, TypedefInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, TypedefInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("types").execute().await?;
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
 
         // Process in smaller batches to avoid query size limits
         for chunk in names.chunks(100) {
@@ -1153,7 +1147,7 @@ impl MacroStore {
         for macro_info in macros {
             if !macro_info.definition.is_empty() {
                 content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&macro_info.definition),
+                    gxhash: crate::hash::compute_gxhash(&macro_info.definition),
                     content: macro_info.definition.clone(),
                 });
             }
@@ -1207,7 +1201,7 @@ impl MacroStore {
                 if macro_info.definition.is_empty() {
                     None
                 } else {
-                    Some(crate::hash::compute_blake3_hash(&macro_info.definition))
+                    Some(crate::hash::compute_gxhash(&macro_info.definition))
                 }
             })
             .collect();
@@ -1217,8 +1211,7 @@ impl MacroStore {
             if item.definition.is_empty() {
                 definition_hash_builder.append_null();
             } else {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             }
         }
         let definition_hash_array = definition_hash_builder.finish();
@@ -1314,7 +1307,7 @@ impl MacroStore {
             .iter()
             .map(|macro_info| {
                 if !macro_info.definition.is_empty() {
-                    crate::hash::compute_blake3_hash(&macro_info.definition)
+                    crate::hash::compute_gxhash(&macro_info.definition)
                 } else {
                     String::new() // Empty hash for empty definition
                 }
@@ -1323,8 +1316,7 @@ impl MacroStore {
         let mut definition_hash_builder = StringBuilder::new();
         for item in macros {
             if !item.definition.is_empty() {
-                definition_hash_builder
-                    .append_value(crate::hash::compute_blake3_hash(&item.definition));
+                definition_hash_builder.append_value(crate::hash::compute_gxhash(&item.definition));
             } else {
                 definition_hash_builder.append_value(""); // Empty hash for empty definition
             }
@@ -1513,7 +1505,7 @@ impl MacroStore {
                     if let Ok(Some(macro_data)) = self.extract_macro_metadata_from_batch(batch, i) {
                         // Create MacroInfo with hash placeholder instead of resolving content
                         let definition = match macro_data.definition_hash {
-                            Some(ref hash) => format!("[blake3:{}]", hex::encode(hash)),
+                            Some(ref hash) => format!("[gxhash:{}]", hex::encode(hash)),
                             None => String::new(),
                         };
 
@@ -1543,16 +1535,13 @@ impl MacroStore {
     }
 
     /// Get macros by a list of names (batch lookup)
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, MacroInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, MacroInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("macros").execute().await?;
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
 
         // Process in smaller batches to avoid query size limits
         for chunk in names.chunks(100) {
@@ -1785,7 +1774,7 @@ impl MacroStore {
             Field::new("line", DataType::Int64, false),
             Field::new("is_function_like", DataType::Boolean, false),
             Field::new("parameters", DataType::Utf8, true),
-            Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
+            Field::new("definition_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this macro
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this macro
         ]))

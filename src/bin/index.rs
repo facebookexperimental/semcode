@@ -13,8 +13,8 @@ use semcode::{FunctionInfo, MacroInfo, TypeInfo};
 // Temporary call relationships are now embedded in function JSON columns
 use dashmap::DashSet;
 use gix::revision::walk::Sorting;
+use gxhash::{HashMap, HashMapExt, HashSet};
 use semcode::perf_monitor::PERF_STATS;
-use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -253,16 +253,21 @@ async fn run_commits_only(args: Args) -> Result<()> {
     // Process database path
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
 
+    // Handle --clear flag by removing entire database directory
+    if args.clear {
+        if std::path::Path::new(&database_path).exists() {
+            println!("Removing existing database at {}...", database_path);
+            std::fs::remove_dir_all(&database_path)?;
+            println!("Existing database removed.");
+        } else {
+            println!("No existing database found at {}", database_path);
+        }
+    }
+
     // Create database manager and tables
     let db_manager =
         DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
     db_manager.create_tables().await?;
-
-    if args.clear {
-        println!("Clearing existing data...");
-        db_manager.clear_all_data().await?;
-        println!("Existing data cleared.");
-    }
 
     // Open repository and get list of commits in range
     let repo = gix::discover(&args.source)
@@ -564,16 +569,21 @@ async fn run_pipeline(args: Args) -> Result<()> {
     // Process database path with search order: 1) -d flag, 2) source directory, 3) current directory
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
 
+    // Handle --clear flag by removing entire database directory
+    if args.clear {
+        if std::path::Path::new(&database_path).exists() {
+            println!("Removing existing database at {}...", database_path);
+            std::fs::remove_dir_all(&database_path)?;
+            println!("Existing database removed.");
+        } else {
+            println!("No existing database found at {}", database_path);
+        }
+    }
+
     // Create database manager and tables
     let db_manager =
         DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
     db_manager.create_tables().await?;
-
-    if args.clear {
-        println!("Clearing existing data...");
-        db_manager.clear_all_data().await?;
-        println!("Existing data cleared.");
-    }
 
     // Wrap database manager in Arc for sharing across pipeline stages
     let db_manager = Arc::new(db_manager);
@@ -582,7 +592,7 @@ async fn run_pipeline(args: Args) -> Result<()> {
     if !args.vectors {
         // Determine which files to process based on incremental mode
         let mut files_to_process = Vec::new();
-        let git_files_map: Option<std::collections::HashMap<PathBuf, GitFileEntry>> = None;
+        let git_files_map: Option<HashMap<PathBuf, GitFileEntry>> = None;
         let extensions: Vec<String> = args
             .extensions
             .iter()
@@ -778,6 +788,18 @@ async fn run_pipeline(args: Args) -> Result<()> {
     // ===============================================================================
 
     // Call relationships are now embedded in function/macro JSON columns
+
+    // Build indexes after all data has been inserted (deferred indexing for performance)
+    // Only skip in git range mode for faster incremental updates
+    if args.git.is_none() {
+        println!("\nBuilding database indexes...");
+        match measure!("index_building", { db_manager.rebuild_indices().await }) {
+            Ok(_) => println!("✓ Indexes built successfully"),
+            Err(e) => error!("Failed to build indexes: {}", e),
+        }
+    } else {
+        println!("\nSkipping index rebuild in git range indexing mode (indexes already exist)");
+    }
 
     // Generate vectors if requested
     if args.vectors {
@@ -1532,9 +1554,7 @@ async fn process_git_tuples_streaming(
 }
 
 /// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
-fn parse_commit_message_tags(message: &str) -> std::collections::HashMap<String, Vec<String>> {
-    use std::collections::HashMap;
-
+fn parse_commit_message_tags(message: &str) -> HashMap<String, Vec<String>> {
     let mut tags: HashMap<String, Vec<String>> = HashMap::new();
 
     for line in message.lines() {

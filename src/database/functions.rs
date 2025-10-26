@@ -4,10 +4,13 @@ use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, Stri
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
+use crate::consts::SMALLVEC_PARAM_SIZE;
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::content::ContentStore;
 use crate::types::{FunctionInfo, ParameterInfo};
@@ -20,7 +23,7 @@ struct FunctionMetadata {
     pub line_start: u32,
     pub line_end: u32,
     pub return_type: String,
-    pub parameters: Vec<ParameterInfo>,
+    pub parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]>,
     pub body_hash: Option<String>,
     pub calls: Option<Vec<String>>,
     pub types: Option<Vec<String>>,
@@ -98,7 +101,7 @@ impl FunctionStore {
         for func in functions {
             if !func.body.is_empty() {
                 content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&func.body),
+                    gxhash: crate::hash::compute_gxhash(&func.body),
                     content: func.body.clone(),
                 });
             }
@@ -148,7 +151,7 @@ impl FunctionStore {
             if func.body.is_empty() {
                 body_hash_builder.append_null();
             } else {
-                body_hash_builder.append_value(crate::hash::compute_blake3_hash(&func.body));
+                body_hash_builder.append_value(crate::hash::compute_gxhash(&func.body));
             }
         }
         let body_hash_array = body_hash_builder.finish();
@@ -246,7 +249,7 @@ impl FunctionStore {
         let mut body_hash_builder = StringBuilder::new();
         for func in functions {
             if !func.body.is_empty() {
-                body_hash_builder.append_value(crate::hash::compute_blake3_hash(&func.body));
+                body_hash_builder.append_value(crate::hash::compute_gxhash(&func.body));
             } else {
                 body_hash_builder.append_value(""); // Empty hash for empty body
             }
@@ -456,7 +459,7 @@ impl FunctionStore {
                     {
                         // Create FunctionInfo with hash placeholder instead of resolving content
                         let body = match func_data.body_hash {
-                            Some(ref hash) => format!("[blake3:{}]", hex::encode(hash)),
+                            Some(ref hash) => format!("[gxhash:{}]", hex::encode(hash)),
                             None => String::new(),
                         };
 
@@ -490,7 +493,7 @@ impl FunctionStore {
     pub async fn get_all_bulk_optimized(&self) -> Result<Vec<FunctionInfo>> {
         let table = self.connection.open_table("functions").execute().await?;
         let mut all_function_data = Vec::new();
-        let mut all_body_hashes = std::collections::HashSet::new();
+        let mut all_body_hashes = HashSet::new();
         let batch_size = 10000;
         let mut offset = 0;
 
@@ -534,7 +537,7 @@ impl FunctionStore {
             let hash_vec: Vec<String> = all_body_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct FunctionInfo objects with content
@@ -619,8 +622,8 @@ impl FunctionStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let parameters: Vec<ParameterInfo> =
-            serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
+        let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
+            serde_json::from_str(parameters_array.value(row))?;
 
         // Get body hash if not null
         let body_hash = if body_hash_array.is_null(row) {
@@ -657,25 +660,19 @@ impl FunctionStore {
     }
 
     /// Bulk fetch content for multiple hashes
-    async fn bulk_get_content(
-        &self,
-        hashes: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+    async fn bulk_get_content(&self, hashes: &[String]) -> Result<HashMap<String, String>> {
         self.content_store.get_content_bulk(hashes).await
     }
 
     /// Get functions by a list of names (batch lookup) - optimized to minimize content queries
-    pub async fn get_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+    pub async fn get_by_names(&self, names: &[String]) -> Result<HashMap<String, FunctionInfo>> {
         if names.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
 
         let table = self.connection.open_table("functions").execute().await?;
         let mut all_function_data = Vec::new();
-        let mut all_body_hashes = std::collections::HashSet::new();
+        let mut all_body_hashes = HashSet::new();
 
         // Step 1: Fetch all function metadata and collect unique body hashes
         for chunk in names.chunks(100) {
@@ -714,11 +711,11 @@ impl FunctionStore {
             let hash_vec: Vec<String> = all_body_hashes.into_iter().collect();
             self.bulk_get_content(&hash_vec).await?
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
         // Step 3: Reconstruct FunctionInfo objects with content
-        let mut result = std::collections::HashMap::new();
+        let mut result = HashMap::new();
         for func_data in all_function_data {
             let body = match func_data.body_hash {
                 Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),
@@ -800,8 +797,8 @@ impl FunctionStore {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let parameters: Vec<ParameterInfo> =
-            serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
+        let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
+            serde_json::from_str(parameters_array.value(row))?;
 
         // Get function body from content table using hash (if not null)
         let body = if body_hash_array.is_null(row) {
@@ -881,7 +878,7 @@ impl FunctionStore {
             Field::new("line_end", DataType::Int64, false),
             Field::new("return_type", DataType::Utf8, false),
             Field::new("parameters", DataType::Utf8, false),
-            Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
+            Field::new("body_hash", DataType::Utf8, true), // gxhash128 hash referencing content table as hex string (nullable for empty bodies)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called (nullable)
             Field::new("types", DataType::Utf8, true), // JSON array of type names used (nullable)
         ]))

@@ -6,11 +6,13 @@ use lancedb::connection::Connection;
 use lancedb::index::{vector::IvfPqIndexBuilder, Index as LanceIndex};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
+use smallvec::SmallVec;
 
+use crate::consts::{SMALLVEC_FIELD_SIZE, SMALLVEC_PARAM_SIZE};
 use crate::database::content::ContentStore;
 use crate::types::{FieldInfo, FunctionInfo, MacroInfo, ParameterInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
-use std::collections::HashMap;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 #[derive(Debug)]
 pub struct FunctionMatch {
@@ -159,7 +161,7 @@ impl SearchManager {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                let parameters: Vec<ParameterInfo> =
+                let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                     serde_json::from_str(parameters_array.value(i))?;
 
                 // Get function body from content table using hash (if not null)
@@ -232,7 +234,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -337,7 +339,7 @@ impl SearchManager {
                     .unwrap();
 
                 for i in 0..batch.num_rows() {
-                    let parameters: Vec<ParameterInfo> =
+                    let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                         serde_json::from_str(parameters_array.value(i))?;
 
                     // Get function body from content table using hash (if not null)
@@ -445,7 +447,8 @@ impl SearchManager {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                    serde_json::from_str(fields_array.value(i))?;
                 let size = if size_array.is_null(i) {
                     None
                 } else {
@@ -507,7 +510,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -617,7 +620,8 @@ impl SearchManager {
                     .unwrap();
 
                 for i in 0..batch.num_rows() {
-                    let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                    let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                        serde_json::from_str(fields_array.value(i))?;
                     let size = if size_array.is_null(i) {
                         None
                     } else {
@@ -702,7 +706,8 @@ impl SearchManager {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                    serde_json::from_str(fields_array.value(i))?;
                 let size = if size_array.is_null(i) {
                     None
                 } else {
@@ -961,7 +966,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1028,7 +1033,7 @@ impl SearchManager {
         };
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1311,7 +1316,8 @@ impl SearchManager {
                     continue;
                 }
 
-                let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                    serde_json::from_str(fields_array.value(i))?;
                 let size = if size_array.is_null(i) {
                     None
                 } else {
@@ -1361,7 +1367,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1389,6 +1395,9 @@ impl SearchManager {
 
         // Query with specific git_file_hashes using regexp_match
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
+
+        // Compile regex once before processing batches (performance optimization)
+        let regex = regex::Regex::new(pattern)?;
 
         let mut types = Vec::new();
         for chunk in hash_values.chunks(100) {
@@ -1459,15 +1468,12 @@ impl SearchManager {
                     }
 
                     // Apply regex matching in code since LanceDB has issues with combined conditions
-                    let regex = match regex::Regex::new(pattern) {
-                        Ok(r) => r,
-                        Err(_) => continue, // Skip invalid regex patterns
-                    };
                     if !regex.is_match(name) {
                         continue;
                     }
 
-                    let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(i))?;
+                    let fields: SmallVec<[FieldInfo; SMALLVEC_FIELD_SIZE]> =
+                        serde_json::from_str(fields_array.value(i))?;
                     let size = if size_array.is_null(i) {
                         None
                     } else {
@@ -1606,7 +1612,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1634,6 +1640,9 @@ impl SearchManager {
 
         // Query with specific git_file_hashes using regexp_match for typedefs
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
+
+        // Compile regex once before processing batches (performance optimization)
+        let regex = regex::Regex::new(pattern)?;
 
         let mut typedefs = Vec::new();
         for chunk in hash_values.chunks(100) {
@@ -1694,10 +1703,6 @@ impl SearchManager {
                     }
 
                     // Apply regex matching in code since LanceDB has issues with combined conditions
-                    let regex = match regex::Regex::new(pattern) {
-                        Ok(r) => r,
-                        Err(_) => continue, // Skip invalid regex patterns
-                    };
                     if !regex.is_match(name) {
                         continue;
                     }
@@ -1794,7 +1799,7 @@ impl SearchManager {
                     continue;
                 }
 
-                let parameters: Vec<ParameterInfo> =
+                let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                     serde_json::from_str(parameters_array.value(i))?;
 
                 // Get function body from content table using hash (if not null)
@@ -1855,7 +1860,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -1955,7 +1960,7 @@ impl SearchManager {
                         continue;
                     }
 
-                    let parameters: Vec<ParameterInfo> =
+                    let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
                         serde_json::from_str(parameters_array.value(i))?;
 
                     // Get function body from content table using hash (if not null)
@@ -2009,6 +2014,9 @@ impl SearchManager {
             .try_collect::<Vec<_>>()
             .await?;
 
+        // Compile regex once before processing batches (performance optimization)
+        let regex = regex::Regex::new(pattern)?;
+
         let mut macros = Vec::new();
         for batch in &results {
             let name_array = batch
@@ -2051,10 +2059,6 @@ impl SearchManager {
                 let name = name_array.value(i);
 
                 // Apply regex matching in code
-                let regex = match regex::Regex::new(pattern) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
                 if !regex.is_match(name) {
                     continue;
                 }
@@ -2126,7 +2130,7 @@ impl SearchManager {
         }
 
         // Extract unique file paths
-        let mut file_paths = std::collections::HashSet::new();
+        let mut file_paths = HashSet::new();
         for batch in &initial_results {
             let file_path_array = batch
                 .column(1)
@@ -2154,6 +2158,9 @@ impl SearchManager {
 
         // Query with specific git_file_hashes using regex filtering in code
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
+
+        // Compile regex once before processing batches (performance optimization)
+        let regex = regex::Regex::new(pattern)?;
 
         let mut macros = Vec::new();
         for chunk in hash_values.chunks(100) {
@@ -2212,10 +2219,6 @@ impl SearchManager {
                     let name = name_array.value(i);
 
                     // Apply regex matching in code
-                    let regex = match regex::Regex::new(pattern) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
                     if !regex.is_match(name) {
                         continue;
                     }
@@ -2518,7 +2521,8 @@ impl VectorSearchManager {
             .downcast_ref::<StringArray>()
             .unwrap();
 
-        let parameters: Vec<ParameterInfo> = serde_json::from_str(parameters_array.value(row))?;
+        let parameters: SmallVec<[ParameterInfo; SMALLVEC_PARAM_SIZE]> =
+            serde_json::from_str(parameters_array.value(row))?;
 
         // Get function body from content table using hash (if not null)
         let body = if body_hash_array.is_null(row) {
@@ -2649,7 +2653,7 @@ impl VectorSearchManager {
                         // Extract content from database results
                         let mut chunk_content = Vec::new();
                         for batch in &results {
-                            let blake3_hash_array = batch
+                            let gxhash_array = batch
                                 .column(0)
                                 .as_any()
                                 .downcast_ref::<arrow::array::StringArray>()
@@ -2661,7 +2665,7 @@ impl VectorSearchManager {
                                 .unwrap();
 
                             for i in 0..batch.num_rows() {
-                                let content_hash = blake3_hash_array.value(i).to_string();
+                                let content_hash = gxhash_array.value(i).to_string();
                                 let content = content_array.value(i).to_string();
 
                                 if !content.trim().is_empty() {
@@ -2799,7 +2803,7 @@ impl VectorSearchManager {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut existing_commit_shas = std::collections::HashSet::new();
+        let mut existing_commit_shas = HashSet::new();
         for batch in &existing_vector_results {
             let sha_array = batch
                 .column(0)
@@ -3030,9 +3034,11 @@ impl VectorSearchManager {
             return Ok(Vec::new());
         }
 
-        // Create a map from git_sha to similarity score
-        let score_map: HashMap<String, f32> = sha_scores.iter().cloned().collect();
-        let shas: Vec<String> = sha_scores.into_iter().map(|(sha, _)| sha).collect();
+        // Create a map from git_sha to similarity score and collect SHAs in one pass
+        let (shas, score_map): (Vec<String>, HashMap<String, f32>) = sha_scores
+            .into_iter()
+            .map(|(sha, score)| (sha.clone(), (sha, score)))
+            .unzip();
 
         // Query git_commits table for these commit SHAs
         let commits_table = self.connection.open_table("git_commits").execute().await?;
@@ -3105,7 +3111,7 @@ impl VectorSearchManager {
                     let similarity_score = score_map.get(&git_sha).copied().unwrap_or(0.0);
 
                     let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(i))?;
-                    let tags: std::collections::HashMap<String, Vec<String>> =
+                    let tags: HashMap<String, Vec<String>> =
                         serde_json::from_str(tags_array.value(i))?;
                     let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
                     let files: Vec<String> = serde_json::from_str(files_array.value(i))?;

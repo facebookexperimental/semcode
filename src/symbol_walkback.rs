@@ -5,7 +5,7 @@
 //! to find enclosing function, struct, or macro definitions. This is much faster than
 //! full TreeSitter parsing while still accurately identifying modified symbols.
 
-use std::collections::HashSet;
+use gxhash::{HashSet, HashSetExt};
 
 /// Extract symbols by walking back from modified lines to find function/struct/macro definitions
 /// Returns formatted symbol names (e.g., "function_name()", "struct foo", "#MACRO")

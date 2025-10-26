@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
+cargo-features = ["profile-rustflags"]  # Not needed past Rust 1.80 stable, kept for compatibility
+
 [package]
 name = "semcode"
 version = "0.1.0"
@@ -34,7 +36,6 @@ streaming-iterator = "0.1"
 once_cell = "1.20"
 crossbeam-channel = "0.5"
 sha1 = "0.10"
-blake3 = "1.8.2"
 hex = "0.4"
 dashmap = "6.1"
 tempfile = "3.14"
@@ -49,6 +50,32 @@ tower-lsp = "0.20"      # Language Server Protocol framework for LSP server
 url = "2.5"             # URL parsing for file URIs in LSP
 similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for commit diffs
 shlex = "1.3"           # Shell-like parsing for quoted strings in CLI
+gxhash = { version = "3.4", features = ["deterministic"] }  # Fast HashMap/HashSet with SIMD acceleration (deterministic for reproducible hashing)
+mimalloc = "0.1"        # Fast allocator (10-20% faster than system malloc, works on Linux and macOS)
+smallvec = { version = "1.13", features = ["serde", "union"] }  # Stack-allocated vectors for small collections (avoids heap allocation)
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "core_operations"
+harness = false
+
+[[bench]]
+name = "treesitter_parsing"
+harness = false
+
+[[bench]]
+name = "database_operations"
+harness = false
+
+[[bench]]
+name = "io_operations"
+harness = false
+
+[[bench]]
+name = "collection_operations"
+harness = false
 
 [[bin]]
 name = "semcode-index"
@@ -66,5 +93,26 @@ path = "src/bin/semcode-mcp.rs"
 name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
 
+[profile.dev]
+rustflags = [
+  "-C", "target-cpu=native",             # tune for your CPU; enables all supported instructions (required for gxhash)
+]
+
 [profile.release]
-debug = false
+debug = false          # no debug
+opt-level = 3          # max performance (O3)
+# painfully slow, but better.
+# lto = "fat"            # full link-time optimization across crates
+# codegen-units = 1      # single codegen unit for better optimization
+# incremental = false    # always fully optimize
+# not as good, but tolerable build times.
+lto = "thin"
+incremental = true     # implicitly set codegen units to 256
+#
+panic = "abort"        # remove unwinding runtime
+strip = "symbols"      # remove debug symbols
+overflow-checks = false # no runtime overflow checks
+rpath = false          # omit runtime search paths
+rustflags = [
+  "-C", "target-cpu=native",             # tune for your CPU; enables all supported instructions
+]

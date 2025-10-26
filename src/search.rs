@@ -2,9 +2,10 @@
 use crate::{CodeVectorizer, DatabaseManager};
 use anstream::stdout;
 use anyhow::Result;
+use gxhash::{HashSet, HashSetExt};
 use owo_colors::OwoColorize as _;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 use crate::display::{
     display_function_to_writer_with_options, display_macro_to_writer, display_type_to_writer,
@@ -252,7 +253,7 @@ pub async fn dump_functions(db: &DatabaseManager, output_file: &str) -> Result<(
     let functions = db.get_all_functions_metadata_only().await?;
     let json = serde_json::to_string_pretty(&functions)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -271,7 +272,7 @@ pub async fn dump_types(db: &DatabaseManager, output_file: &str) -> Result<()> {
     let types = db.get_all_types_metadata_only().await?;
     let json = serde_json::to_string_pretty(&types)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -290,7 +291,7 @@ pub async fn dump_typedefs(db: &DatabaseManager, output_file: &str) -> Result<()
     let typedefs = db.get_all_typedefs().await?;
     let json = serde_json::to_string_pretty(&typedefs)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -309,7 +310,7 @@ pub async fn dump_macros(db: &DatabaseManager, output_file: &str) -> Result<()> 
     let macros = db.get_all_macros_metadata_only().await?;
     let json = serde_json::to_string_pretty(&macros)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -351,7 +352,7 @@ pub async fn dump_calls(db: &DatabaseManager, output_file: &str) -> Result<()> {
 
     let json = serde_json::to_string_pretty(&json_calls)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -378,7 +379,7 @@ pub async fn dump_processed_files(db: &DatabaseManager, output_file: &str) -> Re
 
     let json = serde_json::to_string_pretty(&json_records)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -404,7 +405,7 @@ pub async fn dump_content(db: &DatabaseManager, output_file: &str) -> Result<()>
 
     let json = serde_json::to_string_pretty(&json_records)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -439,7 +440,7 @@ pub async fn dump_symbol_filename(db: &DatabaseManager, output_file: &str) -> Re
 
     let json = serde_json::to_string_pretty(&json_records)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -458,7 +459,7 @@ pub async fn dump_git_commits(db: &DatabaseManager, output_file: &str) -> Result
     let commits = db.get_all_git_commits().await?;
     let json = serde_json::to_string_pretty(&commits)?;
 
-    let mut file = File::create(output_file)?;
+    let mut file = BufWriter::new(File::create(output_file)?);
     file.write_all(json.as_bytes())?;
 
     println!(
@@ -587,10 +588,10 @@ async fn query_function_or_macro_to_writer_with_options(
             writeln!(writer, "\n{} Macro:", "==>".bold().blue())?;
             display_macro_to_writer(&macro_info, writer)?;
             // Get and display call relationships for the macro too (use macro's calls field directly)
-            let macro_calls = macro_info.calls.clone().unwrap_or_default();
+            let macro_calls = macro_info.calls.as_deref().unwrap_or(&[]);
             display_call_relationships_with_options(
                 &macro_info.name,
-                &macro_calls,
+                macro_calls,
                 &[],
                 writer,
                 true,
@@ -734,13 +735,13 @@ async fn query_function_or_macro_to_writer_with_options(
             // Found macro only
             display_macro_to_writer(&macro_info, writer)?;
             // Get and display call relationships for macros too (use macro's calls field directly)
-            let calls = macro_info.calls.clone().unwrap_or_default();
+            let calls = macro_info.calls.as_deref().unwrap_or(&[]);
             let called_by = db
                 .get_function_callers_git_aware(&macro_info.name, git_sha)
                 .await?;
             display_call_relationships_with_truncation(
                 &macro_info.name,
-                &calls,
+                calls,
                 &called_by,
                 writer,
                 true,
@@ -806,7 +807,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     }
 
                     // Collect and display callers for all matched function definitions and macros
-                    let mut all_callers = std::collections::HashSet::new();
+                    let mut all_callers = HashSet::new();
                     for func in &regex_definitions {
                         let func_callers = get_function_callers(db, &func.name).await?;
                         all_callers.extend(func_callers);
@@ -863,7 +864,7 @@ async fn query_function_or_macro_to_writer_with_options(
 
                     // For regex results with multiple function definitions, collect unique function names and show consolidated callers
                     if regex_definitions.len() > 1 {
-                        let mut all_callers = std::collections::HashSet::new();
+                        let mut all_callers = HashSet::new();
                         for func in &regex_definitions {
                             let func_callers = get_function_callers(db, &func.name).await?;
                             all_callers.extend(func_callers);
@@ -930,7 +931,7 @@ async fn query_function_or_macro_to_writer_with_options(
 
                     // For regex results with multiple macros, collect unique callers and show consolidated callers
                     if regex_macros.len() > 1 {
-                        let mut all_callers = std::collections::HashSet::new();
+                        let mut all_callers = HashSet::new();
                         for macro_info in &regex_macros {
                             let macro_callers = get_function_callers(db, &macro_info.name).await?;
                             all_callers.extend(macro_callers);

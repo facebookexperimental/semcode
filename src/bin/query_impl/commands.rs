@@ -2,6 +2,7 @@
 use anstream::stdout;
 use anyhow::Result;
 use colored::*;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use regex;
 use semcode::{git, DatabaseManager};
 
@@ -132,11 +133,16 @@ async fn show_callchain_with_limits(
 
     // Show callers with depth and limit control
     if !callers.is_empty() && up_levels > 0 {
-        println!(
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+
+        writeln!(
+            handle,
             "\n{} ({} levels)",
             "=== Reverse Chain (Callers) ===".bold().magenta(),
             up_levels
-        );
+        )?;
 
         let limited_callers: Vec<_> = if calls_limit == 0 {
             callers.clone()
@@ -145,16 +151,22 @@ async fn show_callchain_with_limits(
         };
 
         for (i, caller) in limited_callers.iter().enumerate() {
-            println!("{}. {}", (i + 1).to_string().yellow(), caller.cyan());
+            writeln!(
+                handle,
+                "{}. {}",
+                (i + 1).to_string().yellow(),
+                caller.cyan()
+            )?;
 
             // Show caller details if available
             if let Ok(Some(caller_func)) = db.find_function_git_aware(caller, git_sha).await {
-                println!(
+                writeln!(
+                    handle,
                     "   └─ {} ({}:{})",
                     caller_func.return_type.bright_black(),
                     caller_func.file_path.bright_black(),
                     caller_func.line_start.to_string().bright_black()
-                );
+                )?;
             }
 
             // For multi-level depth, show second-level callers
@@ -173,31 +185,37 @@ async fn show_callchain_with_limits(
                     };
 
                     for second_caller in limited_second.iter().take(3) {
-                        println!("      └─ {}", second_caller.bright_black());
+                        writeln!(handle, "      └─ {}", second_caller.bright_black())?;
                     }
                     if limited_second.len() > 3 {
-                        println!("      └─ ... and {} more", limited_second.len() - 3);
+                        writeln!(handle, "      └─ ... and {} more", limited_second.len() - 3)?;
                     }
                 }
             }
         }
 
         if calls_limit > 0 && callers.len() > calls_limit {
-            println!(
+            writeln!(
+                handle,
                 "... and {} more callers (limited by calls_limit={})",
                 callers.len() - calls_limit,
                 calls_limit
-            );
+            )?;
         }
     }
 
     // Show callees with depth and limit control
     if !callees.is_empty() && down_levels > 0 {
-        println!(
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+
+        writeln!(
+            handle,
             "\n{} ({} levels)",
             "=== Forward Chain (Callees) ===".bold().blue(),
             down_levels
-        );
+        )?;
 
         let limited_callees: Vec<_> = if calls_limit == 0 {
             callees.clone()
@@ -206,16 +224,22 @@ async fn show_callchain_with_limits(
         };
 
         for (i, callee) in limited_callees.iter().enumerate() {
-            println!("{}. {}", (i + 1).to_string().yellow(), callee.cyan());
+            writeln!(
+                handle,
+                "{}. {}",
+                (i + 1).to_string().yellow(),
+                callee.cyan()
+            )?;
 
             // Show callee details if available
             if let Ok(Some(callee_func)) = db.find_function_git_aware(callee, git_sha).await {
-                println!(
+                writeln!(
+                    handle,
                     "   └─ {} ({}:{})",
                     callee_func.return_type.bright_black(),
                     callee_func.file_path.bright_black(),
                     callee_func.line_start.to_string().bright_black()
-                );
+                )?;
             }
 
             // For multi-level depth, show second-level callees
@@ -234,21 +258,22 @@ async fn show_callchain_with_limits(
                     };
 
                     for second_callee in limited_second.iter().take(3) {
-                        println!("      └─ {}", second_callee.bright_black());
+                        writeln!(handle, "      └─ {}", second_callee.bright_black())?;
                     }
                     if limited_second.len() > 3 {
-                        println!("      └─ ... and {} more", limited_second.len() - 3);
+                        writeln!(handle, "      └─ ... and {} more", limited_second.len() - 3)?;
                     }
                 }
             }
         }
 
         if calls_limit > 0 && callees.len() > calls_limit {
-            println!(
+            writeln!(
+                handle,
                 "... and {} more callees (limited by calls_limit={})",
                 callees.len() - calls_limit,
                 calls_limit
-            );
+            )?;
         }
     }
 
@@ -1559,7 +1584,7 @@ async fn vcommit_similar_commits(
                 };
 
                 // Get all commits in the range using gitoxide
-                let mut range_commits = std::collections::HashSet::new();
+                let mut range_commits = HashSet::new();
 
                 // Walk from to_commit back to from_commit
                 let to_id = to_commit.id().detach();
@@ -2440,7 +2465,7 @@ async fn show_commit_metadata(
                         git_commit.parent_sha,
                         git_commit.symbols, // Symbols extracted from diff
                         git_commit.files,   // Files changed in commit
-                        std::collections::HashMap::new(), // No tags extracted from git
+                        HashMap::new(),     // No tags extracted from git
                         git_commit.diff,
                         false,
                     )

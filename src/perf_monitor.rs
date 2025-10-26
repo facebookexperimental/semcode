@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+use gxhash::{HashMap, HashMapExt};
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ pub fn enable_performance_monitoring() {
 }
 
 /// Check if performance monitoring is enabled
+#[inline]
 pub fn is_performance_monitoring_enabled() -> bool {
     PERF_MONITORING_ENABLED.load(Ordering::Relaxed)
 }
@@ -138,6 +139,7 @@ impl Drop for PerfGuard {
 }
 
 /// Create a performance guard for the current scope
+#[inline]
 pub fn perf_guard(name: impl Into<String>) -> PerfGuard {
     PerfGuard::new(name)
 }

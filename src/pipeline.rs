@@ -148,8 +148,8 @@
 // ==============================================================================
 use anyhow::Result;
 use crossbeam_channel::bounded;
+use gxhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -177,6 +177,29 @@ struct ProcessedBatch {
     types: Vec<TypeInfo>, // Now includes typedefs with kind="typedef"
     macros: Vec<MacroInfo>,
     processed_files: Vec<crate::database::processed_files::ProcessedFileRecord>, // Files to mark as processed
+}
+
+/// Check if a large file contains only preprocessor directives and should be skipped
+/// Returns true if the file is pure preprocessor (only #define, comments, whitespace, etc.)
+fn is_pure_preprocessor_file(source_code: &str) -> bool {
+    source_code.lines().all(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("*/")
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("#define")
+            || trimmed.starts_with("#ifdef")
+            || trimmed.starts_with("#ifndef")
+            || trimmed.starts_with("#endif")
+            || trimmed.starts_with("#if")
+            || trimmed.starts_with("#else")
+            || trimmed.starts_with("#elif")
+            || trimmed.starts_with("#undef")
+            || trimmed.starts_with("#include")
+            || trimmed.starts_with("#pragma")
+    })
 }
 
 pub struct PipelineBuilder {
@@ -284,10 +307,25 @@ impl PipelineBuilder {
     pub async fn build_and_run_with_git_files(
         self,
         _files: Vec<PathBuf>,
-        git_files: Option<std::collections::HashMap<PathBuf, GitFileEntry>>,
+        git_files: Option<HashMap<PathBuf, GitFileEntry>>,
     ) -> Result<()> {
         let num_threads = num_cpus::get();
         tracing::info!("=== PIPELINE START: {} threads available ===", num_threads);
+
+        // Determine number of DB inserter tasks for parallel insertion
+        // Balance parallelism with database I/O limits - too many writers causes contention
+        // Empirically, 8 inserters provides good balance between CPU utilization and I/O
+        let num_db_inserters = if num_threads >= 64 {
+            8 // Medium-high CPU: 8 parallel DB inserters
+        } else if num_threads >= 32 {
+            6 // Medium CPU: 6 parallel DB inserters
+        } else {
+            4 // Default: 4 parallel DB inserters
+        };
+        tracing::info!(
+            "Using {} parallel DB inserter tasks for maximum throughput",
+            num_db_inserters
+        );
 
         // Step 1: Load git manifest of current commit (lightweight)
         tracing::info!("Loading git manifest for current commit...");
@@ -329,7 +367,7 @@ impl PipelineBuilder {
         // Dynamic channel sizes based on number of filtered files and available memory
         let file_channel_size = (files_to_process.len().min(10000) / 10).max(100);
         let parsed_channel_size = num_threads * 50; // Allow backpressure but keep threads busy
-        let processed_channel_size = 100; // Larger buffer to prevent backpressure from DB thread
+        let processed_channel_size = num_db_inserters * 10; // Larger buffer for multiple DB inserters
 
         // Create channels with bounded capacity to prevent memory bloat
         let (file_tx, file_rx) = bounded::<(PathBuf, String)>(file_channel_size);
@@ -429,6 +467,25 @@ impl PipelineBuilder {
                                             &git_file_entry.temp_file_path,
                                         ) {
                                             Ok(source_code) => {
+                                                // For files >256KB, do fast heuristic check before expensive TreeSitter parsing
+                                                const FAST_CHECK_THRESHOLD: usize = 256_000; // 256KB
+
+                                                if source_code.len() > FAST_CHECK_THRESHOLD {
+                                                    // Quick scan: if ALL lines are just preprocessor directives/comments/whitespace, skip
+                                                    // This catches auto-generated register definition headers (e.g., AMD GPU headers)
+                                                    if is_pure_preprocessor_file(&source_code) {
+                                                        tracing::info!(
+                                                            "Skipping preprocessor-only file ({:.1}MB): {}",
+                                                            source_code.len() as f64 / 1_048_576.0,
+                                                            file_path.display()
+                                                        );
+                                                        processed.fetch_add(1, Ordering::Relaxed);
+                                                        pb_clone.inc(1);
+                                                        continue;
+                                                    }
+                                                    // Otherwise, parse normally even if large (might be legitimate large .c file with functions)
+                                                }
+
                                                 let git_hash = &git_file_entry.blob_id;
                                                 ts_analyzer.analyze_source_with_metadata(
                                                     &source_code,
@@ -455,13 +512,30 @@ impl PipelineBuilder {
                                         // Fallback to regular file reading with git SHA
                                         let git_hash_hex = git_file_sha.clone();
                                         match std::fs::read_to_string(&file_path) {
-                                            Ok(source_code) => ts_analyzer
-                                                .analyze_source_with_metadata(
+                                            Ok(source_code) => {
+                                                // For files >256KB, do fast heuristic check before expensive TreeSitter parsing
+                                                const FAST_CHECK_THRESHOLD: usize = 256_000; // 256KB
+
+                                                if source_code.len() > FAST_CHECK_THRESHOLD {
+                                                    if is_pure_preprocessor_file(&source_code) {
+                                                        tracing::info!(
+                                                            "Skipping preprocessor-only file ({:.1}MB): {}",
+                                                            source_code.len() as f64 / 1_048_576.0,
+                                                            file_path.display()
+                                                        );
+                                                        processed.fetch_add(1, Ordering::Relaxed);
+                                                        pb_clone.inc(1);
+                                                        continue;
+                                                    }
+                                                }
+
+                                                ts_analyzer.analyze_source_with_metadata(
                                                     &source_code,
                                                     &file_path,
                                                     &git_hash_hex,
                                                     Some(&source_root),
-                                                ),
+                                                )
+                                            }
                                             Err(e) => {
                                                 tracing::warn!(
                                                     "Failed to read file {}: {}",
@@ -476,13 +550,30 @@ impl PipelineBuilder {
                                     // Regular mode: read from working directory with git SHA
                                     let git_hash_hex = git_file_sha.clone();
                                     match std::fs::read_to_string(&file_path) {
-                                        Ok(source_code) => ts_analyzer
-                                            .analyze_source_with_metadata(
+                                        Ok(source_code) => {
+                                            // For files >256KB, do fast heuristic check before expensive TreeSitter parsing
+                                            const FAST_CHECK_THRESHOLD: usize = 256_000; // 256KB
+
+                                            if source_code.len() > FAST_CHECK_THRESHOLD {
+                                                if is_pure_preprocessor_file(&source_code) {
+                                                    tracing::info!(
+                                                        "Skipping preprocessor-only file ({:.1}MB): {}",
+                                                        source_code.len() as f64 / 1_048_576.0,
+                                                        file_path.display()
+                                                    );
+                                                    processed.fetch_add(1, Ordering::Relaxed);
+                                                    pb_clone.inc(1);
+                                                    continue;
+                                                }
+                                            }
+
+                                            ts_analyzer.analyze_source_with_metadata(
                                                 &source_code,
                                                 &file_path,
                                                 &git_hash_hex,
                                                 Some(&source_root),
-                                            ),
+                                            )
+                                        }
                                         Err(e) => {
                                             tracing::warn!(
                                                 "Failed to read file {}: {}",
@@ -561,14 +652,13 @@ impl PipelineBuilder {
                     let start = Instant::now();
                     let mut total_processed = 0;
 
-                    let mut batch = ProcessedBatch {
-                        functions: Vec::new(),
-                        types: Vec::new(),
-                        macros: Vec::new(),
-                        processed_files: Vec::new(),
-                    };
-
                     let mut batch_size = 2000;
+                    let mut batch = ProcessedBatch {
+                        functions: Vec::with_capacity(batch_size),
+                        types: Vec::with_capacity(batch_size),
+                        macros: Vec::with_capacity(batch_size / 5), // Fewer macros typically
+                        processed_files: Vec::with_capacity(50),    // ~1 file per batch avg
+                    };
                     let mut last_batch_time = Instant::now();
 
                     loop {
@@ -587,13 +677,10 @@ impl PipelineBuilder {
                                 batch.macros.extend(parsed.macros);
 
                                 // Create processed file record
-                                let file_path_str = {
-                                    let raw_path = parsed.path.to_string_lossy().to_string();
-                                    if raw_path.starts_with("./") {
-                                        raw_path.strip_prefix("./").unwrap().to_string()
-                                    } else {
-                                        raw_path
-                                    }
+                                let file_path_str = match parsed.path.to_str() {
+                                    Some(s) if s.starts_with("./") => s[2..].to_owned(),
+                                    Some(s) => s.to_owned(),
+                                    None => parsed.path.to_string_lossy().into_owned(),
                                 };
 
                                 batch.processed_files.push(
@@ -634,10 +721,10 @@ impl PipelineBuilder {
                                     let batch_to_send = std::mem::replace(
                                         &mut batch,
                                         ProcessedBatch {
-                                            functions: Vec::new(),
-                                            types: Vec::new(),
-                                            macros: Vec::new(),
-                                            processed_files: Vec::new(),
+                                            functions: Vec::with_capacity(batch_size),
+                                            types: Vec::with_capacity(batch_size),
+                                            macros: Vec::with_capacity(batch_size / 5),
+                                            processed_files: Vec::with_capacity(50),
                                         },
                                     );
 
@@ -685,90 +772,131 @@ impl PipelineBuilder {
                 .expect("Failed to spawn batch processor thread")
         };
 
-        // Clone processed_rx for DB thread, then drop original immediately
-        // (crossbeam MPMC channels distribute messages round-robin between receivers)
-        let processed_rx_db = processed_rx.clone();
+        // Clone processed_rx for DB inserters, then drop original immediately
+        // Crossbeam MPMC channels distribute messages efficiently across multiple receiver clones
+        // Each inserter gets its own receiver handle - no mutex needed!
+        let mut db_receivers = Vec::new();
+        for _ in 0..num_db_inserters {
+            db_receivers.push(processed_rx.clone());
+        }
         drop(processed_rx);
 
-        // Stage 4: Database insertion (async in tokio runtime)
-        let db_thread = {
-            let processed_rx = processed_rx_db;
-            let db_manager = self.db_manager.clone();
+        // Stage 4: Multiple parallel database inserters
+        let mut db_inserter_handles = Vec::new();
+        let total_batches_processed = Arc::new(AtomicUsize::new(0));
+        let total_functions_inserted = Arc::new(AtomicUsize::new(0));
+        let total_types_inserted = Arc::new(AtomicUsize::new(0));
+        let total_macros_inserted = Arc::new(AtomicUsize::new(0));
+        let db_start_time = Arc::new(Mutex::new(None::<Instant>));
 
-            thread::Builder::new()
-                .name("db-inserter".to_string())
+        for (inserter_id, processed_rx_clone) in db_receivers.into_iter().enumerate() {
+            let db_manager = self.db_manager.clone();
+            let batches_counter = total_batches_processed.clone();
+            let functions_counter = total_functions_inserted.clone();
+            let types_counter = total_types_inserted.clone();
+            let macros_counter = total_macros_inserted.clone();
+            let start_time_shared = db_start_time.clone();
+
+            let handle = thread::Builder::new()
+                .name(format!("db-inserter-{inserter_id}"))
                 .spawn(move || {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(num_cpus::get()) // Use all available CPU cores
-                        .thread_name("db-worker")
+                        .worker_threads(num_threads / num_db_inserters) // Distribute CPU cores
+                        .thread_name(format!("db-worker-{inserter_id}"))
                         .enable_all()
                         .build()
                         .expect("Failed to create tokio runtime");
 
                     runtime.block_on(async move {
-                        let start = Instant::now();
-                        let mut batches_processed = 0;
-                        let mut total_functions = 0;
-                        let mut total_types = 0;
-                        let mut total_macros = 0;
+                        let mut local_batches = 0;
+                        let mut local_functions = 0;
+                        let mut local_types = 0;
+                        let mut local_macros = 0;
 
-                        while let Ok(batch) = processed_rx.recv() {
-                            let batch_start = Instant::now();
-                            let func_count = batch.functions.len();
-                            let type_count = batch.types.len();
-                            let macro_count = batch.macros.len();
-
-                            // Insert processed files and all data in parallel using combined content insertion
-                            let (file_result, combined_result) = measure!("database_batch_insert", {
-                                tokio::join!(
-                                    async {
-                                        if !batch.processed_files.is_empty() {
-                                            measure!("db_mark_files_processed", {
-                                                db_manager.mark_files_processed(batch.processed_files).await
-                                            })
-                                        } else {
-                                            Ok::<(), anyhow::Error>(())
+                        loop {
+                            // Get next batch directly from our receiver clone (no mutex!)
+                            // Crossbeam handles distribution efficiently
+                            match processed_rx_clone.recv() {
+                                Ok(batch) => {
+                                    // Record start time on first batch
+                                    {
+                                        let mut start = start_time_shared.lock().unwrap();
+                                        if start.is_none() {
+                                            *start = Some(Instant::now());
                                         }
-                                    },
-                                    async {
-                                        measure!("db_insert_combined", {
-                                            db_manager.insert_batch_combined(
-                                                batch.functions,
-                                                batch.types,
-                                                batch.macros
-                                            ).await
-                                        })
                                     }
-                                )
-                            });
 
-                            // Log any errors but continue processing
-                            if let Err(e) = file_result {
-                                tracing::error!("Failed to mark files as processed: {}", e);
-                            }
-                            if let Err(e) = combined_result {
-                                tracing::error!("Failed to insert combined data (functions/types/macros): {}", e);
-                            }
+                                    let batch_start = Instant::now();
+                                    let func_count = batch.functions.len();
+                                    let type_count = batch.types.len();
+                                    let macro_count = batch.macros.len();
 
-                            batches_processed += 1;
-                            total_functions += func_count;
-                            total_types += type_count;
-                            total_macros += macro_count;
+                                    // Insert processed files and all data in parallel
+                                    let (file_result, combined_result) = measure!("database_batch_insert", {
+                                        tokio::join!(
+                                            async {
+                                                if !batch.processed_files.is_empty() {
+                                                    measure!("db_mark_files_processed", {
+                                                        db_manager.mark_files_processed(batch.processed_files).await
+                                                    })
+                                                } else {
+                                                    Ok::<(), anyhow::Error>(())
+                                                }
+                                            },
+                                            async {
+                                                measure!("db_insert_combined", {
+                                                    db_manager.insert_batch_combined(
+                                                        batch.functions,
+                                                        batch.types,
+                                                        batch.macros
+                                                    ).await
+                                                })
+                                            }
+                                        )
+                                    });
 
-                            let batch_time = batch_start.elapsed();
-                            if batch_time > Duration::from_secs(1) {
-                                tracing::warn!("Slow DB batch (combined content+metadata): {} functions, {} types, {} macros took {:.1}s",
-                                             func_count, type_count, macro_count, batch_time.as_secs_f64());
+                                    // Log any errors but continue processing
+                                    if let Err(e) = file_result {
+                                        tracing::error!("Inserter {} failed to mark files as processed: {}", inserter_id, e);
+                                    }
+                                    if let Err(e) = combined_result {
+                                        tracing::error!("Inserter {} failed to insert combined data: {}", inserter_id, e);
+                                    }
+
+                                    local_batches += 1;
+                                    local_functions += func_count;
+                                    local_types += type_count;
+                                    local_macros += macro_count;
+
+                                    batches_counter.fetch_add(1, Ordering::Relaxed);
+                                    functions_counter.fetch_add(func_count, Ordering::Relaxed);
+                                    types_counter.fetch_add(type_count, Ordering::Relaxed);
+                                    macros_counter.fetch_add(macro_count, Ordering::Relaxed);
+
+                                    let batch_time = batch_start.elapsed();
+                                    if batch_time > Duration::from_secs(1) {
+                                        tracing::warn!("Inserter {} slow batch: {} functions, {} types, {} macros took {:.1}s",
+                                                     inserter_id, func_count, type_count, macro_count, batch_time.as_secs_f64());
+                                    }
+                                }
+                                Err(_) => break, // Channel closed
                             }
                         }
 
-                        let elapsed = start.elapsed().as_secs_f64();
-                        tracing::info!("DB inserter completed: {} batches, {} functions, {} types, {} macros in {:.1}s",
-                                      batches_processed, total_functions, total_types, total_macros, elapsed);
+                        tracing::info!(
+                            "DB inserter {} completed: {} batches, {} functions, {} types, {} macros",
+                            inserter_id,
+                            local_batches,
+                            local_functions,
+                            local_types,
+                            local_macros
+                        );
                     })
                 })
-                .expect("Failed to spawn db thread")
-        };
+                .expect("Failed to spawn DB inserter thread");
+
+            db_inserter_handles.push(handle);
+        }
 
         // Drop original senders to signal pipeline start
         drop(file_tx);
@@ -786,7 +914,34 @@ impl PipelineBuilder {
         }
 
         batch_thread.join().unwrap();
-        db_thread.join().unwrap();
+
+        // Wait for all DB inserters
+        for (inserter_id, handle) in db_inserter_handles.into_iter().enumerate() {
+            if let Err(e) = handle.join() {
+                tracing::error!("DB inserter {} thread panicked: {:?}", inserter_id, e);
+            }
+        }
+
+        // Print aggregate statistics
+        let total_elapsed = db_start_time
+            .lock()
+            .unwrap()
+            .map(|start| start.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let total_batches = total_batches_processed.load(Ordering::Relaxed);
+        let total_funcs = total_functions_inserted.load(Ordering::Relaxed);
+        let total_types_count = total_types_inserted.load(Ordering::Relaxed);
+        let total_macros_count = total_macros_inserted.load(Ordering::Relaxed);
+
+        tracing::info!(
+            "All DB inserters completed: {} batches, {} functions, {} types, {} macros in {:.1}s ({:.1} batches/sec)",
+            total_batches,
+            total_funcs,
+            total_types_count,
+            total_macros_count,
+            total_elapsed,
+            total_batches as f64 / total_elapsed
+        );
 
         // Finish progress bar
         pb_shared.finish_with_message("Processing complete");
@@ -806,7 +961,7 @@ impl PipelineBuilder {
     }
 
     /// Load git manifest of current commit - returns (file_path, git_file_sha) for all files
-    async fn load_git_manifest(&self) -> Result<std::collections::HashMap<PathBuf, String>> {
+    async fn load_git_manifest(&self) -> Result<HashMap<PathBuf, String>> {
         // Get current commit SHA
         let repo = gix::discover(&self.source_root)
             .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
@@ -819,7 +974,7 @@ impl PipelineBuilder {
             .tree()
             .map_err(|e| anyhow::anyhow!("Failed to get tree for HEAD commit: {}", e))?;
 
-        let mut manifest = std::collections::HashMap::new();
+        let mut manifest = HashMap::new();
 
         // Walk the entire git tree
         use gix::traverse::tree::Recorder;
@@ -842,7 +997,7 @@ impl PipelineBuilder {
     /// Filter manifest files against database - return files that need processing
     fn filter_files_by_manifest(
         &self,
-        git_manifest: &std::collections::HashMap<PathBuf, String>,
+        git_manifest: &HashMap<PathBuf, String>,
         processed_files_set: &HashSet<(String, String)>,
     ) -> Result<Vec<(PathBuf, String)>> {
         let mut files_to_process = Vec::new();
@@ -850,13 +1005,10 @@ impl PipelineBuilder {
 
         for (file_path, git_file_sha) in git_manifest {
             // Normalize path for lookup (same as database storage)
-            let file_path_str = {
-                let raw_path = file_path.to_string_lossy().to_string();
-                if raw_path.starts_with("./") {
-                    raw_path.strip_prefix("./").unwrap().to_string()
-                } else {
-                    raw_path
-                }
+            let file_path_str = match file_path.to_str() {
+                Some(s) if s.starts_with("./") => s[2..].to_owned(),
+                Some(s) => s.to_owned(),
+                None => file_path.to_string_lossy().into_owned(),
             };
 
             let lookup_key = (file_path_str, git_file_sha.clone());

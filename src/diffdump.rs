@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use colored::*;
-use std::collections::HashSet;
+use gxhash::{HashSet, HashSetExt};
 use std::io::Read;
 use std::path::Path;
 
