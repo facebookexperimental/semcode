@@ -296,307 +296,266 @@ impl SchemaManager {
     pub async fn create_scalar_indices(&self) -> Result<()> {
         let table_names = self.connection.table_names().execute().await?;
 
-        // Create indices for functions table
+        // Build ALL indexes in parallel using tokio::spawn for maximum throughput
+        // Each individual index gets its own spawn for true parallelism
+        let mut handles = Vec::new();
+
+        // Create indices for functions table - each index spawned independently
         if table_names.iter().any(|n| n == "functions") {
-            let table = self.connection.open_table("functions").execute().await?;
+            let indexes = vec![
+                (vec!["name"], "BTree index on functions.name"),
+                (
+                    vec!["git_file_hash"],
+                    "BTree index on functions.git_file_hash",
+                ),
+                (vec!["file_path"], "BTree index on functions.file_path"),
+                (vec!["body_hash"], "BTree index on functions.body_hash"),
+                (vec!["calls"], "BTree index on functions.calls"),
+                (vec!["types"], "BTree index on functions.types"),
+                (vec!["line_start"], "BTree index on functions.line_start"),
+                (vec!["line_end"], "BTree index on functions.line_end"),
+                (
+                    vec!["name", "git_file_hash"],
+                    "Composite index on functions.(name,git_file_hash)",
+                ),
+            ];
 
-            // Index on name for exact matches
-            self.try_create_index(&table, &["name"], "BTree index on functions.name")
-                .await;
+            for (columns, description) in indexes {
+                let connection = self.connection.clone();
+                let cols: Vec<&str> = columns.iter().map(|s| &**s).collect();
+                let desc = description.to_string();
 
-            // Index on git_file_hash for content-based lookups
-            self.try_create_index(
-                &table,
-                &["git_file_hash"],
-                "BTree index on functions.git_file_hash",
-            )
-            .await;
-
-            // Index on file_path for file-based queries
-            self.try_create_index(&table, &["file_path"], "BTree index on functions.file_path")
-                .await;
-
-            // Index on body_hash for content reference lookups
-            self.try_create_index(&table, &["body_hash"], "BTree index on functions.body_hash")
-                .await;
-
-            // Index on calls for function call relationship queries
-            self.try_create_index(&table, &["calls"], "BTree index on functions.calls")
-                .await;
-
-            // Index on types for type relationship queries
-            self.try_create_index(&table, &["types"], "BTree index on functions.types")
-                .await;
-
-            // Index on line_start for line-based queries and sorting
-            self.try_create_index(
-                &table,
-                &["line_start"],
-                "BTree index on functions.line_start",
-            )
-            .await;
-
-            // Index on line_end for range-based queries
-            self.try_create_index(&table, &["line_end"], "BTree index on functions.line_end")
-                .await;
-
-            // Composite index for duplicate checking with content hash
-            self.try_create_index(
-                &table,
-                &["name", "git_file_hash"],
-                "Composite index on functions.(name,git_file_hash)",
-            )
-            .await;
+                let handle = tokio::spawn(async move {
+                    let table = connection.open_table("functions").execute().await?;
+                    Self::try_create_index_static(&table, &cols, &desc).await;
+                    Ok::<(), anyhow::Error>(())
+                });
+                handles.push(handle);
+            }
         }
 
-        // Create indices for types table
+        // Create indices for types table - each index spawned independently
         if table_names.iter().any(|n| n == "types") {
-            let table = self.connection.open_table("types").execute().await?;
+            let indexes = vec![
+                (vec!["name"], "BTree index on types.name"),
+                (vec!["git_file_hash"], "BTree index on types.git_file_hash"),
+                (vec!["kind"], "BTree index on types.kind"),
+                (vec!["file_path"], "BTree index on types.file_path"),
+                (
+                    vec!["definition_hash"],
+                    "BTree index on types.definition_hash",
+                ),
+                (
+                    vec!["name", "kind", "git_file_hash"],
+                    "Composite index on types.(name,kind,git_file_hash)",
+                ),
+            ];
 
-            // Index on name
-            self.try_create_index(&table, &["name"], "BTree index on types.name")
-                .await;
+            for (columns, description) in indexes {
+                let connection = self.connection.clone();
+                let cols: Vec<&str> = columns.iter().map(|s| &**s).collect();
+                let desc = description.to_string();
 
-            // Index on git_file_hash for content-based lookups
-            self.try_create_index(
-                &table,
-                &["git_file_hash"],
-                "BTree index on types.git_file_hash",
-            )
-            .await;
-
-            // Index on kind
-            self.try_create_index(&table, &["kind"], "BTree index on types.kind")
-                .await;
-
-            // Index on file_path for file-based queries
-            self.try_create_index(&table, &["file_path"], "BTree index on types.file_path")
-                .await;
-
-            // Index on definition_hash for content reference lookups
-            self.try_create_index(
-                &table,
-                &["definition_hash"],
-                "BTree index on types.definition_hash",
-            )
-            .await;
-
-            // Composite index for duplicate checking with content hash
-            self.try_create_index(
-                &table,
-                &["name", "kind", "git_file_hash"],
-                "Composite index on types.(name,kind,git_file_hash)",
-            )
-            .await;
+                let handle = tokio::spawn(async move {
+                    let table = connection.open_table("types").execute().await?;
+                    Self::try_create_index_static(&table, &cols, &desc).await;
+                    Ok::<(), anyhow::Error>(())
+                });
+                handles.push(handle);
+            }
         }
 
-        // Create indices for macros table
+        // Create indices for macros table - each index spawned independently
         if table_names.iter().any(|n| n == "macros") {
-            let table = self.connection.open_table("macros").execute().await?;
+            let indexes = vec![
+                (vec!["name"], "BTree index on macros.name"),
+                (vec!["git_file_hash"], "BTree index on macros.git_file_hash"),
+                (vec!["file_path"], "BTree index on macros.file_path"),
+                (
+                    vec!["definition_hash"],
+                    "BTree index on macros.definition_hash",
+                ),
+                (
+                    vec!["name", "git_file_hash"],
+                    "Composite index on macros.(name,git_file_hash)",
+                ),
+            ];
 
-            // Index on name
-            self.try_create_index(&table, &["name"], "BTree index on macros.name")
-                .await;
+            for (columns, description) in indexes {
+                let connection = self.connection.clone();
+                let cols: Vec<&str> = columns.iter().map(|s| &**s).collect();
+                let desc = description.to_string();
 
-            // Index on git_file_hash for content-based lookups
-            self.try_create_index(
-                &table,
-                &["git_file_hash"],
-                "BTree index on macros.git_file_hash",
-            )
-            .await;
-
-            // Index on file_path for file-based queries
-            self.try_create_index(&table, &["file_path"], "BTree index on macros.file_path")
-                .await;
-
-            // Index on definition_hash for content reference lookups
-            self.try_create_index(
-                &table,
-                &["definition_hash"],
-                "BTree index on macros.definition_hash",
-            )
-            .await;
-
-            // Composite index for duplicate checking with content hash
-            self.try_create_index(
-                &table,
-                &["name", "git_file_hash"],
-                "Composite index on macros.(name,git_file_hash)",
-            )
-            .await;
+                let handle = tokio::spawn(async move {
+                    let table = connection.open_table("macros").execute().await?;
+                    Self::try_create_index_static(&table, &cols, &desc).await;
+                    Ok::<(), anyhow::Error>(())
+                });
+                handles.push(handle);
+            }
         }
 
         // Create indices for vectors table
         if table_names.iter().any(|n| n == "vectors") {
-            let table = self.connection.open_table("vectors").execute().await?;
+            let connection = self.connection.clone();
+            let handle = tokio::spawn(async move {
+                let table = connection.open_table("vectors").execute().await?;
 
-            // Primary index on content_hash for fast lookups
-            self.try_create_index(
-                &table,
-                &["content_hash"],
-                "BTree index on vectors.content_hash",
-            )
-            .await;
+                // Primary index on content_hash for fast lookups
+                Self::try_create_index_static(
+                    &table,
+                    &["content_hash"],
+                    "BTree index on vectors.content_hash",
+                )
+                .await;
+
+                Ok::<(), anyhow::Error>(())
+            });
+            handles.push(handle);
         }
 
         // Create indices for commit_vectors table
         if table_names.iter().any(|n| n == "commit_vectors") {
-            let table = self
-                .connection
-                .open_table("commit_vectors")
-                .execute()
-                .await?;
+            let connection = self.connection.clone();
+            let handle = tokio::spawn(async move {
+                let table = connection.open_table("commit_vectors").execute().await?;
 
-            // Primary index on git_commit_sha for fast lookups
-            self.try_create_index(
-                &table,
-                &["git_commit_sha"],
-                "BTree index on commit_vectors.git_commit_sha",
-            )
-            .await;
+                // Primary index on git_commit_sha for fast lookups
+                Self::try_create_index_static(
+                    &table,
+                    &["git_commit_sha"],
+                    "BTree index on commit_vectors.git_commit_sha",
+                )
+                .await;
+
+                Ok::<(), anyhow::Error>(())
+            });
+            handles.push(handle);
         }
 
-        // Create indices for processed_files table
+        // Create indices for processed_files table - each index spawned independently
         if table_names.iter().any(|n| n == "processed_files") {
-            let table = self
-                .connection
-                .open_table("processed_files")
-                .execute()
-                .await?;
+            let indexes = vec![
+                (vec!["file"], "BTree index on processed_files.file"),
+                (vec!["git_sha"], "BTree index on processed_files.git_sha"),
+                (
+                    vec!["git_file_sha"],
+                    "BTree index on processed_files.git_file_sha",
+                ),
+                (
+                    vec!["file", "git_sha"],
+                    "Composite index on processed_files.(file,git_sha)",
+                ),
+            ];
 
-            // Index on file for file-based lookups
-            self.try_create_index(&table, &["file"], "BTree index on processed_files.file")
-                .await;
+            for (columns, description) in indexes {
+                let connection = self.connection.clone();
+                let cols: Vec<&str> = columns.iter().map(|s| &**s).collect();
+                let desc = description.to_string();
 
-            // Index on git_sha for git commit-based lookups
-            self.try_create_index(
-                &table,
-                &["git_sha"],
-                "BTree index on processed_files.git_sha",
-            )
-            .await;
-
-            // Index on git_file_sha for file content-based lookups
-            self.try_create_index(
-                &table,
-                &["git_file_sha"],
-                "BTree index on processed_files.git_file_sha",
-            )
-            .await;
-
-            // Composite index for efficient file + git_sha lookups
-            self.try_create_index(
-                &table,
-                &["file", "git_sha"],
-                "Composite index on processed_files.(file,git_sha)",
-            )
-            .await;
+                let handle = tokio::spawn(async move {
+                    let table = connection.open_table("processed_files").execute().await?;
+                    Self::try_create_index_static(&table, &cols, &desc).await;
+                    Ok::<(), anyhow::Error>(())
+                });
+                handles.push(handle);
+            }
         }
 
-        // Create indices for symbol_filename table
+        // Create indices for symbol_filename table - each index spawned independently
         if table_names.iter().any(|n| n == "symbol_filename") {
-            let table = self
-                .connection
-                .open_table("symbol_filename")
-                .execute()
-                .await?;
+            let indexes = vec![
+                (vec!["symbol"], "BTree index on symbol_filename.symbol"),
+                (vec!["filename"], "BTree index on symbol_filename.filename"),
+                (
+                    vec!["symbol", "filename"],
+                    "Composite index on symbol_filename.(symbol,filename)",
+                ),
+            ];
 
-            // Index on symbol for symbol name-based lookups
-            self.try_create_index(&table, &["symbol"], "BTree index on symbol_filename.symbol")
-                .await;
+            for (columns, description) in indexes {
+                let connection = self.connection.clone();
+                let cols: Vec<&str> = columns.iter().map(|s| &**s).collect();
+                let desc = description.to_string();
 
-            // Index on filename for file-based lookups
-            self.try_create_index(
-                &table,
-                &["filename"],
-                "BTree index on symbol_filename.filename",
-            )
-            .await;
-
-            // Composite index on (symbol, filename) for fast deduplication
-            self.try_create_index(
-                &table,
-                &["symbol", "filename"],
-                "Composite index on symbol_filename.(symbol,filename)",
-            )
-            .await;
+                let handle = tokio::spawn(async move {
+                    let table = connection.open_table("symbol_filename").execute().await?;
+                    Self::try_create_index_static(&table, &cols, &desc).await;
+                    Ok::<(), anyhow::Error>(())
+                });
+                handles.push(handle);
+            }
         }
 
-        // Create indices for git_commits table
+        // Create indices for git_commits table - each index spawned independently
         if table_names.iter().any(|n| n == "git_commits") {
-            let table = self.connection.open_table("git_commits").execute().await?;
+            let indexes = vec![
+                (vec!["git_sha"], "BTree index on git_commits.git_sha"),
+                (vec!["parent_sha"], "BTree index on git_commits.parent_sha"),
+                (vec!["author"], "BTree index on git_commits.author"),
+                (vec!["subject"], "BTree index on git_commits.subject"),
+                (vec!["message"], "BTree index on git_commits.message"),
+                (vec!["tags"], "BTree index on git_commits.tags"),
+                (vec!["diff"], "BTree index on git_commits.diff"),
+                (vec!["symbols"], "BTree index on git_commits.symbols"),
+                (vec!["files"], "BTree index on git_commits.files"),
+            ];
 
-            // Index on git_sha for commit lookups
-            self.try_create_index(&table, &["git_sha"], "BTree index on git_commits.git_sha")
-                .await;
+            for (columns, description) in indexes {
+                let connection = self.connection.clone();
+                let cols: Vec<&str> = columns.iter().map(|s| &**s).collect();
+                let desc = description.to_string();
 
-            // Index on parent_sha for parent commit lookups
-            self.try_create_index(
-                &table,
-                &["parent_sha"],
-                "BTree index on git_commits.parent_sha",
-            )
-            .await;
-
-            // Index on author for author-based queries
-            self.try_create_index(&table, &["author"], "BTree index on git_commits.author")
-                .await;
-
-            // Index on subject for subject searches
-            self.try_create_index(&table, &["subject"], "BTree index on git_commits.subject")
-                .await;
-
-            // Index on message for message searches
-            self.try_create_index(&table, &["message"], "BTree index on git_commits.message")
-                .await;
-
-            // Index on tags for tag-based queries
-            self.try_create_index(&table, &["tags"], "BTree index on git_commits.tags")
-                .await;
-
-            // Index on diff for diff searches
-            self.try_create_index(&table, &["diff"], "BTree index on git_commits.diff")
-                .await;
-
-            // Index on symbols for symbol-based queries
-            self.try_create_index(&table, &["symbols"], "BTree index on git_commits.symbols")
-                .await;
-
-            // Index on files for file-based queries
-            self.try_create_index(&table, &["files"], "BTree index on git_commits.files")
-                .await;
+                let handle = tokio::spawn(async move {
+                    let table = connection.open_table("git_commits").execute().await?;
+                    Self::try_create_index_static(&table, &cols, &desc).await;
+                    Ok::<(), anyhow::Error>(())
+                });
+                handles.push(handle);
+            }
         }
 
-        // Create indices for all content shard tables
+        // Create indices for all content shard tables - each index spawned independently
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
             if table_names.iter().any(|n| n == &table_name) {
-                let table = self.connection.open_table(&table_name).execute().await?;
+                // Spawn each index separately for this shard
+                let indexes = vec![
+                    (
+                        vec!["gxhash"],
+                        format!("BTree index on {table_name}.gxhash"),
+                    ),
+                    (
+                        vec!["content"],
+                        format!("BTree index on {table_name}.content"),
+                    ),
+                ];
 
-                // Primary index on gxhash for deduplication and fast lookups
-                self.try_create_index(
-                    &table,
-                    &["gxhash"],
-                    &format!("BTree index on {table_name}.gxhash"),
-                )
-                .await;
+                for (columns, description) in indexes {
+                    let connection = self.connection.clone();
+                    let table_name_clone = table_name.clone();
+                    let cols: Vec<&str> = columns.iter().map(|s| &**s).collect();
 
-                // Index on content for text searches and pattern matching
-                self.try_create_index(
-                    &table,
-                    &["content"],
-                    &format!("BTree index on {table_name}.content"),
-                )
-                .await;
+                    let handle = tokio::spawn(async move {
+                        let table = connection.open_table(&table_name_clone).execute().await?;
+                        Self::try_create_index_static(&table, &cols, &description).await;
+                        Ok::<(), anyhow::Error>(())
+                    });
+                    handles.push(handle);
+                }
             }
+        }
+
+        // Wait for all index creation tasks to complete
+        for handle in handles {
+            handle.await??;
         }
 
         Ok(())
     }
 
-    async fn try_create_index(
-        &self,
+    /// Static version of try_create_index for use in spawned tasks
+    async fn try_create_index_static(
         table: &lancedb::table::Table,
         columns: &[&str],
         description: &str,
