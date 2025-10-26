@@ -289,6 +289,21 @@ impl PipelineBuilder {
         let num_threads = num_cpus::get();
         tracing::info!("=== PIPELINE START: {} threads available ===", num_threads);
 
+        // Determine number of DB inserter tasks for parallel insertion
+        // Balance parallelism with database I/O limits - too many writers causes contention
+        // Empirically, 8 inserters provides good balance between CPU utilization and I/O
+        let num_db_inserters = if num_threads >= 64 {
+            8 // Medium-high CPU: 8 parallel DB inserters
+        } else if num_threads >= 32 {
+            6 // Medium CPU: 6 parallel DB inserters
+        } else {
+            4 // Default: 4 parallel DB inserters
+        };
+        tracing::info!(
+            "Using {} parallel DB inserter tasks for maximum throughput",
+            num_db_inserters
+        );
+
         // Step 1: Load git manifest of current commit (lightweight)
         tracing::info!("Loading git manifest for current commit...");
         let git_manifest = self.load_git_manifest().await?;
@@ -329,7 +344,7 @@ impl PipelineBuilder {
         // Dynamic channel sizes based on number of filtered files and available memory
         let file_channel_size = (files_to_process.len().min(10000) / 10).max(100);
         let parsed_channel_size = num_threads * 50; // Allow backpressure but keep threads busy
-        let processed_channel_size = 100; // Larger buffer to prevent backpressure from DB thread
+        let processed_channel_size = num_db_inserters * 10; // Larger buffer for multiple DB inserters
 
         // Create channels with bounded capacity to prevent memory bloat
         let (file_tx, file_rx) = bounded::<(PathBuf, String)>(file_channel_size);
@@ -681,90 +696,131 @@ impl PipelineBuilder {
                 .expect("Failed to spawn batch processor thread")
         };
 
-        // Clone processed_rx for DB thread, then drop original immediately
-        // (crossbeam MPMC channels distribute messages round-robin between receivers)
-        let processed_rx_db = processed_rx.clone();
+        // Clone processed_rx for DB inserters, then drop original immediately
+        // Crossbeam MPMC channels distribute messages efficiently across multiple receiver clones
+        // Each inserter gets its own receiver handle - no mutex needed!
+        let mut db_receivers = Vec::new();
+        for _ in 0..num_db_inserters {
+            db_receivers.push(processed_rx.clone());
+        }
         drop(processed_rx);
 
-        // Stage 4: Database insertion (async in tokio runtime)
-        let db_thread = {
-            let processed_rx = processed_rx_db;
-            let db_manager = self.db_manager.clone();
+        // Stage 4: Multiple parallel database inserters
+        let mut db_inserter_handles = Vec::new();
+        let total_batches_processed = Arc::new(AtomicUsize::new(0));
+        let total_functions_inserted = Arc::new(AtomicUsize::new(0));
+        let total_types_inserted = Arc::new(AtomicUsize::new(0));
+        let total_macros_inserted = Arc::new(AtomicUsize::new(0));
+        let db_start_time = Arc::new(Mutex::new(None::<Instant>));
 
-            thread::Builder::new()
-                .name("db-inserter".to_string())
+        for (inserter_id, processed_rx_clone) in db_receivers.into_iter().enumerate() {
+            let db_manager = self.db_manager.clone();
+            let batches_counter = total_batches_processed.clone();
+            let functions_counter = total_functions_inserted.clone();
+            let types_counter = total_types_inserted.clone();
+            let macros_counter = total_macros_inserted.clone();
+            let start_time_shared = db_start_time.clone();
+
+            let handle = thread::Builder::new()
+                .name(format!("db-inserter-{inserter_id}"))
                 .spawn(move || {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(num_cpus::get()) // Use all available CPU cores
-                        .thread_name("db-worker")
+                        .worker_threads(num_threads / num_db_inserters) // Distribute CPU cores
+                        .thread_name(format!("db-worker-{inserter_id}"))
                         .enable_all()
                         .build()
                         .expect("Failed to create tokio runtime");
 
                     runtime.block_on(async move {
-                        let start = Instant::now();
-                        let mut batches_processed = 0;
-                        let mut total_functions = 0;
-                        let mut total_types = 0;
-                        let mut total_macros = 0;
+                        let mut local_batches = 0;
+                        let mut local_functions = 0;
+                        let mut local_types = 0;
+                        let mut local_macros = 0;
 
-                        while let Ok(batch) = processed_rx.recv() {
-                            let batch_start = Instant::now();
-                            let func_count = batch.functions.len();
-                            let type_count = batch.types.len();
-                            let macro_count = batch.macros.len();
-
-                            // Insert processed files and all data in parallel using combined content insertion
-                            let (file_result, combined_result) = measure!("database_batch_insert", {
-                                tokio::join!(
-                                    async {
-                                        if !batch.processed_files.is_empty() {
-                                            measure!("db_mark_files_processed", {
-                                                db_manager.mark_files_processed(batch.processed_files).await
-                                            })
-                                        } else {
-                                            Ok::<(), anyhow::Error>(())
+                        loop {
+                            // Get next batch directly from our receiver clone (no mutex!)
+                            // Crossbeam handles distribution efficiently
+                            match processed_rx_clone.recv() {
+                                Ok(batch) => {
+                                    // Record start time on first batch
+                                    {
+                                        let mut start = start_time_shared.lock().unwrap();
+                                        if start.is_none() {
+                                            *start = Some(Instant::now());
                                         }
-                                    },
-                                    async {
-                                        measure!("db_insert_combined", {
-                                            db_manager.insert_batch_combined(
-                                                batch.functions,
-                                                batch.types,
-                                                batch.macros
-                                            ).await
-                                        })
                                     }
-                                )
-                            });
 
-                            // Log any errors but continue processing
-                            if let Err(e) = file_result {
-                                tracing::error!("Failed to mark files as processed: {}", e);
-                            }
-                            if let Err(e) = combined_result {
-                                tracing::error!("Failed to insert combined data (functions/types/macros): {}", e);
-                            }
+                                    let batch_start = Instant::now();
+                                    let func_count = batch.functions.len();
+                                    let type_count = batch.types.len();
+                                    let macro_count = batch.macros.len();
 
-                            batches_processed += 1;
-                            total_functions += func_count;
-                            total_types += type_count;
-                            total_macros += macro_count;
+                                    // Insert processed files and all data in parallel
+                                    let (file_result, combined_result) = measure!("database_batch_insert", {
+                                        tokio::join!(
+                                            async {
+                                                if !batch.processed_files.is_empty() {
+                                                    measure!("db_mark_files_processed", {
+                                                        db_manager.mark_files_processed(batch.processed_files).await
+                                                    })
+                                                } else {
+                                                    Ok::<(), anyhow::Error>(())
+                                                }
+                                            },
+                                            async {
+                                                measure!("db_insert_combined", {
+                                                    db_manager.insert_batch_combined(
+                                                        batch.functions,
+                                                        batch.types,
+                                                        batch.macros
+                                                    ).await
+                                                })
+                                            }
+                                        )
+                                    });
 
-                            let batch_time = batch_start.elapsed();
-                            if batch_time > Duration::from_secs(1) {
-                                tracing::warn!("Slow DB batch (combined content+metadata): {} functions, {} types, {} macros took {:.1}s",
-                                             func_count, type_count, macro_count, batch_time.as_secs_f64());
+                                    // Log any errors but continue processing
+                                    if let Err(e) = file_result {
+                                        tracing::error!("Inserter {} failed to mark files as processed: {}", inserter_id, e);
+                                    }
+                                    if let Err(e) = combined_result {
+                                        tracing::error!("Inserter {} failed to insert combined data: {}", inserter_id, e);
+                                    }
+
+                                    local_batches += 1;
+                                    local_functions += func_count;
+                                    local_types += type_count;
+                                    local_macros += macro_count;
+
+                                    batches_counter.fetch_add(1, Ordering::Relaxed);
+                                    functions_counter.fetch_add(func_count, Ordering::Relaxed);
+                                    types_counter.fetch_add(type_count, Ordering::Relaxed);
+                                    macros_counter.fetch_add(macro_count, Ordering::Relaxed);
+
+                                    let batch_time = batch_start.elapsed();
+                                    if batch_time > Duration::from_secs(1) {
+                                        tracing::warn!("Inserter {} slow batch: {} functions, {} types, {} macros took {:.1}s",
+                                                     inserter_id, func_count, type_count, macro_count, batch_time.as_secs_f64());
+                                    }
+                                }
+                                Err(_) => break, // Channel closed
                             }
                         }
 
-                        let elapsed = start.elapsed().as_secs_f64();
-                        tracing::info!("DB inserter completed: {} batches, {} functions, {} types, {} macros in {:.1}s",
-                                      batches_processed, total_functions, total_types, total_macros, elapsed);
+                        tracing::info!(
+                            "DB inserter {} completed: {} batches, {} functions, {} types, {} macros",
+                            inserter_id,
+                            local_batches,
+                            local_functions,
+                            local_types,
+                            local_macros
+                        );
                     })
                 })
-                .expect("Failed to spawn db thread")
-        };
+                .expect("Failed to spawn DB inserter thread");
+
+            db_inserter_handles.push(handle);
+        }
 
         // Drop original senders to signal pipeline start
         drop(file_tx);
@@ -782,7 +838,34 @@ impl PipelineBuilder {
         }
 
         batch_thread.join().unwrap();
-        db_thread.join().unwrap();
+
+        // Wait for all DB inserters
+        for (inserter_id, handle) in db_inserter_handles.into_iter().enumerate() {
+            if let Err(e) = handle.join() {
+                tracing::error!("DB inserter {} thread panicked: {:?}", inserter_id, e);
+            }
+        }
+
+        // Print aggregate statistics
+        let total_elapsed = db_start_time
+            .lock()
+            .unwrap()
+            .map(|start| start.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let total_batches = total_batches_processed.load(Ordering::Relaxed);
+        let total_funcs = total_functions_inserted.load(Ordering::Relaxed);
+        let total_types_count = total_types_inserted.load(Ordering::Relaxed);
+        let total_macros_count = total_macros_inserted.load(Ordering::Relaxed);
+
+        tracing::info!(
+            "All DB inserters completed: {} batches, {} functions, {} types, {} macros in {:.1}s ({:.1} batches/sec)",
+            total_batches,
+            total_funcs,
+            total_types_count,
+            total_macros_count,
+            total_elapsed,
+            total_batches as f64 / total_elapsed
+        );
 
         // Finish progress bar
         pb_shared.finish_with_message("Processing complete");
