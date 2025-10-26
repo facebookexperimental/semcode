@@ -179,6 +179,29 @@ struct ProcessedBatch {
     processed_files: Vec<crate::database::processed_files::ProcessedFileRecord>, // Files to mark as processed
 }
 
+/// Check if a large file contains only preprocessor directives and should be skipped
+/// Returns true if the file is pure preprocessor (only #define, comments, whitespace, etc.)
+fn is_pure_preprocessor_file(source_code: &str) -> bool {
+    source_code.lines().all(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("*/")
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("#define")
+            || trimmed.starts_with("#ifdef")
+            || trimmed.starts_with("#ifndef")
+            || trimmed.starts_with("#endif")
+            || trimmed.starts_with("#if")
+            || trimmed.starts_with("#else")
+            || trimmed.starts_with("#elif")
+            || trimmed.starts_with("#undef")
+            || trimmed.starts_with("#include")
+            || trimmed.starts_with("#pragma")
+    })
+}
+
 pub struct PipelineBuilder {
     db_manager: Arc<DatabaseManager>,
     source_root: PathBuf,
@@ -444,6 +467,25 @@ impl PipelineBuilder {
                                             &git_file_entry.temp_file_path,
                                         ) {
                                             Ok(source_code) => {
+                                                // For files >256KB, do fast heuristic check before expensive TreeSitter parsing
+                                                const FAST_CHECK_THRESHOLD: usize = 256_000; // 256KB
+
+                                                if source_code.len() > FAST_CHECK_THRESHOLD {
+                                                    // Quick scan: if ALL lines are just preprocessor directives/comments/whitespace, skip
+                                                    // This catches auto-generated register definition headers (e.g., AMD GPU headers)
+                                                    if is_pure_preprocessor_file(&source_code) {
+                                                        tracing::info!(
+                                                            "Skipping preprocessor-only file ({:.1}MB): {}",
+                                                            source_code.len() as f64 / 1_048_576.0,
+                                                            file_path.display()
+                                                        );
+                                                        processed.fetch_add(1, Ordering::Relaxed);
+                                                        pb_clone.inc(1);
+                                                        continue;
+                                                    }
+                                                    // Otherwise, parse normally even if large (might be legitimate large .c file with functions)
+                                                }
+
                                                 let git_hash = &git_file_entry.blob_id;
                                                 ts_analyzer.analyze_source_with_metadata(
                                                     &source_code,
@@ -470,13 +512,30 @@ impl PipelineBuilder {
                                         // Fallback to regular file reading with git SHA
                                         let git_hash_hex = git_file_sha.clone();
                                         match std::fs::read_to_string(&file_path) {
-                                            Ok(source_code) => ts_analyzer
-                                                .analyze_source_with_metadata(
+                                            Ok(source_code) => {
+                                                // For files >256KB, do fast heuristic check before expensive TreeSitter parsing
+                                                const FAST_CHECK_THRESHOLD: usize = 256_000; // 256KB
+
+                                                if source_code.len() > FAST_CHECK_THRESHOLD {
+                                                    if is_pure_preprocessor_file(&source_code) {
+                                                        tracing::info!(
+                                                            "Skipping preprocessor-only file ({:.1}MB): {}",
+                                                            source_code.len() as f64 / 1_048_576.0,
+                                                            file_path.display()
+                                                        );
+                                                        processed.fetch_add(1, Ordering::Relaxed);
+                                                        pb_clone.inc(1);
+                                                        continue;
+                                                    }
+                                                }
+
+                                                ts_analyzer.analyze_source_with_metadata(
                                                     &source_code,
                                                     &file_path,
                                                     &git_hash_hex,
                                                     Some(&source_root),
-                                                ),
+                                                )
+                                            }
                                             Err(e) => {
                                                 tracing::warn!(
                                                     "Failed to read file {}: {}",
@@ -491,13 +550,30 @@ impl PipelineBuilder {
                                     // Regular mode: read from working directory with git SHA
                                     let git_hash_hex = git_file_sha.clone();
                                     match std::fs::read_to_string(&file_path) {
-                                        Ok(source_code) => ts_analyzer
-                                            .analyze_source_with_metadata(
+                                        Ok(source_code) => {
+                                            // For files >256KB, do fast heuristic check before expensive TreeSitter parsing
+                                            const FAST_CHECK_THRESHOLD: usize = 256_000; // 256KB
+
+                                            if source_code.len() > FAST_CHECK_THRESHOLD {
+                                                if is_pure_preprocessor_file(&source_code) {
+                                                    tracing::info!(
+                                                        "Skipping preprocessor-only file ({:.1}MB): {}",
+                                                        source_code.len() as f64 / 1_048_576.0,
+                                                        file_path.display()
+                                                    );
+                                                    processed.fetch_add(1, Ordering::Relaxed);
+                                                    pb_clone.inc(1);
+                                                    continue;
+                                                }
+                                            }
+
+                                            ts_analyzer.analyze_source_with_metadata(
                                                 &source_code,
                                                 &file_path,
                                                 &git_hash_hex,
                                                 Some(&source_root),
-                                            ),
+                                            )
+                                        }
                                         Err(e) => {
                                             tracing::warn!(
                                                 "Failed to read file {}: {}",
