@@ -789,6 +789,18 @@ async fn run_pipeline(args: Args) -> Result<()> {
 
     // Call relationships are now embedded in function/macro JSON columns
 
+    // Build indexes after all data has been inserted (deferred indexing for performance)
+    // Only skip in git range mode for faster incremental updates
+    if args.git.is_none() {
+        println!("\nBuilding database indexes...");
+        match measure!("index_building", { db_manager.rebuild_indices().await }) {
+            Ok(_) => println!("✓ Indexes built successfully"),
+            Err(e) => error!("Failed to build indexes: {}", e),
+        }
+    } else {
+        println!("\nSkipping index rebuild in git range indexing mode (indexes already exist)");
+    }
+
     // Generate vectors if requested
     if args.vectors {
         println!("\nStarting vector generation process...");

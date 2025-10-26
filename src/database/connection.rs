@@ -65,7 +65,8 @@ impl DatabaseManager {
 
     pub async fn create_tables(&self) -> Result<()> {
         self.schema_manager.create_all_tables().await?;
-        self.schema_manager.create_scalar_indices().await?;
+        // NOTE: Indexes are NOT created here! They should be built AFTER bulk inserts
+        // for optimal performance. Call rebuild_indices() after all inserts are complete.
         Ok(())
     }
 
