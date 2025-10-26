@@ -253,16 +253,21 @@ async fn run_commits_only(args: Args) -> Result<()> {
     // Process database path
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
 
+    // Handle --clear flag by removing entire database directory
+    if args.clear {
+        if std::path::Path::new(&database_path).exists() {
+            println!("Removing existing database at {}...", database_path);
+            std::fs::remove_dir_all(&database_path)?;
+            println!("Existing database removed.");
+        } else {
+            println!("No existing database found at {}", database_path);
+        }
+    }
+
     // Create database manager and tables
     let db_manager =
         DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
     db_manager.create_tables().await?;
-
-    if args.clear {
-        println!("Clearing existing data...");
-        db_manager.clear_all_data().await?;
-        println!("Existing data cleared.");
-    }
 
     // Open repository and get list of commits in range
     let repo = gix::discover(&args.source)
@@ -564,16 +569,21 @@ async fn run_pipeline(args: Args) -> Result<()> {
     // Process database path with search order: 1) -d flag, 2) source directory, 3) current directory
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
 
+    // Handle --clear flag by removing entire database directory
+    if args.clear {
+        if std::path::Path::new(&database_path).exists() {
+            println!("Removing existing database at {}...", database_path);
+            std::fs::remove_dir_all(&database_path)?;
+            println!("Existing database removed.");
+        } else {
+            println!("No existing database found at {}", database_path);
+        }
+    }
+
     // Create database manager and tables
     let db_manager =
         DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
     db_manager.create_tables().await?;
-
-    if args.clear {
-        println!("Clearing existing data...");
-        db_manager.clear_all_data().await?;
-        println!("Existing data cleared.");
-    }
 
     // Wrap database manager in Arc for sharing across pipeline stages
     let db_manager = Arc::new(db_manager);
