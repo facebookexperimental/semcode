@@ -90,22 +90,37 @@ impl ContentStore {
             shard_groups.entry(shard).or_default().push(item);
         }
 
-        // Process each shard
+        // Process each shard in parallel using tokio::spawn
+        // This maximizes database throughput by writing to multiple shards concurrently
+        let mut handles = Vec::new();
+
         for (shard, items) in shard_groups {
             let table_name = Self::get_shard_table_name(shard);
-            let table = self.connection.open_table(&table_name).execute().await?;
+            let connection = self.connection.clone();
 
-            // Process in optimal batch sizes
-            for chunk in items.chunks(OPTIMAL_BATCH_SIZE) {
-                self.insert_chunk(&table, chunk).await?;
-            }
+            let handle = tokio::spawn(async move {
+                let table = connection.open_table(&table_name).execute().await?;
+
+                // Process in optimal batch sizes within this shard
+                for chunk in items.chunks(OPTIMAL_BATCH_SIZE) {
+                    Self::insert_chunk_static(&table, chunk).await?;
+                }
+
+                Ok::<(), anyhow::Error>(())
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all shard writes to complete
+        for handle in handles {
+            handle.await??;
         }
 
         Ok(())
     }
 
-    async fn insert_chunk(
-        &self,
+    async fn insert_chunk_static(
         table: &lancedb::table::Table,
         content_items: &[ContentInfo],
     ) -> Result<()> {
@@ -123,7 +138,7 @@ impl ContentStore {
         }
         let gxhash_array = gxhash_builder.finish();
 
-        let schema = self.get_schema();
+        let schema = Self::get_schema_static();
 
         let batch = RecordBatch::try_from_iter(vec![
             ("gxhash", Arc::new(gxhash_array) as ArrayRef),
@@ -340,7 +355,7 @@ impl ContentStore {
         }))
     }
 
-    fn get_schema(&self) -> Arc<Schema> {
+    fn get_schema_static() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("gxhash", DataType::Utf8, false), // gxhash128 hash as hex string
             Field::new("content", DataType::Utf8, false), // The actual content
