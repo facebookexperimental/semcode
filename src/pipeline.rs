@@ -699,7 +699,7 @@ impl PipelineBuilder {
                 .name("db-inserter".to_string())
                 .spawn(move || {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(num_cpus::get()) // Use all available CPU cores
+                        .worker_threads(4) // Sufficient for I/O-bound database operations
                         .thread_name("db-worker")
                         .enable_all()
                         .build()

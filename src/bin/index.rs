@@ -157,10 +157,10 @@ async fn main() -> Result<()> {
         0
     };
 
-    // Use all CPU cores if 0 or not specified, but leave one for system/IO
+    // Use all CPU cores if 0 or not specified, but leave one for system/IO and cap at 32
     let num_threads = if num_analysis_threads == 0 {
         // Leave at least one core for system/IO operations for better overall performance
-        num_cpus::get().saturating_sub(1).max(1)
+        num_cpus::get().saturating_sub(1).max(1).min(32)
     } else {
         num_analysis_threads
     };
@@ -1032,7 +1032,7 @@ fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>
 
 /// Stream git file tuples to a channel from a subset of commits (producer)
 fn stream_git_file_tuples_batch(
-    _generator_id: usize,
+    generator_id: usize,
     repo_path: PathBuf,
     commit_batch: Vec<String>,
     extensions: Vec<String>,
@@ -1043,21 +1043,29 @@ fn stream_git_file_tuples_batch(
     // Open repository ONCE per generator thread and reuse for all commits
     let repo = gix::discover(&repo_path)?;
 
+    let mut total_files = 0;
+    let mut sent_files = 0;
+    let mut filtered_already_processed = 0;
+    let mut filtered_already_sent = 0;
+
     for commit_sha in commit_batch.iter() {
         // Get all files from this commit using reused repo handle
         let manifest = get_git_commit_manifest_with_repo(&repo, commit_sha, &extensions)?;
 
         for manifest_entry in manifest {
             let file_sha = manifest_entry.object_id.to_string();
+            total_files += 1;
 
             // Filter out files already processed in database
             if processed_files.contains(&file_sha) {
+                filtered_already_processed += 1;
                 continue;
             }
 
             // Filter out files already sent in this run (lock-free with DashSet)
             if !sent_in_this_run.insert(file_sha.clone()) {
                 // File already sent by another generator
+                filtered_already_sent += 1;
                 continue;
             }
 
@@ -1071,8 +1079,18 @@ fn stream_git_file_tuples_batch(
             if tuple_tx.send(tuple).is_err() {
                 break;
             }
+            sent_files += 1;
         }
     }
+
+    tracing::info!(
+        "Generator {} finished: {} total files, {} sent, {} filtered (already processed), {} filtered (duplicate)",
+        generator_id,
+        total_files,
+        sent_files,
+        filtered_already_processed,
+        filtered_already_sent
+    );
 
     Ok(())
 }
@@ -1157,6 +1175,7 @@ fn tuple_worker_shared(
     no_macros: bool,
     processed_count: Arc<AtomicUsize>,
     batches_sent: Arc<AtomicUsize>,
+    accumulate_lock: Arc<std::sync::Mutex<()>>,
 ) {
     // Open repository ONCE per worker thread and reuse for all tuples
     let thread_repo = match gix::discover(&repo_path) {
@@ -1167,61 +1186,80 @@ fn tuple_worker_shared(
         }
     };
 
-    // Accumulate results into a batch for sending to inserters
-    let mut batch = GitTupleResults::default();
-    const DB_BATCH_SIZE: usize = 2048; // Send to inserters after this many files
+    const DB_BATCH_SIZE: usize = 2048; // Number of files required before processing begins
 
-    // Process tuples in batches to reduce channel lock overhead
-    const TUPLE_BATCH_SIZE: usize = 8;
     loop {
-        // Collect a batch of tuples (reduces lock contention)
-        let mut tuple_batch = Vec::with_capacity(TUPLE_BATCH_SIZE);
-        {
-            let rx = match shared_tuple_rx.lock() {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
-                    break;
-                }
-            };
+        // Step 1: Acquire lock to ensure only one worker accumulates at a time
+        let _guard = match accumulate_lock.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!("Worker {} failed to acquire accumulate lock", worker_id);
+                return;
+            }
+        };
 
-            // Try to get a batch of tuples without blocking
-            for _ in 0..TUPLE_BATCH_SIZE {
-                match rx.try_recv() {
-                    Ok(tuple) => tuple_batch.push(tuple),
-                    Err(mpsc::TryRecvError::Empty) => break, // No more tuples available now
-                    Err(mpsc::TryRecvError::Disconnected) => break, // Channel closed
-                }
+        // Step 2: Accumulate tuples until we have DB_BATCH_SIZE files
+        let mut tuples_to_process = Vec::new();
+
+        'accumulate: loop {
+            // Keep accumulating until we have DB_BATCH_SIZE files
+            if tuples_to_process.len() >= DB_BATCH_SIZE {
+                break 'accumulate;
             }
 
-            // If we got nothing with try_recv, do a blocking recv for at least one
-            if tuple_batch.is_empty() {
-                match rx.recv() {
-                    Ok(tuple) => tuple_batch.push(tuple),
-                    Err(_) => break, // Channel closed
+            // Get next tuple with blocking receive
+            let tuple = {
+                let rx = match shared_tuple_rx.lock() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
+                        return;
+                    }
+                };
+
+                // Blocking receive - wait for work
+                rx.recv()
+            };
+
+            match tuple {
+                Ok(t) => {
+                    tuples_to_process.push(t);
+                }
+                Err(_) => {
+                    // Channel closed
+                    if tuples_to_process.is_empty() {
+                        // No files at all - exit worker
+                        tracing::debug!(
+                            "Worker {} exiting: channel closed, no files accumulated",
+                            worker_id
+                        );
+                        return;
+                    }
+                    // Have some files - process them even if < DB_BATCH_SIZE
+                    tracing::info!(
+                        "Worker {} processing final batch: {} files (channel closed)",
+                        worker_id,
+                        tuples_to_process.len()
+                    );
+                    break 'accumulate;
                 }
             }
         }
 
-        // Process the batch
-        for tuple in tuple_batch {
+        // Step 3: Release lock so next worker can start accumulating
+        drop(_guard);
+
+        // Step 2: Process exactly DB_BATCH_SIZE files
+        let mut batch = GitTupleResults::default();
+        let tuples_to_process_now: Vec<_> = tuples_to_process
+            .drain(..DB_BATCH_SIZE.min(tuples_to_process.len()))
+            .collect();
+
+        for tuple in tuples_to_process_now {
             match process_git_file_tuple_with_repo(&tuple, &thread_repo, &source_root, no_macros) {
                 Ok(tuple_result) => {
                     batch.merge(tuple_result);
                     processed_count.fetch_add(1, Ordering::Relaxed);
-
-                    // Send batch to inserters when it reaches DB_BATCH_SIZE
-                    if batch.files_processed >= DB_BATCH_SIZE {
-                        batches_sent.fetch_add(1, Ordering::Relaxed);
-                        if result_tx.send(batch.clone()).is_err() {
-                            tracing::warn!(
-                                "Worker {} failed to send batch (channel closed)",
-                                worker_id
-                            );
-                            return;
-                        }
-                        batch = GitTupleResults::default(); // Reset for next batch
-                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1233,13 +1271,14 @@ fn tuple_worker_shared(
                 }
             }
         }
-    }
 
-    // Send remaining batch if not empty
-    if batch.files_processed > 0 {
-        batches_sent.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = result_tx.send(batch) {
-            tracing::warn!("Worker {} failed to send final batch: {}", worker_id, e);
+        // Step 3: Send the batch (always exactly DB_BATCH_SIZE files)
+        if batch.files_processed > 0 {
+            batches_sent.fetch_add(1, Ordering::Relaxed);
+            if result_tx.send(batch).is_err() {
+                tracing::warn!("Worker {} failed to send batch (channel closed)", worker_id);
+                return;
+            }
         }
     }
 }
@@ -1301,9 +1340,16 @@ async fn process_git_tuples_streaming(
 
     // Create channels with backpressure
     let (tuple_tx, tuple_rx) = mpsc::channel::<GitFileTuple>();
-    // Bounded channel for results to prevent memory explosion (3 batches in flight max)
-    // Each batch = 10000 files, so max 30000 files in memory at inserters
-    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(3);
+    // Scale result channel size with number of workers to prevent blocking
+    // Allow 2 batches per worker in flight, with minimum of 4 and maximum of 64
+    // Each batch ~= 2048 files, so this provides buffering without excessive memory use
+    let result_channel_size = (num_workers * 2).clamp(4, 64);
+    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(result_channel_size);
+    tracing::info!(
+        "Result channel size: {} (scaled with {} workers)",
+        result_channel_size,
+        num_workers
+    );
 
     // Wrap receivers for shared access
     let shared_tuple_rx = Arc::new(Mutex::new(tuple_rx));
@@ -1380,6 +1426,10 @@ async fn process_git_tuples_streaming(
     // Close the original tuple sender (generators have clones)
     drop(tuple_tx);
 
+    // Use a mutex as a simple semaphore to control worker batch filling
+    // Only one worker can accumulate files at a time to ensure sequential batches
+    let accumulate_lock = Arc::new(std::sync::Mutex::new(()));
+
     // Spawn worker threads
     let mut worker_handles = Vec::new();
     for worker_id in 0..num_workers {
@@ -1389,6 +1439,7 @@ async fn process_git_tuples_streaming(
         let worker_source_root = source_root.clone();
         let worker_processed_count = processed_count.clone();
         let worker_batches_sent = batches_sent.clone();
+        let worker_accumulate_lock = accumulate_lock.clone();
 
         let handle = thread::spawn(move || {
             tuple_worker_shared(
@@ -1400,6 +1451,7 @@ async fn process_git_tuples_streaming(
                 no_macros,
                 worker_processed_count,
                 worker_batches_sent,
+                worker_accumulate_lock,
             );
         });
         worker_handles.push(handle);
