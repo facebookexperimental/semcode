@@ -5,6 +5,7 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use semcode::git;
 use semcode::git::resolve_to_commit;
+use semcode::indexer::list_shas_in_range;
 use semcode::{
     measure, process_database_path, CodeVectorizer, DatabaseManager, GitFileEntry,
     GitFileManifestEntry, TreeSitterAnalyzer,
@@ -12,7 +13,6 @@ use semcode::{
 use semcode::{FunctionInfo, MacroInfo, TypeInfo};
 // Temporary call relationships are now embedded in function JSON columns
 use dashmap::DashSet;
-use gix::revision::walk::Sorting;
 use semcode::perf_monitor::PERF_STATS;
 use std::collections::HashSet;
 use std::io::Write;
@@ -966,68 +966,6 @@ fn load_git_file_to_temp(
     temp_file.flush()?;
 
     Ok(temp_path)
-}
-
-/// Parse git range and get all commit SHAs in the range
-/// Uses gitoxide's built-in rev-spec parsing for proper A..B semantics
-fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>> {
-    // For simplicity, let's just handle the common A..B case manually for now
-    // and use gitoxide's rev_walk properly
-    if !range.contains("..") {
-        return Err(anyhow::anyhow!(
-            "Only range format (A..B) is supported, got: '{}'",
-            range
-        ));
-    }
-
-    // Parse A..B manually
-    let parts: Vec<&str> = range.split("..").collect();
-    if parts.len() != 2 {
-        return Err(anyhow::anyhow!("Invalid range format '{}'", range));
-    }
-
-    let from_spec = parts[0];
-    let to_spec = parts[1];
-
-    // Resolve the commit IDs
-    let from_commit = resolve_to_commit(repo, from_spec)?;
-    let to_commit = resolve_to_commit(repo, to_spec)?;
-    let from_id = from_commit.id().detach();
-    let to_id = to_commit.id().detach();
-
-    // Use rev_walk with proper include/exclude
-    let walk = repo
-        .rev_walk([to_id])
-        .with_hidden([from_id])
-        .sorting(Sorting::ByCommitTime(Default::default()))
-        .all()?;
-
-    let mut shas = Vec::new();
-    let mut commit_count = 0;
-    const MAX_COMMITS: usize = 10000000; // Safety limit
-
-    // Iterate commits in the set "reachable from B but not from A"
-    for info in walk {
-        let info = info?;
-        commit_count += 1;
-
-        // Safety check to prevent runaway processing
-        if commit_count > MAX_COMMITS {
-            return Err(anyhow::anyhow!(
-                "Commit range {} is too large (>{} commits). This may indicate a problem with the repository.",
-                range, MAX_COMMITS
-            ));
-        }
-
-        let commit_id = info.id();
-        let commit_sha = commit_id.to_string();
-        shas.push(commit_sha);
-    }
-
-    // Reverse to get chronological order (oldest first)
-    shas.reverse();
-
-    Ok(shas)
 }
 
 /// Stream git file tuples to a channel from a subset of commits (producer)

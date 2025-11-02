@@ -4,6 +4,7 @@ mod database;
 pub mod database_utils;
 pub mod git;
 pub mod hash;
+pub mod indexer;
 pub mod perf_monitor;
 pub mod pipeline;
 pub mod symbol_walkback;
