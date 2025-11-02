@@ -126,6 +126,12 @@ fn print_command_help() {
     println!();
     println!("{}", "General:".bold().cyan());
     println!(
+        "  {} ({}, {}) - Check if database needs optimization",
+        "check_health".yellow(),
+        "health".yellow(),
+        "check_db".yellow()
+    );
+    println!(
         "  {} ({}, {})      - Optimize database (rebuild indices, compact)",
         "optimize_db".yellow(),
         "optimize".yellow(),

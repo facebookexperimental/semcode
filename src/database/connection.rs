@@ -2162,6 +2162,153 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Check if database needs optimization based on fragment statistics
+    /// Returns (needs_optimization, diagnostic_message)
+    pub async fn check_optimization_health(&self) -> Result<(bool, String)> {
+        use colored::Colorize;
+
+        let table_names = self.connection.table_names().execute().await?;
+        let mut needs_optimization = false;
+        let mut messages = Vec::new();
+
+        // Tables to check (prioritize the largest ones)
+        let critical_tables = [
+            "functions",
+            "types",
+            "macros",
+            "processed_files",
+            "git_commits",
+        ];
+
+        let mut total_fragments = 0;
+        let mut total_small_fragments = 0;
+
+        for table_name in &critical_tables {
+            if !table_names.iter().any(|n| n == table_name) {
+                continue;
+            }
+
+            let table = self.connection.open_table(*table_name).execute().await?;
+
+            // Get table statistics
+            match table.stats().await {
+                Ok(stats) => {
+                    let frag_stats = &stats.fragment_stats;
+                    total_fragments += frag_stats.num_fragments;
+                    total_small_fragments += frag_stats.num_small_fragments;
+
+                    // Heuristics for when optimization is needed:
+                    // 1. More than 100 fragments (LanceDB recommendation)
+                    if frag_stats.num_fragments > 100 {
+                        needs_optimization = true;
+                        messages.push(format!(
+                            "{}: {} fragments (recommended: <100)",
+                            table_name.yellow(),
+                            frag_stats.num_fragments.to_string().red()
+                        ));
+                    }
+
+                    // 2. More than 50% small fragments (< 100K rows each)
+                    if frag_stats.num_fragments > 0 {
+                        let small_fragment_pct = (frag_stats.num_small_fragments as f64
+                            / frag_stats.num_fragments as f64)
+                            * 100.0;
+                        if small_fragment_pct > 50.0 && frag_stats.num_small_fragments > 10 {
+                            needs_optimization = true;
+                            messages.push(format!(
+                                "{}: {:.1}% small fragments ({}/{})",
+                                table_name.yellow(),
+                                small_fragment_pct,
+                                frag_stats.num_small_fragments.to_string().red(),
+                                frag_stats.num_fragments
+                            ));
+                        }
+                    }
+
+                    // 3. Very small mean fragment size suggests many small inserts
+                    if frag_stats.lengths.mean < 1000 && stats.num_rows > 10000 {
+                        needs_optimization = true;
+                        messages.push(format!(
+                            "{}: small mean fragment size ({} rows/fragment)",
+                            table_name.yellow(),
+                            frag_stats.lengths.mean.to_string().red()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get stats for table {}: {}", table_name, e);
+                }
+            }
+        }
+
+        // Also check content shards (aggregate stats)
+        let mut content_fragments = 0;
+        let mut content_small_fragments = 0;
+        for shard in 0..16u8 {
+            let table_name = format!("content_{shard}");
+            if !table_names.iter().any(|n| n == &table_name) {
+                continue;
+            }
+
+            let table = self.connection.open_table(&table_name).execute().await?;
+            if let Ok(stats) = table.stats().await {
+                content_fragments += stats.fragment_stats.num_fragments;
+                content_small_fragments += stats.fragment_stats.num_small_fragments;
+            }
+        }
+
+        if content_fragments > 0 {
+            total_fragments += content_fragments;
+            total_small_fragments += content_small_fragments;
+
+            // Content shards are expected to have more fragments due to sharding
+            // But still check if they're excessive
+            if content_fragments > 500 {
+                needs_optimization = true;
+                messages.push(format!(
+                    "{}: {} fragments across 16 shards",
+                    "content shards".yellow(),
+                    content_fragments.to_string().red()
+                ));
+            }
+        }
+
+        // Build summary message
+        let summary = if needs_optimization {
+            let mut msg = format!(
+                "{}\n\nDatabase health check detected issues:\n",
+                "⚠️  Optimization recommended".yellow().bold()
+            );
+            for message in &messages {
+                msg.push_str(&format!("  • {}\n", message));
+            }
+            msg.push_str(&format!(
+                "\nTotal: {} fragments ({} small)\n",
+                total_fragments.to_string().yellow(),
+                total_small_fragments.to_string().yellow()
+            ));
+            msg.push_str(&format!(
+                "\n{} Run '{}' to optimize the database.\n",
+                "Recommendation:".cyan().bold(),
+                "optimize_db".yellow()
+            ));
+            msg.push_str(&format!(
+                "{} This will compact fragments, prune old versions, and update indices.\n",
+                "           ".cyan()
+            ));
+            msg
+        } else {
+            format!(
+                "{} Database is healthy ({} fragments, {} small)\n",
+                "✓".green().bold(),
+                total_fragments.to_string().green(),
+                total_small_fragments.to_string().green()
+            )
+        };
+
+        Ok((needs_optimization, summary))
+    }
+
     /// Get database storage statistics and compression info
     pub async fn get_storage_stats(&self) -> Result<()> {
         let table_names = self.connection.table_names().execute().await?;
