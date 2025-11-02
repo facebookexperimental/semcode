@@ -673,8 +673,12 @@ impl SchemaManager {
             tables_to_compact.push(Box::leak(format!("content_{shard}").into_boxed_str()));
         }
 
+        let mut tables_optimized = 0;
+        let mut tables_failed = 0;
+
         for table_name in &tables_to_compact {
             if table_names.iter().any(|n| n == table_name) {
+                let table_start = std::time::Instant::now();
                 tracing::info!("Compacting table: {}", table_name);
                 let table = self.connection.open_table(*table_name).execute().await?;
 
@@ -684,21 +688,70 @@ impl SchemaManager {
                         tracing::info!("Table {} has {} rows", table_name, count);
 
                         // Proper LanceDB cleanup sequence
+                        let mut table_success = true;
 
-                        // 1. Optimize table (compact files, optimize indices)
-                        match table.optimize(OptimizeAction::All).await {
+                        // 1. Compact files
+                        match table
+                            .optimize(OptimizeAction::Compact {
+                                options: Default::default(),
+                                remap_options: None,
+                            })
+                            .await
+                        {
                             Ok(_stats) => {
-                                tracing::info!(
-                                    "Optimized table {}: compacted files and indices",
-                                    table_name
-                                );
+                                tracing::info!("Compacted table {}", table_name);
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to optimize table {}: {}", table_name, e);
+                                tracing::warn!("Failed to compact table {}: {}", table_name, e);
+                                table_success = false;
                             }
                         }
 
-                        // 2. CRITICAL: Checkout latest version to release old handles
+                        // 2. Prune ALL old versions (not just >7 days)
+                        // Set older_than to 0 seconds and delete_unverified to true
+                        match table
+                            .optimize(OptimizeAction::Prune {
+                                older_than: Some(
+                                    lancedb::table::Duration::try_seconds(0)
+                                        .expect("valid duration"),
+                                ),
+                                delete_unverified: Some(true),
+                                error_if_tagged_old_versions: Some(false),
+                            })
+                            .await
+                        {
+                            Ok(_stats) => {
+                                tracing::info!("Pruned all old versions from table {}", table_name);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to prune old versions from table {}: {}",
+                                    table_name,
+                                    e
+                                );
+                                table_success = false;
+                            }
+                        }
+
+                        // 3. Optimize indices
+                        match table
+                            .optimize(OptimizeAction::Index(Default::default()))
+                            .await
+                        {
+                            Ok(_stats) => {
+                                tracing::info!("Optimized indices for table {}", table_name);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to optimize indices for table {}: {}",
+                                    table_name,
+                                    e
+                                );
+                                table_success = false;
+                            }
+                        }
+
+                        // 4. CRITICAL: Checkout latest version to release old handles
                         match table.checkout_latest().await {
                             Ok(_) => {
                                 tracing::info!(
@@ -715,11 +768,11 @@ impl SchemaManager {
                             }
                         }
 
-                        // 3. Force garbage collection by dropping the table handle
+                        // 5. Force garbage collection by dropping the table handle
                         // In some LanceDB versions, this helps trigger cleanup of old versions
                         std::mem::drop(table);
 
-                        // 4. Additional cleanup attempt - force a small query to trigger background cleanup
+                        // 6. Additional cleanup attempt - force a small query to trigger background cleanup
                         match self.connection.open_table(*table_name).execute().await {
                             Ok(fresh_table) => {
                                 // Perform a minimal operation to trigger potential cleanup
@@ -740,18 +793,37 @@ impl SchemaManager {
 
                         // Large tables benefit more from these operations
                         if count > 10000 {
-                            tracing::info!("Large table {} ({} rows) should see significant space savings after optimization", 
+                            tracing::info!("Large table {} ({} rows) should see significant space savings after optimization",
                                          table_name, count);
+                        }
+
+                        let _table_elapsed = table_start.elapsed();
+
+                        if table_success {
+                            tables_optimized += 1;
+                        } else {
+                            tables_failed += 1;
                         }
 
                         // Handle dropping is managed above
                     }
                     Err(e) => {
                         tracing::warn!("Failed to count rows in {}: {}", table_name, e);
+                        tables_failed += 1;
                     }
                 }
             }
         }
+
+        println!(
+            "    Optimized {} tables{}",
+            tables_optimized,
+            if tables_failed > 0 {
+                format!(", {} failed", tables_failed)
+            } else {
+                String::new()
+            }
+        );
 
         Ok(())
     }

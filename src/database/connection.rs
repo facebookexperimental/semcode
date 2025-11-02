@@ -2147,18 +2147,44 @@ impl DatabaseManager {
 
     /// Run database optimization and rebuild indices
     pub async fn optimize_database(&self) -> Result<()> {
+        use colored::Colorize;
+
+        println!(
+            "\n{}",
+            "═══ DATABASE OPTIMIZATION STARTED ═══".yellow().bold()
+        );
+        let start_time = std::time::Instant::now();
         tracing::info!("Running database optimization...");
 
         // Rebuild all scalar indices to ensure they're optimal
+        println!("{}", "  → Rebuilding scalar indices...".cyan());
         self.rebuild_indices().await?;
+        println!("{}", "  ✓ Scalar indices rebuilt".green());
 
         // Run table optimization
+        println!("{}", "  → Optimizing tables...".cyan());
         self.optimize_tables().await?;
+        println!("{}", "  ✓ Tables optimized".green());
 
         // Compact and cleanup (triggers compression)
+        println!("{}", "  → Compacting and pruning old versions...".cyan());
         self.compact_and_cleanup().await?;
+        println!("{}", "  ✓ Compaction complete".green());
 
-        tracing::info!("Database optimization complete");
+        let elapsed = start_time.elapsed();
+        println!(
+            "{}",
+            format!(
+                "═══ DATABASE OPTIMIZATION COMPLETE ({:.1}s) ═══\n",
+                elapsed.as_secs_f64()
+            )
+            .yellow()
+            .bold()
+        );
+        tracing::info!(
+            "Database optimization complete in {:.1}s",
+            elapsed.as_secs_f64()
+        );
         Ok(())
     }
 
@@ -2198,11 +2224,13 @@ impl DatabaseManager {
                     total_small_fragments += frag_stats.num_small_fragments;
 
                     // Heuristics for when optimization is needed:
-                    // 1. More than 100 fragments (LanceDB recommendation)
-                    if frag_stats.num_fragments > 100 {
+                    // 1. More than 600 fragments triggers auto-optimization
+                    //    (LanceDB recommends <100 for optimal performance, but we use 600
+                    //     to avoid over-optimizing during incremental updates)
+                    if frag_stats.num_fragments > 600 {
                         needs_optimization = true;
                         messages.push(format!(
-                            "{}: {} fragments (recommended: <100)",
+                            "{}: {} fragments (auto-optimize threshold: 600)",
                             table_name.yellow(),
                             frag_stats.num_fragments.to_string().red()
                         ));
@@ -2262,11 +2290,11 @@ impl DatabaseManager {
             total_small_fragments += content_small_fragments;
 
             // Content shards are expected to have more fragments due to sharding
-            // But still check if they're excessive
-            if content_fragments > 500 {
+            // But still check if they're excessive (16 shards × 600 = 9600, use 3000 as threshold)
+            if content_fragments > 3000 {
                 needs_optimization = true;
                 messages.push(format!(
-                    "{}: {} fragments across 16 shards",
+                    "{}: {} fragments across 16 shards (threshold: 3000)",
                     "content shards".yellow(),
                     content_fragments.to_string().red()
                 ));

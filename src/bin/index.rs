@@ -832,17 +832,13 @@ async fn run_pipeline(args: Args) -> Result<()> {
         }
     }
 
-    // Optimize database (skip in git range mode for faster incremental updates)
-    if args.git.is_none() {
-        println!("\nStarting database optimization...");
-        match measure!("database_optimization", {
-            db_manager.optimize_database().await
-        }) {
-            Ok(_) => println!("Database optimization completed successfully"),
-            Err(e) => error!("Failed to optimize database: {}", e),
-        }
-    } else {
-        println!("\nSkipping database optimization in git range indexing mode (use full scan for optimization)");
+    // Optimize database after full scan (git range mode handled in process_git_range)
+    println!("\nStarting database optimization...");
+    match measure!("database_optimization", {
+        db_manager.optimize_database().await
+    }) {
+        Ok(_) => println!("Database optimization completed successfully"),
+        Err(e) => error!("Failed to optimize database: {}", e),
     }
 
     // Drop and recreate if requested
@@ -898,6 +894,7 @@ struct GitTupleResults {
     functions: Vec<FunctionInfo>,
     types: Vec<TypeInfo>,
     macros: Vec<MacroInfo>,
+    processed_files: Vec<semcode::ProcessedFileRecord>,
     files_processed: usize,
 }
 
@@ -906,6 +903,7 @@ impl GitTupleResults {
         self.functions.extend(other.functions);
         self.types.extend(other.types);
         self.macros.extend(other.macros);
+        self.processed_files.extend(other.processed_files);
         self.files_processed += other.files_processed;
     }
 }
@@ -1093,10 +1091,18 @@ fn process_git_file_tuple_with_repo(
     // Function-type and type-type mapping extraction removed - now using embedded columns
     // Call relationships are now embedded in function/macro JSON columns
 
+    // Track this file as processed
+    let processed_file_record = semcode::ProcessedFileRecord {
+        file: tuple.file_path.to_string_lossy().to_string(),
+        git_sha: None, // Will be set by caller if available
+        git_file_sha: tuple.file_sha.clone(),
+    };
+
     let results = GitTupleResults {
         functions,
         types,
         macros: if no_macros { Vec::new() } else { macros },
+        processed_files: vec![processed_file_record],
         files_processed: 1,
     };
 
@@ -1401,6 +1407,10 @@ async fn process_git_tuples_streaming(
     // Spawn database inserter tasks (configurable via --db-threads)
     let mut inserter_handles = Vec::new();
 
+    // Shared flag to coordinate periodic optimization checks
+    // Only one inserter should check at a time to avoid redundant checks
+    let last_optimization_check = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+
     for inserter_id in 0..num_inserters {
         let db_manager_clone = Arc::clone(&db_manager);
         let result_rx_clone = shared_result_rx.clone();
@@ -1408,6 +1418,7 @@ async fn process_git_tuples_streaming(
         let types_counter = inserted_types.clone();
         let macros_counter = inserted_macros.clone();
         let batches_inserted_counter = batches_inserted.clone();
+        let optimization_check_timer = last_optimization_check.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1423,8 +1434,8 @@ async fn process_git_tuples_streaming(
                         let type_count = batch.types.len();
                         let macro_count = batch.macros.len();
 
-                        // Insert all three types in parallel
-                        let (func_result, type_result, macro_result) = tokio::join!(
+                        // Insert all four types in parallel
+                        let (func_result, type_result, macro_result, processed_files_result) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -1442,6 +1453,15 @@ async fn process_git_tuples_streaming(
                             async {
                                 if !batch.macros.is_empty() {
                                     db_manager_clone.insert_macros(batch.macros).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.processed_files.is_empty() {
+                                    db_manager_clone
+                                        .mark_files_processed(batch.processed_files)
+                                        .await
                                 } else {
                                     Ok(())
                                 }
@@ -1468,10 +1488,75 @@ async fn process_git_tuples_streaming(
                         } else {
                             macros_counter.fetch_add(macro_count, Ordering::Relaxed);
                         }
+                        if let Err(e) = processed_files_result {
+                            error!(
+                                "Inserter {} failed to insert processed_files: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+                        // Note: not tracking processed_files_count in a counter since it's not displayed
 
                         // Only increment batches_inserted if insertion was successful
                         if insertion_successful {
-                            batches_inserted_counter.fetch_add(1, Ordering::Relaxed);
+                            let total_batches =
+                                batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                            // Periodic optimization check (only inserter 0, every 300 batches total, at most once per 15 minutes)
+                            // Don't check until we've done at least 300 batches (skip the very first check)
+                            if inserter_id == 0 && total_batches > 300 && total_batches % 300 == 0 {
+                                // Check if we should run optimization (must drop lock before await)
+                                let should_optimize = {
+                                    // Try to acquire lock without blocking - if another thread is checking, skip
+                                    if let Ok(last_check) = optimization_check_timer.try_lock() {
+                                        let elapsed = last_check.elapsed();
+                                        // Only check if it's been at least 15 minutes since last check
+                                        elapsed.as_secs() >= 900
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                if should_optimize {
+                                    // Quick health check (lock is dropped, safe to await)
+                                    match db_manager_clone.check_optimization_health().await {
+                                        Ok((needs_optimization, message)) => {
+                                            if needs_optimization {
+                                                println!("{}", message);
+                                                println!(
+                                                    "\n{} Fragment threshold exceeded during indexing, running optimization...",
+                                                    "⚠️".yellow()
+                                                );
+                                                match db_manager_clone.optimize_database().await {
+                                                    Ok(_) => {
+                                                        println!(
+                                                            "{} In-progress optimization completed",
+                                                            "✓".green()
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "In-progress optimization failed: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to check database health: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+
+                                    // Update last check time
+                                    if let Ok(mut last_check) = optimization_check_timer.lock() {
+                                        *last_check = std::time::Instant::now();
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(_) => break, // Channel closed, exit task
@@ -1900,6 +1985,32 @@ async fn process_git_range(
     println!("Types indexed: {}", stats.types_count);
     if !args.no_macros {
         println!("Macros indexed: {}", stats.macros_count);
+    }
+
+    // Check if optimization is needed after git range indexing
+    println!("\nChecking database health after incremental update...");
+    match db_manager.check_optimization_health().await {
+        Ok((needs_optimization, message)) => {
+            if needs_optimization {
+                println!("{}", message);
+                println!(
+                    "{}",
+                    "Auto-optimization triggered due to high fragment count".yellow()
+                );
+                println!("\nStarting database optimization...");
+                match measure!("database_optimization", {
+                    db_manager.optimize_database().await
+                }) {
+                    Ok(_) => println!("Database optimization completed successfully"),
+                    Err(e) => error!("Failed to optimize database: {}", e),
+                }
+            } else {
+                println!("{}", "✓ Database is healthy, skipping optimization".green());
+            }
+        }
+        Err(e) => {
+            error!("Failed to check database health: {}", e);
+        }
     }
 
     Ok(())
