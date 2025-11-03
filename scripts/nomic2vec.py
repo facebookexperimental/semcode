@@ -188,7 +188,7 @@ def main():
             str(model_dir),
             local_files_only=True,
             trust_remote_code=True,  # Required for nomic models
-            cache_dir=str(Path.home() / ".cache" / "huggingface")  # Explicit cache dir
+            cache_dir=str(Path.home() / ".cache" / "huggingface" / "hub")  # Explicit cache dir
         )
         model.to(args.device)
         model.eval()

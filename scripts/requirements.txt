@@ -11,3 +11,7 @@ tqdm>=4.60.0
 model2vec>=0.1.0
 sentence-transformers>=2.2.0
 sentencepiece>=0.1.97
+einops>=0.8.1
+huggingface_hub
+datasets
+wheel
