@@ -894,24 +894,20 @@ pub async fn handle_command(
             use semcode::diffdump::diffinfo;
             diffinfo(input_file.as_deref()).await?;
         }
-        "check_health" | "health" | "check_db" => {
-            println!("{}", "Checking database health...".yellow());
-            match db.check_optimization_health().await {
-                Ok((needs_optimization, message)) => {
-                    println!("{}", message);
-                    if needs_optimization {
-                        println!(
-                            "{}",
-                            "Note: Optimization is recommended but not required for normal operation."
-                                .bright_black()
-                        );
-                    }
-                }
-                Err(e) => {
-                    println!("{} Failed to check database health: {}", "Error:".red(), e);
+        "check_health" | "health" | "check_db" => match db.check_optimization_health().await {
+            Ok((needs_optimization, message)) => {
+                println!("{}", message);
+                if needs_optimization {
+                    println!(
+                        "{}",
+                        "Run 'optimize_db' to optimize the database.".bright_black()
+                    );
                 }
             }
-        }
+            Err(e) => {
+                println!("{} Failed to check database health: {}", "Error:".red(), e);
+            }
+        },
         "optimize_db" | "optimize" | "opt" => {
             println!(
                 "{}",

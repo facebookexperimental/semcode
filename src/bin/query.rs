@@ -5,10 +5,13 @@ use anyhow::Result;
 use clap::Parser;
 use rustyline::DefaultEditor;
 use semcode::{process_database_path, DatabaseManager};
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
 use query_impl::commands::handle_command;
 use semcode::display::print_welcome_message_with_model;
+use semcode::pipeline::PipelineBuilder;
 
 #[derive(Parser, Debug)]
 #[command(name = "semcode")]
@@ -25,6 +28,83 @@ struct Args {
     /// Path to local model directory (for semantic search)
     #[arg(long, value_name = "PATH")]
     model_path: Option<String>,
+}
+
+/// Check if the current commit needs indexing and perform incremental indexing if needed
+async fn index_current_commit_if_needed(
+    db_manager: Arc<DatabaseManager>,
+    git_repo: &str,
+) -> Result<()> {
+    // Get current git SHA
+    let git_sha = match semcode::git::get_git_sha(git_repo)? {
+        Some(sha) => sha,
+        None => {
+            info!("Not in a git repository, skipping auto-indexing");
+            return Ok(());
+        }
+    };
+
+    info!("Current commit: {}", git_sha);
+
+    let repo_path = PathBuf::from(git_repo);
+
+    // Quick check: if a file changed in the current commit is already indexed with
+    // its current SHA, we can skip indexing entirely (nothing new to process)
+    // Compare HEAD with HEAD~1 (parent) to find changed files
+    match semcode::git::get_changed_files(&repo_path, "HEAD~1", "HEAD") {
+        Ok(changed_files) => {
+            if !changed_files.is_empty() {
+                // Find first C/C++ file that was changed (added or modified)
+                let extensions = vec!["c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx"];
+                if let Some(changed_file) = changed_files.iter().find(|cf| {
+                    matches!(
+                        cf.change_type,
+                        semcode::git::ChangeType::Added | semcode::git::ChangeType::Modified
+                    ) && cf.new_file_hash.is_some()
+                        && extensions.iter().any(|ext| cf.path.ends_with(ext))
+                }) {
+                    if let Some(new_hash) = &changed_file.new_file_hash {
+                        // Get already processed files from database
+                        let processed_pairs = db_manager.get_processed_file_pairs().await?;
+
+                        // Check if this changed file with its new SHA is already in database
+                        if processed_pairs.contains(&(changed_file.path.clone(), new_hash.clone()))
+                        {
+                            info!(
+                                "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
+                                changed_file.path,
+                                &new_hash[..8]
+                            );
+                            return Ok(());
+                        } else {
+                            info!(
+                                "Changed file '{}' (SHA: {}) needs indexing",
+                                changed_file.path,
+                                &new_hash[..8]
+                            );
+                        }
+                    }
+                }
+            } else {
+                // No changes in this commit (might be initial commit or root commit)
+                info!("No changed files found in current commit, will check all files");
+            }
+        }
+        Err(e) => {
+            // Failed to get changed files (might be initial commit, root commit, etc.)
+            info!("Could not get changed files ({}), will check all files", e);
+        }
+    }
+
+    // Run pipeline to index new/modified files
+    // The pipeline will handle all filtering and deduplication internally
+    println!("Checking for files to index...");
+    let pipeline = PipelineBuilder::new(db_manager.clone(), repo_path.clone());
+    pipeline.build_and_run(vec![]).await?;
+
+    println!("Indexing complete");
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -45,7 +125,15 @@ async fn main() -> Result<()> {
     info!("Connecting to database: {}", database_path);
 
     // Connect to database
-    let db_manager = DatabaseManager::new(&database_path, args.git_repo.clone()).await?;
+    let db_manager = Arc::new(DatabaseManager::new(&database_path, args.git_repo.clone()).await?);
+
+    // Ensure tables exist
+    db_manager.create_tables().await?;
+
+    // Perform incremental indexing if needed
+    if let Err(e) = index_current_commit_if_needed(db_manager.clone(), &args.git_repo).await {
+        eprintln!("Warning: Auto-indexing failed: {}", e);
+    }
 
     // Show available tables
     let tables = db_manager.list_tables().await?;

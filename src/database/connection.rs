@@ -2303,10 +2303,7 @@ impl DatabaseManager {
 
         // Build summary message
         let summary = if needs_optimization {
-            let mut msg = format!(
-                "{}\n\nDatabase health check detected issues:\n",
-                "⚠️  Optimization recommended".yellow().bold()
-            );
+            let mut msg = format!("{}\n", "Optimizing database...".yellow());
             for message in &messages {
                 msg.push_str(&format!("  • {}\n", message));
             }
@@ -2314,15 +2311,6 @@ impl DatabaseManager {
                 "\nTotal: {} fragments ({} small)\n",
                 total_fragments.to_string().yellow(),
                 total_small_fragments.to_string().yellow()
-            ));
-            msg.push_str(&format!(
-                "\n{} Run '{}' to optimize the database.\n",
-                "Recommendation:".cyan().bold(),
-                "optimize_db".yellow()
-            ));
-            msg.push_str(&format!(
-                "{} This will compact fragments, prune old versions, and update indices.\n",
-                "           ".cyan()
             ));
             msg
         } else {

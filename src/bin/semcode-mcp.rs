@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use anstream::stdout;
 use anyhow::Result;
 use clap::Parser;
-use semcode::{git, pages::PageCache, process_database_path, DatabaseManager};
+use semcode::{
+    git, pages::PageCache, pipeline::PipelineBuilder, process_database_path, DatabaseManager,
+};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Truncate output at 3,000 lines with a warning message
@@ -1679,7 +1681,7 @@ struct Args {
 }
 
 struct McpServer {
-    db: DatabaseManager,
+    db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
     model_path: Option<String>,
     page_cache: PageCache,
@@ -1691,7 +1693,7 @@ impl McpServer {
         git_repo_path: &str,
         model_path: Option<String>,
     ) -> Result<Self> {
-        let db = DatabaseManager::new(database_path, git_repo_path.to_string()).await?;
+        let db = Arc::new(DatabaseManager::new(database_path, git_repo_path.to_string()).await?);
 
         // Get the default git SHA (current HEAD)
         let default_git_sha = match git::get_git_sha(git_repo_path) {
@@ -3407,16 +3409,180 @@ async fn mcp_vcommit_similar_commits(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+/// Background task to index the current commit if needed (non-blocking)
+async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_repo: String) {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+
+    eprintln!("[DEBUG] Background task actually started!");
+
+    // Open log file in append mode
+    let mut log_file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/wtgdf")
+    {
+        Ok(f) => {
+            eprintln!("[DEBUG] Successfully opened /tmp/wtgdf");
+            f
+        }
+        Err(e) => {
+            eprintln!("[Background] Failed to open log file /tmp/wtgdf: {}", e);
+            return;
+        }
+    };
+
+    let mut log = |msg: &str| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let _ = writeln!(log_file, "[{}] {}", timestamp, msg);
+        let _ = log_file.flush();
+    };
+
+    log("Background indexing task started");
+    eprintln!("[DEBUG] Wrote first log message");
+
+    // Get current git SHA
+    let _git_sha = match semcode::git::get_git_sha(&git_repo) {
+        Ok(Some(sha)) => {
+            log(&format!("Current commit: {}", sha));
+            sha
+        }
+        Ok(None) => {
+            log("Not in a git repository, skipping auto-indexing");
+            return;
+        }
+        Err(e) => {
+            log(&format!("Warning: Failed to get git SHA: {}", e));
+            return;
+        }
+    };
+
+    let repo_path = PathBuf::from(&git_repo);
+
+    // Quick check: if a file changed in the current commit is already indexed with
+    // its current SHA, we can skip indexing entirely (nothing new to process)
+    // Compare HEAD with HEAD~1 (parent) to find changed files
+    match semcode::git::get_changed_files(&repo_path, "HEAD~1", "HEAD") {
+        Ok(changed_files) => {
+            if !changed_files.is_empty() {
+                // Find first C/C++ file that was changed (added or modified)
+                let extensions = vec!["c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx"];
+                if let Some(changed_file) = changed_files.iter().find(|cf| {
+                    matches!(
+                        cf.change_type,
+                        semcode::git::ChangeType::Added | semcode::git::ChangeType::Modified
+                    ) && cf.new_file_hash.is_some()
+                        && extensions.iter().any(|ext| cf.path.ends_with(ext))
+                }) {
+                    if let Some(new_hash) = &changed_file.new_file_hash {
+                        // Get already processed files from database
+                        match db_manager.get_processed_file_pairs().await {
+                            Ok(processed_pairs) => {
+                                // Check if this changed file with its new SHA is already in database
+                                if processed_pairs
+                                    .contains(&(changed_file.path.clone(), new_hash.clone()))
+                                {
+                                    log(&format!(
+                                        "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
+                                        changed_file.path,
+                                        &new_hash[..8]
+                                    ));
+                                    return;
+                                } else {
+                                    log(&format!(
+                                        "Changed file '{}' (SHA: {}) needs indexing",
+                                        changed_file.path,
+                                        &new_hash[..8]
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                log(&format!("Warning: Failed to get processed files: {}", e));
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No changes in this commit (might be initial commit or root commit)
+                log("No changed files found in current commit, will check all files");
+            }
+        }
+        Err(e) => {
+            // Failed to get changed files (might be initial commit, root commit, etc.)
+            log(&format!(
+                "Could not get changed files ({}), will check all files",
+                e
+            ));
+        }
+    }
+
+    // Run pipeline to index new/modified files
+    // The pipeline will handle all filtering and deduplication internally
+    log("Checking for files to index...");
+    let pipeline = PipelineBuilder::new(db_manager.clone(), repo_path.clone());
+    match pipeline.build_and_run(vec![]).await {
+        Ok(()) => {
+            log("Indexing complete");
+
+            // Check if database needs optimization
+            match db_manager.check_optimization_health().await {
+                Ok((needs_optimization, diagnostic_msg)) => {
+                    if needs_optimization {
+                        log("Database needs optimization");
+                        log(&format!("Diagnostic: {}", diagnostic_msg));
+                        log("Running optimization...");
+                        match db_manager.optimize_tables().await {
+                            Ok(()) => {
+                                log("Database optimization complete");
+                            }
+                            Err(e) => {
+                                log(&format!("Warning: Database optimization failed: {}", e));
+                            }
+                        }
+                    } else {
+                        log("Database is healthy, skipping optimization");
+                    }
+                }
+                Err(e) => {
+                    log(&format!(
+                        "Warning: Failed to check optimization health: {}",
+                        e
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            log(&format!("Warning: Indexing failed: {}", e));
+        }
+    }
+}
+
 async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
     eprintln!("MCP server ready on stdin/stdout");
 
-    // Handle MCP protocol over stdin/stdout
-    let stdin = io::stdin();
-    let mut stdout = stdout();
+    // Handle MCP protocol over stdin/stdout using tokio's async I/O
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(line) => {
+    let stdin = tokio::io::stdin();
+    let mut stdin = BufReader::new(stdin);
+    let mut stdout = tokio::io::stdout();
+
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+
+        match stdin.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF
+                eprintln!("Reached EOF on stdin");
+                break;
+            }
+            Ok(_) => {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -3425,11 +3591,15 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                     Ok(request) => {
                         let response = server.handle_request(request).await;
                         if let Ok(response_str) = serde_json::to_string(&response) {
-                            if let Err(e) = writeln!(stdout, "{response_str}") {
+                            if let Err(e) = stdout.write_all(response_str.as_bytes()).await {
                                 eprintln!("Failed to write response: {e}");
                                 break;
                             }
-                            if let Err(e) = stdout.flush() {
+                            if let Err(e) = stdout.write_all(b"\n").await {
+                                eprintln!("Failed to write newline: {e}");
+                                break;
+                            }
+                            if let Err(e) = stdout.flush().await {
                                 eprintln!("Failed to flush stdout: {e}");
                                 break;
                             }
@@ -3446,8 +3616,9 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                             }
                         });
                         if let Ok(response_str) = serde_json::to_string(&error_response) {
-                            let _ = writeln!(stdout, "{response_str}");
-                            let _ = stdout.flush();
+                            let _ = stdout.write_all(response_str.as_bytes()).await;
+                            let _ = stdout.write_all(b"\n").await;
+                            let _ = stdout.flush().await;
                         }
                     }
                 }
@@ -3488,6 +3659,24 @@ async fn main() -> Result<()> {
 
     // Create MCP server
     let server = Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path).await?);
+
+    // Ensure tables exist
+    server.db.create_tables().await?;
+
+    // Spawn background task to index current commit if needed
+    eprintln!("[DEBUG] About to spawn background indexing task");
+    let db_for_indexing = server.db.clone();
+    let git_repo_for_indexing = args.git_repo.clone();
+    let _indexing_handle = tokio::spawn(async move {
+        eprintln!("[DEBUG] Inside spawned task closure");
+        index_current_commit_background(db_for_indexing, git_repo_for_indexing).await;
+        eprintln!("[DEBUG] Background indexing function returned");
+    });
+    eprintln!("[DEBUG] Task spawned, handle created");
+
+    // Give the background task a chance to start before entering the blocking loop
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    eprintln!("[DEBUG] Yielded to background task");
 
     // Run MCP server on stdio
     run_stdio_server(server).await?;

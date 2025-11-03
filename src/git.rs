@@ -49,6 +49,11 @@ pub fn clear_git_cache() {
     GIT_MANIFEST.clear();
 }
 
+/// Get reference to the git manifest (for reading)
+pub fn get_git_manifest() -> &'static DashMap<PathBuf, String> {
+    &GIT_MANIFEST
+}
+
 /// Pre-compute all git file hashes for the current commit to avoid lock contention
 pub fn build_git_manifest<P: AsRef<Path>>(repo_path: P) -> Result<()> {
     let repo_path = repo_path.as_ref();

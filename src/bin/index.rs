@@ -22,10 +22,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use tracing::{error, info, warn};
-use walkdir::WalkDir;
-
-// Import pipeline
-use semcode::pipeline::PipelineBuilder;
 
 #[derive(Parser, Debug)]
 #[command(name = "semcode-index")]
@@ -580,157 +576,58 @@ async fn run_pipeline(args: Args) -> Result<()> {
 
     // Skip source indexing if we're only doing vectorization
     if !args.vectors {
-        // Determine which files to process based on incremental mode
-        let mut files_to_process = Vec::new();
-        let git_files_map: Option<std::collections::HashMap<PathBuf, GitFileEntry>> = None;
         let extensions: Vec<String> = args
             .extensions
             .iter()
             .map(|ext| ext.trim_start_matches('.').to_string())
             .collect();
 
-        if let Some(ref git_range) = args.git {
-            // Git range indexing mode - only ranges with ".." are supported
-            if !git_range.contains("..") {
+        // Determine git range to process
+        let git_range = if let Some(ref explicit_range) = args.git {
+            // Explicit --git flag provided
+            if !explicit_range.contains("..") {
                 return Err(anyhow::anyhow!(
                     "Git indexing requires a range format (e.g., 'HEAD~10..HEAD'). Single commit mode has been removed. Got: '{}'",
-                    git_range
+                    explicit_range
                 ));
             }
-
-            info!("Running git range indexing for: {}", git_range);
-            return process_git_range(&args, db_manager.clone(), git_range, &extensions).await;
+            explicit_range.clone()
         } else {
-            // Full scan mode - find all files to process
-            for entry in WalkDir::new(&args.source)
-                .max_depth(args.max_depth)
-                .follow_links(false) // Explicitly disable symlink following to prevent infinite loops
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-            {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if extensions.contains(&ext.to_string_lossy().to_string()) {
-                        files_to_process.push(path.to_path_buf());
-                    }
-                }
-            }
-
-            info!("Found {} files to process", files_to_process.len());
-
-            // Extract and store git commit metadata for current commit
-            info!("Extracting git commit metadata for current commit");
+            // No --git flag: detect current HEAD commit and process it
+            // This is the new default behavior for semcode-index -s .
             match gix::discover(&args.source) {
                 Ok(repo) => {
-                    // Get current HEAD commit
                     match repo.head_commit() {
                         Ok(commit) => {
                             let commit_sha = commit.id().to_string();
-                            info!("Current commit: {}", commit_sha);
-
-                            match extract_commit_metadata(&repo, &commit_sha) {
-                                Ok(metadata) => {
-                                    info!("Inserting commit metadata for {}", commit_sha);
-                                    if let Err(e) =
-                                        db_manager.insert_git_commits(vec![metadata]).await
-                                    {
-                                        warn!("Failed to insert commit metadata: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Failed to extract commit metadata: {}", e);
-                                }
-                            }
+                            info!(
+                                "No --git flag provided, indexing current HEAD commit: {}",
+                                commit_sha
+                            );
+                            // Create a range that includes just the current commit
+                            // Format: HEAD^..HEAD (parent to current)
+                            format!("{}^..{}", commit_sha, commit_sha)
                         }
                         Err(e) => {
-                            warn!("Failed to get HEAD commit: {}", e);
+                            return Err(anyhow::anyhow!(
+                                "Not in a git repository or HEAD is unborn (no commits yet): {}. Use --git flag to specify a commit range.",
+                                e
+                            ));
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "Not in a git repository ({}), skipping commit metadata extraction",
+                    return Err(anyhow::anyhow!(
+                        "Not in a git repository: {}. semcode-index requires a git repository. Initialize one with 'git init' first.",
                         e
-                    );
+                    ));
                 }
             }
-        }
-
-        // Build and run pipeline (TreeSitter-only now)
-        let pipeline = if args.git.is_some() {
-            // Git range mode: use git-specific pipeline with temp tables
-            PipelineBuilder::new_for_git_commit(
-                db_manager.clone(),
-                args.source.clone(),
-                args.git.as_ref().unwrap().clone(),
-            )
-        } else {
-            PipelineBuilder::new(db_manager.clone(), args.source.clone())
         };
-        let processed = pipeline.processed_files.clone();
-        let new_functions = pipeline.new_functions.clone();
-        let new_types = pipeline.new_types.clone();
-        let new_macros = pipeline.new_macros.clone();
 
-        // Note: Progress bar will be managed by the pipeline itself since it knows
-        // the actual number of files that need processing after filtering
-
-        // Run the pipeline
-        let cleanup_git_files = git_files_map.clone();
-        println!(
-            "About to start pipeline processing with {} files...",
-            files_to_process.len()
-        );
-
-        measure!("pipeline_processing", {
-            if args.git.is_some() {
-                // Git range mode: use git-specific pipeline with git files mapping
-                pipeline
-                    .build_and_run_with_git_files(files_to_process, git_files_map)
-                    .await
-            } else {
-                // Standard pipeline with direct file paths
-                pipeline.build_and_run(files_to_process).await
-            }
-        })?;
-        println!("Pipeline processing completed successfully");
-
-        // Explicit cleanup of git temp files after pipeline processing
-        if let Some(git_files) = cleanup_git_files {
-            let temp_file_count = git_files.len();
-            println!("Cleaning up {temp_file_count} temporary git files...");
-            for (_, git_file) in git_files {
-                if let Err(e) = git_file.cleanup() {
-                    tracing::warn!(
-                        "Failed to cleanup temp file {}: {}",
-                        git_file.temp_file_path.display(),
-                        e
-                    );
-                }
-            }
-            println!("Cleanup completed for {temp_file_count} temporary git files");
-        }
-
-        // Progress is managed by the pipeline itself
-
-        // Display stats
-        let total_processed = processed.load(Ordering::Relaxed);
-        let total_functions = new_functions.load(Ordering::Relaxed);
-        let total_types = new_types.load(Ordering::Relaxed);
-        let total_macros = new_macros.load(Ordering::Relaxed);
-
-        if args.git.is_some() {
-            println!("\n=== Git Commit Pipeline Processing Complete ===");
-        } else {
-            println!("\n=== Pipeline Processing Complete ===");
-        }
-        println!("Files processed: {total_processed}");
-        println!("Functions indexed: {total_functions}");
-        println!("Types indexed: {total_types}");
-        if !args.no_macros {
-            println!("Macros indexed: {total_macros}");
-        }
+        // Use git range processing for all modes (both explicit --git and auto-detected HEAD)
+        info!("Running git commit-based indexing for: {}", git_range);
+        process_git_range(&args, db_manager.clone(), &git_range, &extensions).await?;
     } else {
         println!("Skipping source indexing - vectorization only mode");
     }
@@ -832,14 +729,7 @@ async fn run_pipeline(args: Args) -> Result<()> {
         }
     }
 
-    // Optimize database after full scan (git range mode handled in process_git_range)
-    println!("\nStarting database optimization...");
-    match measure!("database_optimization", {
-        db_manager.optimize_database().await
-    }) {
-        Ok(_) => println!("Database optimization completed successfully"),
-        Err(e) => error!("Failed to optimize database: {}", e),
-    }
+    // Optimization is now handled inside process_git_range for all modes
 
     // Drop and recreate if requested
     if args.drop_recreate {
@@ -1988,16 +1878,10 @@ async fn process_git_range(
     }
 
     // Check if optimization is needed after git range indexing
-    println!("\nChecking database health after incremental update...");
     match db_manager.check_optimization_health().await {
         Ok((needs_optimization, message)) => {
             if needs_optimization {
-                println!("{}", message);
-                println!(
-                    "{}",
-                    "Auto-optimization triggered due to high fragment count".yellow()
-                );
-                println!("\nStarting database optimization...");
+                println!("\n{}", message);
                 match measure!("database_optimization", {
                     db_manager.optimize_database().await
                 }) {
@@ -2005,7 +1889,7 @@ async fn process_git_range(
                     Err(e) => error!("Failed to optimize database: {}", e),
                 }
             } else {
-                println!("{}", "✓ Database is healthy, skipping optimization".green());
+                println!("\n{}", message);
             }
         }
         Err(e) => {

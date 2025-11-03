@@ -296,6 +296,22 @@ impl SchemaManager {
     pub async fn create_scalar_indices(&self) -> Result<()> {
         let table_names = self.connection.table_names().execute().await?;
 
+        // Check if database already has data (skip index creation if it does - likely already indexed)
+        // This significantly speeds up startup time from 12+ seconds to milliseconds
+        if let Ok(table) = self.connection.open_table("functions").execute().await {
+            if let Ok(count) = table.count_rows(None).await {
+                if count > 100 {
+                    tracing::debug!(
+                        "Skipping index creation - functions table has {} rows (likely already indexed)",
+                        count
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        tracing::info!("Creating database indices (first time or small database)...");
+
         // Create indices for functions table
         if table_names.iter().any(|n| n == "functions") {
             let table = self.connection.open_table("functions").execute().await?;

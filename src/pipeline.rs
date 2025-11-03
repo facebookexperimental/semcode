@@ -56,11 +56,11 @@
 // - **Threading**: Single thread (lightweight batching logic)
 // - **Channel**: `processed_tx` -> `processed_rx` (bounded: 100)
 // - **Batching Logic**:
-//   - Adaptive batch sizing (2000-8000 items, adjusts based on processing speed)
+//   - Fixed batch sizing (2048 items, same as git range mode for consistency)
 //   - Time-based flushing (every 2 seconds maximum)
 //   - No deduplication needed (git SHA pre-filtering ensures uniqueness)
 //   - Creates ProcessedFileRecord entries for database tracking
-// - **Performance Tuning**: Batch size adapts to maintain optimal throughput
+// - **Performance Tuning**: Fixed batch size provides consistent performance across all tools
 //
 // ### Stage 4: Database Insertion
 // - **Purpose**: Asynchronously insert batched data into LanceDB
@@ -111,7 +111,7 @@
 //    columns (file_path, git_file_sha) for memory-efficient filtering
 // 3. **Thread-local Parsers**: Each parsing thread reuses its TreeSitter analyzer
 //    instance to avoid repeated initialization overhead
-// 4. **Adaptive Batching**: Batch processor adjusts batch sizes based on database
+// 4. **Fixed Batching**: Batch processor uses fixed 2048 batch size for consistency
 //    insertion speed to maintain optimal throughput
 // 5. **Parallel Database Operations**: Uses tokio::join! to insert different data
 //    types concurrently, maximizing database throughput
@@ -141,7 +141,7 @@
 // - **Pre-filtering**: Files skipped vs. files requiring processing
 // - **Progress tracking**: Files/second rates for each stage with periodic updates
 // - **Performance warnings**: Operations taking >1s (parsing, database batches)
-// - **Adaptive tuning**: Batch size adjustments logged for optimization visibility
+// - **Fixed batch size**: Uses 2048 items per batch (same as git range mode)
 // - **Completion statistics**: Final timing summaries and throughput metrics
 // - **Thread monitoring**: Per-thread completion statistics and performance rates
 //
@@ -568,7 +568,7 @@ impl PipelineBuilder {
                         processed_files: Vec::new(),
                     };
 
-                    let mut batch_size = 2000;
+                    const DB_BATCH_SIZE: usize = 2048; // Fixed batch size matching git range mode
                     let mut last_batch_time = Instant::now();
 
                     loop {
@@ -615,21 +615,12 @@ impl PipelineBuilder {
                                     || !batch.macros.is_empty();
 
                                 let should_send = batch_has_content
-                                    && (batch.functions.len() >= batch_size
-                                        || batch.types.len() >= batch_size
+                                    && (batch.functions.len() >= DB_BATCH_SIZE
+                                        || batch.types.len() >= DB_BATCH_SIZE
                                         || last_batch_time.elapsed() > Duration::from_secs(2));
 
                                 if should_send {
-                                    // Adaptive batch sizing
-                                    let batch_time = last_batch_time.elapsed();
-                                    if batch_time < Duration::from_millis(300) && batch_size < 8000
-                                    {
-                                        batch_size = (batch_size * 2).min(8000);
-                                    } else if batch_time > Duration::from_secs(3)
-                                        && batch_size > 500
-                                    {
-                                        batch_size = (batch_size * 3 / 4).max(500);
-                                    }
+                                    // Fixed batch size for consistency across all indexing modes
 
                                     let batch_to_send = std::mem::replace(
                                         &mut batch,
