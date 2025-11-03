@@ -3,8 +3,8 @@
 use crate::git::walk_tree_at_commit_with_repo;
 use crate::indexer::{list_shas_in_range, process_commits_pipeline};
 use crate::{
-    DatabaseManager, FunctionInfo, GitFileEntry, GitFileManifestEntry, MacroInfo,
-    ProcessedFileRecord, TreeSitterAnalyzer, TypeInfo,
+    DatabaseManager, FunctionInfo, GitFileEntry, GitFileManifestEntry, ProcessedFileRecord,
+    TreeSitterAnalyzer, TypeInfo,
 };
 use anyhow::Result;
 use colored::Colorize;
@@ -30,7 +30,6 @@ struct GitFileTuple {
 struct GitTupleResults {
     functions: Vec<FunctionInfo>,
     types: Vec<TypeInfo>,
-    macros: Vec<MacroInfo>,
     processed_files: Vec<ProcessedFileRecord>,
     files_processed: usize,
 }
@@ -39,7 +38,6 @@ impl GitTupleResults {
     fn merge(&mut self, other: GitTupleResults) {
         self.functions.extend(other.functions);
         self.types.extend(other.types);
-        self.macros.extend(other.macros);
         self.processed_files.extend(other.processed_files);
         self.files_processed += other.files_processed;
     }
@@ -51,7 +49,6 @@ struct GitTupleStats {
     files_processed: usize,
     functions_count: usize,
     types_count: usize,
-    macros_count: usize,
 }
 
 /// Get manifest of files from a specific git commit with a reused repository reference
@@ -223,7 +220,12 @@ fn process_git_file_tuple_with_repo(
     }
 
     // Check analysis results
-    let (functions, types, macros) = analysis_result?;
+    let (mut functions, types, macros) = analysis_result?;
+
+    // Macros are now stored as functions - combine them
+    if !no_macros {
+        functions.extend(macros);
+    }
 
     // Function-type and type-type mapping extraction removed - now using embedded columns
     // Call relationships are now embedded in function/macro JSON columns
@@ -238,7 +240,6 @@ fn process_git_file_tuple_with_repo(
     let results = GitTupleResults {
         functions,
         types,
-        macros: if no_macros { Vec::new() } else { macros },
         processed_files: vec![processed_file_record],
         files_processed: 1,
     };
@@ -389,7 +390,6 @@ async fn process_git_tuples_streaming(
             files_processed: 0,
             functions_count: 0,
             types_count: 0,
-            macros_count: 0,
         });
     }
 
@@ -440,7 +440,6 @@ async fn process_git_tuples_streaming(
     let processed_count = Arc::new(AtomicUsize::new(0));
     let inserted_functions = Arc::new(AtomicUsize::new(0));
     let inserted_types = Arc::new(AtomicUsize::new(0));
-    let inserted_macros = Arc::new(AtomicUsize::new(0));
     let batches_sent = Arc::new(AtomicUsize::new(0));
     let batches_inserted = Arc::new(AtomicUsize::new(0));
 
@@ -452,7 +451,6 @@ async fn process_git_tuples_streaming(
     let processed_clone = processed_count.clone();
     let functions_clone = inserted_functions.clone();
     let types_clone = inserted_types.clone();
-    let macros_clone = inserted_macros.clone();
     let batches_sent_clone = batches_sent.clone();
     let batches_inserted_clone = batches_inserted.clone();
     let progress_thread = std::thread::spawn(move || {
@@ -460,15 +458,14 @@ async fn process_git_tuples_streaming(
             let files = processed_clone.load(Ordering::Relaxed);
             let funcs = functions_clone.load(Ordering::Relaxed);
             let types = types_clone.load(Ordering::Relaxed);
-            let macros = macros_clone.load(Ordering::Relaxed);
             let sent = batches_sent_clone.load(Ordering::Relaxed);
             let inserted = batches_inserted_clone.load(Ordering::Relaxed);
             let pending = sent.saturating_sub(inserted);
 
             pb_clone.set_position(files as u64);
             pb_clone.set_message(format!(
-                "{} funcs, {} types, {} macros | {} batches pending",
-                funcs, types, macros, pending
+                "{} funcs, {} types | {} batches pending",
+                funcs, types, pending
             ));
 
             // Check if we should exit
@@ -553,7 +550,6 @@ async fn process_git_tuples_streaming(
         let result_rx_clone = shared_result_rx.clone();
         let functions_counter = inserted_functions.clone();
         let types_counter = inserted_types.clone();
-        let macros_counter = inserted_macros.clone();
         let batches_inserted_counter = batches_inserted.clone();
         let optimization_check_timer = last_optimization_check.clone();
 
@@ -569,10 +565,9 @@ async fn process_git_tuples_streaming(
                     Ok(batch) => {
                         let func_count = batch.functions.len();
                         let type_count = batch.types.len();
-                        let macro_count = batch.macros.len();
 
-                        // Insert all four types in parallel
-                        let (func_result, type_result, macro_result, processed_files_result) = tokio::join!(
+                        // Insert all three types in parallel
+                        let (func_result, type_result, processed_files_result) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -583,13 +578,6 @@ async fn process_git_tuples_streaming(
                             async {
                                 if !batch.types.is_empty() {
                                     db_manager_clone.insert_types(batch.types).await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.macros.is_empty() {
-                                    db_manager_clone.insert_macros(batch.macros).await
                                 } else {
                                     Ok(())
                                 }
@@ -618,12 +606,6 @@ async fn process_git_tuples_streaming(
                             insertion_successful = false;
                         } else {
                             types_counter.fetch_add(type_count, Ordering::Relaxed);
-                        }
-                        if let Err(e) = macro_result {
-                            error!("Inserter {} failed to insert macros: {}", inserter_id, e);
-                            insertion_successful = false;
-                        } else {
-                            macros_counter.fetch_add(macro_count, Ordering::Relaxed);
                         }
                         if let Err(e) = processed_files_result {
                             error!(
@@ -730,13 +712,12 @@ async fn process_git_tuples_streaming(
         files_processed: processed_count.load(Ordering::Relaxed),
         functions_count: inserted_functions.load(Ordering::Relaxed),
         types_count: inserted_types.load(Ordering::Relaxed),
-        macros_count: inserted_macros.load(Ordering::Relaxed),
     };
 
     // Finish progress bar
     pb.finish_with_message(format!(
-        "Complete: {} files, {} functions, {} types, {} macros",
-        stats.files_processed, stats.functions_count, stats.types_count, stats.macros_count
+        "Complete: {} files, {} functions, {} types",
+        stats.files_processed, stats.functions_count, stats.types_count
     ));
     progress_thread.join().unwrap();
 
@@ -869,12 +850,11 @@ pub async fn process_git_range(
     let processing_time = processing_start.elapsed();
 
     info!(
-        "Streaming pipeline completed in {:.1}s: {} files, {} functions, {} types, {} macros (inserted throughout processing)",
+        "Streaming pipeline completed in {:.1}s: {} files, {} functions, {} types (inserted throughout processing)",
         processing_time.as_secs_f64(),
         stats.files_processed,
         stats.functions_count,
-        stats.types_count,
-        stats.macros_count
+        stats.types_count
     );
 
     // Database insertion happened throughout processing via streaming inserters
@@ -888,9 +868,6 @@ pub async fn process_git_range(
     println!("Files processed: {}", stats.files_processed);
     println!("Functions indexed: {}", stats.functions_count);
     println!("Types indexed: {}", stats.types_count);
-    if !no_macros {
-        println!("Macros indexed: {}", stats.macros_count);
-    }
 
     // Check if optimization is needed after git range indexing
     match db_manager.check_optimization_health().await {

@@ -18,6 +18,45 @@ pub struct FunctionInfo {
     pub types: Option<Vec<String>>, // Type names used by this function
 }
 
+impl FunctionInfo {
+    /// Create a FunctionInfo for a function-like macro
+    /// Macros are treated as functions with empty return types and untyped parameters
+    pub fn from_macro(
+        name: String,
+        file_path: String,
+        git_file_hash: String,
+        line_start: u32,
+        parameters: Vec<String>,
+        definition: String,
+        calls: Option<Vec<String>>,
+        types: Option<Vec<String>>,
+    ) -> Self {
+        // Convert simple parameter names to ParameterInfo structs
+        let params = parameters
+            .into_iter()
+            .map(|p| ParameterInfo {
+                name: p,
+                type_name: String::new(), // Macros don't have typed parameters
+                type_file_path: None,
+                type_git_file_hash: None,
+            })
+            .collect();
+
+        Self {
+            name,
+            file_path,
+            git_file_hash,
+            line_start,
+            line_end: line_start,       // Macros are single-line in our model
+            return_type: String::new(), // Macros don't have return types
+            parameters: params,
+            body: definition,
+            calls,
+            types,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParameterInfo {
     pub name: String,      // Parameter name (e.g., "buffer")
@@ -57,21 +96,6 @@ pub struct TypedefInfo {
     pub line_start: u32,
     pub underlying_type: String,
     pub definition: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MacroInfo {
-    pub name: String,
-    pub file_path: String,
-    pub git_file_hash: String, // Git hash of the file content as hex string
-    pub line_start: u32,
-    pub is_function_like: bool,
-    pub parameters: Option<Vec<String>>,
-    pub definition: String,
-    #[serde(default)]
-    pub calls: Option<Vec<String>>, // Function names called by this macro
-    #[serde(default)]
-    pub types: Option<Vec<String>>, // Type names used by this macro
 }
 
 /// Git commit metadata with changed symbols

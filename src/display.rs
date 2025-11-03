@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use crate::{FunctionInfo, MacroInfo, TypeInfo, TypedefInfo};
+use crate::{FunctionInfo, TypeInfo, TypedefInfo};
 use anstream::stdout;
 use anyhow::Result;
 use owo_colors::OwoColorize as _;
@@ -215,10 +215,6 @@ pub fn display_typedef(typedef_info: &TypedefInfo) {
     let _ = display_typedef_to_writer(typedef_info, &mut stdout());
 }
 
-pub fn display_macro(macro_info: &MacroInfo) {
-    let _ = display_macro_to_writer(macro_info, &mut stdout());
-}
-
 pub fn print_welcome_message(database_path: &str, tables: &[String]) {
     print_welcome_message_with_model(database_path, tables, None);
 }
@@ -409,39 +405,6 @@ pub fn display_typedef_to_writer(typedef_info: &TypedefInfo, writer: &mut dyn Wr
         writeln!(writer, "\nTypedef Definition:")?;
         writeln!(writer, "{}", "─".repeat(80).bright_black())?;
         writeln!(writer, "{}", typedef_info.definition)?;
-        writeln!(writer, "{}", "─".repeat(80).bright_black())?;
-    }
-
-    writeln!(writer)?;
-    Ok(())
-}
-
-pub fn display_macro_to_writer(macro_info: &MacroInfo, writer: &mut dyn Write) -> Result<()> {
-    writeln!(writer, "\n{}", "=== Macro Information ===".bold().green())?;
-
-    writeln!(writer, "Name: {}", macro_info.name.yellow())?;
-    writeln!(writer, "File: {}", macro_info.file_path.cyan())?;
-    writeln!(writer, "Hash: {}", macro_info.git_file_hash.bright_black())?;
-    writeln!(writer, "Line: {}", macro_info.line_start)?;
-
-    let kind = if macro_info.is_function_like {
-        "Function-like"
-    } else {
-        "Object-like"
-    };
-    writeln!(writer, "Type: {}", kind.magenta())?;
-
-    if let Some(parameters) = &macro_info.parameters {
-        writeln!(writer, "\nParameters:")?;
-        for param in parameters {
-            writeln!(writer, "  - {}", param.yellow())?;
-        }
-    }
-
-    if !macro_info.definition.is_empty() {
-        writeln!(writer, "\nMacro Definition:")?;
-        writeln!(writer, "{}", "─".repeat(80).bright_black())?;
-        writeln!(writer, "{}", macro_info.definition)?;
         writeln!(writer, "{}", "─".repeat(80).bright_black())?;
     }
 

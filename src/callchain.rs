@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use crate::{DatabaseManager, FunctionInfo, MacroInfo};
+use crate::{DatabaseManager, FunctionInfo};
 use anstream::stdout;
 use anyhow::Result;
 use owo_colors::OwoColorize as _;
@@ -85,12 +85,10 @@ async fn build_forward_callchain_with_git(
         .await?;
     let function_names: Vec<String> = chain_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
-    let macro_map = db.get_macros_by_names(&function_names).await?;
     let call_relationships = CallRelationships::new_with_git(db, &function_names, git_sha).await?;
 
     Ok(build_callchain_recursive_sync(
         &function_map,
-        &macro_map,
         &call_relationships,
         func_name,
         max_depth,
@@ -111,12 +109,10 @@ async fn build_reverse_callchain_with_git(
         .await?;
     let function_names: Vec<String> = chain_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
-    let macro_map = db.get_macros_by_names(&function_names).await?;
     let call_relationships = CallRelationships::new_with_git(db, &function_names, git_sha).await?;
 
     Ok(build_callchain_recursive_sync(
         &function_map,
-        &macro_map,
         &call_relationships,
         func_name,
         max_depth,
@@ -127,7 +123,6 @@ async fn build_reverse_callchain_with_git(
 
 fn build_callchain_recursive_sync(
     function_map: &HashMap<String, FunctionInfo>,
-    macro_map: &HashMap<String, MacroInfo>,
     call_relationships: &CallRelationships,
     func_name: &str,
     remaining_depth: usize,
@@ -167,32 +162,6 @@ fn build_callchain_recursive_sync(
             for next_func in funcs {
                 let child = build_callchain_recursive_sync(
                     function_map,
-                    macro_map,
-                    call_relationships,
-                    next_func,
-                    remaining_depth - 1,
-                    forward,
-                    visited,
-                );
-                node.children.push(child);
-            }
-        }
-    } else if let Some(macro_info) = macro_map.get(func_name) {
-        // Handle macros - process their call relationships like functions
-        node.file = macro_info.file_path.clone();
-        node.line = macro_info.line_start;
-
-        let next_funcs = if forward {
-            call_relationships.function_calls.get(func_name)
-        } else {
-            call_relationships.function_callers.get(func_name)
-        };
-
-        if let Some(funcs) = next_funcs {
-            for next_func in funcs {
-                let child = build_callchain_recursive_sync(
-                    function_map,
-                    macro_map,
                     call_relationships,
                     next_func,
                     remaining_depth - 1,
@@ -236,7 +205,6 @@ pub fn print_callchain_tree(node: &CallNode, indent: usize) {
 
 fn find_paths_bfs(
     function_map: &HashMap<String, FunctionInfo>,
-    _macro_map: &HashMap<String, MacroInfo>,
     call_relationships: &CallRelationships,
     start: &str,
     target: &str,
@@ -275,7 +243,6 @@ fn find_paths_bfs(
                 }
             }
         }
-        // Macros don't call other functions/macros, so they're always leaf nodes in the call graph
     }
 
     if paths.is_empty() {
@@ -297,12 +264,11 @@ pub async fn show_callers_to_writer(
     let search_msg = format!("Finding all functions that call: {}", name.cyan());
     writeln!(writer, "{search_msg}")?;
 
-    // Search for both functions and macros - always use git-aware queries
+    // Search for function - macros are now stored as functions
     let func_opt = db.find_function_git_aware(name, git_sha).await?;
-    let macro_opt = db.find_macro_git_aware(name, git_sha).await?;
 
-    match (func_opt, macro_opt) {
-        (Some(func), None) => {
+    match func_opt {
+        Some(func) => {
             // Always use git-aware callers query
             let callers = db.get_function_callers_git_aware(name, git_sha).await?;
             if callers.is_empty() {
@@ -339,12 +305,10 @@ pub async fn show_callers_to_writer(
 
                     // Only perform extra lookups in verbose mode
                     if verbose {
-                        // Try to get more info about the caller (function or macro) - always use git-aware version
-                        let caller_func_opt = db
-                            .find_function_git_aware(caller, git_sha)
-                            .await
-                            .unwrap_or(None);
-                        if let Some(caller_func) = caller_func_opt {
+                        // Get more info about the caller
+                        if let Ok(Some(caller_func)) =
+                            db.find_function_git_aware(caller, git_sha).await
+                        {
                             let info = format!(
                                 "     {} ({}:{}) [file SHA: {}]",
                                 caller_func.return_type.bright_black(),
@@ -353,213 +317,14 @@ pub async fn show_callers_to_writer(
                                 caller_func.git_file_hash.bright_black()
                             );
                             writeln!(writer, "{info}")?;
-                        } else {
-                            // Try to get macro info - always use git-aware version
-                            let caller_macro_opt = db
-                                .find_macro_git_aware(caller, git_sha)
-                                .await
-                                .unwrap_or(None);
-                            if let Some(caller_macro) = caller_macro_opt {
-                                let info = format!(
-                                    "     {} ({}:{}) [file SHA: {}]",
-                                    "macro".bright_black(),
-                                    caller_macro.file_path.bright_black(),
-                                    caller_macro.line_start,
-                                    caller_macro.git_file_hash.bright_black()
-                                );
-                                writeln!(writer, "{info}")?;
-                            }
                         }
                     }
                 }
             }
         }
-        (None, Some(macro_info)) => {
-            // Handle macros - use git-aware callers query
-            let callers = db.get_function_callers_git_aware(name, git_sha).await?;
-            if callers.is_empty() {
-                let info_msg = format!("{} No functions call macro '{}'", "Info:".yellow(), name);
-                writeln!(writer, "{info_msg}")?;
-            } else {
-                let header = format!("\n{}", "=== Direct Callers ===".bold().green());
-                writeln!(writer, "{header}")?;
-
-                // Show git commit SHA and target macro file SHA in verbose mode
-                if verbose {
-                    let commit_info = format!("Using git commit: {}", git_sha.yellow());
-                    writeln!(writer, "{commit_info}")?;
-
-                    let target_info = format!(
-                        "Target macro '{}' defined in: {} [file SHA: {}]",
-                        name.cyan(),
-                        macro_info.file_path.bright_black(),
-                        macro_info.git_file_hash.bright_black()
-                    );
-                    writeln!(writer, "{target_info}")?;
-                }
-
-                writeln!(
-                    writer,
-                    "{} functions directly call macro '{}':",
-                    callers.len(),
-                    name
-                )?;
-
-                for (i, caller) in callers.iter().enumerate() {
-                    let line = format!("  {}. {}", (i + 1).to_string().yellow(), caller.cyan());
-                    writeln!(writer, "{line}")?;
-
-                    // Only perform extra lookups in verbose mode
-                    if verbose {
-                        // Try to get more info about the caller (function or macro) - always use git-aware version
-                        let caller_func_opt = db
-                            .find_function_git_aware(caller, git_sha)
-                            .await
-                            .unwrap_or(None);
-                        if let Some(caller_func) = caller_func_opt {
-                            let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
-                                caller_func.return_type.bright_black(),
-                                caller_func.file_path.bright_black(),
-                                caller_func.line_start,
-                                caller_func.git_file_hash.bright_black()
-                            );
-                            writeln!(writer, "{info}")?;
-                        } else {
-                            // Try to get macro info - always use git-aware version
-                            let caller_macro_opt = db
-                                .find_macro_git_aware(caller, git_sha)
-                                .await
-                                .unwrap_or(None);
-                            if let Some(caller_macro) = caller_macro_opt {
-                                let info = format!(
-                                    "     {} ({}:{}) [file SHA: {}]",
-                                    "macro".bright_black(),
-                                    caller_macro.file_path.bright_black(),
-                                    caller_macro.line_start,
-                                    caller_macro.git_file_hash.bright_black()
-                                );
-                                writeln!(writer, "{info}")?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (Some(func), Some(macro_info)) => {
-            // Found both - show a note and display function info (could be extended to show both)
-            let note = format!("\n{} Found both a function and a macro with this name! Showing function call relationships.", "Note:".yellow());
-            writeln!(writer, "{note}")?;
-
-            // Always use git-aware callers query
-            let callers = db.get_function_callers_git_aware(name, git_sha).await?;
-            if callers.is_empty() {
-                let info_msg =
-                    format!("{} No functions call function '{}'", "Info:".yellow(), name);
-                writeln!(writer, "{info_msg}")?;
-
-                // Also check macro callers
-                let macro_callers = db
-                    .get_function_callers_git_aware(&macro_info.name, git_sha)
-                    .await?;
-                if !macro_callers.is_empty() {
-                    let info_msg = format!(
-                        "{} But {} functions call macro '{}'",
-                        "Note:".cyan(),
-                        macro_callers.len(),
-                        name
-                    );
-                    writeln!(writer, "{info_msg}")?;
-                }
-            } else {
-                let header = format!("\n{}", "=== Direct Callers (Function) ===".bold().green());
-                writeln!(writer, "{header}")?;
-
-                // Show git commit SHA and target function file SHA in verbose mode
-                if verbose {
-                    let commit_info = format!("Using git commit: {}", git_sha.yellow());
-                    writeln!(writer, "{commit_info}")?;
-
-                    let target_info = format!(
-                        "Target function '{}' defined in: {} [file SHA: {}]",
-                        name.cyan(),
-                        func.file_path.bright_black(),
-                        func.git_file_hash.bright_black()
-                    );
-                    writeln!(writer, "{target_info}")?;
-                }
-
-                writeln!(
-                    writer,
-                    "{} functions directly call function '{}':",
-                    callers.len(),
-                    name
-                )?;
-
-                for (i, caller) in callers.iter().enumerate() {
-                    let line = format!("  {}. {}", (i + 1).to_string().yellow(), caller.cyan());
-                    writeln!(writer, "{line}")?;
-
-                    // Only perform extra lookups in verbose mode
-                    if verbose {
-                        // Try to get more info about the caller (function or macro) - always use git-aware version
-                        let caller_func_opt = db
-                            .find_function_git_aware(caller, git_sha)
-                            .await
-                            .unwrap_or(None);
-                        if let Some(caller_func) = caller_func_opt {
-                            let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
-                                caller_func.return_type.bright_black(),
-                                caller_func.file_path.bright_black(),
-                                caller_func.line_start,
-                                caller_func.git_file_hash.bright_black()
-                            );
-                            writeln!(writer, "{info}")?;
-                        } else {
-                            // Try to get macro info - always use git-aware version
-                            let caller_macro_opt = db
-                                .find_macro_git_aware(caller, git_sha)
-                                .await
-                                .unwrap_or(None);
-                            if let Some(caller_macro) = caller_macro_opt {
-                                let info = format!(
-                                    "     {} ({}:{}) [file SHA: {}]",
-                                    "macro".bright_black(),
-                                    caller_macro.file_path.bright_black(),
-                                    caller_macro.line_start,
-                                    caller_macro.git_file_hash.bright_black()
-                                );
-                                writeln!(writer, "{info}")?;
-                            }
-                        }
-                    }
-                }
-
-                // Also show macro callers if they exist
-                let macro_callers = db
-                    .get_function_callers_git_aware(&macro_info.name, git_sha)
-                    .await?;
-                if !macro_callers.is_empty() {
-                    let header = format!("\n{}", "=== Direct Callers (Macro) ===".bold().green());
-                    writeln!(writer, "{header}")?;
-                    writeln!(
-                        writer,
-                        "{} functions directly call macro '{}':",
-                        macro_callers.len(),
-                        name
-                    )?;
-
-                    for (i, caller) in macro_callers.iter().enumerate() {
-                        let line = format!("  {}. {}", (i + 1).to_string().yellow(), caller.cyan());
-                        writeln!(writer, "{line}")?;
-                    }
-                }
-            }
-        }
-        (None, None) => {
+        None => {
             let error_msg = format!(
-                "{} No function or macro '{}' found in database",
+                "{} No function '{}' found in database",
                 "Error:".red(),
                 name
             );
@@ -580,12 +345,11 @@ pub async fn show_callees_to_writer(
     let search_msg = format!("Finding all functions called by: {}", name.cyan());
     writeln!(writer, "{search_msg}")?;
 
-    // Search for both functions and macros - always use git-aware queries
+    // Search for function - macros are now stored as functions
     let func_opt = db.find_function_git_aware(name, git_sha).await?;
-    let macro_opt = db.find_macro_git_aware(name, git_sha).await?;
 
-    match (func_opt, macro_opt) {
-        (Some(func), None) => {
+    match func_opt {
+        Some(func) => {
             // Always use git-aware callees query
             let callees = db.get_function_callees_git_aware(name, git_sha).await?;
             if callees.is_empty() {
@@ -626,12 +390,10 @@ pub async fn show_callees_to_writer(
 
                     // Only perform extra lookups in verbose mode
                     if verbose {
-                        // Try to get more info about the callee (function or macro) - always use git-aware version
-                        let callee_func_opt = db
-                            .find_function_git_aware(callee, git_sha)
-                            .await
-                            .unwrap_or(None);
-                        if let Some(callee_func) = callee_func_opt {
+                        // Get more info about the callee
+                        if let Ok(Some(callee_func)) =
+                            db.find_function_git_aware(callee, git_sha).await
+                        {
                             let info = format!(
                                 "     {} ({}:{}) [file SHA: {}]",
                                 callee_func.return_type.bright_black(),
@@ -640,216 +402,14 @@ pub async fn show_callees_to_writer(
                                 callee_func.git_file_hash.bright_black()
                             );
                             writeln!(writer, "{info}")?;
-                        } else {
-                            // Try to get macro info - always use git-aware version
-                            let callee_macro_opt = db
-                                .find_macro_git_aware(callee, git_sha)
-                                .await
-                                .unwrap_or(None);
-                            if let Some(callee_macro) = callee_macro_opt {
-                                let info = format!(
-                                    "     {} ({}:{}) [file SHA: {}]",
-                                    "macro".bright_black(),
-                                    callee_macro.file_path.bright_black(),
-                                    callee_macro.line_start,
-                                    callee_macro.git_file_hash.bright_black()
-                                );
-                                writeln!(writer, "{info}")?;
-                            }
                         }
                     }
                 }
             }
         }
-        (None, Some(macro_info)) => {
-            // Handle macros - get callees directly from macro's calls field
-            let callees = macro_info.calls.clone().unwrap_or_default();
-            if callees.is_empty() {
-                let info_msg = format!(
-                    "{} Macro '{}' doesn't call any other functions",
-                    "Info:".yellow(),
-                    name
-                );
-                writeln!(writer, "{info_msg}")?;
-            } else {
-                let header = format!("\n{}", "=== Direct Callees ===".bold().green());
-                writeln!(writer, "{header}")?;
-
-                // Show git commit SHA and target macro file SHA in verbose mode
-                if verbose {
-                    let commit_info = format!("Using git commit: {}", git_sha.yellow());
-                    writeln!(writer, "{commit_info}")?;
-
-                    let target_info = format!(
-                        "Target macro '{}' defined in: {} [file SHA: {}]",
-                        name.cyan(),
-                        macro_info.file_path.bright_black(),
-                        macro_info.git_file_hash.bright_black()
-                    );
-                    writeln!(writer, "{target_info}")?;
-                }
-
-                writeln!(
-                    writer,
-                    "'{}' directly calls {} functions:",
-                    name,
-                    callees.len()
-                )?;
-
-                for (i, callee) in callees.iter().enumerate() {
-                    let line = format!("  {}. {}", (i + 1).to_string().yellow(), callee.cyan());
-                    writeln!(writer, "{line}")?;
-
-                    // Only perform extra lookups in verbose mode
-                    if verbose {
-                        // Try to get more info about the callee (function or macro) - always use git-aware version
-                        let callee_func_opt = db
-                            .find_function_git_aware(callee, git_sha)
-                            .await
-                            .unwrap_or(None);
-                        if let Some(callee_func) = callee_func_opt {
-                            let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
-                                callee_func.return_type.bright_black(),
-                                callee_func.file_path.bright_black(),
-                                callee_func.line_start,
-                                callee_func.git_file_hash.bright_black()
-                            );
-                            writeln!(writer, "{info}")?;
-                        } else {
-                            // Try to get macro info - always use git-aware version
-                            let callee_macro_opt = db
-                                .find_macro_git_aware(callee, git_sha)
-                                .await
-                                .unwrap_or(None);
-                            if let Some(callee_macro) = callee_macro_opt {
-                                let info = format!(
-                                    "     {} ({}:{}) [file SHA: {}]",
-                                    "macro".bright_black(),
-                                    callee_macro.file_path.bright_black(),
-                                    callee_macro.line_start,
-                                    callee_macro.git_file_hash.bright_black()
-                                );
-                                writeln!(writer, "{info}")?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (Some(func), Some(macro_info)) => {
-            // Found both - show a note and display function info (could be extended to show both)
-            let note = format!("\n{} Found both a function and a macro with this name! Showing function call relationships.", "Note:".yellow());
-            writeln!(writer, "{note}")?;
-
-            // Always use git-aware callees query
-            let callees = db.get_function_callees_git_aware(name, git_sha).await?;
-            if callees.is_empty() {
-                let info_msg = format!(
-                    "{} Function '{}' doesn't call any other functions",
-                    "Info:".yellow(),
-                    name
-                );
-                writeln!(writer, "{info_msg}")?;
-
-                // Also check macro calls
-                let macro_callees = macro_info.calls.clone().unwrap_or_default();
-                if !macro_callees.is_empty() {
-                    let info_msg = format!(
-                        "{} But macro '{}' calls {} functions",
-                        "Note:".cyan(),
-                        name,
-                        macro_callees.len()
-                    );
-                    writeln!(writer, "{info_msg}")?;
-                }
-            } else {
-                let header = format!("\n{}", "=== Direct Callees (Function) ===".bold().green());
-                writeln!(writer, "{header}")?;
-
-                // Show git commit SHA and target function file SHA in verbose mode
-                if verbose {
-                    let commit_info = format!("Using git commit: {}", git_sha.yellow());
-                    writeln!(writer, "{commit_info}")?;
-
-                    let target_info = format!(
-                        "Target function '{}' defined in: {} [file SHA: {}]",
-                        name.cyan(),
-                        func.file_path.bright_black(),
-                        func.git_file_hash.bright_black()
-                    );
-                    writeln!(writer, "{target_info}")?;
-                }
-
-                writeln!(
-                    writer,
-                    "Function '{}' directly calls {} functions:",
-                    name,
-                    callees.len()
-                )?;
-
-                for (i, callee) in callees.iter().enumerate() {
-                    let line = format!("  {}. {}", (i + 1).to_string().yellow(), callee.cyan());
-                    writeln!(writer, "{line}")?;
-
-                    // Only perform extra lookups in verbose mode
-                    if verbose {
-                        // Try to get more info about the callee (function or macro) - always use git-aware version
-                        let callee_func_opt = db
-                            .find_function_git_aware(callee, git_sha)
-                            .await
-                            .unwrap_or(None);
-                        if let Some(callee_func) = callee_func_opt {
-                            let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
-                                callee_func.return_type.bright_black(),
-                                callee_func.file_path.bright_black(),
-                                callee_func.line_start,
-                                callee_func.git_file_hash.bright_black()
-                            );
-                            writeln!(writer, "{info}")?;
-                        } else {
-                            // Try to get macro info - always use git-aware version
-                            let callee_macro_opt = db
-                                .find_macro_git_aware(callee, git_sha)
-                                .await
-                                .unwrap_or(None);
-                            if let Some(callee_macro) = callee_macro_opt {
-                                let info = format!(
-                                    "     {} ({}:{}) [file SHA: {}]",
-                                    "macro".bright_black(),
-                                    callee_macro.file_path.bright_black(),
-                                    callee_macro.line_start,
-                                    callee_macro.git_file_hash.bright_black()
-                                );
-                                writeln!(writer, "{info}")?;
-                            }
-                        }
-                    }
-                }
-
-                // Also show macro callees if they exist
-                let macro_callees = macro_info.calls.clone().unwrap_or_default();
-                if !macro_callees.is_empty() {
-                    let header = format!("\n{}", "=== Direct Callees (Macro) ===".bold().green());
-                    writeln!(writer, "{header}")?;
-                    writeln!(
-                        writer,
-                        "Macro '{}' directly calls {} functions:",
-                        name,
-                        macro_callees.len()
-                    )?;
-
-                    for (i, callee) in macro_callees.iter().enumerate() {
-                        let line = format!("  {}. {}", (i + 1).to_string().yellow(), callee.cyan());
-                        writeln!(writer, "{line}")?;
-                    }
-                }
-            }
-        }
-        (None, None) => {
+        None => {
             let error_msg = format!(
-                "{} No function or macro '{}' found in database",
+                "{} No function '{}' found in database",
                 "Error:".red(),
                 name
             );
@@ -991,7 +551,6 @@ pub async fn find_all_paths_to_writer(
 
     let function_names: Vec<String> = all_path_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
-    let macro_map = db.get_macros_by_names(&function_names).await?;
     let call_relationships =
         CallRelationships::new_with_git(db, &function_names, Some(git_sha)).await?;
 
@@ -1011,7 +570,6 @@ pub async fn find_all_paths_to_writer(
     for entry_point in entry_points.iter() {
         if let Some(paths) = find_paths_bfs(
             &function_map,
-            &macro_map,
             &call_relationships,
             entry_point,
             target_name,

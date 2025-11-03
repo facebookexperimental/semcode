@@ -12,12 +12,12 @@ use crate::database::functions::FunctionStore;
 use crate::database::schema::SchemaManager;
 use crate::database::search::{SearchManager, VectorSearchManager};
 use crate::database::symbol_filename::SymbolFilenameStore;
-use crate::database::types::{MacroStore, TypeStore, TypedefStore};
+use crate::database::types::{TypeStore, TypedefStore};
 // CallStore removed - call relationships are now embedded in function JSON columns
 use crate::database::content::{ContentInfo, ContentStore};
 use crate::database::processed_files::{ProcessedFileRecord, ProcessedFileStore};
 use crate::database::vectors::VectorStore;
-use crate::types::{FunctionInfo, MacroInfo, TypeInfo, TypedefInfo};
+use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 
 // Optimal batch size for LanceDB operations
@@ -29,7 +29,6 @@ pub struct DatabaseManager {
     function_store: FunctionStore,
     type_store: TypeStore,
     typedef_store: TypedefStore,
-    macro_store: MacroStore,
     search_manager: SearchManager,
     vector_search_manager: VectorSearchManager,
     schema_manager: SchemaManager,
@@ -48,7 +47,6 @@ impl DatabaseManager {
             function_store: FunctionStore::new(connection.clone()),
             type_store: TypeStore::new(connection.clone()),
             typedef_store: TypedefStore::new(connection.clone()),
-            macro_store: MacroStore::new(connection.clone()),
             search_manager: SearchManager::new(connection.clone(), git_repo_path),
             vector_search_manager: VectorSearchManager::new(connection.clone()),
             schema_manager: SchemaManager::new(connection.clone()),
@@ -491,10 +489,12 @@ impl DatabaseManager {
     // Combined batch operations for optimal performance
     pub async fn insert_batch_combined(
         &self,
-        functions: Vec<FunctionInfo>,
+        mut functions: Vec<FunctionInfo>,
         types: Vec<TypeInfo>,
-        macros: Vec<MacroInfo>,
+        macros: Vec<FunctionInfo>,
     ) -> Result<()> {
+        // Macros are now stored as functions - combine them
+        functions.extend(macros);
         // Step 1: Extract all content and combine into a single batch
         let mut all_content_items = Vec::new();
 
@@ -518,15 +518,7 @@ impl DatabaseManager {
             }
         }
 
-        // Extract macro definitions
-        for macro_info in &macros {
-            if !macro_info.definition.is_empty() {
-                all_content_items.push(crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&macro_info.definition),
-                    content: macro_info.definition.clone(),
-                });
-            }
-        }
+        // Note: Macros are now stored as functions, so no separate loop needed
 
         // Step 2: Extract symbol_filename pairs for all entities
         let mut symbol_filename_pairs = Vec::new();
@@ -541,13 +533,10 @@ impl DatabaseManager {
             symbol_filename_pairs.push((type_info.name.clone(), type_info.file_path.clone()));
         }
 
-        // Extract from macros
-        for macro_info in &macros {
-            symbol_filename_pairs.push((macro_info.name.clone(), macro_info.file_path.clone()));
-        }
+        // Note: Macros are now in functions, so no separate loop needed
 
         // Step 3: Insert content and metadata in parallel
-        let (content_result, func_result, type_result, macro_result, symbol_filename_result) = tokio::join!(
+        let (content_result, func_result, type_result, symbol_filename_result) = tokio::join!(
             async {
                 if !all_content_items.is_empty() {
                     self.content_store.insert_batch(all_content_items).await
@@ -570,13 +559,6 @@ impl DatabaseManager {
                 }
             },
             async {
-                if !macros.is_empty() {
-                    self.insert_macros_metadata_only(macros).await
-                } else {
-                    Ok(())
-                }
-            },
-            async {
                 if !symbol_filename_pairs.is_empty() {
                     self.symbol_filename_store
                         .insert_batch(symbol_filename_pairs)
@@ -590,7 +572,6 @@ impl DatabaseManager {
         content_result?;
         func_result?;
         type_result?;
-        macro_result?;
         symbol_filename_result?;
 
         Ok(())
@@ -797,6 +778,11 @@ impl DatabaseManager {
         functions
             .into_iter()
             .filter(|func| {
+                // Macros (empty return_type) are always implementations
+                if func.return_type.is_empty() {
+                    return true;
+                }
+
                 // Filter criteria: exclude likely declarations
                 let span = func.line_end.saturating_sub(func.line_start);
                 let has_substantial_body = func.body.len() > 50; // More than just a declaration
@@ -1094,11 +1080,6 @@ impl DatabaseManager {
         self.function_store.count_all().await
     }
 
-    /// Count all macros without resolving content - much faster for counts
-    pub async fn count_macros(&self) -> Result<usize> {
-        self.macro_store.count_all().await
-    }
-
     /// Count all typedefs without resolving content - much faster for counts
     pub async fn count_typedefs(&self) -> Result<usize> {
         self.typedef_store.count_all().await
@@ -1346,70 +1327,6 @@ impl DatabaseManager {
             .await
     }
 
-    // Macro operations
-    pub async fn insert_macros(&self, macros: Vec<MacroInfo>) -> Result<()> {
-        // Extract unique macro definitions and expansions and store them in content table for deduplication
-        let mut unique_content = std::collections::HashSet::new();
-        for macro_info in &macros {
-            if !macro_info.definition.is_empty() {
-                unique_content.insert(macro_info.definition.clone());
-            }
-        }
-
-        // Store unique macro content in content table
-        if !unique_content.is_empty() {
-            let unique_count = unique_content.len();
-            let content_items: Vec<crate::database::content::ContentInfo> = unique_content
-                .into_iter()
-                .map(|content| crate::database::content::ContentInfo {
-                    blake3_hash: crate::hash::compute_blake3_hash(&content),
-                    content,
-                })
-                .collect();
-
-            // Insert content items with batch existence checking
-            if let Err(e) = self.content_store.insert_batch(content_items).await {
-                tracing::warn!("Failed to populate content table during insertion: {}", e);
-                // Continue with insertion even if content storage fails
-            } else {
-                tracing::debug!("Successfully populated content table with {} unique macro definitions/expansions", unique_count);
-            }
-        }
-
-        // Extract (macro_name, filename) pairs for symbol_filename table
-        let macro_filename_pairs: Vec<(String, String)> = macros
-            .iter()
-            .map(|m| (m.name.clone(), m.file_path.clone()))
-            .collect();
-
-        // Insert macros as usual (keeping existing definition and expansion columns for now)
-        self.macro_store.insert_batch(macros).await?;
-
-        // Insert into symbol_filename table
-        self.symbol_filename_store
-            .insert_batch(macro_filename_pairs)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Find a macro by name without git awareness (non-git-aware)
-    ///
-    /// **WARNING**: This method does NOT filter by git commit and may return an outdated version.
-    /// For normal operations, use `find_macro_git_aware()` instead.
-    ///
-    /// # When to Use This Method
-    /// - Fallback when git SHA cannot be determined (not in a git repository)
-    /// - Administrative/debugging operations that need to see all versions
-    /// - Operations that explicitly require seeing historical data across commits
-    ///
-    /// # Behavior
-    /// Returns the first matching macro found without considering git history.
-    /// The returned macro may not match the version in your working directory.
-    pub async fn find_macro(&self, name: &str) -> Result<Option<MacroInfo>> {
-        self.macro_store.find_by_name(name).await
-    }
-
     // Metadata-only insertion methods (skip content storage for performance)
     async fn insert_functions_metadata_only(&self, functions: Vec<FunctionInfo>) -> Result<()> {
         // Insert functions metadata
@@ -1419,82 +1336,6 @@ impl DatabaseManager {
 
     async fn insert_types_metadata_only(&self, types: Vec<TypeInfo>) -> Result<()> {
         self.type_store.insert_metadata_only(types).await
-    }
-
-    async fn insert_macros_metadata_only(&self, macros: Vec<MacroInfo>) -> Result<()> {
-        // Insert macros metadata
-        self.macro_store.insert_metadata_only(macros).await?;
-        Ok(())
-    }
-
-    pub async fn find_macro_git_aware(
-        &self,
-        name: &str,
-        git_sha: &str,
-    ) -> Result<Option<MacroInfo>> {
-        // Phase 1: Get candidate file paths from symbol_filename table (optimized - macros are also stored there)
-        let file_paths = self
-            .symbol_filename_store
-            .get_filenames_for_symbol(name)
-            .await?;
-        if file_paths.is_empty() {
-            return Ok(None);
-        }
-
-        // Phase 2: Resolve file paths to git blob hashes using centralized method
-
-        let resolved_hashes = self.resolve_git_file_hashes(&file_paths, git_sha).await?;
-        if resolved_hashes.is_empty() {
-            return Ok(None);
-        }
-
-        // Phase 3: Find macro with matching git blob hash
-        for (file_path, expected_hash) in &resolved_hashes {
-            // Query macro store for this specific file and hash combination
-            let all_macros_in_file = self.macro_store.find_all_by_name(name).await?;
-            for mac in all_macros_in_file {
-                if &mac.file_path == file_path && &mac.git_file_hash == expected_hash {
-                    return Ok(Some(mac));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    pub async fn get_all_macros(&self) -> Result<Vec<MacroInfo>> {
-        self.macro_store.get_all().await
-    }
-
-    pub async fn get_all_macros_metadata_only(&self) -> Result<Vec<MacroInfo>> {
-        self.macro_store.get_all_metadata_only().await
-    }
-
-    /// Search for macros using fuzzy matching without git awareness (non-git-aware)
-    ///
-    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
-    /// For normal operations, use `search_macros_fuzzy_git_aware()` instead.
-    ///
-    /// # When to Use This Method
-    /// - Fallback when git SHA cannot be determined (not in a git repository)
-    /// - Administrative/debugging operations that need to see all versions
-    /// - Operations that explicitly require seeing historical data across commits
-    ///
-    /// # Behavior
-    /// Returns fuzzy matches across all indexed commits without filtering by git history.
-    /// Results may include macros that have been deleted, renamed, or modified.
-    pub async fn search_macros_fuzzy(&self, pattern: &str) -> Result<Vec<MacroInfo>> {
-        self.search_manager.search_macros_fuzzy(pattern).await
-    }
-
-    pub async fn search_macros_fuzzy_git_aware(
-        &self,
-        pattern: &str,
-        git_sha: &str,
-    ) -> Result<Vec<MacroInfo>> {
-        self.search_manager
-            .search_macros_fuzzy_git_aware(pattern, git_sha)
-            .await
     }
 
     /// Search functions using regex patterns on the name column without git awareness (non-git-aware)
@@ -1523,38 +1364,6 @@ impl DatabaseManager {
         self.search_manager
             .search_functions_regex_git_aware(pattern, git_sha)
             .await
-    }
-
-    /// Search macros using regex patterns on the name column without git awareness (non-git-aware)
-    ///
-    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
-    /// For normal operations, use `search_macros_regex_git_aware()` instead.
-    ///
-    /// # When to Use This Method
-    /// - Fallback when git SHA cannot be determined (not in a git repository)
-    /// - Administrative/debugging operations that need to see all versions
-    /// - Operations that explicitly require seeing historical data across commits
-    ///
-    /// # Behavior
-    /// Returns regex matches across all indexed commits without filtering by git history.
-    /// Results may include macros that have been deleted, renamed, or modified.
-    pub async fn search_macros_regex(&self, pattern: &str) -> Result<Vec<MacroInfo>> {
-        self.search_manager.search_macros_regex(pattern).await
-    }
-
-    /// Search macros using regex patterns on the name column (git-aware)
-    pub async fn search_macros_regex_git_aware(
-        &self,
-        pattern: &str,
-        git_sha: &str,
-    ) -> Result<Vec<MacroInfo>> {
-        self.search_manager
-            .search_macros_regex_git_aware(pattern, git_sha)
-            .await
-    }
-
-    pub async fn macro_exists(&self, name: &str, file_path: &str) -> Result<bool> {
-        self.macro_store.exists(name, file_path).await
     }
 
     // Call relationship operations
@@ -1833,14 +1642,6 @@ impl DatabaseManager {
         self.function_store.get_by_names(names).await
     }
 
-    /// Get macros by a list of names (batch lookup)
-    pub async fn get_macros_by_names(
-        &self,
-        names: &[String],
-    ) -> Result<std::collections::HashMap<String, MacroInfo>> {
-        self.macro_store.get_by_names(names).await
-    }
-
     /// Get types by a list of names (batch lookup)
     pub async fn get_types_by_names(
         &self,
@@ -1994,45 +1795,7 @@ impl DatabaseManager {
                     }
                 }
             }
-
-            // Also check if it's a macro
-            let macro_exists = if let Some(manifest) = &git_manifest {
-                self.macro_exists_in_manifest(&func_name, manifest).await?
-            } else {
-                self.find_macro(&func_name).await?.is_some()
-            };
-
-            if macro_exists {
-                if include_forward {
-                    let callees = if let Some(manifest) = &git_manifest {
-                        self.get_function_callees_with_manifest(&func_name, manifest)
-                            .await?
-                    } else {
-                        self.get_function_callees(&func_name).await?
-                    };
-                    for callee in callees {
-                        if !result.contains(&callee) {
-                            result.insert(callee.clone());
-                            to_visit.push_back((callee, depth + 1));
-                        }
-                    }
-                }
-
-                if include_reverse {
-                    let callers = if let Some(manifest) = &git_manifest {
-                        self.get_function_callers_with_manifest(&func_name, manifest)
-                            .await?
-                    } else {
-                        self.get_function_callers(&func_name).await?
-                    };
-                    for caller in callers {
-                        if !result.contains(&caller) {
-                            result.insert(caller.clone());
-                            to_visit.push_back((caller, depth + 1));
-                        }
-                    }
-                }
-            }
+            // Note: Macros are now stored as functions, so no separate macro check needed
         }
 
         Ok(result)
@@ -3400,27 +3163,6 @@ impl DatabaseManager {
         for func in &all_functions {
             if let Some(expected_hash) = git_manifest.get(&func.file_path) {
                 if &func.git_file_hash == expected_hash {
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// Check if a macro exists at git commit using pre-generated manifest (fast)
-    async fn macro_exists_in_manifest(
-        &self,
-        macro_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
-    ) -> Result<bool> {
-        // Get all macros with this name (non-git-aware, fast database query)
-        let all_macros = self.macro_store.find_all_by_name(macro_name).await?;
-
-        // Check if any macro exists in the git manifest (fast HashMap lookup)
-        for mac in &all_macros {
-            if let Some(expected_hash) = git_manifest.get(&mac.file_path) {
-                if &mac.git_file_hash == expected_hash {
                     return Ok(true);
                 }
             }

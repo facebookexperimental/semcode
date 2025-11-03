@@ -39,7 +39,7 @@ async fn mcp_query_function_or_macro(
 ) -> Result<String> {
     // Use the same method as the query tool - find the single best matches
     let func_opt = db.find_function_git_aware(name, git_sha).await?;
-    let macro_result = db.find_macro_git_aware(name, git_sha).await?;
+    let macro_result = db.find_function_git_aware(name, git_sha).await?;
 
     let result = match (func_opt, macro_result) {
         (Some(func), None) => {
@@ -81,11 +81,13 @@ async fn mcp_query_function_or_macro(
             result
         }
         (None, Some(mac)) => {
-            // Found macro only
-            let params_str = match &mac.parameters {
-                Some(params) => params.join(", "),
-                None => "none".to_string(),
-            };
+            // Found macro only (stored as function)
+            let params_str = mac
+                .parameters
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.type_name))
+                .collect::<Vec<_>>()
+                .join(", ");
 
             // Get macro call relationships to show counts
             let macro_calls = mac.calls.clone().unwrap_or_default();
@@ -96,7 +98,7 @@ async fn mcp_query_function_or_macro(
 
             format!(
                 "Macro: {} (git SHA: {})\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}",
-                mac.name, git_sha, mac.file_path, mac.line_start, params_str, macro_calls.len(), macro_callers.len(), mac.definition
+                mac.name, git_sha, mac.file_path, mac.line_start, params_str, macro_calls.len(), macro_callers.len(), mac.body
             )
         }
         (Some(func), Some(mac)) => {
@@ -128,17 +130,19 @@ async fn mcp_query_function_or_macro(
                 func.name, func.file_path, func.line_start, func.line_end, func.return_type, func_params_str, func_calls.len(), func_callers.len(), func.body
             ));
 
-            // Display macro
-            let macro_params_str = match &mac.parameters {
-                Some(params) => params.join(", "),
-                None => "none".to_string(),
-            };
+            // Display macro (stored as function)
+            let macro_params_str = mac
+                .parameters
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.type_name))
+                .collect::<Vec<_>>()
+                .join(", ");
 
             let macro_calls = mac.calls.clone().unwrap_or_default();
 
             result.push_str(&format!(
                 "==> Macro:\nMacro: {}\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}\n\n",
-                mac.name, mac.file_path, mac.line_start, macro_params_str, macro_calls.len(), func_callers.len(), mac.definition
+                mac.name, mac.file_path, mac.line_start, macro_params_str, macro_calls.len(), func_callers.len(), mac.body
             ));
 
             result
@@ -149,55 +153,34 @@ async fn mcp_query_function_or_macro(
                 .search_functions_regex_git_aware(name, git_sha)
                 .await
                 .unwrap_or_default();
-            let regex_macros = db
-                .search_macros_regex_git_aware(name, git_sha)
-                .await
-                .unwrap_or_default();
 
-            if !regex_functions.is_empty() || !regex_macros.is_empty() {
+            if !regex_functions.is_empty() {
                 let mut result = format!("No exact match found for '{name}' at git SHA {git_sha}, but found matches using it as a regex pattern:\n\n");
 
-                if !regex_functions.is_empty() {
-                    result.push_str("=== Functions (regex matches) ===\n");
-                    for func in regex_functions.iter().take(10) {
-                        let params_str = func
-                            .parameters
-                            .iter()
-                            .map(|p| format!("{}: {}", p.name, p.type_name))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                result.push_str("=== Functions (includes macros stored as functions) ===\n");
+                for func in regex_functions.iter().take(10) {
+                    let params_str = func
+                        .parameters
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name, p.type_name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
 
-                        result.push_str(&format!(
-                            "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\n\n",
-                            func.name,
-                            git_sha,
-                            func.file_path,
-                            func.line_start,
-                            func.line_end,
-                            func.return_type,
-                            params_str
-                        ));
-                    }
-                }
-
-                if !regex_macros.is_empty() {
-                    result.push_str("=== Macros (regex matches) ===\n");
-                    for mac in regex_macros.iter().take(10) {
-                        let params_str = match &mac.parameters {
-                            Some(params) => params.join(", "),
-                            None => "none".to_string(),
-                        };
-
-                        result.push_str(&format!(
-                            "Macro: {} (git SHA: {})\nFile: {}:{}\nParameters: ({})\n\n",
-                            mac.name, git_sha, mac.file_path, mac.line_start, params_str
-                        ));
-                    }
+                    result.push_str(&format!(
+                        "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\n\n",
+                        func.name,
+                        git_sha,
+                        func.file_path,
+                        func.line_start,
+                        func.line_end,
+                        func.return_type,
+                        params_str
+                    ));
                 }
 
                 result
             } else {
-                format!("Function or macro '{name}' not found at git SHA {git_sha}")
+                format!("Function '{name}' not found at git SHA {git_sha}")
             }
         }
     };
@@ -262,7 +245,7 @@ async fn mcp_show_callers(
 
     // Use the same method as the query tool - find the single best function match
     let func_opt = db.find_function_git_aware(function_name, git_sha).await?;
-    let macro_opt = db.find_macro_git_aware(function_name, git_sha).await?;
+    let macro_opt = db.find_function_git_aware(function_name, git_sha).await?;
 
     match (func_opt, macro_opt) {
         (Some(_func), None) => {
@@ -301,7 +284,7 @@ async fn mcp_show_callers(
                             caller_func.return_type, caller_func.file_path, caller_func.line_start
                         )?;
                     } else if let Ok(Some(caller_macro)) =
-                        db.find_macro_git_aware(caller, git_sha).await
+                        db.find_function_git_aware(caller, git_sha).await
                     {
                         writeln!(
                             buffer,
@@ -379,7 +362,7 @@ async fn mcp_show_calls(
 
     // Use the same method as the query tool - find the single best function match
     let func_opt = db.find_function_git_aware(function_name, git_sha).await?;
-    let macro_opt = db.find_macro_git_aware(function_name, git_sha).await?;
+    let macro_opt = db.find_function_git_aware(function_name, git_sha).await?;
 
     match (func_opt, macro_opt) {
         (Some(_func), None) => {
@@ -421,7 +404,7 @@ async fn mcp_show_calls(
                             callee_func.return_type, callee_func.file_path, callee_func.line_start
                         )?;
                     } else if let Ok(Some(callee_macro)) =
-                        db.find_macro_git_aware(callee, git_sha).await
+                        db.find_function_git_aware(callee, git_sha).await
                     {
                         writeln!(
                             buffer,

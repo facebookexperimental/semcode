@@ -6,9 +6,7 @@ use std::path::Path;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
-use crate::types::{
-    FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroInfo, ParameterInfo, TypeInfo,
-};
+use crate::types::{FieldInfo, FunctionInfo, GlobalTypeRegistry, ParameterInfo, TypeInfo};
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
 
@@ -178,7 +176,7 @@ impl TreeSitterAnalyzer {
     pub fn analyze_file(
         &mut self,
         file_path: &Path,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<MacroInfo>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         self.analyze_file_with_source_root(file_path, None)
     }
 
@@ -186,7 +184,7 @@ impl TreeSitterAnalyzer {
         &mut self,
         file_path: &Path,
         source_root: Option<&Path>,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<MacroInfo>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         let source_code = std::fs::read_to_string(file_path)?;
         let tree = self
             .parser
@@ -268,7 +266,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<MacroInfo>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         let tree = self.parser.parse(source_code, None).ok_or_else(|| {
             anyhow::anyhow!("Failed to parse source code for: {}", file_path.display())
         })?;
@@ -310,7 +308,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<MacroInfo>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         // Single pass: extract all calls once and map them to functions by byte ranges
         let all_calls = self.extract_all_calls_optimized(tree, source_code)?;
 
@@ -577,7 +575,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
-    ) -> Result<Vec<MacroInfo>> {
+    ) -> Result<Vec<FunctionInfo>> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
         self.extract_macros(tree, source, file_path, git_hash, source_root)
@@ -953,7 +951,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
-    ) -> Result<Vec<MacroInfo>> {
+    ) -> Result<Vec<FunctionInfo>> {
         let mut cursor = QueryCursor::new();
         let mut captures = cursor.captures(&self.macro_query, tree.root_node(), source.as_bytes());
         let mut macros = Vec::new();
@@ -996,28 +994,29 @@ impl TreeSitterAnalyzer {
                 // Extract calls and types from macro definition
                 let (macro_calls, macro_types) = self.extract_macro_calls_and_types(&definition);
 
-                let macro_info = MacroInfo {
+                let macro_info = FunctionInfo::from_macro(
                     name,
-                    file_path: self.make_relative_path(file_path, source_root),
-                    git_file_hash: git_hash.to_string(),
+                    self.make_relative_path(file_path, source_root),
+                    git_hash.to_string(),
                     line_start,
-                    is_function_like,
-                    parameters,
+                    parameters.unwrap_or_default(),
                     definition,
-                    calls: if macro_calls.is_empty() {
+                    if macro_calls.is_empty() {
                         None
                     } else {
                         Some(macro_calls)
                     },
-                    types: if macro_types.is_empty() {
+                    if macro_types.is_empty() {
                         None
                     } else {
                         Some(macro_types)
                     },
-                };
+                );
 
                 // Only add function-like macros (consistent with libclang mode)
-                if macro_info.is_function_like {
+                // Note: from_macro() is only called when is_function_like is true,
+                // so all macros here are function-like by definition
+                if is_function_like {
                     macros.push(macro_info);
                 }
             }
@@ -1705,7 +1704,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         source_root: Option<&Path>,
         global_types: &GlobalTypeRegistry,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<MacroInfo>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         // First do normal analysis
         let (mut functions, types, macros) =
             self.analyze_file_with_source_root(file_path, source_root)?;
@@ -2117,22 +2116,22 @@ impl TreeSitterAnalyzer {
 
     /// Deduplicate macros within a single file  
     /// Simple deduplication by name - macros should be unique within a file anyway
-    fn deduplicate_macros_within_file(&self, raw_macros: Vec<MacroInfo>) -> Vec<MacroInfo> {
+    fn deduplicate_macros_within_file(&self, raw_macros: Vec<FunctionInfo>) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_macros = HashMap::<String, MacroInfo>::new();
+        let mut seen_macros = HashMap::<String, FunctionInfo>::new();
 
         for macro_info in raw_macros {
             let key = macro_info.name.clone();
 
             if let Some(existing) = seen_macros.get(&key) {
-                // If definitions are identical, skip
-                if existing.definition == macro_info.definition {
+                // If bodies are identical, skip
+                if existing.body == macro_info.body {
                     continue;
                 }
 
-                // Prefer longer/more detailed definitions
-                let should_replace = macro_info.definition.len() > existing.definition.len();
+                // Prefer longer/more detailed bodies
+                let should_replace = macro_info.body.len() > existing.body.len();
 
                 if !should_replace {
                     continue;

@@ -110,14 +110,14 @@ impl SemcodeLspBackend {
             if let Some(git_sha) = git_sha_guard.as_ref() {
                 // Use git-aware lookup to find function, macro, type, and typedef at current commit
                 let func = db.find_function_git_aware(identifier_name, git_sha).await;
-                let mac = db.find_macro_git_aware(identifier_name, git_sha).await;
+                let mac = db.find_function_git_aware(identifier_name, git_sha).await;
                 let typ = db.find_type_git_aware(identifier_name, git_sha).await;
                 let typedef = db.find_typedef_git_aware(identifier_name, git_sha).await;
                 (func, mac, typ, typedef)
             } else {
                 // Fall back to non-git-aware lookup
                 let func = db.find_function(identifier_name).await;
-                let mac = db.find_macro(identifier_name).await;
+                let mac = db.find_function(identifier_name).await;
                 let typ = db.find_type(identifier_name).await;
                 let typedef = db.find_typedef(identifier_name).await;
                 (func, mac, typ, typedef)
@@ -197,7 +197,9 @@ impl SemcodeLspBackend {
                 // Try in priority order
                 if let Ok(Some(func)) = db.find_function_git_aware(&caller_name, git_sha).await {
                     (func.file_path, func.line_start)
-                } else if let Ok(Some(mac)) = db.find_macro_git_aware(&caller_name, git_sha).await {
+                } else if let Ok(Some(mac)) =
+                    db.find_function_git_aware(&caller_name, git_sha).await
+                {
                     (mac.file_path, mac.line_start)
                 } else if let Ok(Some(typ)) = db.find_type_git_aware(&caller_name, git_sha).await {
                     (typ.file_path, typ.line_start)
@@ -213,7 +215,7 @@ impl SemcodeLspBackend {
                 // Try in priority order
                 if let Ok(Some(func)) = db.find_function(&caller_name).await {
                     (func.file_path, func.line_start)
-                } else if let Ok(Some(mac)) = db.find_macro(&caller_name).await {
+                } else if let Ok(Some(mac)) = db.find_function(&caller_name).await {
                     (mac.file_path, mac.line_start)
                 } else if let Ok(Some(typ)) = db.find_type(&caller_name).await {
                     (typ.file_path, typ.line_start)

@@ -30,10 +30,6 @@ impl SchemaManager {
             self.create_types_table().await?;
         }
 
-        if !table_names.iter().any(|n| n == "macros") {
-            self.create_macros_table().await?;
-        }
-
         if !table_names.iter().any(|n| n == "vectors") {
             self.create_vectors_table().await?;
         }
@@ -105,31 +101,6 @@ impl SchemaManager {
 
         self.connection
             .create_table("types", batch_iterator)
-            .execute()
-            .await?;
-
-        Ok(())
-    }
-
-    async fn create_macros_table(&self) -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("file_path", DataType::Utf8, false),
-            Field::new("git_file_hash", DataType::Utf8, false), // Git hash of file content as hex string
-            Field::new("line", DataType::Int64, false),
-            Field::new("is_function_like", DataType::Boolean, false),
-            Field::new("parameters", DataType::Utf8, true),
-            Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
-            Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this macro
-            Field::new("types", DataType::Utf8, true), // JSON array of type names used by this macro
-        ]));
-
-        let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-
-        self.connection
-            .create_table("macros", batch_iterator)
             .execute()
             .await?;
 
@@ -406,43 +377,6 @@ impl SchemaManager {
             .await;
         }
 
-        // Create indices for macros table
-        if table_names.iter().any(|n| n == "macros") {
-            let table = self.connection.open_table("macros").execute().await?;
-
-            // Index on name
-            self.try_create_index(&table, &["name"], "BTree index on macros.name")
-                .await;
-
-            // Index on git_file_hash for content-based lookups
-            self.try_create_index(
-                &table,
-                &["git_file_hash"],
-                "BTree index on macros.git_file_hash",
-            )
-            .await;
-
-            // Index on file_path for file-based queries
-            self.try_create_index(&table, &["file_path"], "BTree index on macros.file_path")
-                .await;
-
-            // Index on definition_hash for content reference lookups
-            self.try_create_index(
-                &table,
-                &["definition_hash"],
-                "BTree index on macros.definition_hash",
-            )
-            .await;
-
-            // Composite index for duplicate checking with content hash
-            self.try_create_index(
-                &table,
-                &["name", "git_file_hash"],
-                "Composite index on macros.(name,git_file_hash)",
-            )
-            .await;
-        }
-
         // Create indices for vectors table
         if table_names.iter().any(|n| n == "vectors") {
             let table = self.connection.open_table("vectors").execute().await?;
@@ -676,7 +610,6 @@ impl SchemaManager {
         let mut tables_to_compact = vec![
             "functions",
             "types",
-            "macros",
             "vectors",
             "commit_vectors",
             "processed_files",
@@ -854,7 +787,6 @@ impl SchemaManager {
         let mut tables_to_recreate = vec![
             "functions",
             "types",
-            "macros",
             "vectors",
             "commit_vectors",
             "processed_files",
@@ -1004,7 +936,6 @@ impl SchemaManager {
         match table_name {
             "functions" => self.create_functions_table().await,
             "types" => self.create_types_table().await,
-            "macros" => self.create_macros_table().await,
             "vectors" => self.create_vectors_table().await,
             "commit_vectors" => self.create_commit_vectors_table().await,
             "processed_files" => self.create_processed_files_table().await,

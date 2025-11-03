@@ -7,33 +7,19 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::display::{
-    display_function_to_writer_with_options, display_macro_to_writer, display_type_to_writer,
-    display_typedef_to_writer,
+    display_function_to_writer_with_options, display_type_to_writer, display_typedef_to_writer,
 };
 
-/// Get functions called by the given function name (or macro name) - git-aware version
+/// Get functions called by the given function name - git-aware version
 async fn get_function_calls_git_aware(
     db: &DatabaseManager,
     function_name: &str,
     git_sha: &str,
 ) -> Result<Vec<String>> {
-    // First try to get callees from functions table using git-aware method
-    match db
-        .get_function_callees_git_aware(function_name, git_sha)
+    // Get callees from functions table using git-aware method (includes macros stored as functions)
+    db.get_function_callees_git_aware(function_name, git_sha)
         .await
-    {
-        Ok(callees) if !callees.is_empty() => Ok(callees),
-        _ => {
-            // If no function found or no callees, try to find a macro using git-aware method
-            match db.find_macro_git_aware(function_name, git_sha).await {
-                Ok(Some(macro_info)) => {
-                    // Get calls directly from macro's calls field
-                    Ok(macro_info.calls.unwrap_or_default())
-                }
-                _ => Ok(vec![]), // No function or macro found
-            }
-        }
-    }
+        .or_else(|_| Ok(vec![]))
 }
 
 /// Get functions that call the given function name
@@ -42,25 +28,6 @@ async fn get_function_callers(db: &DatabaseManager, function_name: &str) -> Resu
 }
 
 /// Display call relationships for a function with truncation control
-fn display_call_relationships_with_truncation(
-    _function_name: &str,
-    calls: &[String],
-    called_by: &[String],
-    writer: &mut dyn Write,
-    truncate: bool,
-    verbose: bool,
-) -> Result<()> {
-    display_call_relationships_with_options(
-        _function_name,
-        calls,
-        called_by,
-        writer,
-        truncate,
-        verbose,
-        true,
-        true,
-    )
-}
 
 /// Display call relationships for a function with full control over what to show
 fn display_call_relationships_with_options(
@@ -303,21 +270,10 @@ pub async fn dump_typedefs(db: &DatabaseManager, output_file: &str) -> Result<()
     Ok(())
 }
 
-pub async fn dump_macros(db: &DatabaseManager, output_file: &str) -> Result<()> {
-    println!("Dumping all macros to {}...", output_file.cyan());
-
-    let macros = db.get_all_macros_metadata_only().await?;
-    let json = serde_json::to_string_pretty(&macros)?;
-
-    let mut file = File::create(output_file)?;
-    file.write_all(json.as_bytes())?;
-
-    println!(
-        "{} Dumped {} macros to {}",
-        "Success:".green(),
-        macros.len(),
-        output_file.cyan()
-    );
+pub async fn dump_macros(_db: &DatabaseManager, _output_file: &str) -> Result<()> {
+    println!("{} dump-macros command is deprecated", "Note:".yellow());
+    println!("Macros are now stored as functions in the functions table.");
+    println!("Use dump-functions instead to export all functions.");
 
     Ok(())
 }
@@ -498,6 +454,11 @@ fn is_function_definition(func: &crate::FunctionInfo) -> bool {
         return false; // Empty body is definitely a declaration
     }
 
+    // Macros have empty return_type and are always definitions (never just declarations)
+    if func.return_type.is_empty() {
+        return true;
+    }
+
     let body = func.body.trim();
 
     // If body ends with just a semicolon, it's a declaration
@@ -528,118 +489,17 @@ async fn query_function_or_macro_to_writer_with_options(
     verbose: bool,
 ) -> Result<()> {
     let search_msg = format!(
-        "Searching for function or macro: {} (git SHA: {})",
+        "Searching for function: {} (git SHA: {})",
         name.cyan(),
         git_sha.yellow()
     );
     writeln!(writer, "{search_msg}")?;
 
-    // First try to find all functions at the specific git SHA (excluding declarations)
+    // Find all functions at the specific git SHA (includes macros stored as functions)
     let func_results = db.find_all_functions_git_aware(name, git_sha).await?;
-    // Then try to find a macro at the specific git SHA
-    let macro_result = db.find_macro_git_aware(name, git_sha).await?;
 
-    match (func_results.is_empty(), macro_result) {
-        (false, Some(macro_info)) => {
-            // Found both functions and macro - display all
-            // Filter out declarations and display only definitions
-            let definitions: Vec<_> = func_results
-                .iter()
-                .filter(|func| is_function_definition(func))
-                .collect();
-
-            let note = format!(
-                "\n{} Found {} function definition(s) and a macro with this name at git SHA {}!",
-                "Note:".yellow(),
-                definitions.len(),
-                git_sha.yellow()
-            );
-            writeln!(writer, "{note}")?;
-
-            for (i, func) in definitions.iter().enumerate() {
-                if definitions.len() > 1 {
-                    writeln!(
-                        writer,
-                        "\n{} Function {} of {}:",
-                        "==>".bold().blue(),
-                        i + 1,
-                        definitions.len()
-                    )?;
-                }
-                display_function_to_writer_with_options(func, writer, true)?;
-                // Get and display calls (outgoing) for each function definition
-                let calls = db
-                    .get_function_callees_git_aware(&func.name, git_sha)
-                    .await?;
-                display_call_relationships_with_options(
-                    &func.name,
-                    &calls,
-                    &[],
-                    writer,
-                    true,
-                    verbose,
-                    true,
-                    false,
-                )?;
-            }
-
-            // Display macro
-            writeln!(writer, "\n{} Macro:", "==>".bold().blue())?;
-            display_macro_to_writer(&macro_info, writer)?;
-            // Get and display call relationships for the macro too (use macro's calls field directly)
-            let macro_calls = macro_info.calls.clone().unwrap_or_default();
-            display_call_relationships_with_options(
-                &macro_info.name,
-                &macro_calls,
-                &[],
-                writer,
-                true,
-                verbose,
-                true,
-                false,
-            )?;
-
-            // Display callers once at the end for all functions and macro with this name
-            if definitions.is_empty() {
-                writeln!(
-                    writer,
-                    "\n{} Found function declarations but no definitions for '{}' at git SHA {}",
-                    "Info:".yellow(),
-                    name,
-                    git_sha.yellow()
-                )?;
-            }
-
-            let called_by = db.get_function_callers_git_aware(name, git_sha).await?;
-            if !called_by.is_empty() {
-                if definitions.is_empty() {
-                    writeln!(
-                        writer,
-                        "\n{} Callers to '{}' macro:",
-                        "==>".bold().blue(),
-                        name
-                    )?;
-                } else {
-                    writeln!(
-                        writer,
-                        "\n{} Callers to all '{}' functions and macro:",
-                        "==>".bold().blue(),
-                        name
-                    )?;
-                }
-                display_call_relationships_with_options(
-                    name,
-                    &[],
-                    &called_by,
-                    writer,
-                    true,
-                    verbose,
-                    false,
-                    true,
-                )?;
-            }
-        }
-        (false, None) => {
+    match func_results.is_empty() {
+        false => {
             // Found functions only - filter out declarations and display only definitions
             let definitions: Vec<_> = func_results
                 .iter()
@@ -729,33 +589,17 @@ async fn query_function_or_macro_to_writer_with_options(
                     git_sha.yellow()
                 )?;
             }
+            // Early return - we found exact matches (even if only declarations)
+            return Ok(());
         }
-        (true, Some(macro_info)) => {
-            // Found macro only
-            display_macro_to_writer(&macro_info, writer)?;
-            // Get and display call relationships for macros too (use macro's calls field directly)
-            let calls = macro_info.calls.clone().unwrap_or_default();
-            let called_by = db
-                .get_function_callers_git_aware(&macro_info.name, git_sha)
-                .await?;
-            display_call_relationships_with_truncation(
-                &macro_info.name,
-                &calls,
-                &called_by,
-                writer,
-                true,
-                verbose,
-            )?;
-        }
-        (true, None) => {
+        true => {
             // No exact match found, try regex search
             let regex_functions = db.search_functions_regex_git_aware(name, git_sha).await?;
-            let regex_macros = db.search_macros_regex_git_aware(name, git_sha).await?;
 
-            match (regex_functions.is_empty(), regex_macros.is_empty()) {
-                (false, false) => {
-                    // Found both functions and macros with regex
-                    writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found matches using it as a regex pattern:", "Info:".yellow(), name, git_sha.yellow())?;
+            match regex_functions.is_empty() {
+                false => {
+                    // Found functions with regex
+                    writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found functions using it as a regex pattern:", "Info:".yellow(), name, git_sha.yellow())?;
 
                     writeln!(
                         writer,
@@ -783,43 +627,17 @@ async fn query_function_or_macro_to_writer_with_options(
                         )?;
                     }
 
-                    writeln!(
-                        writer,
-                        "\n{}",
-                        "=== Macros (regex matches) ===".bold().green()
-                    )?;
-                    for macro_info in &regex_macros {
-                        display_macro_to_writer(macro_info, writer)?;
-                        // Get and display only calls (outgoing) for macros too
-                        let macro_calls =
-                            get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
-                        display_call_relationships_with_options(
-                            &macro_info.name,
-                            &macro_calls,
-                            &[],
-                            writer,
-                            true,
-                            verbose,
-                            true,
-                            false,
-                        )?;
-                    }
-
-                    // Collect and display callers for all matched function definitions and macros
+                    // Collect and display callers for all matched function definitions
                     let mut all_callers = std::collections::HashSet::new();
                     for func in &regex_definitions {
                         let func_callers = get_function_callers(db, &func.name).await?;
                         all_callers.extend(func_callers);
                     }
-                    for macro_info in &regex_macros {
-                        let macro_callers = get_function_callers(db, &macro_info.name).await?;
-                        all_callers.extend(macro_callers);
-                    }
                     if !all_callers.is_empty() {
                         let callers: Vec<String> = all_callers.into_iter().collect();
                         writeln!(
                             writer,
-                            "\n{} Callers to all matched functions and macros:",
+                            "\n{} Callers to all matched functions:",
                             "==>".bold().blue()
                         )?;
                         display_call_relationships_with_options(
@@ -834,144 +652,10 @@ async fn query_function_or_macro_to_writer_with_options(
                         )?;
                     }
                 }
-                (false, true) => {
-                    // Found only functions with regex
-                    writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found functions using it as a regex pattern:", "Info:".yellow(), name, git_sha.yellow())?;
-
-                    // Filter out declarations and display only function definitions
-                    let regex_definitions: Vec<_> = regex_functions
-                        .iter()
-                        .filter(|func| !func.body.is_empty())
-                        .collect();
-
-                    // Display each function definition with its outgoing calls
-                    for func in &regex_definitions {
-                        display_function_to_writer_with_options(func, writer, true)?;
-                        // Get and display calls (outgoing) for each function definition
-                        let calls = get_function_calls_git_aware(db, &func.name, git_sha).await?;
-                        display_call_relationships_with_options(
-                            &func.name,
-                            &calls,
-                            &[],
-                            writer,
-                            true,
-                            verbose,
-                            true,
-                            false,
-                        )?;
-                    }
-
-                    // For regex results with multiple function definitions, collect unique function names and show consolidated callers
-                    if regex_definitions.len() > 1 {
-                        let mut all_callers = std::collections::HashSet::new();
-                        for func in &regex_definitions {
-                            let func_callers = get_function_callers(db, &func.name).await?;
-                            all_callers.extend(func_callers);
-                        }
-                        if !all_callers.is_empty() {
-                            let callers: Vec<String> = all_callers.into_iter().collect();
-                            writeln!(
-                                writer,
-                                "\n{} Callers to all matched functions:",
-                                "==>".bold().blue()
-                            )?;
-                            display_call_relationships_with_options(
-                                "",
-                                &[],
-                                &callers,
-                                writer,
-                                true,
-                                verbose,
-                                false,
-                                true,
-                            )?;
-                        }
-                    } else if regex_definitions.len() == 1 {
-                        // For single function definition, show callers normally
-                        let called_by =
-                            get_function_callers(db, &regex_definitions[0].name).await?;
-                        display_call_relationships_with_options(
-                            &regex_definitions[0].name,
-                            &[],
-                            &called_by,
-                            writer,
-                            true,
-                            verbose,
-                            false,
-                            true,
-                        )?;
-                    } else {
-                        // No definitions found, only declarations
-                        writeln!(writer, "\n{} Found function declarations but no definitions matching '{}' at git SHA {}",
-                            "Info:".yellow(), name, git_sha.yellow())?;
-                    }
-                }
-                (true, false) => {
-                    // Found only macros with regex
-                    writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found macros using it as a regex pattern:", "Info:".yellow(), name, git_sha.yellow())?;
-
-                    // Display each macro with only its outgoing calls
-                    for macro_info in &regex_macros {
-                        display_macro_to_writer(macro_info, writer)?;
-                        // Get and display only calls (outgoing) for macros too
-                        let macro_calls =
-                            get_function_calls_git_aware(db, &macro_info.name, git_sha).await?;
-                        display_call_relationships_with_options(
-                            &macro_info.name,
-                            &macro_calls,
-                            &[],
-                            writer,
-                            true,
-                            verbose,
-                            true,
-                            false,
-                        )?;
-                    }
-
-                    // For regex results with multiple macros, collect unique callers and show consolidated callers
-                    if regex_macros.len() > 1 {
-                        let mut all_callers = std::collections::HashSet::new();
-                        for macro_info in &regex_macros {
-                            let macro_callers = get_function_callers(db, &macro_info.name).await?;
-                            all_callers.extend(macro_callers);
-                        }
-                        if !all_callers.is_empty() {
-                            let callers: Vec<String> = all_callers.into_iter().collect();
-                            writeln!(
-                                writer,
-                                "\n{} Callers to all matched macros:",
-                                "==>".bold().blue()
-                            )?;
-                            display_call_relationships_with_options(
-                                "",
-                                &[],
-                                &callers,
-                                writer,
-                                true,
-                                verbose,
-                                false,
-                                true,
-                            )?;
-                        }
-                    } else if regex_macros.len() == 1 {
-                        // For single macro, show callers normally
-                        let called_by = get_function_callers(db, &regex_macros[0].name).await?;
-                        display_call_relationships_with_options(
-                            &regex_macros[0].name,
-                            &[],
-                            &called_by,
-                            writer,
-                            true,
-                            verbose,
-                            false,
-                            true,
-                        )?;
-                    }
-                }
-                (true, true) => {
+                true => {
                     // No regex matches either, show fuzzy suggestions
                     let error_msg = format!(
-                        "{} No function or macro '{}' found at git SHA {}",
+                        "{} No function '{}' found at git SHA {}",
                         "Error:".red(),
                         name,
                         git_sha.yellow()
@@ -981,9 +665,8 @@ async fn query_function_or_macro_to_writer_with_options(
                     // Try git-aware fuzzy search for suggestions
                     let func_suggestions =
                         db.search_functions_fuzzy_git_aware(name, git_sha).await?;
-                    let macro_suggestions = db.search_macros_fuzzy_git_aware(name, git_sha).await?;
 
-                    if !func_suggestions.is_empty() || !macro_suggestions.is_empty() {
+                    if !func_suggestions.is_empty() {
                         writeln!(writer, "\nDid you mean:")?;
                         for func in func_suggestions.iter().take(3) {
                             writeln!(
@@ -991,15 +674,6 @@ async fn query_function_or_macro_to_writer_with_options(
                                 "  - {} {} (function at git SHA {})",
                                 "func --git".yellow(),
                                 func.name,
-                                git_sha.yellow()
-                            )?;
-                        }
-                        for mac in macro_suggestions.iter().take(3) {
-                            writeln!(
-                                writer,
-                                "  - {} {} (macro at git SHA {})",
-                                "func --git".yellow(),
-                                mac.name,
                                 git_sha.yellow()
                             )?;
                         }
@@ -1015,7 +689,6 @@ async fn query_function_or_macro_to_writer_with_options(
 pub async fn show_tables_to_writer(db: &DatabaseManager, writer: &mut dyn Write) -> Result<()> {
     // Get counts using efficient count methods (no table scans)
     let function_count = db.count_functions().await?;
-    let macro_count = db.count_macros().await?;
     let type_count = db.count_types().await?;
     let typedef_count = db.count_typedefs().await?;
 
@@ -1030,12 +703,6 @@ pub async fn show_tables_to_writer(db: &DatabaseManager, writer: &mut dyn Write)
     writeln!(
         writer,
         "{}: {}",
-        "Macros".bold(),
-        macro_count.to_string().cyan()
-    )?;
-    writeln!(
-        writer,
-        "{}: {}",
         "Types".bold(),
         type_count.to_string().cyan()
     )?;
@@ -1046,8 +713,9 @@ pub async fn show_tables_to_writer(db: &DatabaseManager, writer: &mut dyn Write)
         typedef_count.to_string().cyan()
     )?;
 
-    let total = function_count + macro_count + type_count + typedef_count;
+    let total = function_count + type_count + typedef_count;
     writeln!(writer, "{}: {}", "Total".bold(), total.to_string().cyan())?;
+    writeln!(writer, "\nNote: Macros are stored in the functions table")?;
 
     Ok(())
 }
@@ -1201,7 +869,6 @@ pub async fn list_functions_and_macros_to_writer(
     let functions = db
         .search_functions_fuzzy_git_aware(pattern, git_sha)
         .await?;
-    let macros = db.search_macros_fuzzy_git_aware(pattern, git_sha).await?;
 
     if !functions.is_empty() {
         writeln!(writer, "\n{}", "=== Functions ===".bold().green())?;
@@ -1218,22 +885,7 @@ pub async fn list_functions_and_macros_to_writer(
         }
     }
 
-    if !macros.is_empty() {
-        writeln!(writer, "\n{}", "=== Macros ===".bold().green())?;
-
-        for (i, mac) in macros.iter().enumerate() {
-            writeln!(
-                writer,
-                "  {}. {} ({}:{})",
-                (i + 1).to_string().yellow(),
-                mac.name.cyan(),
-                mac.file_path.bright_black(),
-                mac.line_start
-            )?;
-        }
-    }
-
-    if functions.is_empty() && macros.is_empty() {
+    if functions.is_empty() {
         writeln!(
             writer,
             "{} No matches found for pattern '{}' at git SHA {}",
@@ -1244,10 +896,9 @@ pub async fn list_functions_and_macros_to_writer(
     } else {
         writeln!(
             writer,
-            "\n{} Found {} functions, {} macros at git SHA {}",
+            "\n{} Found {} functions (including macros) at git SHA {}",
             "Summary:".bold().cyan(),
             functions.len(),
-            macros.len(),
             git_sha.yellow()
         )?;
     }

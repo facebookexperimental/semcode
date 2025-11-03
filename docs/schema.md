@@ -27,21 +27,22 @@ Semcode uses LanceDB (Apache Arrow-based columnar database) with several key arc
 
 The database consists of the following tables:
 
-1. **functions** - Function definitions and declarations with embedded call and type relationships
+1. **functions** - Function definitions, declarations, and function-like macros with embedded call and type relationships
 2. **types** - Struct, union, and enum definitions with embedded type dependencies
-3. **macros** - Function-like macro definitions with embedded call and type relationships
-4. **vectors** - CodeBERT embeddings for semantic search of functions/types/macros
-5. **commit_vectors** - Embeddings for git commit messages and diffs
-6. **processed_files** - Tracks processed files for incremental indexing
-7. **symbol_filename** - Fast lookup cache mapping symbols to file paths
-8. **git_commits** - Git commit metadata with unified diffs and changed symbols
-9. **content_0 through content_15** - Deduplicated content storage (16 shards)
+3. **vectors** - CodeBERT embeddings for semantic search of functions and types
+4. **commit_vectors** - Embeddings for git commit messages and diffs
+5. **processed_files** - Tracks processed files for incremental indexing
+6. **symbol_filename** - Fast lookup cache mapping symbols to file paths
+7. **git_commits** - Git commit metadata with unified diffs and changed symbols
+8. **content_0 through content_15** - Deduplicated content storage (16 shards)
 
 ## Table Schemas
 
 ### 1. functions
 
-Stores analyzed C/C++ function definitions and declarations with content deduplication.
+Stores analyzed C/C++ function definitions, declarations, and function-like macros with content deduplication.
+
+**Note:** Function-like macros are stored in this table with empty `return_type` and untyped parameters (empty `type_name` in ParameterInfo).
 
 **Schema:**
 ```
@@ -123,49 +124,7 @@ types               (Utf8, nullable)     - JSON array of type names referenced b
 - BTree on `definition_hash` (content reference lookups)
 - Composite on `(name, kind, git_file_hash)` (duplicate checking)
 
-### 3. macros
-
-Stores function-like macro definitions with content deduplication and embedded call and type relationship data.
-
-**Schema:**
-```
-name                (Utf8, NOT NULL)     - Macro name
-file_path           (Utf8, NOT NULL)     - Source file path
-git_file_hash       (Utf8, NOT NULL)     - SHA-1 hash of file content as hex string
-line                (Int64, NOT NULL)    - Line number where macro is defined
-is_function_like    (Boolean, NOT NULL)  - Whether macro takes parameters
-parameters          (Utf8, nullable)     - JSON string of parameter names (if function-like)
-definition_hash     (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty definitions)
-calls               (Utf8, nullable)     - JSON array of function names called in macro expansion
-types               (Utf8, nullable)     - JSON array of type names used in macro expansion
-```
-
-**Content Storage:**
-- Macro definitions are stored in sharded content tables, referenced by `definition_hash`
-- Empty definitions have null hash values
-- Content deduplication: identical macro definitions share the same Blake3 hash
-- Shard selection based on first hex character of Blake3 hash
-
-**Example JSON columns:**
-```json
-// parameters column
-["x", "y", "type"]
-
-// calls column
-["malloc", "memset"]
-
-// types column
-["size_t", "struct buffer"]
-```
-
-**Indices:**
-- BTree on `name` (fast macro name lookups)
-- BTree on `git_file_hash` (content-based lookups)
-- BTree on `file_path` (file-based queries)
-- BTree on `definition_hash` (content reference lookups)
-- Composite on `(name, git_file_hash)` (duplicate checking)
-
-### 4. vectors
+### 3. vectors
 
 Stores CodeBERT embeddings for semantic search functionality.
 
@@ -177,7 +136,7 @@ vector              (FixedSizeList[Float32, 256], NOT NULL)  - CodeBERT embeddin
 
 **Notes:**
 - Vectors are linked to content via `content_hash` (Blake3 hash of the content)
-- Enables semantic search across functions, types, and macros
+- Enables semantic search across functions and types
 - Vector generation is optional and controlled by the `--vectors` flag
 - Vector dimension is configurable (currently 256)
 
@@ -188,7 +147,7 @@ vector              (FixedSizeList[Float32, 256], NOT NULL)  - CodeBERT embeddin
   - Dynamically configured partitions based on dataset size
   - Optimized for semantic code search with 8 sub-vectors and 8-bit quantization
 
-### 5. processed_files
+### 4. processed_files
 
 Tracks which files have been processed for incremental indexing.
 
@@ -210,20 +169,20 @@ git_file_sha        (Utf8, NOT NULL)     - SHA-1 hash of specific file content a
 - BTree on `git_file_sha` (content-based deduplication)
 - Composite on `(file, git_sha)` (efficient file + git_sha lookups)
 
-### 6. symbol_filename
+### 5. symbol_filename
 
 Fast lookup cache mapping symbol names to file paths. Optimizes git-aware queries by avoiding full table scans.
 
 **Schema:**
 ```
-symbol              (Utf8, NOT NULL)     - Symbol name (function, macro, type, or typedef)
+symbol              (Utf8, NOT NULL)     - Symbol name (function, type, or typedef)
 filename            (Utf8, NOT NULL)     - File path where symbol is defined
 ```
 
 **Purpose:**
 - Acts as an index cache for the question "which files contain symbol X?"
 - Dramatically speeds up git-aware lookups by providing candidate file paths without scanning entity tables
-- Populated automatically during indexing for all functions, types, typedefs, and macros
+- Populated automatically during indexing for all functions, types, and typedefs
 - Duplicate symbol-filename pairs are automatically deduplicated using composite key
 
 **Performance Benefits:**
@@ -239,7 +198,7 @@ filename            (Utf8, NOT NULL)     - File path where symbol is defined
 - BTree on `filename` (file-based lookups)
 - Composite on `(symbol, filename)` (fast deduplication)
 
-### 7. commit_vectors
+### 6. commit_vectors
 
 Stores embeddings for git commit messages and diffs, enabling semantic search across commits.
 
@@ -259,7 +218,7 @@ vector              (FixedSizeList[Float32, 256], NOT NULL)  - Embedding vector 
 - BTree on `git_commit_sha` (fast commit lookups)
 - IVF-PQ vector index on `vector` column (for approximate nearest neighbor search)
 
-### 8. git_commits
+### 7. git_commits
 
 Stores git commit metadata including unified diffs and symbols changed in each commit. Enables commit-level analysis and tracking code evolution across git history.
 
@@ -327,7 +286,7 @@ files               (Utf8, NOT NULL)     - JSON array of file paths that were ad
 - BTree on `files` (find commits that modified specific files)
 - BTree on `parent_sha` (traverse commit history)
 
-### 9. content_0 through content_15 (Content Shards)
+### 8. content_0 through content_15 (Content Shards)
 
 Stores deduplicated content referenced by other tables, distributed across 16 shard tables for optimal performance.
 
