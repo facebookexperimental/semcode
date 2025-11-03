@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use clap::Parser;
-use semcode::{
-    git, pages::PageCache, pipeline::PipelineBuilder, process_database_path, DatabaseManager,
-};
+use semcode::{git, pages::PageCache, process_database_path, DatabaseManager};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
@@ -3520,22 +3518,44 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
         }
     }
 
-    // Run pipeline to index new/modified files
-    // The pipeline will handle all filtering and deduplication internally
+    // Run git range indexing using the shared library function
+    // This uses the same code path as semcode-index -s .
     log("Checking for files to index...");
-    let pipeline = PipelineBuilder::new(db_manager.clone(), repo_path.clone());
-    match pipeline.build_and_run(vec![]).await {
+
+    // Create synthetic range for current commit: HEAD^..HEAD
+    let git_range = format!("{}^..{}", _git_sha, _git_sha);
+    let extensions_vec = vec![
+        "c".to_string(),
+        "h".to_string(),
+        "cc".to_string(),
+        "cpp".to_string(),
+        "cxx".to_string(),
+        "c++".to_string(),
+        "hh".to_string(),
+        "hpp".to_string(),
+        "hxx".to_string(),
+    ];
+
+    match semcode::git_range::process_git_range(
+        &repo_path,
+        &git_range,
+        &extensions_vec,
+        db_manager.clone(),
+        false, // no_macros = false (index macros)
+        4,     // db_threads
+    )
+    .await
+    {
         Ok(()) => {
             log("Indexing complete");
 
             // Check if database needs optimization
             match db_manager.check_optimization_health().await {
-                Ok((needs_optimization, diagnostic_msg)) => {
+                Ok((needs_optimization, _diagnostic_msg)) => {
                     if needs_optimization {
                         log("Database needs optimization");
-                        log(&format!("Diagnostic: {}", diagnostic_msg));
                         log("Running optimization...");
-                        match db_manager.optimize_tables().await {
+                        match db_manager.optimize_database().await {
                             Ok(()) => {
                                 log("Database optimization complete");
                             }
@@ -3556,7 +3576,7 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
             }
         }
         Err(e) => {
-            log(&format!("Warning: Indexing failed: {}", e));
+            log(&format!("Warning: Auto-indexing skipped: {}", e));
         }
     }
 }

@@ -11,7 +11,6 @@ use tracing::info;
 
 use query_impl::commands::handle_command;
 use semcode::display::print_welcome_message_with_model;
-use semcode::pipeline::PipelineBuilder;
 
 #[derive(Parser, Debug)]
 #[command(name = "semcode")]
@@ -96,13 +95,42 @@ async fn index_current_commit_if_needed(
         }
     }
 
-    // Run pipeline to index new/modified files
-    // The pipeline will handle all filtering and deduplication internally
+    // Run git range indexing using the shared library function
+    // This uses the same code path as semcode-index -s .
     println!("Checking for files to index...");
-    let pipeline = PipelineBuilder::new(db_manager.clone(), repo_path.clone());
-    pipeline.build_and_run(vec![]).await?;
 
-    println!("Indexing complete");
+    // Create synthetic range for current commit: HEAD^..HEAD
+    let git_range = format!("{}^..{}", git_sha, git_sha);
+    let extensions_vec = vec![
+        "c".to_string(),
+        "h".to_string(),
+        "cc".to_string(),
+        "cpp".to_string(),
+        "cxx".to_string(),
+        "c++".to_string(),
+        "hh".to_string(),
+        "hpp".to_string(),
+        "hxx".to_string(),
+    ];
+
+    match semcode::git_range::process_git_range(
+        &repo_path,
+        &git_range,
+        &extensions_vec,
+        db_manager.clone(),
+        false, // no_macros = false (index macros)
+        4,     // db_threads
+    )
+    .await
+    {
+        Ok(()) => {
+            println!("Indexing complete");
+        }
+        Err(e) => {
+            // If git range processing fails (e.g., root commit with no parent), just warn
+            tracing::warn!("Auto-indexing skipped: {}", e);
+        }
+    }
 
     Ok(())
 }
