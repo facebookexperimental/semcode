@@ -6,13 +6,16 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 // Get batch size from environment or use default based on CPU count
+// This is the batch size passed to model2vec for tokenization batching
 fn get_batch_size() -> usize {
     std::env::var("SEMCODE_BATCH_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
-            // Use CPU count * multiplier for optimal batch size
-            num_cpus::get() * 64
+            // Reasonable batch size for model2vec tokenization
+            // Too large causes cache thrashing, too small loses efficiency
+            // 128-256 per CPU is a good balance for most systems
+            num_cpus::get() * 128
         })
 }
 

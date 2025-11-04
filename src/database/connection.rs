@@ -5,6 +5,7 @@ use arrow::array::{Array, StringArray};
 use colored::*;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
+use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::ExecutableQuery;
 use lancedb::query::QueryBase;
 
@@ -71,10 +72,13 @@ impl DatabaseManager {
         for table_name in &[
             "functions",
             "types",
-            "macros",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
             "processed_files",
             "symbol_filename",
             "git_commits",
+            "lore",
         ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
                 table.delete("1=1").await?;
@@ -100,12 +104,13 @@ impl DatabaseManager {
         let tables_to_scan = [
             "functions",
             "types",
-            "macros",
             "processed_files",
             "symbol_filename",
             "git_commits",
-            "function_vectors",
+            "vectors", // Function vectors table
             "commit_vectors",
+            "lore",
+            "lore_vectors",
         ];
 
         // Scan main tables
@@ -469,6 +474,38 @@ impl DatabaseManager {
     /// Drop and recreate all tables for maximum space savings
     pub async fn drop_and_recreate_tables(&self) -> Result<()> {
         self.schema_manager.drop_and_recreate_tables().await
+    }
+
+    /// Create FTS indices for lore table (must be called after data is inserted)
+    pub async fn create_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.create_lore_fts_indices().await
+    }
+
+    /// Get lore table information including row count and indices
+    pub async fn get_lore_table_info(&self) -> Result<String> {
+        use std::fmt::Write;
+        let mut output = String::new();
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Get row count
+        let count = table.count_rows(None).await?;
+        writeln!(&mut output, "Lore Table Information:")?;
+        writeln!(&mut output, "  Total emails: {}", count)?;
+
+        // List indices
+        let indices = table.list_indices().await?;
+        writeln!(&mut output, "\nIndices ({} total):", indices.len())?;
+
+        for idx in &indices {
+            writeln!(
+                &mut output,
+                "  - {} on {:?} (type: {:?})",
+                idx.name, idx.columns, idx.index_type
+            )?;
+        }
+
+        Ok(output)
     }
 
     /// Drop and recreate a specific table
@@ -906,6 +943,12 @@ impl DatabaseManager {
             .await
     }
 
+    pub async fn update_lore_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        self.vector_search_manager
+            .update_lore_vectors(vectorizer)
+            .await
+    }
+
     pub async fn search_similar_commits(
         &self,
         query_vector: &[f32],
@@ -913,6 +956,29 @@ impl DatabaseManager {
     ) -> Result<Vec<(crate::types::GitCommitInfo, f32)>> {
         self.vector_search_manager
             .search_similar_commits(query_vector, limit)
+            .await
+    }
+
+    pub async fn search_similar_lore_emails(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        from_patterns: Option<&[String]>,
+        subject_patterns: Option<&[String]>,
+        body_patterns: Option<&[String]>,
+        symbols_patterns: Option<&[String]>,
+        recipients_patterns: Option<&[String]>,
+    ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
+        self.vector_search_manager
+            .search_similar_lore_emails(
+                query_vector,
+                limit,
+                from_patterns,
+                subject_patterns,
+                body_patterns,
+                symbols_patterns,
+                recipients_patterns,
+            )
             .await
     }
 
@@ -1964,9 +2030,13 @@ impl DatabaseManager {
         let critical_tables = [
             "functions",
             "types",
-            "macros",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
             "processed_files",
             "git_commits",
+            "lore",
+            "symbol_filename",
         ];
 
         let mut total_fragments = 0;
@@ -2096,7 +2166,17 @@ impl DatabaseManager {
         println!("{}", "=== Database Storage Statistics ===".bold().green());
 
         // Process main tables
-        for table_name in &["functions", "types", "macros", "processed_files"] {
+        for table_name in &[
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "git_commits",
+            "lore",
+            "symbol_filename",
+        ] {
             if table_names.iter().any(|n| n == table_name) {
                 let table = self.connection.open_table(*table_name).execute().await?;
                 match table.count_rows(None).await {
@@ -2207,7 +2287,17 @@ impl DatabaseManager {
         // This is crucial for LanceDB garbage collection to work properly
         let table_names = self.connection.table_names().execute().await?;
 
-        for table_name in &["functions", "types", "macros"] {
+        for table_name in &[
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "git_commits",
+            "lore",
+            "symbol_filename",
+        ] {
             if table_names.iter().any(|n| n == table_name) {
                 // Open table with fresh handle and checkout latest
                 match self.connection.open_table(*table_name).execute().await {
@@ -2239,7 +2329,17 @@ impl DatabaseManager {
         );
 
         // Process main tables
-        for table_name in &["functions", "types", "macros", "processed_files"] {
+        for table_name in &[
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "git_commits",
+            "lore",
+            "symbol_filename",
+        ] {
             if table_names.iter().any(|n| n == table_name) {
                 let table = self.connection.open_table(*table_name).execute().await?;
 
@@ -3409,6 +3509,1101 @@ impl DatabaseManager {
         tracing::info!("insert_git_commits: Batch insertion complete");
 
         Ok(())
+    }
+
+    /// Insert lore emails into the database
+    pub async fn insert_lore_emails(&self, emails: &[crate::types::LoreEmailInfo]) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if emails.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "insert_lore_emails: Starting batch insertion of {} emails into lore table",
+            emails.len()
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+            Field::new("from", DataType::Utf8, false),
+            Field::new("date", DataType::Utf8, false),
+            Field::new("message_id", DataType::Utf8, false),
+            Field::new("in_reply_to", DataType::Utf8, true),
+            Field::new("subject", DataType::Utf8, false),
+            Field::new("references", DataType::Utf8, true),
+            Field::new("recipients", DataType::Utf8, false),
+            Field::new("headers", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("symbols", DataType::Utf8, false),
+        ]));
+
+        let mut git_commit_shas = Vec::new();
+        let mut from_addrs = Vec::new();
+        let mut dates = Vec::new();
+        let mut message_ids = Vec::new();
+        let mut in_reply_tos = Vec::new();
+        let mut subjects = Vec::new();
+        let mut references_list = Vec::new();
+        let mut recipients_list = Vec::new();
+        let mut headers_list = Vec::new();
+        let mut bodies = Vec::new();
+        let mut symbols_list = Vec::new();
+
+        for email in emails {
+            git_commit_shas.push(email.git_commit_sha.clone());
+            from_addrs.push(email.from.clone());
+            dates.push(email.date.clone());
+            message_ids.push(email.message_id.clone());
+            in_reply_tos.push(email.in_reply_to.clone());
+            subjects.push(email.subject.clone());
+            references_list.push(email.references.clone());
+            recipients_list.push(email.recipients.clone());
+            headers_list.push(email.headers.clone());
+            bodies.push(email.body.clone());
+            // Convert Vec<String> to JSON array string
+            let symbols_json = serde_json::to_string(&email.symbols)?;
+            symbols_list.push(symbols_json);
+        }
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(git_commit_shas)),
+            Arc::new(StringArray::from(from_addrs)),
+            Arc::new(StringArray::from(dates)),
+            Arc::new(StringArray::from(message_ids)),
+            Arc::new(StringArray::from(in_reply_tos)),
+            Arc::new(StringArray::from(subjects)),
+            Arc::new(StringArray::from(references_list)),
+            Arc::new(StringArray::from(recipients_list)),
+            Arc::new(StringArray::from(headers_list)),
+            Arc::new(StringArray::from(bodies)),
+            Arc::new(StringArray::from(symbols_list)),
+        ];
+
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        let batches = vec![Ok(batch)];
+        let batch_iterator =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Use merge_insert for upsert functionality (update if exists, insert if not)
+        let mut merge_insert = table.merge_insert(&["message_id"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
+
+        tracing::info!("insert_lore_emails: Batch insertion complete");
+
+        Ok(())
+    }
+
+    /// Get all lore emails from the database
+    pub async fn get_all_lore_emails(&self) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let stream = table.query().execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut emails = Vec::new();
+
+        for batch in batches {
+            let num_rows = batch.num_rows();
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let headers_list = batch
+                .column_by_name("headers")
+                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..num_rows {
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    message_id: message_ids.value(i).to_string(),
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    headers: headers_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Search lore emails using Full Text Search with regex post-filtering
+    pub async fn search_lore_emails(
+        &self,
+        field: &str,
+        pattern: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // FTS uses simple tokenizer - normalize pattern by stripping special chars
+        let fts_pattern = pattern
+            .split(|c: char| !c.is_alphanumeric() && c != ' ')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let regex = regex::Regex::new(pattern)?;
+        let mut emails = Vec::new();
+        let target_limit = if limit > 0 { limit } else { 10000 };
+
+        // Incremental search: start with reasonable limit, expand until matches stop increasing
+        let mut fts_limit = if limit > 0 { limit * 10 } else { 10000 };
+        let mut previous_count = 0;
+
+        loop {
+            let fts_query =
+                FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
+
+            let stream = table
+                .query()
+                .full_text_search(fts_query)
+                .limit(fts_limit)
+                .execute()
+                .await?;
+            let batches: Vec<_> = stream.try_collect().await?;
+
+            let fts_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+            tracing::info!(
+                "FTS returned {} candidates with limit {} for field '{}'",
+                fts_count,
+                fts_limit,
+                field
+            );
+
+            // Step 2: Post-filter with regex and build email objects
+            emails.clear(); // Reset for this iteration
+
+            for batch in batches {
+                let num_rows = batch.num_rows();
+
+                // Extract columns
+                let git_commit_shas = batch
+                    .column_by_name("git_commit_sha")
+                    .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                    .as_string::<i32>();
+                let from_addrs = batch
+                    .column_by_name("from")
+                    .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                    .as_string::<i32>();
+                let dates = batch
+                    .column_by_name("date")
+                    .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                    .as_string::<i32>();
+                let message_ids = batch
+                    .column_by_name("message_id")
+                    .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                    .as_string::<i32>();
+                let in_reply_tos = batch
+                    .column_by_name("in_reply_to")
+                    .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                    .as_string::<i32>();
+                let subjects = batch
+                    .column_by_name("subject")
+                    .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                    .as_string::<i32>();
+                let references_list = batch
+                    .column_by_name("references")
+                    .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                    .as_string::<i32>();
+                let recipients_list = batch
+                    .column_by_name("recipients")
+                    .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                    .as_string::<i32>();
+                let headers_list = batch
+                    .column_by_name("headers")
+                    .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
+                    .as_string::<i32>();
+                let bodies = batch
+                    .column_by_name("body")
+                    .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                    .as_string::<i32>();
+                let symbols_list = batch
+                    .column_by_name("symbols")
+                    .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                    .as_string::<i32>();
+
+                for i in 0..num_rows {
+                    // Get the field value for regex matching
+                    let field_value = match field {
+                        "from" => from_addrs.value(i),
+                        "subject" => subjects.value(i),
+                        "body" => bodies.value(i),
+                        "recipients" => recipients_list.value(i),
+                        "symbols" => symbols_list.value(i),
+                        _ => continue, // Skip if unknown field
+                    };
+
+                    // Apply regex filter (case-insensitive for better matching)
+                    if !regex.is_match(field_value) {
+                        continue;
+                    }
+
+                    // Check limit
+                    if limit > 0 && emails.len() >= limit {
+                        break;
+                    }
+
+                    // Parse JSON symbols array
+                    let symbols_json = symbols_list.value(i);
+                    let symbols: Vec<String> =
+                        serde_json::from_str(symbols_json).unwrap_or_default();
+
+                    let email = crate::types::LoreEmailInfo {
+                        git_commit_sha: git_commit_shas.value(i).to_string(),
+                        from: from_addrs.value(i).to_string(),
+                        date: dates.value(i).to_string(),
+                        message_id: message_ids.value(i).to_string(),
+                        in_reply_to: if in_reply_tos.is_null(i) {
+                            None
+                        } else {
+                            Some(in_reply_tos.value(i).to_string())
+                        },
+                        subject: subjects.value(i).to_string(),
+                        references: if references_list.is_null(i) {
+                            None
+                        } else {
+                            Some(references_list.value(i).to_string())
+                        },
+                        recipients: recipients_list.value(i).to_string(),
+                        headers: headers_list.value(i).to_string(),
+                        body: bodies.value(i).to_string(),
+                        symbols,
+                    };
+                    emails.push(email);
+                }
+
+                if limit > 0 && emails.len() >= limit {
+                    break;
+                }
+            }
+
+            // Check stopping conditions
+            if emails.len() >= target_limit {
+                tracing::info!(
+                    "Found {} results (target: {}), stopping",
+                    emails.len(),
+                    target_limit
+                );
+                break;
+            }
+
+            // Stop if count didn't increase (no more matches available)
+            if emails.len() == previous_count {
+                tracing::info!(
+                    "Found {} results, count stopped increasing at FTS limit {}",
+                    emails.len(),
+                    fts_limit
+                );
+                break;
+            }
+
+            // Stop if we've searched a very large set
+            if fts_limit >= 1000000 {
+                tracing::info!(
+                    "Found {} results, reached max FTS limit of {}",
+                    emails.len(),
+                    fts_limit
+                );
+                break;
+            }
+
+            tracing::info!(
+                "Found {} results with FTS limit {}, trying larger limit",
+                emails.len(),
+                fts_limit
+            );
+
+            previous_count = emails.len();
+            fts_limit *= 5; // Exponential expansion
+        }
+
+        Ok(emails)
+    }
+
+    /// Helper function to query lore emails by multiple fields and return intersection
+    /// Uses regex alternation for OR within fields, intersection for AND across fields
+    pub(crate) async fn query_lore_by_fields_intersection(
+        &self,
+        from_patterns: Option<&[String]>,
+        subject_patterns: Option<&[String]>,
+        body_patterns: Option<&[String]>,
+        recipients_patterns: Option<&[String]>,
+        search_limit: usize,
+    ) -> Result<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+
+        let lore_table = self.connection.open_table("lore").execute().await?;
+        let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
+
+        // Helper function to query a field using FTS with regex post-filtering
+        async fn query_field_impl(
+            lore_table: &lancedb::Table,
+            field_name: String,
+            pattern: String,
+            search_limit: usize,
+        ) -> Result<HashSet<String>> {
+            // FTS uses simple tokenizer - normalize pattern by stripping special chars
+            let fts_pattern = pattern
+                .split(|c: char| !c.is_alphanumeric() && c != ' ')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            tracing::info!(
+                "FTS query on field '{}': original='{}' normalized='{}'",
+                field_name,
+                pattern,
+                fts_pattern
+            );
+
+            let fts_query =
+                FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
+            let mut query = lore_table.query().full_text_search(fts_query).select(
+                lancedb::query::Select::Columns(vec![
+                    "message_id".to_string(),
+                    "_score".to_string(),
+                    field_name.clone(),
+                ]),
+            );
+
+            // Apply limit - use large limit if search_limit is 0 (unlimited)
+            // FTS has a default limit of 10, so we must explicitly set a large limit
+            let effective_limit = if search_limit > 0 {
+                search_limit
+            } else {
+                100000
+            };
+            query = query.limit(effective_limit);
+
+            let results = query.execute().await?.try_collect::<Vec<_>>().await?;
+
+            // Step 2: Post-filter with regex in memory
+            let fts_result_count: usize = results.iter().map(|b| b.num_rows()).sum();
+            tracing::info!(
+                "FTS returned {} candidates for field '{}'",
+                fts_result_count,
+                field_name
+            );
+
+            let regex = regex::Regex::new(&pattern)?;
+            let mut message_ids = HashSet::new();
+            let mut first_candidate_logged = false;
+
+            for batch in &results {
+                let msg_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let field_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let field_value = field_array.value(i);
+
+                    // Log first candidate for debugging
+                    if !first_candidate_logged {
+                        tracing::info!("Sample {} value: '{}'", field_name, field_value);
+                        tracing::info!("Regex pattern: '{}'", pattern);
+                        first_candidate_logged = true;
+                    }
+
+                    if regex.is_match(field_value) {
+                        message_ids.insert(msg_array.value(i).to_string());
+                    }
+                }
+            }
+
+            tracing::info!(
+                "Regex filter kept {} of {} FTS candidates",
+                message_ids.len(),
+                fts_result_count
+            );
+
+            Ok(message_ids)
+        }
+
+        // Query from field
+        if let Some(patterns) = from_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                let results = query_field_impl(
+                    &lore_table,
+                    "from".to_string(),
+                    combined_pattern,
+                    search_limit,
+                )
+                .await?;
+                tracing::info!("lore from field returned {} results", results.len());
+                field_result_sets.push(results);
+            }
+        }
+
+        // Query subject field
+        if let Some(patterns) = subject_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                let results = query_field_impl(
+                    &lore_table,
+                    "subject".to_string(),
+                    combined_pattern,
+                    search_limit,
+                )
+                .await?;
+                tracing::info!("lore subject field returned {} results", results.len());
+                field_result_sets.push(results);
+            }
+        }
+
+        // Query body field
+        if let Some(patterns) = body_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                let results = query_field_impl(
+                    &lore_table,
+                    "body".to_string(),
+                    combined_pattern,
+                    search_limit,
+                )
+                .await?;
+                tracing::info!("lore body field returned {} results", results.len());
+                field_result_sets.push(results);
+            }
+        }
+
+        // Query recipients field
+        if let Some(patterns) = recipients_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                let results = query_field_impl(
+                    &lore_table,
+                    "recipients".to_string(),
+                    combined_pattern,
+                    search_limit,
+                )
+                .await?;
+                tracing::info!("lore recipients field returned {} results", results.len());
+                field_result_sets.push(results);
+            }
+        }
+
+        // Compute intersection efficiently
+        if field_result_sets.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        tracing::info!(
+            "lore intersection: {} field result sets with sizes: {:?}",
+            field_result_sets.len(),
+            field_result_sets
+                .iter()
+                .map(|s| s.len())
+                .collect::<Vec<_>>()
+        );
+
+        // Start with the smallest set for faster intersection
+        field_result_sets.sort_by_key(|s| s.len());
+
+        let mut intersection = field_result_sets[0].clone();
+        for set in field_result_sets.iter().skip(1) {
+            // Use retain for in-place intersection (faster than creating new set)
+            intersection.retain(|id| set.contains(id));
+
+            // Early exit if intersection becomes empty
+            if intersection.is_empty() {
+                break;
+            }
+        }
+
+        Ok(intersection)
+    }
+
+    /// Search lore emails with multiple field-pattern conditions
+    /// field_patterns: Vec of (field_name, pattern) tuples
+    /// Patterns for the same field are combined with OR, different fields are combined with AND
+    pub async fn search_lore_emails_multi_field(
+        &self,
+        field_patterns: Vec<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use std::collections::HashMap;
+
+        if field_patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Group patterns by field
+        let mut field_map: HashMap<&str, Vec<String>> = HashMap::new();
+        for (field, pattern) in field_patterns {
+            field_map
+                .entry(field)
+                .or_insert_with(Vec::new)
+                .push(pattern.to_string());
+        }
+
+        // Extract patterns for each field
+        let from_patterns = field_map.get("from").map(|v| v.as_slice());
+        let subject_patterns = field_map.get("subject").map(|v| v.as_slice());
+        let body_patterns = field_map.get("body").map(|v| v.as_slice());
+        let recipients_patterns = field_map.get("recipients").map(|v| v.as_slice());
+
+        // Use helper to get intersection of message_ids
+        let intersection = self
+            .query_lore_by_fields_intersection(
+                from_patterns,
+                subject_patterns,
+                body_patterns,
+                recipients_patterns,
+                0, // No limit for individual queries
+            )
+            .await?;
+
+        tracing::info!("Final intersection has {} message_ids", intersection.len());
+
+        if intersection.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fetch full email records for the intersection
+        let mut final_emails = Vec::new();
+        let count_limit = if limit > 0 { limit } else { intersection.len() };
+
+        for message_id in intersection.iter().take(count_limit) {
+            if let Some(email) = self.get_lore_email_by_message_id(message_id).await? {
+                final_emails.push(email);
+            } else {
+                tracing::warn!("Message ID in intersection not found: {}", message_id);
+            }
+        }
+
+        tracing::info!(
+            "Fetched {} email records from {} message_ids",
+            final_emails.len(),
+            count_limit
+        );
+
+        Ok(final_emails)
+    }
+
+    /// Get a lore email by exact message_id match
+    pub async fn get_lore_email_by_message_id(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        // Add < > around message_id if not already present
+        let normalized_message_id = if message_id.starts_with('<') && message_id.ends_with('>') {
+            message_id.to_string()
+        } else {
+            format!("<{}>", message_id)
+        };
+
+        // Escape SQL string literal
+        let escaped_message_id = normalized_message_id.replace("'", "''");
+        let filter = format!("message_id = '{}'", escaped_message_id);
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let stream = table.query().only_if(&filter).limit(1).execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let headers_list = batch
+                .column_by_name("headers")
+                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            // Parse JSON symbols array
+            let symbols_json = symbols_list.value(0);
+            let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+            // Return the first (and only) result
+            let email = crate::types::LoreEmailInfo {
+                git_commit_sha: git_commit_shas.value(0).to_string(),
+                from: from_addrs.value(0).to_string(),
+                date: dates.value(0).to_string(),
+                message_id: message_ids.value(0).to_string(),
+                in_reply_to: if in_reply_tos.is_null(0) {
+                    None
+                } else {
+                    Some(in_reply_tos.value(0).to_string())
+                },
+                subject: subjects.value(0).to_string(),
+                references: if references_list.is_null(0) {
+                    None
+                } else {
+                    Some(references_list.value(0).to_string())
+                },
+                recipients: recipients_list.value(0).to_string(),
+                headers: headers_list.value(0).to_string(),
+                body: bodies.value(0).to_string(),
+                symbols,
+            };
+
+            return Ok(Some(email));
+        }
+
+        Ok(None)
+    }
+
+    /// Get all emails that reference a message-id (in in_reply_to or references fields)
+    pub async fn get_lore_emails_referencing(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+        use std::collections::HashSet;
+
+        // Escape SQL string literal for pattern matching
+        let escaped_message_id = message_id.replace("\\", "\\\\").replace("'", "''");
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Query 1: Find emails where in_reply_to matches
+        let filter1 = format!("in_reply_to = '{}'", escaped_message_id);
+        let stream1 = table.query().only_if(&filter1).execute().await?;
+        let batches1: Vec<_> = stream1.try_collect().await?;
+
+        // Query 2: Find emails where references contains the message-id
+        let filter2 = format!("regexp_match(`references`, '{}')", escaped_message_id);
+        let stream2 = table.query().only_if(&filter2).execute().await?;
+        let batches2: Vec<_> = stream2.try_collect().await?;
+
+        // Combine batches from both queries
+        let mut batches = batches1;
+        batches.extend(batches2);
+
+        let mut emails = Vec::new();
+        let mut seen_message_ids = HashSet::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let headers_list = batch
+                .column_by_name("headers")
+                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                let message_id = message_ids.value(i).to_string();
+
+                // Skip if we've already seen this message_id (deduplication)
+                if !seen_message_ids.insert(message_id.clone()) {
+                    continue;
+                }
+
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    message_id,
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    headers: headers_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Search lore emails by exact subject match (case-sensitive substring match)
+    pub async fn search_lore_emails_by_subject(
+        &self,
+        subject: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        // Escape SQL string literal
+        let escaped_subject = subject.replace("'", "''");
+
+        // Use LIKE for substring matching (case-sensitive in LanceDB)
+        let where_clause = format!("subject LIKE '%{}%'", escaped_subject);
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let mut query = table.query().only_if(&where_clause);
+
+        if limit > 0 {
+            query = query.limit(limit);
+        }
+
+        let stream = query.execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut emails = Vec::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let headers_list = batch
+                .column_by_name("headers")
+                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    message_id: message_ids.value(i).to_string(),
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    headers: headers_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Get all lore emails for a specific git commit SHA
+    pub async fn get_lore_emails_by_commit(
+        &self,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        // Escape SQL string literal
+        let escaped_sha = git_sha.replace("'", "''");
+        let filter = format!("git_commit_sha = '{}'", escaped_sha);
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let stream = table.query().only_if(&filter).execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut emails = Vec::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let headers_list = batch
+                .column_by_name("headers")
+                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    message_id: message_ids.value(i).to_string(),
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    headers: headers_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
     }
 
     /// Get a single git commit by SHA

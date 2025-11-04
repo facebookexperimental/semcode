@@ -5,7 +5,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
-use lancedb::index::{scalar::BTreeIndexBuilder, Index as LanceIndex};
+use lancedb::index::{scalar::BTreeIndexBuilder, scalar::FtsIndexBuilder, Index as LanceIndex};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::OptimizeAction;
 use std::sync::Arc;
@@ -48,6 +48,14 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "commit_vectors") {
             self.create_commit_vectors_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "lore") {
+            self.create_lore_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "lore_vectors") {
+            self.create_lore_vectors_table().await?;
         }
 
         // Check and create content shard tables (content_0 through content_15)
@@ -155,6 +163,30 @@ impl SchemaManager {
         Ok(())
     }
 
+    async fn create_lore_vectors_table(&self) -> Result<()> {
+        // Create lore_vectors table with 256 dimensions, indexed by message_id
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("message_id", DataType::Utf8, false), // Email message-id
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 256),
+                false, // Non-nullable - we only store entries that have vectors
+            ),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("lore_vectors", batch_iterator)
+            .execute()
+            .await?;
+
+        tracing::info!("Created lore_vectors table with 256 dimensions");
+        Ok(())
+    }
+
     async fn create_processed_files_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("file", DataType::Utf8, false),   // File path
@@ -217,6 +249,34 @@ impl SchemaManager {
         Ok(())
     }
 
+    async fn create_lore_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false), // Git commit SHA containing this email
+            Field::new("from", DataType::Utf8, false),           // From header in the email
+            Field::new("date", DataType::Utf8, false),           // Date field
+            Field::new("message_id", DataType::Utf8, false),     // Message-ID header
+            Field::new("in_reply_to", DataType::Utf8, true),     // In-Reply-To header (nullable)
+            Field::new("subject", DataType::Utf8, false),        // Subject line
+            Field::new("references", DataType::Utf8, true), // Full list of references (nullable)
+            Field::new("recipients", DataType::Utf8, false), // Full list of cc/to recipients
+            Field::new("headers", DataType::Utf8, false), // Email headers (everything before first blank line)
+            Field::new("body", DataType::Utf8, false), // Email body (everything after first blank line)
+            Field::new("symbols", DataType::Utf8, false), // JSON array of symbols referenced in email
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("lore", batch_iterator)
+            .execute()
+            .await?;
+
+        tracing::info!("Created lore table for email archive indexing");
+        Ok(())
+    }
+
     async fn create_content_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("blake3_hash", DataType::Utf8, false), // Blake3 hash of content as hex string
@@ -269,11 +329,24 @@ impl SchemaManager {
 
         // Check if database already has data (skip index creation if it does - likely already indexed)
         // This significantly speeds up startup time from 12+ seconds to milliseconds
+        // Check both functions and lore tables
         if let Ok(table) = self.connection.open_table("functions").execute().await {
             if let Ok(count) = table.count_rows(None).await {
                 if count > 100 {
                     tracing::debug!(
                         "Skipping index creation - functions table has {} rows (likely already indexed)",
+                        count
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        if let Ok(table) = self.connection.open_table("lore").execute().await {
+            if let Ok(count) = table.count_rows(None).await {
+                if count > 100 {
+                    tracing::debug!(
+                        "Skipping index creation - lore table has {} rows (likely already indexed)",
                         count
                     );
                     return Ok(());
@@ -407,6 +480,64 @@ impl SchemaManager {
             .await;
         }
 
+        // Create indices for lore_vectors table
+        if table_names.iter().any(|n| n == "lore_vectors") {
+            let table = self.connection.open_table("lore_vectors").execute().await?;
+
+            // Primary index on message_id for fast lookups
+            self.try_create_index(
+                &table,
+                &["message_id"],
+                "BTree index on lore_vectors.message_id",
+            )
+            .await;
+        }
+
+        // Create indices for lore table
+        if table_names.iter().any(|n| n == "lore") {
+            let table = self.connection.open_table("lore").execute().await?;
+
+            // Index on message_id for fast lookups and joins
+            self.try_create_index(&table, &["message_id"], "BTree index on lore.message_id")
+                .await;
+
+            // Index on from field for email sender queries
+            self.try_create_index(&table, &["from"], "BTree index on lore.from")
+                .await;
+
+            // Index on subject for subject-based searches
+            self.try_create_index(&table, &["subject"], "BTree index on lore.subject")
+                .await;
+
+            // Index on git_commit_sha for commit-based lookups
+            self.try_create_index(
+                &table,
+                &["git_commit_sha"],
+                "BTree index on lore.git_commit_sha",
+            )
+            .await;
+
+            // Index on date for chronological queries
+            self.try_create_index(&table, &["date"], "BTree index on lore.date")
+                .await;
+
+            // Index on in_reply_to for threading queries
+            self.try_create_index(&table, &["in_reply_to"], "BTree index on lore.in_reply_to")
+                .await;
+
+            // Index on references for threading
+            self.try_create_index(&table, &["references"], "BTree index on lore.references")
+                .await;
+
+            // Index on headers (large text field)
+            self.try_create_index(&table, &["headers"], "BTree index on lore.headers")
+                .await;
+
+            // Note: FTS indices for lore table are created separately after data is inserted
+            // via create_lore_fts_indices() - see process_lore_commits_pipeline completion
+            // BTree indices on body, recipients, and symbols removed - FTS indices used instead
+        }
+
         // Create indices for processed_files table
         if table_names.iter().any(|n| n == "processed_files") {
             let table = self
@@ -518,6 +649,49 @@ impl SchemaManager {
                 .await;
         }
 
+        // Create indices for lore table
+        if table_names.iter().any(|n| n == "lore") {
+            let table = self.connection.open_table("lore").execute().await?;
+
+            // Index on git_commit_sha for commit-based queries
+            self.try_create_index(
+                &table,
+                &["git_commit_sha"],
+                "BTree index on lore.git_commit_sha",
+            )
+            .await;
+
+            // Index on message_id for unique message lookups
+            self.try_create_index(&table, &["message_id"], "BTree index on lore.message_id")
+                .await;
+
+            // Index on from for sender-based queries
+            self.try_create_index(&table, &["from"], "BTree index on lore.from")
+                .await;
+
+            // Index on date for date-based queries and sorting
+            self.try_create_index(&table, &["date"], "BTree index on lore.date")
+                .await;
+
+            // Index on in_reply_to for threading
+            self.try_create_index(&table, &["in_reply_to"], "BTree index on lore.in_reply_to")
+                .await;
+
+            // Index on subject for subject searches
+            self.try_create_index(&table, &["subject"], "BTree index on lore.subject")
+                .await;
+
+            // Index on references for threading
+            self.try_create_index(&table, &["references"], "BTree index on lore.references")
+                .await;
+
+            // Index on headers for header searches
+            self.try_create_index(&table, &["headers"], "BTree index on lore.headers")
+                .await;
+
+            // Note: BTree indices on body, recipients, and symbols removed - FTS used instead
+        }
+
         // Create indices for all content shard tables
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
@@ -559,6 +733,81 @@ impl SchemaManager {
             Ok(_) => tracing::info!("Created {}", description),
             Err(e) => tracing::debug!("{} may already exist: {}", description, e),
         }
+    }
+
+    async fn try_create_fts_index(
+        &self,
+        table: &lancedb::table::Table,
+        columns: &[&str],
+        description: &str,
+    ) {
+        // Configure FTS index optimized for source code and technical docs
+        let fts_config = FtsIndexBuilder::default()
+            .with_position(false) // Enable phrase queries for exact code snippets
+            .base_tokenizer("simple".to_string())
+            .lower_case(true) // Case-insensitive search for better matching
+            .stem(false) // No stemming (run != running in code)
+            .remove_stop_words(false) // Keep all tokens (if, for, while are keywords)
+            .ascii_folding(true) // Preserve exact characters
+            .max_token_length(Some(100)); // Allow long identifiers/symbols
+
+        tracing::info!("Starting {}", description);
+        match table
+            .create_index(columns, LanceIndex::FTS(fts_config))
+            .execute()
+            .await
+        {
+            Ok(_) => tracing::info!("✓ Completed {}", description),
+            Err(e) => tracing::debug!("{} may already exist: {}", description, e),
+        }
+    }
+
+    /// Create FTS indices for lore table (must be called after data is inserted)
+    /// Only creates indices if they don't already exist
+    pub async fn create_lore_fts_indices(&self) -> Result<()> {
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Check if FTS indices already exist by trying to list them
+        let indices = match table.list_indices().await {
+            Ok(indices) => indices,
+            Err(_) => Vec::new(),
+        };
+
+        // Check if FTS indices already exist (index_type must be FTS)
+        use lancedb::index::IndexType;
+        let has_fts_indices = indices.iter().any(|idx| {
+            idx.index_type == IndexType::FTS
+                && (idx.columns.contains(&"from".to_string())
+                    || idx.columns.contains(&"subject".to_string())
+                    || idx.columns.contains(&"body".to_string())
+                    || idx.columns.contains(&"recipients".to_string())
+                    || idx.columns.contains(&"symbols".to_string()))
+        });
+
+        if has_fts_indices {
+            tracing::info!("FTS indices already exist for lore table, skipping creation");
+            return Ok(());
+        }
+
+        // Create FTS indices for text search on all searchable fields in parallel
+        let start_time = std::time::Instant::now();
+        tracing::info!("Creating 5 FTS indices for lore table in parallel (from, subject, body, recipients, symbols)...");
+
+        // Create all 5 indices concurrently for faster indexing
+        tokio::join!(
+            self.try_create_fts_index(&table, &["from"], "FTS index on lore.from"),
+            self.try_create_fts_index(&table, &["subject"], "FTS index on lore.subject"),
+            self.try_create_fts_index(&table, &["body"], "FTS index on lore.body"),
+            self.try_create_fts_index(&table, &["recipients"], "FTS index on lore.recipients"),
+            self.try_create_fts_index(&table, &["symbols"], "FTS index on lore.symbols"),
+        );
+
+        let elapsed = start_time.elapsed();
+        tracing::info!(
+            "Completed creating 5 FTS indices in {:.1}s",
+            elapsed.as_secs_f64()
+        );
+        Ok(())
     }
 
     pub async fn rebuild_indices(&self) -> Result<()> {
@@ -612,9 +861,11 @@ impl SchemaManager {
             "types",
             "vectors",
             "commit_vectors",
+            "lore_vectors",
             "processed_files",
             "symbol_filename",
             "git_commits",
+            "lore",
         ];
 
         // Add all content shard tables
@@ -789,9 +1040,11 @@ impl SchemaManager {
             "types",
             "vectors",
             "commit_vectors",
+            "lore_vectors",
             "processed_files",
             "symbol_filename",
             "git_commits",
+            "lore",
         ];
 
         // Add all content shard tables
@@ -849,6 +1102,18 @@ impl SchemaManager {
                             return Err(e);
                         }
                     }
+                } else if *table_name == "lore_vectors" {
+                    // Always create lore_vectors table with 256 dimensions
+                    tracing::info!("Recreating lore_vectors table with 256 dimensions");
+                    match self.create_lore_vectors_table().await {
+                        Ok(_) => {
+                            tracing::info!("Successfully recreated lore_vectors table");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to recreate lore_vectors table: {}", e);
+                            return Err(e);
+                        }
+                    }
                 } else {
                     // Normal table recreation
                     match self.create_table_by_name(table_name).await {
@@ -892,6 +1157,14 @@ impl SchemaManager {
         // Recreate indices after all tables are reconstructed
         tracing::info!("Recreating indices after drop/recreate...");
         self.create_scalar_indices().await?;
+
+        // Recreate FTS indices for lore table if it has data
+        if table_names.iter().any(|n| n == "lore") {
+            tracing::info!("Recreating FTS indices for lore table...");
+            if let Err(e) = self.create_lore_fts_indices().await {
+                tracing::warn!("Failed to create lore FTS indices: {}", e);
+            }
+        }
 
         tracing::info!("Drop and recreate operation complete - maximum space reclaimed!");
         Ok(())
@@ -938,9 +1211,11 @@ impl SchemaManager {
             "types" => self.create_types_table().await,
             "vectors" => self.create_vectors_table().await,
             "commit_vectors" => self.create_commit_vectors_table().await,
+            "lore_vectors" => self.create_lore_vectors_table().await,
             "processed_files" => self.create_processed_files_table().await,
             "symbol_filename" => self.create_symbol_filename_table().await,
             "git_commits" => self.create_git_commits_table().await,
+            "lore" => self.create_lore_table().await,
             "content" => self.create_content_table().await,
             name if name.starts_with("content_") => {
                 // Handle content shard tables
@@ -1004,6 +1279,11 @@ impl SchemaManager {
             tracing::info!("Recreating commit_vectors table with 256 dimensions");
             self.create_commit_vectors_table().await?;
             tracing::info!("Recreated commit_vectors table");
+        } else if table_name == "lore_vectors" {
+            // Always create lore_vectors table with 256 dimensions
+            tracing::info!("Recreating lore_vectors table with 256 dimensions");
+            self.create_lore_vectors_table().await?;
+            tracing::info!("Recreated lore_vectors table");
         } else {
             // Normal table recreation
             self.create_table_by_name(table_name).await?;
@@ -1016,6 +1296,14 @@ impl SchemaManager {
 
         // Step 5: Recreate indices for this table
         self.create_scalar_indices().await?;
+
+        // Step 6: Recreate FTS indices for lore table if applicable
+        if table_name == "lore" {
+            tracing::info!("Recreating FTS indices for lore table...");
+            if let Err(e) = self.create_lore_fts_indices().await {
+                tracing::warn!("Failed to create lore FTS indices: {}", e);
+            }
+        }
 
         tracing::info!("Drop and recreate complete for table {}", table_name);
         Ok(())

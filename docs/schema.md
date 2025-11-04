@@ -34,7 +34,9 @@ The database consists of the following tables:
 5. **processed_files** - Tracks processed files for incremental indexing
 6. **symbol_filename** - Fast lookup cache mapping symbols to file paths
 7. **git_commits** - Git commit metadata with unified diffs and changed symbols
-8. **content_0 through content_15** - Deduplicated content storage (16 shards)
+8. **lore** - Lore.kernel.org email archive with FTS indices for fast searching
+9. **lore_vectors** - Vector embeddings for semantic search of lore emails
+10. **content_0 through content_15** - Deduplicated content storage (16 shards)
 
 ## Table Schemas
 
@@ -222,71 +224,71 @@ vector              (FixedSizeList[Float32, 256], NOT NULL)  - Embedding vector 
 
 Stores git commit metadata including unified diffs and symbols changed in each commit. Enables commit-level analysis and tracking code evolution across git history.
 
+---
+
+### 8. lore
+
+Stores lore.kernel.org email archives for searching kernel development discussions, patches, and reviews.
+
 **Schema:**
 ```
-git_sha             (Utf8, NOT NULL)     - Commit SHA (primary key)
-parent_sha          (Utf8, NOT NULL)     - JSON array of parent commit SHAs (multiple for merges)
-author              (Utf8, NOT NULL)     - Author name and email (format: "Name <email>")
-subject             (Utf8, NOT NULL)     - Commit subject line (first line of message)
-message             (Utf8, NOT NULL)     - Full commit message
-tags                (Utf8, NOT NULL)     - JSON map of commit message tags (e.g., Signed-off-by, Reviewed-by)
-diff                (Utf8, NOT NULL)     - Full unified diff with symbol context in hunk headers
-symbols             (Utf8, NOT NULL)     - JSON array of changed symbols extracted via walk-back algorithm
-files               (Utf8, NOT NULL)     - JSON array of file paths that were added, removed, or changed
+git_commit_sha      (Utf8, NOT NULL)     - Git commit SHA from lore repository
+from                (Utf8, NOT NULL)     - Sender email address
+date                (Utf8, NOT NULL)     - ISO 8601 timestamp
+message_id          (Utf8, NOT NULL)     - Unique Message-ID (primary key)
+in_reply_to         (Utf8, nullable)     - Message-ID of parent email
+subject             (Utf8, NOT NULL)     - Email subject line
+references          (Utf8, nullable)     - Space-separated Message-IDs of thread ancestors
+recipients          (Utf8, NOT NULL)     - Comma-separated To/Cc recipients
+headers             (Utf8, NOT NULL)     - Full email headers
+body                (Utf8, NOT NULL)     - Email body content
+symbols             (Utf8, NOT NULL)     - JSON array of symbols found in patches/diffs
 ```
-
-**Symbol Extraction:**
-- Detects modified functions, types (structs/unions/enums), and macros
-- Handles both additions and deletions by analyzing old and new file versions
-- Symbol formats: "function_name()", "struct type_name", "union type_name", "enum type_name", "#MACRO_NAME"
-- Includes symbol context in unified diff hunk headers (git-style: `@@ ... @@ function_name()`)
-
-**Example JSON columns:**
-```json
-// parent_sha column
-["a1b2c3d4e5f6...", "f6e5d4c3b2a1..."]  // Multiple for merge commits
-
-// tags column
-{
-  "Signed-off-by": ["John Doe <john@example.com>"],
-  "Reviewed-by": ["Jane Smith <jane@example.com>", "Bob Jones <bob@example.com>"],
-  "Fixes": ["#1234"]
-}
-
-// symbols column
-["mem_pool_alloc()", "struct kmemleak_object", "kmemleak_init()", "#KMEMLEAK_DEBUG"]
-
-// files column
-["mm/kmemleak.c", "include/linux/kmemleak.h", "Documentation/dev-tools/kmemleak.rst"]
-```
-
-**Unified Diff Format:**
-- Standard git unified diff format with additions (+), deletions (-), and context lines
-- Enhanced with symbol context in hunk headers: `@@ -old_start,old_count +new_start,new_count @@ symbol`
-- Includes file headers (diff --git, ---, +++) for each modified file
-- Only includes diffs for commits with exactly one parent (skips merge commits and root commits)
-
-**Use Cases:**
-- **Commit Analysis**: Understand what changed in each commit and which symbols were affected
-- **Code Evolution**: Track how functions and types evolve across commits
-- **Review Assistance**: Quickly identify modified symbols without parsing full diffs
-- **Git History Search**: Find commits that modified specific functions or types
-- **Incremental Processing**: Process commit ranges efficiently with deduplication
-
-**Notes:**
-- Populated by `semcode-index --commits SHA1..SHA2` for commit metadata only
-- Also populated automatically during `semcode-index --git SHA1..SHA2` (files + commits)
-- Diff generation uses gitoxide for consistent git-compatible output
 
 **Indices:**
-- BTree on `git_sha` (primary key for commit lookups)
-- BTree on `author` (query commits by author)
-- BTree on `subject` (search commit messages)
-- BTree on `symbols` (find commits that modified specific symbols)
-- BTree on `files` (find commits that modified specific files)
-- BTree on `parent_sha` (traverse commit history)
+- BTree on `message_id` (unique lookups, primary key)
+- BTree on `from` (exact sender lookups)
+- BTree on `subject` (exact subject lookups)
+- BTree on `date` (chronological queries)
+- BTree on `in_reply_to` (threading queries)
+- BTree on `references` (threading queries)
+- BTree on `headers` (header searches)
+- **FTS (Full Text Search) on `from`** - Fast keyword search on sender
+- **FTS on `subject`** - Fast keyword search on subject lines
+- **FTS on `body`** - Fast keyword search on email bodies
+- **FTS on `recipients`** - Fast keyword search on recipients
+- **FTS on `symbols`** - Fast keyword search on symbols mentioned in patches
 
-### 8. content_0 through content_15 (Content Shards)
+**Search Performance:**
+All lore searches use a two-phase **FTS + regex post-filtering** approach:
+1. FTS phase: Fast keyword extraction and inverted index lookup returns superset
+2. Regex phase: Precise pattern matching on small FTS result set in memory
+
+This provides both speed (FTS indices) and precision (full regex support).
+
+**Threading Support:**
+Emails are linked via `in_reply_to` and `references` fields for thread reconstruction.
+
+---
+
+### 9. lore_vectors
+
+Stores 256-dimensional vector embeddings for semantic search of lore emails.
+
+**Schema:**
+```
+message_id          (Utf8, NOT NULL)     - Email Message-ID (links to lore table)
+vector              (FixedSizeList[Float32, 256], NOT NULL) - Semantic embedding
+```
+
+**Vector Generation:**
+Embeddings combine from, subject, recipients, and body into a single representation for similarity search.
+
+**Index:**
+- IVF-PQ vector index for fast approximate nearest neighbor search
+
+
+### 10. content_0 through content_15 (Content Shards)
 
 Stores deduplicated content referenced by other tables, distributed across 16 shard tables for optimal performance.
 

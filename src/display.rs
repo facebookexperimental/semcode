@@ -122,6 +122,39 @@ fn print_command_help() {
         "dump-content".yellow(),
         "dcont".yellow()
     );
+    println!(
+        "  {} ({}) <file> - Export all git commits to JSON file",
+        "dump-git-commits".yellow(),
+        "dgc".yellow()
+    );
+    println!(
+        "  {} ({}) <file>     - Export all lore emails to JSON file",
+        "dump-lore".yellow(),
+        "dlore".yellow()
+    );
+
+    println!();
+    println!("{}", "Lore Commands:".bold().cyan());
+    println!(
+        "  {} [options]                - Search lore kernel emails",
+        "lore".yellow()
+    );
+    println!("                                   -m <msg_id>: Get email by message_id");
+    println!(
+        "                                   -f <regex>: Filter by from field (can use multiple)"
+    );
+    println!("                                   -s <regex>: Filter by subject (can use multiple)");
+    println!("                                   -b <regex>: Filter by body (can use multiple)");
+    println!(
+        "                                   -t <regex>: Filter by recipients (can use multiple)"
+    );
+    println!("                                   -v: Show full message body");
+    println!("                                   --limit <N>: Limit results (default: 100)");
+    println!("                                   --thread: Show full thread");
+    println!(
+        "  {} <commit>                    - Find lore emails for a git commit",
+        "dig".yellow()
+    );
 
     println!();
     println!("{}", "General:".bold().cyan());
@@ -200,6 +233,12 @@ pub fn print_help() {
     println!("  vcommit \"fix memory leak\"          # Find commits semantically similar to \"fix memory leak\"");
     println!("  vcommit --git HEAD~50..HEAD \"performance\"  # Search commits in range");
     println!("  vcommit -r \"malloc\" -r \"free\" --limit 10 \"memory\"  # Find memory-related commits with both malloc and free");
+    println!("  lore -s \"memory leak\"                 # Search lore emails by subject");
+    println!("  lore -g \"malloc\"                      # Search lore emails by symbol");
+    println!("  lore -f \"torvalds\" -b \"btrfs\"        # From torvalds AND body contains btrfs");
+    println!("  lore -m \"<msg-id@example.org>\"        # Get email by exact message ID");
+    println!("  dig HEAD                               # Find lore emails for HEAD commit");
+    println!("  dig v6.5                               # Find lore emails for v6.5 tag");
     println!();
 }
 

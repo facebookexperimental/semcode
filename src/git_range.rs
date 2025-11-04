@@ -7,7 +7,6 @@ use crate::{
     TreeSitterAnalyzer, TypeInfo,
 };
 use anyhow::Result;
-use colored::Colorize;
 use dashmap::DashSet;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashSet;
@@ -621,61 +620,14 @@ async fn process_git_tuples_streaming(
                             let total_batches =
                                 batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
-                            // Periodic optimization check (only inserter 0, every 300 batches total, at most once per 15 minutes)
-                            // Don't check until we've done at least 300 batches (skip the very first check)
-                            if inserter_id == 0 && total_batches > 300 && total_batches % 300 == 0 {
-                                // Check if we should run optimization (must drop lock before await)
-                                let should_optimize = {
-                                    // Try to acquire lock without blocking - if another thread is checking, skip
-                                    if let Ok(last_check) = optimization_check_timer.try_lock() {
-                                        let elapsed = last_check.elapsed();
-                                        // Only check if it's been at least 15 minutes since last check
-                                        elapsed.as_secs() >= 900
-                                    } else {
-                                        false
-                                    }
-                                };
-
-                                if should_optimize {
-                                    // Quick health check (lock is dropped, safe to await)
-                                    match db_manager_clone.check_optimization_health().await {
-                                        Ok((needs_optimization, message)) => {
-                                            if needs_optimization {
-                                                println!("{}", message);
-                                                println!(
-                                                    "\n{} Fragment threshold exceeded during indexing, running optimization...",
-                                                    "⚠️".yellow()
-                                                );
-                                                match db_manager_clone.optimize_database().await {
-                                                    Ok(_) => {
-                                                        println!(
-                                                            "{} In-progress optimization completed",
-                                                            "✓".green()
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            "In-progress optimization failed: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to check database health: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-
-                                    // Update last check time
-                                    if let Ok(mut last_check) = optimization_check_timer.lock() {
-                                        *last_check = std::time::Instant::now();
-                                    }
-                                }
-                            }
+                            // Periodic optimization check using shared function
+                            crate::indexer::check_and_optimize_if_needed(
+                                &db_manager_clone,
+                                inserter_id,
+                                total_batches,
+                                &optimization_check_timer,
+                            )
+                            .await;
                         }
                     }
                     Err(_) => break, // Channel closed, exit task

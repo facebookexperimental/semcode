@@ -12,10 +12,79 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::git::resolve_to_commit;
 use crate::{DatabaseManager, GitCommitInfo};
+
+/// Perform periodic optimization check during indexing operations
+/// Returns true if optimization was performed, false otherwise
+pub async fn check_and_optimize_if_needed(
+    db_manager: &DatabaseManager,
+    inserter_id: usize,
+    total_batches: usize,
+    optimization_check_timer: &Arc<std::sync::Mutex<std::time::Instant>>,
+) -> bool {
+    use owo_colors::OwoColorize;
+
+    // Periodic optimization check (only inserter 0, every 300 batches total, at most once per 15 minutes)
+    // Don't check until we've done at least 300 batches (skip the very first check)
+    if inserter_id != 0 || total_batches <= 300 || total_batches % 300 != 0 {
+        return false;
+    }
+
+    // Check if we should run optimization (must drop lock before await)
+    let should_optimize = {
+        // Try to acquire lock without blocking - if another thread is checking, skip
+        if let Ok(last_check) = optimization_check_timer.try_lock() {
+            let elapsed = last_check.elapsed();
+            // Only check if it's been at least 15 minutes since last check
+            elapsed.as_secs() >= 900
+        } else {
+            false
+        }
+    };
+
+    if !should_optimize {
+        return false;
+    }
+
+    // Quick health check (lock is dropped, safe to await)
+    match db_manager.check_optimization_health().await {
+        Ok((needs_optimization, message)) => {
+            if needs_optimization {
+                println!("{}", message);
+                println!(
+                    "\n{} Fragment threshold exceeded during indexing, running optimization...",
+                    "⚠️".yellow()
+                );
+                match db_manager.optimize_database().await {
+                    Ok(_) => {
+                        println!("{} In-progress optimization completed", "✓".green());
+                    }
+                    Err(e) => {
+                        warn!("In-progress optimization failed: {}", e);
+                    }
+                }
+            } else {
+                debug!(
+                    "Optimization health check passed at batch {}",
+                    total_batches
+                );
+            }
+        }
+        Err(e) => {
+            warn!("Failed to check optimization health: {}", e);
+        }
+    }
+
+    // Update last check time
+    if let Ok(mut last_check) = optimization_check_timer.lock() {
+        *last_check = std::time::Instant::now();
+    }
+
+    true
+}
 
 /// Parse git range and get all commit SHAs in the range
 /// Uses gitoxide's built-in rev-spec parsing for proper A..B semantics
@@ -314,6 +383,217 @@ fn generate_commit_diff(
     Ok((diff_output, all_symbols, changed_files))
 }
 
+/// Parse email from a lore commit's 'm' file
+/// Extracts headers and body from an email message
+pub fn parse_email_from_commit(
+    repo: &gix::Repository,
+    commit_sha: &str,
+) -> Result<crate::LoreEmailInfo> {
+    // Resolve commit
+    let commit = resolve_to_commit(repo, commit_sha)?;
+
+    // Get the tree
+    let tree = commit.tree()?;
+
+    // Find the 'm' file in the tree
+    let m_entry = tree
+        .find_entry("m")
+        .ok_or_else(|| anyhow::anyhow!("Commit {} does not contain file 'm'", commit_sha))?;
+
+    // Read the file content
+    let object = m_entry.object()?;
+    let blob = object.try_into_blob()?;
+    let email_content = String::from_utf8_lossy(blob.data.as_slice()).to_string();
+
+    // Parse email headers
+    let mut from = String::new();
+    let mut date = String::new();
+    let mut message_id = String::new();
+    let mut in_reply_to: Option<String> = None;
+    let mut subject = String::new();
+    let mut references: Option<String> = None;
+    let mut recipients_list = Vec::new();
+
+    // Split headers and body
+    let mut lines = email_content.lines();
+    let mut in_headers = true;
+    let mut header_lines = Vec::new();
+    let mut body_lines = Vec::new();
+    let mut current_header: Option<(String, String)> = None;
+
+    for line in lines.by_ref() {
+        if in_headers {
+            if line.is_empty() {
+                // Empty line marks end of headers
+                if let Some((name, value)) = current_header.take() {
+                    process_header(
+                        &name,
+                        &value,
+                        &mut from,
+                        &mut date,
+                        &mut message_id,
+                        &mut in_reply_to,
+                        &mut subject,
+                        &mut references,
+                        &mut recipients_list,
+                    );
+                }
+                in_headers = false;
+                continue;
+            }
+
+            // Store the header line as-is
+            header_lines.push(line);
+
+            // Check if this is a continuation line (starts with whitespace)
+            if line.starts_with(' ') || line.starts_with('\t') {
+                if let Some((_, ref mut value)) = current_header {
+                    value.push(' ');
+                    value.push_str(line.trim());
+                }
+            } else {
+                // New header
+                if let Some((name, value)) = current_header.take() {
+                    process_header(
+                        &name,
+                        &value,
+                        &mut from,
+                        &mut date,
+                        &mut message_id,
+                        &mut in_reply_to,
+                        &mut subject,
+                        &mut references,
+                        &mut recipients_list,
+                    );
+                }
+
+                if let Some(colon_pos) = line.find(':') {
+                    let header_name = line[..colon_pos].trim().to_lowercase();
+                    let header_value = line[colon_pos + 1..].trim().to_string();
+                    current_header = Some((header_name, header_value));
+                }
+            }
+        } else {
+            // Body content
+            body_lines.push(line);
+        }
+    }
+
+    // Process any remaining header
+    if let Some((name, value)) = current_header {
+        process_header(
+            &name,
+            &value,
+            &mut from,
+            &mut date,
+            &mut message_id,
+            &mut in_reply_to,
+            &mut subject,
+            &mut references,
+            &mut recipients_list,
+        );
+    }
+
+    let recipients = recipients_list.join(", ");
+    let headers = header_lines.join("\n");
+    let body = body_lines.join("\n");
+
+    // Extract symbols from any diffs found in the email body
+    let symbols = extract_symbols_from_email_body(&body);
+
+    Ok(crate::LoreEmailInfo {
+        git_commit_sha: commit_sha.to_string(),
+        from,
+        date,
+        message_id,
+        in_reply_to,
+        subject,
+        references,
+        recipients,
+        headers,
+        body,
+        symbols,
+    })
+}
+
+/// Helper function to process a single email header
+fn process_header(
+    name: &str,
+    value: &str,
+    from: &mut String,
+    date: &mut String,
+    message_id: &mut String,
+    in_reply_to: &mut Option<String>,
+    subject: &mut String,
+    references: &mut Option<String>,
+    recipients_list: &mut Vec<String>,
+) {
+    match name {
+        "from" => *from = value.to_string(),
+        "date" => *date = value.to_string(),
+        "message-id" => *message_id = value.to_string(),
+        "in-reply-to" => *in_reply_to = Some(value.to_string()),
+        "subject" => *subject = value.to_string(),
+        "references" => *references = Some(value.to_string()),
+        "to" | "cc" => recipients_list.push(value.to_string()),
+        _ => {}
+    }
+}
+
+/// Extract symbols from unified diffs found in email body
+/// Detects diff headers starting at column 0 (to avoid quoted replies)
+fn extract_symbols_from_email_body(body: &str) -> Vec<String> {
+    use std::collections::HashSet;
+
+    // Check if body contains unified diff markers starting at column 0
+    let has_diff = body.lines().any(|line| {
+        // Look for unified diff headers that start at column 0
+        line.starts_with("--- a/") || line.starts_with("+++ b/") || line.starts_with("diff --git")
+    });
+
+    if !has_diff {
+        return Vec::new();
+    }
+
+    // Try to parse the diff and extract symbols
+    match crate::diffdump::parse_unified_diff(body) {
+        Ok(result) => {
+            // Collect all symbols into a deduplicated set
+            let mut all_symbols = HashSet::new();
+
+            // Add modified functions with file:function() format
+            for func in result.modified_functions {
+                all_symbols.insert(func);
+            }
+
+            // Add called functions
+            for func in result.called_functions {
+                all_symbols.insert(func);
+            }
+
+            // Add modified types
+            for type_name in result.modified_types {
+                all_symbols.insert(type_name);
+            }
+
+            // Add modified macros
+            for macro_name in result.modified_macros {
+                all_symbols.insert(macro_name);
+            }
+
+            // Convert to sorted vector for consistent output
+            let mut symbols: Vec<String> = all_symbols.into_iter().collect();
+            symbols.sort();
+            symbols
+        }
+        Err(e) => {
+            // Log error but don't fail the entire email parsing
+            tracing::debug!("Failed to parse diff in email body: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Process commits using a streaming pipeline
 pub async fn process_commits_pipeline(
     repo_path: &std::path::Path,
@@ -532,6 +812,222 @@ pub async fn process_commits_pipeline(
         "Complete: {} commits processed",
         processed_count.load(Ordering::Relaxed)
     ));
+    progress_thread.join().unwrap();
+
+    Ok(())
+}
+
+/// Process lore commits using a streaming pipeline
+/// Similar to process_commits_pipeline but parses email from 'm' file
+pub async fn process_lore_commits_pipeline(
+    repo_path: &std::path::Path,
+    commit_shas: Vec<String>,
+    db_manager: Arc<DatabaseManager>,
+    batch_size: usize,
+    num_workers: usize,
+    num_inserters: usize,
+) -> Result<()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::sync::Mutex;
+
+    // Create progress bar
+    let pb = ProgressBar::new(commit_shas.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} emails ({per_sec}) - {msg}"
+        )
+        .unwrap()
+        .progress_chars("█▓▒░  ")
+    );
+
+    // Create channels for streaming
+    let (commit_tx, commit_rx) = mpsc::channel::<String>();
+    let (result_tx, result_rx) = mpsc::sync_channel::<Vec<crate::LoreEmailInfo>>(10);
+
+    // Wrap receiver for shared access
+    let shared_commit_rx = Arc::new(Mutex::new(commit_rx));
+
+    // Shared counters
+    let processed_count = Arc::new(AtomicUsize::new(0));
+    let inserted_count = Arc::new(AtomicUsize::new(0));
+
+    // Spawn progress updater thread
+    let pb_clone = pb.clone();
+    let processed_clone = processed_count.clone();
+    let progress_thread = std::thread::spawn(move || loop {
+        let count = processed_clone.load(Ordering::Relaxed);
+        pb_clone.set_position(count as u64);
+        if pb_clone.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+
+    // Spawn worker threads to parse email metadata
+    let mut worker_handles = Vec::new();
+    for worker_id in 0..num_workers {
+        let worker_commit_rx = shared_commit_rx.clone();
+        let worker_result_tx = result_tx.clone();
+        let worker_repo_path = repo_path.to_path_buf();
+        let worker_processed = processed_count.clone();
+
+        let handle = thread::spawn(move || {
+            // Open repository ONCE per worker thread
+            let thread_repo = match gix::discover(&worker_repo_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
+                    return;
+                }
+            };
+
+            let mut batch = Vec::new();
+
+            loop {
+                // Get next commit SHA
+                let commit_sha = {
+                    match worker_commit_rx.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(e) => {
+                            tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
+                            break;
+                        }
+                    }
+                };
+
+                match commit_sha {
+                    Ok(sha) => {
+                        match parse_email_from_commit(&thread_repo, &sha) {
+                            Ok(email_info) => {
+                                batch.push(email_info);
+                                worker_processed.fetch_add(1, Ordering::Relaxed);
+
+                                // Send batch when it reaches batch_size
+                                if batch.len() >= batch_size {
+                                    if worker_result_tx.send(batch.clone()).is_err() {
+                                        break;
+                                    }
+                                    batch.clear();
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Worker {} failed to parse email for {}: {}",
+                                    worker_id, sha, e
+                                );
+                                worker_processed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Channel closed, send remaining batch
+                        if !batch.is_empty() {
+                            let _ = worker_result_tx.send(batch);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        worker_handles.push(handle);
+    }
+
+    // Spawn producer thread to feed commit SHAs
+    let producer_handle = thread::spawn(move || {
+        for commit_sha in commit_shas {
+            if commit_tx.send(commit_sha).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Close original senders
+    drop(result_tx);
+
+    // Wrap result receiver for shared access
+    let shared_result_rx = Arc::new(Mutex::new(result_rx));
+
+    // Shared flag to coordinate periodic optimization checks
+    // Only one inserter should check at a time to avoid redundant checks
+    let last_optimization_check = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let batches_inserted = Arc::new(AtomicUsize::new(0));
+
+    // Spawn multiple database inserter tasks
+    let mut inserter_handles = Vec::new();
+
+    for inserter_id in 0..num_inserters {
+        let db_manager_clone = Arc::clone(&db_manager);
+        let inserted_clone = inserted_count.clone();
+        let pb_clone = pb.clone();
+        let result_rx_clone = shared_result_rx.clone();
+        let batches_counter = batches_inserted.clone();
+        let optimization_check_timer = last_optimization_check.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Get next batch from shared receiver
+                let batch = {
+                    match result_rx_clone.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(e) => {
+                            error!("Inserter {} failed to lock receiver: {}", inserter_id, e);
+                            break;
+                        }
+                    }
+                };
+
+                match batch {
+                    Ok(emails) => {
+                        let batch_len = emails.len();
+
+                        // Insert batch into database
+                        if let Err(e) = db_manager_clone.insert_lore_emails(&emails).await {
+                            error!("Inserter {} failed to insert batch: {}", inserter_id, e);
+                        } else {
+                            let count = inserted_clone.fetch_add(batch_len, Ordering::Relaxed);
+                            pb_clone.set_message(format!("Inserted {} emails", count + batch_len));
+
+                            // Track successful batch insertions and check for periodic optimization
+                            let total_batches = batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            check_and_optimize_if_needed(
+                                &db_manager_clone,
+                                inserter_id,
+                                total_batches,
+                                &optimization_check_timer,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(_) => {
+                        // Channel closed
+                        break;
+                    }
+                }
+            }
+        });
+        inserter_handles.push(handle);
+    }
+
+    // Wait for all workers to finish
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
+
+    // Wait for producer
+    let _ = producer_handle.join();
+
+    // Wait for all inserters to finish
+    for handle in inserter_handles {
+        let _ = handle.await;
+    }
+
+    pb.finish_with_message(format!(
+        "Processed {} emails, inserted {}",
+        processed_count.load(Ordering::Relaxed),
+        inserted_count.load(Ordering::Relaxed)
+    ));
+
+    // Wait for progress thread
     progress_thread.join().unwrap();
 
     Ok(())

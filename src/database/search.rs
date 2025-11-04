@@ -3,6 +3,7 @@ use anyhow::Result;
 use arrow::array::{Array, StringArray};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
+use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::index::{vector::IvfPqIndexBuilder, Index as LanceIndex};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
@@ -1760,6 +1761,231 @@ impl VectorSearchManager {
         }
     }
 
+    /// Helper to query lore by fields and return intersection of message_ids
+    /// Optimized for large result sets with capacity pre-allocation
+    async fn query_lore_fields_intersection(
+        &self,
+        from_patterns: Option<&[String]>,
+        subject_patterns: Option<&[String]>,
+        body_patterns: Option<&[String]>,
+        symbols_patterns: Option<&[String]>,
+        recipients_patterns: Option<&[String]>,
+        search_limit: usize,
+    ) -> Result<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+
+        let lore_table = self.connection.open_table("lore").execute().await?;
+        let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
+
+        // Helper function to query a field using substring matching and collect message_ids efficiently
+        async fn query_field_impl(
+            lore_table: &lancedb::Table,
+            field_name: String,
+            pattern: String,
+            search_limit: usize,
+        ) -> Result<HashSet<String>> {
+            let start = std::time::Instant::now();
+
+            tracing::info!(
+                "vlore filter query: field='{}' pattern='{}' limit={}",
+                field_name,
+                pattern,
+                search_limit
+            );
+
+            // FTS uses simple tokenizer - normalize pattern by stripping special chars
+            let fts_pattern = pattern
+                .split(|c: char| !c.is_alphanumeric() && c != ' ')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let fts_query =
+                FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
+            let mut query = lore_table.query().full_text_search(fts_query).select(
+                lancedb::query::Select::Columns(vec![
+                    "message_id".to_string(),
+                    "_score".to_string(),
+                    field_name.clone(),
+                ]),
+            );
+
+            // Apply limit - use large limit if search_limit is 0 (unlimited)
+            // FTS has a default limit of 10, so we must explicitly set a large limit
+            let effective_limit = if search_limit > 0 {
+                search_limit
+            } else {
+                100000
+            };
+            query = query.limit(effective_limit);
+
+            let results = query.execute().await?.try_collect::<Vec<_>>().await?;
+
+            // Step 2: Post-filter results with regex in memory (small result set)
+            let regex = regex::Regex::new(&pattern)?;
+            let mut message_ids = HashSet::new();
+
+            for batch in &results {
+                let msg_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let field_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let field_value = field_array.value(i);
+                    if regex.is_match(field_value) {
+                        message_ids.insert(msg_array.value(i).to_string());
+                    }
+                }
+            }
+
+            tracing::info!(
+                "vlore filter completed: FTS returned {} candidates, regex filtered to {} in {:?}",
+                results.iter().map(|b| b.num_rows()).sum::<usize>(),
+                message_ids.len(),
+                start.elapsed()
+            );
+
+            Ok(message_ids)
+        }
+
+        // Query from field
+        if let Some(patterns) = from_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                field_result_sets.push(
+                    query_field_impl(
+                        &lore_table,
+                        "from".to_string(),
+                        combined_pattern,
+                        search_limit,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        // Query subject field
+        if let Some(patterns) = subject_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                field_result_sets.push(
+                    query_field_impl(
+                        &lore_table,
+                        "subject".to_string(),
+                        combined_pattern,
+                        search_limit,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        // Query body field
+        if let Some(patterns) = body_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                field_result_sets.push(
+                    query_field_impl(
+                        &lore_table,
+                        "body".to_string(),
+                        combined_pattern,
+                        search_limit,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        // Query symbols field
+        if let Some(patterns) = symbols_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                field_result_sets.push(
+                    query_field_impl(
+                        &lore_table,
+                        "symbols".to_string(),
+                        combined_pattern,
+                        search_limit,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        // Query recipients field
+        if let Some(patterns) = recipients_patterns {
+            if !patterns.is_empty() {
+                // FTS: join patterns with spaces for multi-keyword search
+                let combined_pattern = patterns.join(" ");
+                field_result_sets.push(
+                    query_field_impl(
+                        &lore_table,
+                        "recipients".to_string(),
+                        combined_pattern,
+                        search_limit,
+                    )
+                    .await?,
+                );
+            }
+        }
+
+        // Compute intersection efficiently
+        if field_result_sets.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let intersection_start = std::time::Instant::now();
+
+        // Start with the smallest set for faster intersection
+        field_result_sets.sort_by_key(|s| s.len());
+
+        tracing::info!(
+            "vlore intersection: {} sets with sizes: {:?}",
+            field_result_sets.len(),
+            field_result_sets
+                .iter()
+                .map(|s| s.len())
+                .collect::<Vec<_>>()
+        );
+
+        let mut intersection = field_result_sets[0].clone();
+        for (idx, set) in field_result_sets.iter().enumerate().skip(1) {
+            let before_size = intersection.len();
+            // Use retain for in-place intersection (faster than creating new set)
+            intersection.retain(|id| set.contains(id));
+            tracing::info!(
+                "vlore intersection step {}: {} -> {} results",
+                idx,
+                before_size,
+                intersection.len()
+            );
+
+            // Early exit if intersection becomes empty
+            if intersection.is_empty() {
+                break;
+            }
+        }
+
+        tracing::info!(
+            "vlore intersection completed: {} final results in {:?}",
+            intersection.len(),
+            intersection_start.elapsed()
+        );
+
+        Ok(intersection)
+    }
+
     pub async fn create_vector_index(&self) -> Result<()> {
         let table = self.connection.open_table("vectors").execute().await?;
 
@@ -2047,12 +2273,38 @@ impl VectorSearchManager {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let vector_store = VectorStore::new(self.connection.clone());
-        let existing_vectors = vector_store.get_stats().await?;
+        tracing::info!("Starting function content vectorization");
+
+        // Build hashset of all existing vector content_hashes upfront
+        println!("Loading existing vectors into memory...");
+        let vectors_table = self.connection.open_table("vectors").execute().await?;
+        let existing_vector_results = vectors_table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut existing_content_hashes = std::collections::HashSet::new();
+        for batch in &existing_vector_results {
+            let hash_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                existing_content_hashes.insert(hash_array.value(i).to_string());
+            }
+        }
+
+        println!(
+            "Loaded {} existing content hashes into memory",
+            existing_content_hashes.len()
+        );
 
         tracing::info!(
             "Found {} existing vectors, checking for missing ones in content tables",
-            existing_vectors
+            existing_content_hashes.len()
         );
 
         // First count total entries for progress bar
@@ -2092,6 +2344,9 @@ impl VectorSearchManager {
         // Memory-bounded chunk size (process ~10k entries at a time in memory)
         let memory_chunk_size = 10000;
 
+        // Share the hashset across all shard tasks
+        let existing_content_hashes = Arc::new(existing_content_hashes);
+
         // Process each shard concurrently
         let shard_tasks: Vec<_> = (0..16u8)
             .map(|shard| {
@@ -2101,6 +2356,7 @@ impl VectorSearchManager {
                 let pb = pb.clone();
                 let processed_counter = Arc::clone(&processed_count);
                 let new_vectors_counter = Arc::clone(&new_vectors_count);
+                let existing_hashes = Arc::clone(&existing_content_hashes);
 
                 tokio::spawn(async move {
                     let table_name = format!("content_{shard}");
@@ -2150,14 +2406,10 @@ impl VectorSearchManager {
                         }
 
                         if !chunk_content.is_empty() {
-                            // Check which entries need vectors
-                            let hashes: Vec<String> =
-                                chunk_content.iter().map(|(h, _)| h.clone()).collect();
-                            let existing = vector_store.get_vectors_batch(&hashes).await?;
-
+                            // Filter out already-vectorized content using the shared hashset
                             let new_content: Vec<(String, String)> = chunk_content
                                 .into_iter()
-                                .filter(|(hash, _)| !existing.contains_key(hash))
+                                .filter(|(hash, _)| !existing_hashes.contains(hash))
                                 .collect();
 
                             if !new_content.is_empty() {
@@ -2234,6 +2486,11 @@ impl VectorSearchManager {
             final_processed,
             final_new_vectors
         );
+
+        // Hashset is automatically freed here when function returns
+        drop(existing_content_hashes);
+        println!("Function vectorization complete, memory freed");
+
         Ok(())
     }
 
@@ -2338,7 +2595,12 @@ impl VectorSearchManager {
             return Ok(());
         }
 
-        println!("Vectorizing {} new commits...", commits_to_vectorize.len());
+        // Free the hashset now that we've filtered commits
+        drop(existing_commit_shas);
+        println!(
+            "Commit hashset freed, {} commits to vectorize",
+            commits_to_vectorize.len()
+        );
 
         let pb = ProgressBar::new(commits_to_vectorize.len() as u64);
         pb.set_style(
@@ -2349,6 +2611,13 @@ impl VectorSearchManager {
         );
 
         let processed_count = Arc::new(AtomicUsize::new(0));
+
+        // Open commit_vectors table once and cache it for all insertions
+        let commit_vectors_table = self
+            .connection
+            .open_table("commit_vectors")
+            .execute()
+            .await?;
 
         // Process commits in streaming batches for better progress feedback
         // Larger batch size (500) reduces database insertion overhead while still providing
@@ -2361,7 +2630,7 @@ impl VectorSearchManager {
             let batch = &commits_to_vectorize[batch_start..batch_end];
 
             // Vectorize all texts in one call - vectorizer handles internal batching and
-            // parallelism optimally (model2vec-rs uses num_cpus * 64 batch size internally)
+            // parallelism optimally (model2vec-rs uses num_cpus * 128 batch size internally)
             let texts: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
             let vectors = vectorizer.vectorize_batch(&texts)?;
 
@@ -2374,9 +2643,10 @@ impl VectorSearchManager {
                 })
                 .collect();
 
-            // Insert this batch immediately
+            // Insert this batch immediately using cached table
             if !batch_vectors.is_empty() {
-                self.insert_commit_vectors_batch(&batch_vectors).await?;
+                Self::insert_commit_vectors_batch_with_table(&commit_vectors_table, &batch_vectors)
+                    .await?;
 
                 let count = processed_count.fetch_add(batch_vectors.len(), Ordering::Relaxed)
                     + batch_vectors.len();
@@ -2395,9 +2665,9 @@ impl VectorSearchManager {
         Ok(())
     }
 
-    /// Helper to insert commit vectors into commit_vectors table
-    async fn insert_commit_vectors_batch(
-        &self,
+    /// Helper to insert commit vectors into commit_vectors table with cached table handle
+    async fn insert_commit_vectors_batch_with_table(
+        commit_vectors_table: &lancedb::table::Table,
         vectors: &[crate::database::vectors::VectorEntry],
     ) -> Result<()> {
         use arrow::array::{ArrayRef, FixedSizeListArray, StringBuilder};
@@ -2408,12 +2678,6 @@ impl VectorSearchManager {
         if vectors.is_empty() {
             return Ok(());
         }
-
-        let commit_vectors_table = self
-            .connection
-            .open_table("commit_vectors")
-            .execute()
-            .await?;
 
         // Get vector dimension from first entry
         let vector_dim = vectors[0].vector.len();
@@ -2457,6 +2721,383 @@ impl VectorSearchManager {
         Ok(())
     }
 
+    pub async fn update_lore_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        use crate::database::vectors::VectorEntry;
+        use indicatif::{ProgressBar, ProgressStyle};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        tracing::info!("Starting lore email vectorization");
+
+        // Open lore table
+        let lore_table = self.connection.open_table("lore").execute().await?;
+
+        // Load existing vector message_ids into a HashSet for fast lookup
+        let mut existing_message_ids = std::collections::HashSet::new();
+        match self.connection.open_table("lore_vectors").execute().await {
+            Ok(lore_vectors_table) => {
+                let mut existing_stream = lore_vectors_table.query().execute().await?;
+                while let Some(batch) = existing_stream.try_next().await? {
+                    let message_id_array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .unwrap();
+                    for i in 0..batch.num_rows() {
+                        existing_message_ids.insert(message_id_array.value(i).to_string());
+                    }
+                }
+                println!(
+                    "Loaded {} existing lore message IDs into memory",
+                    existing_message_ids.len()
+                );
+            }
+            Err(_) => {
+                println!("No existing lore vectors found (first run)");
+            }
+        }
+
+        // Share hashset via Arc to avoid cloning for every worker
+        let existing_message_ids = Arc::new(existing_message_ids);
+
+        // Count total for progress bar
+        println!("Counting lore emails...");
+        let mut total_emails = 0;
+        let mut emails_needing_vectors = 0;
+
+        // Quick scan to count
+        let mut temp_stream = lore_table.query().execute().await?;
+        while let Some(batch) = temp_stream.try_next().await? {
+            total_emails += batch.num_rows();
+            let message_id_array = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                if !existing_message_ids.contains(message_id_array.value(i)) {
+                    emails_needing_vectors += 1;
+                }
+            }
+        }
+
+        if emails_needing_vectors == 0 {
+            println!("All {} lore emails already have vectors", total_emails);
+            return Ok(());
+        }
+
+        println!(
+            "Found {} total lore emails, {} need vectorization",
+            total_emails, emails_needing_vectors
+        );
+
+        let pb = ProgressBar::new(emails_needing_vectors as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%) {msg} [{eta}]",
+            )?
+            .progress_chars("##-"),
+        );
+
+        let processed_count = Arc::new(AtomicUsize::new(0));
+
+        // Create parallel pipeline with multiple stages running concurrently:
+        // 1. Reader task: streams RecordBatches from DB and sends to work queue
+        // 2. Multiple extraction+vectorization workers: extract emails and vectorize in parallel
+        // 3. Insertion task: collects vectors and inserts to DB
+        use tokio::sync::mpsc;
+
+        // Work queue: reader -> workers (sends RecordBatches with ~1024 rows each)
+        let (work_tx, work_rx) = mpsc::channel::<arrow::record_batch::RecordBatch>(32);
+        // Results queue: workers -> insertion task
+        let (result_tx, mut result_rx) = mpsc::channel::<Vec<VectorEntry>>(32);
+
+        let num_vectorization_workers = num_cpus::get().max(4); // At least 4 workers
+        tracing::info!(
+            "Starting parallel pipeline: 1 reader, {} vectorization workers, 1 inserter",
+            num_vectorization_workers
+        );
+
+        // Clone for tasks
+        let pb_clone = pb.clone();
+        let processed_clone = processed_count.clone();
+        let connection_clone = self.connection.clone();
+
+        // Spawn database insertion task that consumes results
+        let insertion_task = tokio::spawn(async move {
+            // Open the table ONCE and reuse it for all insertions
+            let lore_vectors_table = connection_clone
+                .open_table("lore_vectors")
+                .execute()
+                .await?;
+
+            let mut total_inserted = 0;
+            while let Some(batch_vectors) = result_rx.recv().await {
+                if let Err(e) =
+                    insert_lore_vectors_batch_with_table(&lore_vectors_table, &batch_vectors).await
+                {
+                    tracing::error!("Failed to insert lore vectors batch: {}", e);
+                    return Err(e);
+                }
+
+                total_inserted += batch_vectors.len();
+                let count = processed_clone.fetch_add(batch_vectors.len(), Ordering::Relaxed)
+                    + batch_vectors.len();
+                pb_clone.set_position(count as u64);
+                pb_clone.set_message(format!("Inserted {} vectors", count));
+            }
+            Ok::<_, anyhow::Error>(total_inserted)
+        });
+
+        // Spawn multiple extraction+vectorization workers
+        // Workers extract emails from RecordBatches and vectorize in parallel
+        let vectorizer_clone = vectorizer.clone();
+        let mut worker_handles = Vec::new();
+
+        // Share receiver via mutex for work distribution
+        let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
+
+        for worker_id in 0..num_vectorization_workers {
+            let work_rx_clone = work_rx.clone();
+            let result_tx_clone = result_tx.clone();
+            let vectorizer_worker = vectorizer_clone.clone();
+            let existing_ids_worker = Arc::clone(&existing_message_ids); // Cheap Arc clone, not HashSet clone
+
+            let worker = tokio::spawn(async move {
+                let mut batches_processed = 0;
+                loop {
+                    // Get RecordBatch from queue
+                    let record_batch = {
+                        let mut rx = work_rx_clone.lock().await;
+                        rx.recv().await
+                    };
+
+                    match record_batch {
+                        Some(record_batch) => {
+                            // Extract and vectorize emails in spawn_blocking (CPU-intensive)
+                            let vectorizer_for_batch = vectorizer_worker.clone();
+                            let existing_ids_for_batch = existing_ids_worker.clone();
+
+                            let vectors =
+                                tokio::task::spawn_blocking(move || -> Result<Vec<VectorEntry>> {
+                                    // Extract email data from RecordBatch
+                                    let message_id_array = record_batch
+                                        .column(3)
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::StringArray>()
+                                        .unwrap();
+                                    let from_array = record_batch
+                                        .column(1)
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::StringArray>()
+                                        .unwrap();
+                                    let subject_array = record_batch
+                                        .column(5)
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::StringArray>()
+                                        .unwrap();
+                                    let recipients_array = record_batch
+                                        .column(7)
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::StringArray>()
+                                        .unwrap();
+                                    let body_array = record_batch
+                                        .column(9)
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::StringArray>()
+                                        .unwrap();
+
+                                    // Extract emails that need vectorization
+                                    let mut emails_to_vectorize = Vec::new();
+                                    for i in 0..record_batch.num_rows() {
+                                        let message_id = message_id_array.value(i).to_string();
+
+                                        // Skip if already vectorized
+                                        if existing_ids_for_batch.contains(&message_id) {
+                                            continue;
+                                        }
+
+                                        let from = from_array.value(i);
+                                        let subject = subject_array.value(i);
+                                        let recipients = recipients_array.value(i);
+                                        let body = body_array.value(i);
+
+                                        let combined_text = format!(
+                                            "From: {}\nTo/Cc: {}\nSubject: {}\n\n{}",
+                                            from, recipients, subject, body
+                                        );
+
+                                        emails_to_vectorize.push((message_id, combined_text));
+                                    }
+
+                                    if emails_to_vectorize.is_empty() {
+                                        return Ok(Vec::new());
+                                    }
+
+                                    // Vectorize all emails in this batch
+                                    let texts: Vec<&str> = emails_to_vectorize
+                                        .iter()
+                                        .map(|(_, text)| text.as_str())
+                                        .collect();
+
+                                    let vector_results =
+                                        vectorizer_for_batch.vectorize_batch(&texts)?;
+
+                                    // Combine with message IDs
+                                    let entries: Vec<VectorEntry> = emails_to_vectorize
+                                        .iter()
+                                        .zip(vector_results.into_iter())
+                                        .map(|((message_id, _), vector)| VectorEntry {
+                                            content_hash: message_id.clone(),
+                                            vector,
+                                        })
+                                        .collect();
+
+                                    Ok(entries)
+                                })
+                                .await??;
+
+                            // Send results to insertion task
+                            if !vectors.is_empty() {
+                                result_tx_clone.send(vectors).await?;
+                            }
+                            batches_processed += 1;
+                        }
+                        None => {
+                            // Channel closed, worker done
+                            tracing::info!(
+                                "Worker {} processed {} RecordBatches",
+                                worker_id,
+                                batches_processed
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+
+            worker_handles.push(worker);
+        }
+
+        // Spawn reader task that streams RecordBatches from DB and distributes to workers
+        let lore_table_clone = lore_table.clone();
+        let reader_task = tokio::spawn(async move {
+            // Stream lore emails from database (LanceDB uses default batch size)
+            let mut lore_stream = lore_table_clone.query().execute().await?;
+
+            let mut total_batches_sent = 0;
+
+            // Simply stream RecordBatches to workers - they'll extract emails in parallel
+            while let Some(record_batch) = lore_stream.try_next().await? {
+                work_tx.send(record_batch).await?;
+                total_batches_sent += 1;
+            }
+
+            drop(work_tx); // Signal completion to workers
+            tracing::info!(
+                "Reader complete: sent {} RecordBatches to workers",
+                total_batches_sent
+            );
+            Ok::<_, anyhow::Error>(())
+        });
+
+        // Let reader, workers, and inserter run concurrently!
+        // Don't wait for reader - let it stream in parallel with workers processing
+
+        // Reader will finish and close work_tx when done
+        // Workers will finish when work_rx is closed and they've processed all batches
+        // Inserter will finish when result_rx is closed and all results are inserted
+
+        // Just wait for workers to complete (reader runs in parallel)
+        tokio::spawn(async move { reader_task.await });
+
+        // Wait for all workers to finish processing
+        for handle in worker_handles {
+            handle.await??;
+        }
+
+        // Drop result_tx to signal completion to insertion task
+        drop(result_tx);
+
+        // Wait for all insertions to complete
+        let total_inserted = insertion_task.await??;
+
+        tracing::info!("Pipeline complete: {} vectors inserted", total_inserted);
+
+        let total_generated = processed_count.load(Ordering::Relaxed);
+        pb.finish_with_message(format!(
+            "Lore email vectorization complete: {} vectors generated",
+            total_generated
+        ));
+
+        tracing::info!("Successfully vectorized {} lore emails", total_generated);
+
+        // Hashset is automatically freed here when function returns
+        drop(existing_message_ids);
+        println!("Lore vectorization complete, memory freed");
+
+        Ok(())
+    }
+}
+
+/// Static helper for inserting lore vectors with a cached table handle
+async fn insert_lore_vectors_batch_with_table(
+    lore_vectors_table: &lancedb::table::Table,
+    vectors: &[crate::database::vectors::VectorEntry],
+) -> Result<()> {
+    use arrow::array::{ArrayRef, FixedSizeListArray, StringBuilder};
+    use arrow::datatypes::{DataType, Field, Float32Type, Schema};
+    use arrow::record_batch::RecordBatchIterator;
+    use std::sync::Arc;
+
+    if vectors.is_empty() {
+        return Ok(());
+    }
+
+    // Get vector dimension from first entry
+    let vector_dim = vectors[0].vector.len();
+
+    // Create message_id StringArray
+    let mut message_id_builder = StringBuilder::new();
+    for entry in vectors {
+        message_id_builder.append_value(&entry.content_hash); // content_hash field contains message_id
+    }
+    let message_id_array = message_id_builder.finish();
+
+    // Create vector array
+    let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        vectors
+            .iter()
+            .map(|entry| Some(entry.vector.iter().map(|&v| Some(v)))),
+        vector_dim as i32,
+    );
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("message_id", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                vector_dim as i32,
+            ),
+            false,
+        ),
+    ]));
+
+    let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![
+        ("message_id", Arc::new(message_id_array) as ArrayRef),
+        ("vector", Arc::new(vector_array) as ArrayRef),
+    ])?;
+
+    let batches = vec![Ok(batch)];
+    let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+    lore_vectors_table.add(batch_iterator).execute().await?;
+
+    Ok(())
+}
+
+impl VectorSearchManager {
     /// Search for similar commits based on vector similarity
     /// Returns commits sorted by similarity score (highest first)
     pub async fn search_similar_commits(
@@ -2610,5 +3251,334 @@ impl VectorSearchManager {
         commit_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(commit_results)
+    }
+
+    pub async fn search_similar_lore_emails(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        from_patterns: Option<&[String]>,
+        subject_patterns: Option<&[String]>,
+        body_patterns: Option<&[String]>,
+        symbols_patterns: Option<&[String]>,
+        recipients_patterns: Option<&[String]>,
+    ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
+        let has_filters = from_patterns.is_some()
+            || subject_patterns.is_some()
+            || body_patterns.is_some()
+            || symbols_patterns.is_some()
+            || recipients_patterns.is_some();
+
+        let lore_vectors_table = self.connection.open_table("lore_vectors").execute().await?;
+        let lore_table = self.connection.open_table("lore").execute().await?;
+
+        // No filters: simple vector search
+        if !has_filters {
+            let vector_results = lore_vectors_table
+                .query()
+                .nearest_to(query_vector)?
+                .refine_factor(5)
+                .nprobes(10)
+                .limit(limit * 2)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            let mut score_map = HashMap::new();
+            let mut message_ids = Vec::new();
+
+            for batch in &vector_results {
+                let msg_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let dist_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float32Array>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let msg_id = msg_array.value(i).to_string();
+                    let similarity = (1.0 - dist_array.value(i) / 2.0).max(0.0);
+                    score_map.insert(msg_id.clone(), similarity);
+                    message_ids.push(msg_id);
+                }
+            }
+
+            return self
+                .fetch_emails_by_ids(&message_ids, &score_map, lore_table, limit)
+                .await;
+        }
+
+        // With filters: Use intersection strategy to avoid SQL AND issues
+        // Query each field separately, then intersect in Rust
+        // FTS is used for fast keyword search on all fields
+
+        // Incremental search: start small, expand if needed
+        let search_limits = vec![1_000, 10_000, 50_000, 100_000];
+        let mut final_results = Vec::new();
+
+        for search_limit in search_limits {
+            let loop_start = std::time::Instant::now();
+            tracing::info!("vlore search iteration: search_limit={}", search_limit);
+
+            if final_results.len() >= limit {
+                break;
+            }
+
+            // 1. Query fields and get intersection using helper
+            let regex_start = std::time::Instant::now();
+            let regex_message_ids = self
+                .query_lore_fields_intersection(
+                    from_patterns,
+                    subject_patterns,
+                    body_patterns,
+                    symbols_patterns,
+                    recipients_patterns,
+                    search_limit,
+                )
+                .await?;
+
+            if regex_message_ids.is_empty() {
+                tracing::info!(
+                    "vlore: No filter matches at limit {}, trying larger limit",
+                    search_limit
+                );
+                continue; // No matches in intersection at this limit, try larger limit
+            }
+
+            tracing::info!(
+                "vlore regex phase: {} emails in {:?}",
+                regex_message_ids.len(),
+                regex_start.elapsed()
+            );
+
+            // 2. Get vector search results
+            let vector_start = std::time::Instant::now();
+            let vector_results = lore_vectors_table
+                .query()
+                .nearest_to(query_vector)?
+                .refine_factor(5)
+                .nprobes(10)
+                .limit(search_limit)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            // 3. Build score map from vector results
+            let mut score_map = HashMap::new();
+            for batch in &vector_results {
+                let message_id_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let distance_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float32Array>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let message_id = message_id_array.value(i).to_string();
+                    let distance = distance_array.value(i);
+                    let similarity = (1.0 - distance / 2.0).max(0.0);
+                    score_map.insert(message_id, similarity);
+                }
+            }
+
+            tracing::info!(
+                "vlore vector phase: {} candidates in {:?}",
+                score_map.len(),
+                vector_start.elapsed()
+            );
+
+            // 4. Find intersection: message_ids that match BOTH regex AND have good vector similarity
+            let final_intersection_start = std::time::Instant::now();
+            let mut intersection_ids: Vec<(String, f32)> = regex_message_ids
+                .into_iter()
+                .filter_map(|msg_id| score_map.get(&msg_id).map(|&score| (msg_id, score)))
+                .collect();
+
+            // Sort by similarity score (highest first)
+            intersection_ids
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            tracing::info!(
+                "vlore final intersection: {} results in {:?}",
+                intersection_ids.len(),
+                final_intersection_start.elapsed()
+            );
+
+            if intersection_ids.is_empty() {
+                continue; // Try larger search if no intersection found
+            }
+
+            // 5. Fetch full email data for intersection (only what we need, up to limit)
+            let ids_to_fetch: Vec<String> = intersection_ids
+                .iter()
+                .take(limit)
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            let fetched_emails = self
+                .fetch_emails_by_ids(&ids_to_fetch, &score_map, lore_table.clone(), limit)
+                .await?;
+
+            final_results.extend(fetched_emails);
+
+            tracing::info!(
+                "vlore iteration completed in {:?}, total results so far: {}",
+                loop_start.elapsed(),
+                final_results.len()
+            );
+
+            // If we found enough results, stop
+            if final_results.len() >= limit {
+                break;
+            }
+        }
+
+        // Sort by similarity score and truncate
+        final_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        final_results.truncate(limit);
+
+        Ok(final_results)
+    }
+
+    /// Helper to fetch full email data given message IDs
+    async fn fetch_emails_by_ids(
+        &self,
+        message_ids: &[String],
+        score_map: &HashMap<String, f32>,
+        lore_table: lancedb::Table,
+        limit: usize,
+    ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
+        let mut results = Vec::new();
+        let chunk_size = 500;
+
+        for chunk in message_ids.chunks(chunk_size) {
+            if results.len() >= limit {
+                break;
+            }
+
+            let conditions: Vec<String> = chunk
+                .iter()
+                .map(|id| format!("message_id = '{}'", id.replace("'", "''")))
+                .collect();
+            let filter = conditions.join(" OR ");
+
+            let batches = lore_table
+                .query()
+                .only_if(filter)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            for batch in &batches {
+                let git_commit_sha_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let from_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let date_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let message_id_array = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let in_reply_to_array = batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let subject_array = batch
+                    .column(5)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let references_array = batch
+                    .column(6)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let recipients_array = batch
+                    .column(7)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let headers_array = batch
+                    .column(8)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let body_array = batch
+                    .column(9)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let symbols_array = batch
+                    .column(10)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    if results.len() >= limit {
+                        break;
+                    }
+
+                    let message_id = message_id_array.value(i).to_string();
+                    let similarity = score_map.get(&message_id).copied().unwrap_or(0.0);
+
+                    // Parse JSON symbols array
+                    let symbols_json = symbols_array.value(i);
+                    let symbols: Vec<String> =
+                        serde_json::from_str(symbols_json).unwrap_or_default();
+
+                    results.push((
+                        crate::types::LoreEmailInfo {
+                            git_commit_sha: git_commit_sha_array.value(i).to_string(),
+                            message_id,
+                            from: from_array.value(i).to_string(),
+                            date: date_array.value(i).to_string(),
+                            subject: subject_array.value(i).to_string(),
+                            in_reply_to: if in_reply_to_array.is_null(i) {
+                                None
+                            } else {
+                                Some(in_reply_to_array.value(i).to_string())
+                            },
+                            references: if references_array.is_null(i) {
+                                None
+                            } else {
+                                Some(references_array.value(i).to_string())
+                            },
+                            recipients: recipients_array.value(i).to_string(),
+                            headers: headers_array.value(i).to_string(),
+                            body: body_array.value(i).to_string(),
+                            symbols,
+                        },
+                        similarity,
+                    ));
+                }
+            }
+        }
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
     }
 }

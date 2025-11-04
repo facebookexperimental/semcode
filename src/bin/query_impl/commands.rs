@@ -8,10 +8,15 @@ use semcode::{git, DatabaseManager};
 use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use semcode::display::print_help;
+use semcode::lore_writers::{
+    lore_get_by_message_id_to_writer, lore_search_multi_field_to_writer,
+    lore_search_with_thread_to_writer,
+};
 use semcode::search::{
-    dump_calls, dump_content, dump_functions, dump_git_commits, dump_macros, dump_processed_files,
-    dump_symbol_filename, dump_typedefs, dump_types, query_function_or_macro_verbose,
-    query_type_or_typedef, show_tables,
+    dump_calls, dump_content, dump_functions, dump_git_commits, dump_lore, dump_macros,
+    dump_processed_files, dump_symbol_filename, dump_typedefs, dump_types, lore_get_by_message_id,
+    lore_search_by_commit, lore_search_multi_field, lore_search_with_thread,
+    query_function_or_macro_verbose, query_type_or_typedef, show_tables,
 };
 
 /// Parse a potential git SHA from command arguments or default to current HEAD
@@ -658,6 +663,110 @@ pub async fn handle_command(
                 }
             }
         }
+        "vlore" => {
+            if parts.len() < 2 {
+                println!(
+                    "{}",
+                    "Usage: vlore [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [--limit <N=20>] <query_text>"
+                        .red()
+                );
+                println!(
+                    "  Search for lore emails similar to the provided text using semantic vectors"
+                );
+                println!(
+                    "  -f <regex>: Filter results by regex pattern on from field (can be used multiple times for OR logic)"
+                );
+                println!(
+                    "  -s <regex>: Filter results by regex pattern on subject (can be used multiple times for OR logic)"
+                );
+                println!(
+                    "  -b <regex>: Filter results by regex pattern on message body (can be used multiple times for OR logic)"
+                );
+                println!(
+                    "  -g <regex>: Filter results by regex pattern on symbols (can be used multiple times for OR logic)"
+                );
+                println!("  --limit <N>: Limit number of results (default: 20, max: 100)");
+                println!("  Example: vlore \"memory leak fix\"");
+                println!("  Example: vlore --limit 10 \"performance optimization\"");
+                println!("  Example: vlore -f \"torvalds\" \"merge pull request\"");
+                println!("  Example: vlore -s \"RFC\" -s \"PATCH\" \"new feature\"");
+                println!("  Example: vlore -b \"Signed-off-by.*Linus\" \"kernel patch\"");
+                println!("  Example: vlore -g \"malloc\" \"memory management\"");
+                println!("  Example: vlore -t \"netdev@vger.kernel.org\" \"network patch\"");
+                println!(
+                    "  Note: Requires lore vectors to be generated first with 'semcode-index --lore <url> --vectors'"
+                );
+            } else {
+                // Parse -f, -s, -b, -g, -t, and --limit flags
+                let mut limit = 20; // default
+                let mut from_patterns = Vec::new();
+                let mut subject_patterns = Vec::new();
+                let mut body_patterns = Vec::new();
+                let mut symbols_patterns = Vec::new();
+                let mut recipients_patterns = Vec::new();
+                let mut query_parts = Vec::new();
+                let mut i = 1;
+
+                while i < parts.len() {
+                    if parts[i] == "--limit" && i + 1 < parts.len() {
+                        match parts[i + 1].parse::<usize>() {
+                            Ok(n) => {
+                                limit = n.min(100); // Cap at 100
+                                i += 2;
+                            }
+                            Err(_) => {
+                                println!(
+                                    "{} Invalid limit value: {}",
+                                    "Error:".red(),
+                                    parts[i + 1]
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    } else if parts[i] == "-f" && i + 1 < parts.len() {
+                        from_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "-s" && i + 1 < parts.len() {
+                        subject_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "-b" && i + 1 < parts.len() {
+                        body_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "-g" && i + 1 < parts.len() {
+                        symbols_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "-t" && i + 1 < parts.len() {
+                        recipients_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else {
+                        query_parts.extend_from_slice(&parts[i..]);
+                        break;
+                    }
+                }
+
+                if query_parts.is_empty() {
+                    println!(
+                        "{}",
+                        "Usage: vlore [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-t <recipients_regex>] [--limit <N=20>] <query_text>"
+                            .red()
+                    );
+                } else {
+                    let query_text = query_parts.join(" ");
+                    vlore_similar_emails(
+                        db,
+                        &query_text,
+                        limit,
+                        &from_patterns,
+                        &subject_patterns,
+                        &body_patterns,
+                        &symbols_patterns,
+                        &recipients_patterns,
+                        model_path,
+                    )
+                    .await?;
+                }
+            }
+        }
         "callers" => {
             // Parse only -v flag (git_sha already parsed by main handler)
             let (parsed_parts, verbose) = parse_verbose_flag(&parts);
@@ -873,6 +982,307 @@ pub async fn handle_command(
             } else {
                 let output_file = parts[1..].join(" ");
                 dump_git_commits(db, &output_file).await?;
+            }
+        }
+        "dump-lore" | "dlore" => {
+            if parts.len() < 2 {
+                println!("{}", "Usage: dump-lore <output_file>".red());
+                println!("  Export all lore emails to JSON");
+            } else {
+                let output_file = parts[1..].join(" ");
+                dump_lore(db, &output_file).await?;
+            }
+        }
+        "lore-info" => {
+            // Show lore table and index information
+            match db.get_lore_table_info().await {
+                Ok(info) => println!("{}", info),
+                Err(e) => println!("{} Failed to get lore info: {}", "Error:".red(), e),
+            }
+        }
+        "dig" => {
+            if parts.len() < 2 {
+                println!("{}", "Usage: dig [-v] [-a] [--thread] <commit>".red());
+                println!("  Search for lore emails related to a git commit");
+                println!("  Orders results by date, newest first");
+                println!("  Options:");
+                println!("    -v              Show full message body");
+                println!("    -a              Show all duplicate results (not just most recent)");
+                println!("    --thread        Show full thread for each result (use with -a)");
+                println!("  Examples:");
+                println!("    dig HEAD                    # Show most recent match thread");
+                println!("    dig -v abc123               # Show most recent match with body");
+                println!("    dig -a v6.5                 # Show all matches (summary)");
+                println!("    dig -a --thread HEAD        # Show all matches with full threads");
+                println!(
+                    "    dig -v -a --thread abc123   # Show all matches with threads and bodies"
+                );
+            } else {
+                // Parse flags
+                let (remaining_parts, verbose) = parse_verbose_flag(&parts);
+                let verbose_level = if verbose { 1 } else { 0 };
+
+                // Parse -a flag (show all)
+                let mut show_all = false;
+                let mut remaining_parts_vec = remaining_parts;
+                if let Some(pos) = remaining_parts_vec.iter().position(|&x| x == "-a") {
+                    show_all = true;
+                    remaining_parts_vec.remove(pos);
+                }
+
+                // Parse --thread flag
+                let mut show_thread = false;
+                if let Some(pos) = remaining_parts_vec.iter().position(|&x| x == "--thread") {
+                    show_thread = true;
+                    remaining_parts_vec.remove(pos);
+                }
+
+                if remaining_parts_vec.len() < 2 {
+                    println!("{}", "Usage: dig [-v] [-a] [--thread] <commit>".red());
+                    println!("  Missing commit argument");
+                } else {
+                    let commit_ish = remaining_parts_vec[1];
+                    lore_search_by_commit(
+                        db,
+                        commit_ish,
+                        git_repo_path,
+                        verbose_level,
+                        show_all,
+                        show_thread,
+                    )
+                    .await?;
+                }
+            }
+        }
+        "lore" => {
+            if parts.len() < 2 {
+                println!("{}", "Usage: lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--thread] [-o <output_file>]".red());
+                println!("  Search lore emails with regex filters");
+                println!("  Options:");
+                println!("    -v              Show full message body");
+                println!("    -m <msg_id>     Get email by exact message_id (no regex)");
+                println!(
+                    "    -f <regex>      Filter by from field (can use multiple times for OR)"
+                );
+                println!(
+                    "    -s <regex>      Filter by subject field (can use multiple times for OR)"
+                );
+                println!(
+                    "    -b <regex>      Filter by body field (can use multiple times for OR)"
+                );
+                println!("    -t <regex>      Filter by recipients field (can use multiple times for OR)");
+                println!(
+                    "    -g <regex>      Filter by symbols field (can use multiple times for OR)"
+                );
+                println!("    --limit <N>     Limit number of results (0=unlimited, default: 100)");
+                println!("    --thread        Show full thread for each matching email");
+                println!("    -o <file>       Write output to file instead of stdout");
+                println!("  Multiple conditions:");
+                println!("    Same field (OR):   lore -f torvalds -f gregkh     - From torvalds OR gregkh");
+                println!("    Different fields:  lore -f torvalds -b btrfs      - From torvalds AND body contains btrfs");
+                println!("  Examples:");
+                println!("    lore -s \"memory leak\"");
+                println!("    lore -v -s \"performance\" --limit 50");
+                println!("    lore -f \"torvalds@linux-foundation.org\"");
+                println!("    lore -t \"netdev@vger.kernel.org\"");
+                println!("    lore -b \"Signed-off-by.*Linus\"");
+                println!("    lore -g \"malloc\"");
+                println!("    lore -g \"struct.*page\"");
+                println!("    lore -m \"<20241201120000.12345@kernel.org>\"");
+                println!("    lore -v -f \"torvalds\" --thread");
+                println!("    lore -v -s \"memory leak\" --thread --limit 5");
+                println!("    lore -o results.txt -s \"memory leak\"");
+                println!("    lore -b btrfs -f clm@meta.com              - Body contains btrfs AND from clm@meta.com");
+                println!("    lore -f torvalds -f gregkh -b \"memory leak\" - From torvalds OR gregkh AND body contains memory leak");
+                println!("  Related commands:");
+                println!("    dump-lore <file> - Export all emails to JSON");
+                println!("    dig <commit>     - Find emails for a git commit");
+            } else {
+                // Parse flags: -v, -m, -f, -s, -b, -t, -g, --limit, --thread, -o
+                let mut verbose: usize = 0;
+                let mut message_id: Option<String> = None;
+                let mut from_patterns = Vec::new();
+                let mut subject_patterns = Vec::new();
+                let mut body_patterns = Vec::new();
+                let mut recipients_patterns = Vec::new();
+                let mut symbols_patterns = Vec::new();
+                let mut limit = 100;
+                let mut show_thread = false;
+                let mut output_file: Option<String> = None;
+                let mut i = 1;
+
+                while i < parts.len() {
+                    match parts[i] {
+                        "-v" => {
+                            verbose = 1;
+                            i += 1;
+                        }
+                        "-m" if i + 1 < parts.len() => {
+                            message_id = Some(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "-f" if i + 1 < parts.len() => {
+                            from_patterns.push(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "-s" if i + 1 < parts.len() => {
+                            subject_patterns.push(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "-b" if i + 1 < parts.len() => {
+                            body_patterns.push(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "-t" if i + 1 < parts.len() => {
+                            recipients_patterns.push(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "-g" if i + 1 < parts.len() => {
+                            symbols_patterns.push(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "--limit" if i + 1 < parts.len() => {
+                            match parts[i + 1].parse::<usize>() {
+                                Ok(n) => limit = n,
+                                Err(_) => {
+                                    println!(
+                                        "{} Invalid limit value: {}",
+                                        "Error:".red(),
+                                        parts[i + 1]
+                                    );
+                                    return Ok(false);
+                                }
+                            }
+                            i += 2;
+                        }
+                        "--thread" => {
+                            show_thread = true;
+                            i += 1;
+                        }
+                        "-o" if i + 1 < parts.len() => {
+                            output_file = Some(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        _ => {
+                            println!(
+                                "{} Unknown option or missing value: {}",
+                                "Error:".red(),
+                                parts[i]
+                            );
+                            println!("Use 'lore' without arguments for usage information");
+                            return Ok(false);
+                        }
+                    }
+                }
+
+                // Handle output file if specified
+                use std::fs::File;
+
+                let mut file_writer: Option<File> = None;
+                if let Some(ref path) = output_file {
+                    match File::create(path) {
+                        Ok(f) => {
+                            file_writer = Some(f);
+                            println!("Writing output to: {}", path);
+                        }
+                        Err(e) => {
+                            println!(
+                                "{} Failed to create output file '{}': {}",
+                                "Error:".red(),
+                                path,
+                                e
+                            );
+                            return Ok(false);
+                        }
+                    }
+                }
+
+                // Handle -m flag for exact message_id lookup
+                if let Some(msg_id) = message_id {
+                    if let Some(ref mut writer) = file_writer {
+                        lore_get_by_message_id_to_writer(db, &msg_id, verbose, show_thread, writer)
+                            .await?;
+                    } else {
+                        lore_get_by_message_id(db, &msg_id, verbose, show_thread).await?;
+                    }
+                } else {
+                    // Build field_patterns from the collected patterns
+                    let mut field_patterns = Vec::new();
+                    for pattern in &from_patterns {
+                        field_patterns.push(("from", pattern.as_str()));
+                    }
+                    for pattern in &subject_patterns {
+                        field_patterns.push(("subject", pattern.as_str()));
+                    }
+                    for pattern in &body_patterns {
+                        field_patterns.push(("body", pattern.as_str()));
+                    }
+                    for pattern in &recipients_patterns {
+                        field_patterns.push(("recipients", pattern.as_str()));
+                    }
+                    for pattern in &symbols_patterns {
+                        field_patterns.push(("symbols", pattern.as_str()));
+                    }
+
+                    if field_patterns.is_empty() {
+                        println!("{} No search filters specified", "Error:".red());
+                        println!("Use at least one of: -m, -f, -s, -b, -t, or -g");
+                        return Ok(false);
+                    }
+
+                    // Use multi-field search if multiple patterns, otherwise use single-field
+                    if let Some(ref mut writer) = file_writer {
+                        if field_patterns.len() == 1 {
+                            let (field, pattern) = field_patterns[0];
+                            lore_search_with_thread_to_writer(
+                                db,
+                                field,
+                                pattern,
+                                limit,
+                                verbose,
+                                show_thread,
+                                writer,
+                            )
+                            .await?;
+                        } else {
+                            lore_search_multi_field_to_writer(
+                                db,
+                                field_patterns,
+                                limit,
+                                verbose,
+                                show_thread,
+                                writer,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        if field_patterns.len() == 1 {
+                            let (field, pattern) = field_patterns[0];
+                            lore_search_with_thread(
+                                db,
+                                field,
+                                pattern,
+                                limit,
+                                verbose,
+                                show_thread,
+                            )
+                            .await?;
+                        } else {
+                            lore_search_multi_field(
+                                db,
+                                field_patterns,
+                                limit,
+                                verbose,
+                                show_thread,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+
+                if file_writer.is_some() {
+                    println!("Output written to: {}", output_file.as_ref().unwrap());
+                }
             }
         }
         "diffinfo" | "di" => {
@@ -1974,6 +2384,205 @@ async fn vcommit_similar_commits(
         Err(e) => {
             println!("{} Commit vector search failed: {}", "Error:".red(), e);
             println!("Make sure commit vectors have been generated with 'semcode-index --vectors'");
+        }
+    }
+
+    Ok(())
+}
+
+async fn vlore_similar_emails(
+    db: &DatabaseManager,
+    query_text: &str,
+    limit: usize,
+    from_patterns: &[String],
+    subject_patterns: &[String],
+    body_patterns: &[String],
+    symbols_patterns: &[String],
+    recipients_patterns: &[String],
+    model_path: &Option<String>,
+) -> Result<()> {
+    use semcode::CodeVectorizer;
+
+    let has_filters = !from_patterns.is_empty()
+        || !subject_patterns.is_empty()
+        || !body_patterns.is_empty()
+        || !symbols_patterns.is_empty()
+        || !recipients_patterns.is_empty();
+    match has_filters {
+        true => {
+            let mut filter_parts = Vec::new();
+            if !from_patterns.is_empty() {
+                filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
+            }
+            if !subject_patterns.is_empty() {
+                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            }
+            if !body_patterns.is_empty() {
+                filter_parts.push(format!("{} body pattern(s)", body_patterns.len()));
+            }
+            if !symbols_patterns.is_empty() {
+                filter_parts.push(format!("{} symbols pattern(s)", symbols_patterns.len()));
+            }
+            if !recipients_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} recipients pattern(s)",
+                    recipients_patterns.len()
+                ));
+            }
+            let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
+            println!(
+                "Searching for lore emails similar to: {} ({}, limit: {})",
+                query_text.yellow(),
+                filter_desc,
+                limit
+            );
+        }
+        false => println!(
+            "Searching for lore emails similar to: {} (limit: {})",
+            query_text.yellow(),
+            limit
+        ),
+    }
+
+    // Initialize vectorizer
+    println!("Initializing vectorizer...");
+    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("{} Failed to initialize vectorizer: {}", "Error:".red(), e);
+            println!(
+                "Make sure you have a model available. Use --model-path to specify a custom model."
+            );
+            return Ok(());
+        }
+    };
+
+    // Generate vector for query text
+    println!("Generating query vector...");
+    let query_vector = match vectorizer.vectorize_code(query_text) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "{} Failed to generate vector for query: {}",
+                "Error:".red(),
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    // Prepare filter patterns for database-level filtering
+    let from_filter = if !from_patterns.is_empty() {
+        Some(&from_patterns[..])
+    } else {
+        None
+    };
+
+    let subject_filter = if !subject_patterns.is_empty() {
+        Some(&subject_patterns[..])
+    } else {
+        None
+    };
+
+    let body_filter = if !body_patterns.is_empty() {
+        Some(&body_patterns[..])
+    } else {
+        None
+    };
+
+    let symbols_filter = if !symbols_patterns.is_empty() {
+        Some(&symbols_patterns[..])
+    } else {
+        None
+    };
+
+    let recipients_filter = if !recipients_patterns.is_empty() {
+        Some(&recipients_patterns[..])
+    } else {
+        None
+    };
+
+    // Search for similar lore emails with database-level filtering
+    match db
+        .search_similar_lore_emails(
+            &query_vector,
+            limit,
+            from_filter,
+            subject_filter,
+            body_filter,
+            symbols_filter,
+            recipients_filter,
+        )
+        .await
+    {
+        Ok(results) if results.is_empty() => {
+            println!("{} No similar lore emails found", "Info:".yellow());
+            if has_filters {
+                println!("Try adjusting the filters or removing the -f/-s/-b/-g options");
+            } else {
+                println!("Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'");
+            }
+        }
+        Ok(final_results) => {
+            if final_results.is_empty() {
+                println!("{} No similar lore emails found", "Info:".yellow());
+                if has_filters {
+                    println!("Try adjusting the filters or removing the -f/-s/-b/-g options");
+                } else {
+                    println!(
+                        "Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'"
+                    );
+                }
+                return Ok(());
+            }
+
+            println!(
+                "\n{} Found {} similar email(s):",
+                "Results:".bold().green(),
+                final_results.len()
+            );
+            println!("{}", "=".repeat(80));
+
+            for (i, (email, similarity)) in final_results.iter().enumerate() {
+                println!(
+                    "\n{}. {} {} {}%",
+                    (i + 1).to_string().yellow(),
+                    "Similarity:".bold(),
+                    format!("{:.1}", similarity * 100.0).bright_green(),
+                    ""
+                );
+                println!(
+                    "   {} {}",
+                    "Message-ID:".bold(),
+                    email.message_id.bright_black()
+                );
+                println!("   {} {}", "From:".bold(), email.from.cyan());
+                println!("   {} {}", "Date:".bold(), email.date.bright_black());
+                println!("   {} {}", "Subject:".bold(), email.subject.white());
+
+                // Show first 10 lines of message body
+                println!("   {}:", "Message:".bold());
+                for (idx, line) in email.body.lines().take(10).enumerate() {
+                    if idx == 0 {
+                        println!("     {}", line.bright_white());
+                    } else {
+                        println!("     {}", line);
+                    }
+                }
+                if email.body.lines().count() > 10 {
+                    println!("     {}", "...".bright_black());
+                }
+            }
+
+            println!("\n{}", "=".repeat(80));
+            println!(
+                "{} Use 'lore <message_id>' to see full details of a specific email",
+                "Tip:".bold().blue()
+            );
+        }
+        Err(e) => {
+            println!("{} Lore email vector search failed: {}", "Error:".red(), e);
+            println!("Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'");
         }
     }
 

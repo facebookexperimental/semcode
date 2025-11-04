@@ -2041,6 +2041,170 @@ impl McpServer {
                         },
                         "required": ["query_text"]
                     }
+                },
+                {
+                    "name": "lore_search",
+                    "description": "Search lore.kernel.org email archives with regex filters. Supports multiple field filters (from, subject, body, symbols, recipients) with OR logic within each field and AND logic across fields. Can show full threads. Results can be paginated with 50 lines per page. Same functionality as query tool's 'lore' command.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "from_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by from field (OR logic). Equivalent to passing -f multiple times in query tool."
+                            },
+                            "subject_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by subject (OR logic). Equivalent to passing -s multiple times in query tool."
+                            },
+                            "body_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by message body (OR logic). Equivalent to passing -b multiple times in query tool."
+                            },
+                            "symbols_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by symbols mentioned in patches (OR logic). Equivalent to passing -g multiple times in query tool."
+                            },
+                            "recipients_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by recipients field (OR logic). Equivalent to passing -t multiple times in query tool."
+                            },
+                            "message_id": {
+                                "type": "string",
+                                "description": "Optional exact message ID for direct lookup (equivalent to -m flag in query tool)"
+                            },
+                            "verbose": {
+                                "type": "boolean",
+                                "description": "Show full message body (default: false, shows only headers)",
+                                "default": false
+                            },
+                            "show_thread": {
+                                "type": "boolean",
+                                "description": "Show full email thread for each match (default: false)",
+                                "default": false
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of results (default: 100, 0 = unlimited)",
+                                "default": 100,
+                                "minimum": 0
+                            },
+                            "page": {
+                                "type": "integer",
+                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                                "minimum": 1
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "dig",
+                    "description": "Search for lore.kernel.org emails related to a git commit. Orders results by date (newest first). Same functionality as query tool's 'dig' command.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "commit": {
+                                "type": "string",
+                                "description": "Git commit reference (SHA, short SHA, HEAD, branch name, etc.)"
+                            },
+                            "verbose": {
+                                "type": "boolean",
+                                "description": "Show full message body (default: false)",
+                                "default": false
+                            },
+                            "show_all": {
+                                "type": "boolean",
+                                "description": "Show all duplicate results, not just most recent (equivalent to -a flag in query tool)",
+                                "default": false
+                            },
+                            "show_thread": {
+                                "type": "boolean",
+                                "description": "Show full thread for each result (use with show_all, equivalent to --thread flag in query tool)",
+                                "default": false
+                            },
+                            "page": {
+                                "type": "integer",
+                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                                "minimum": 1
+                            }
+                        },
+                        "required": ["commit"]
+                    }
+                },
+                {
+                    "name": "vlore_similar_emails",
+                    "description": "Search lore.kernel.org emails similar to the provided text using semantic vector embeddings. Requires lore vectors to be generated first. Supports filtering by from address, subject, body, symbols, and recipients patterns. Results can be paginated with 50 lines per page.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query_text": {
+                                "type": "string",
+                                "description": "Text describing the kind of emails to find (e.g., 'memory leak fix', 'patch review', 'performance optimization')"
+                            },
+                            "from_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by from field - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
+                            },
+                            "subject_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by subject - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
+                            },
+                            "body_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by message body - ANY pattern must match (OR logic). Equivalent to passing -b multiple times."
+                            },
+                            "symbols_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by symbols mentioned in patches - ANY pattern must match (OR logic). Equivalent to passing -g multiple times."
+                            },
+                            "recipients_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter by recipients (To/Cc) - ANY pattern must match (OR logic). Equivalent to passing -t multiple times."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return (default: 20, max: 100)",
+                                "default": 20,
+                                "minimum": 1,
+                                "maximum": 100
+                            },
+                            "page": {
+                                "type": "integer",
+                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                                "minimum": 1
+                            }
+                        },
+                        "required": ["query_text"]
+                    }
                 }
             ]
         })
@@ -2061,6 +2225,9 @@ impl McpServer {
             "vgrep_functions" => self.handle_vgrep_functions(arguments).await,
             "find_commit" => self.handle_find_commit(arguments).await,
             "vcommit_similar_commits" => self.handle_vcommit_similar_commits(arguments).await,
+            "lore_search" => self.handle_lore_search(arguments).await,
+            "dig" => self.handle_dig(arguments).await,
+            "vlore_similar_emails" => self.handle_vlore_similar_emails(arguments).await,
             _ => json!({
                 "error": format!("Unknown tool: {}", name),
                 "isError": true
@@ -2438,6 +2605,245 @@ impl McpServer {
             }
             Err(e) => json!({
                 "error": format!("Failed to search similar commits: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
+    async fn handle_lore_search(&self, args: &Value) -> Value {
+        let verbose = args["verbose"].as_bool().unwrap_or(false) as usize; // Convert to usize for function signature
+        let show_thread = args["show_thread"].as_bool().unwrap_or(false);
+        let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+        let page = args["page"].as_u64().map(|p| p as usize);
+
+        // Extract pattern arrays (same logic as query tool)
+        let from_patterns: Vec<String> = args["from_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let subject_patterns: Vec<String> = args["subject_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let body_patterns: Vec<String> = args["body_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let symbols_patterns: Vec<String> = args["symbols_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let recipients_patterns: Vec<String> = args["recipients_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let message_id = args["message_id"].as_str();
+
+        // Generate a query key for caching
+        let query_key = format!(
+            "lore:{}:{}:{}:{}:{}:{}:{}:{}",
+            from_patterns.join("|"),
+            subject_patterns.join("|"),
+            body_patterns.join("|"),
+            symbols_patterns.join("|"),
+            recipients_patterns.join("|"),
+            message_id.unwrap_or(""),
+            verbose,
+            show_thread
+        );
+
+        // Handle message_id lookup (same as query tool's -m flag)
+        if let Some(msg_id) = message_id {
+            match mcp_lore_get_by_message_id(&self.db, msg_id, verbose, show_thread).await {
+                Ok(output) => {
+                    let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
+                    json!({
+                        "content": [{"type": "text", "text": truncate_output(result)}]
+                    })
+                }
+                Err(e) => json!({
+                    "error": format!("Failed to lookup lore email: {}", e),
+                    "isError": true
+                }),
+            }
+        } else {
+            // Multi-field search (same as query tool's lore command with multiple -f/-s/-b/-g/-t flags)
+            match mcp_lore_search_multi_field(
+                &self.db,
+                &from_patterns,
+                &subject_patterns,
+                &body_patterns,
+                &symbols_patterns,
+                &recipients_patterns,
+                limit,
+                verbose,
+                show_thread,
+            )
+            .await
+            {
+                Ok(output) => {
+                    let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
+                    json!({
+                        "content": [{"type": "text", "text": truncate_output(result)}]
+                    })
+                }
+                Err(e) => json!({
+                    "error": format!("Failed to search lore emails: {}", e),
+                    "isError": true
+                }),
+            }
+        }
+    }
+
+    async fn handle_dig(&self, args: &Value) -> Value {
+        let commit = args["commit"].as_str().unwrap_or("");
+        let verbose = args["verbose"].as_bool().unwrap_or(false) as usize;
+        let show_all = args["show_all"].as_bool().unwrap_or(false);
+        let show_thread = args["show_thread"].as_bool().unwrap_or(false);
+        let page = args["page"].as_u64().map(|p| p as usize);
+
+        // Generate a query key for caching
+        let query_key = format!("dig:{}:{}:{}:{}", commit, verbose, show_all, show_thread);
+
+        let git_repo_path = "."; // MCP server typically runs in the repo directory
+
+        match mcp_dig_lore_by_commit(
+            &self.db,
+            commit,
+            git_repo_path,
+            verbose,
+            show_all,
+            show_thread,
+        )
+        .await
+        {
+            Ok(output) => {
+                let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
+                json!({
+                    "content": [{"type": "text", "text": truncate_output(result)}]
+                })
+            }
+            Err(e) => json!({
+                "error": format!("Failed to search lore emails for commit: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
+    async fn handle_vlore_similar_emails(&self, args: &Value) -> Value {
+        let query_text = args["query_text"].as_str().unwrap_or("");
+
+        // Extract from_patterns array
+        let from_patterns: Vec<String> = args["from_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract subject_patterns array
+        let subject_patterns: Vec<String> = args["subject_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract body_patterns array
+        let body_patterns: Vec<String> = args["body_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract symbols_patterns array
+        let symbols_patterns: Vec<String> = args["symbols_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract recipients_patterns array
+        let recipients_patterns: Vec<String> = args["recipients_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+        let page = args["page"].as_u64().map(|p| p as usize);
+
+        // Generate a query key for caching
+        let query_key = format!(
+            "vlore:{}:{}:{}:{}:{}:{}:{}",
+            query_text,
+            from_patterns.join("|"),
+            subject_patterns.join("|"),
+            body_patterns.join("|"),
+            symbols_patterns.join("|"),
+            recipients_patterns.join("|"),
+            limit
+        );
+
+        match mcp_vlore_similar_emails(
+            &self.db,
+            query_text,
+            limit,
+            &from_patterns,
+            &subject_patterns,
+            &body_patterns,
+            &symbols_patterns,
+            &recipients_patterns,
+            &self.model_path,
+        )
+        .await
+        {
+            Ok(output) => {
+                let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
+                json!({
+                    "content": [{"type": "text", "text": truncate_output(result)}]
+                })
+            }
+            Err(e) => json!({
+                "error": format!("Failed to search similar lore emails: {}", e),
                 "isError": true
             }),
         }
@@ -2849,6 +3255,493 @@ async fn mcp_vgrep_similar_functions(
                 buffer,
                 "Make sure vectors have been generated with 'semcode-index --vectors'"
             )?;
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Look up a single lore email by message_id
+async fn mcp_lore_get_by_message_id(
+    db: &DatabaseManager,
+    message_id: &str,
+    verbose: usize,
+    show_thread: bool,
+) -> Result<String> {
+    let mut buffer = Vec::new();
+
+    // Use shared writer function
+    semcode::lore_writers::lore_get_by_message_id_to_writer(
+        db,
+        message_id,
+        verbose,
+        show_thread,
+        &mut buffer,
+    )
+    .await?;
+
+    Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Multi-field lore search supporting combinations of field filters
+async fn mcp_lore_search_multi_field(
+    db: &DatabaseManager,
+    from_patterns: &[String],
+    subject_patterns: &[String],
+    body_patterns: &[String],
+    symbols_patterns: &[String],
+    recipients_patterns: &[String],
+    limit: usize,
+    verbose: usize,
+    show_thread: bool,
+) -> Result<String> {
+    let mut buffer = Vec::new();
+
+    // Build field_patterns from the collected patterns (same logic as query tool)
+    let mut field_patterns = Vec::new();
+    for pattern in from_patterns {
+        field_patterns.push(("from", pattern.as_str()));
+    }
+    for pattern in subject_patterns {
+        field_patterns.push(("subject", pattern.as_str()));
+    }
+    for pattern in body_patterns {
+        field_patterns.push(("body", pattern.as_str()));
+    }
+    for pattern in symbols_patterns {
+        field_patterns.push(("symbols", pattern.as_str()));
+    }
+    for pattern in recipients_patterns {
+        field_patterns.push(("recipients", pattern.as_str()));
+    }
+
+    if field_patterns.is_empty() {
+        use std::io::Write;
+        writeln!(buffer, "Error: No search filters specified")?;
+        writeln!(
+            buffer,
+            "Use at least one of: from, subject, body, symbols, or recipients patterns"
+        )?;
+        return Ok(String::from_utf8_lossy(&buffer).to_string());
+    }
+
+    // Use shared writer function
+    semcode::lore_writers::lore_search_multi_field_to_writer(
+        db,
+        field_patterns,
+        limit,
+        verbose,
+        show_thread,
+        &mut buffer,
+    )
+    .await?;
+
+    Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Helper function to write an email to a buffer
+fn write_email_to_buffer(
+    email: &semcode::LoreEmailInfo,
+    verbose: usize,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    use std::io::Write;
+
+    writeln!(buffer, "From: {}", email.from)?;
+    writeln!(buffer, "Date: {}", email.date)?;
+    writeln!(buffer, "Subject: {}", email.subject)?;
+    writeln!(buffer, "Message-ID: {}", email.message_id)?;
+
+    if let Some(ref in_reply_to) = email.in_reply_to {
+        writeln!(buffer, "In-Reply-To: {}", in_reply_to)?;
+    }
+
+    if let Some(ref references) = email.references {
+        writeln!(buffer, "References: {}", references)?;
+    }
+
+    if !email.recipients.is_empty() {
+        writeln!(buffer, "Recipients: {}", email.recipients)?;
+    }
+
+    if verbose >= 1 {
+        writeln!(buffer, "\n--- Message Body ---")?;
+        for line in email.body.lines() {
+            writeln!(buffer, "{}", line)?;
+        }
+        writeln!(buffer, "--- End Message ---")?;
+    }
+
+    Ok(())
+}
+
+/// Search for lore emails related to a git commit (dig command)
+async fn mcp_dig_lore_by_commit(
+    db: &DatabaseManager,
+    commit_ish: &str,
+    git_repo_path: &str,
+    verbose: usize,
+    show_all: bool,
+    show_thread: bool,
+) -> Result<String> {
+    use std::io::Write;
+
+    let mut buffer = Vec::new();
+
+    writeln!(
+        buffer,
+        "Searching for lore emails related to git commit: {}",
+        commit_ish
+    )?;
+    if show_all {
+        writeln!(buffer, "  (showing all matches)")?;
+    } else {
+        writeln!(buffer, "  (showing most recent match only)")?;
+    }
+    if show_thread {
+        writeln!(buffer, "  (with full threads)")?;
+    }
+
+    // Resolve git commit-ish to full SHA and get commit info (reuse git resolution logic)
+    let (git_sha, subject) = match gix::discover(git_repo_path) {
+        Ok(repo) => match semcode::git::resolve_to_commit(&repo, commit_ish) {
+            Ok(commit) => {
+                let sha = commit.id().to_string();
+                let message = commit.message_raw().ok().and_then(|msg| {
+                    std::str::from_utf8(msg.as_ref())
+                        .ok()
+                        .map(|s| s.to_string())
+                });
+                let subject = message
+                    .as_ref()
+                    .and_then(|m| m.lines().next())
+                    .unwrap_or("")
+                    .to_string();
+                (sha, subject)
+            }
+            Err(e) => {
+                writeln!(
+                    buffer,
+                    "Error: Failed to resolve git reference '{}': {}",
+                    commit_ish, e
+                )?;
+                return Ok(String::from_utf8_lossy(&buffer).to_string());
+            }
+        },
+        Err(e) => {
+            writeln!(buffer, "Error: Not in a git repository: {}", e)?;
+            return Ok(String::from_utf8_lossy(&buffer).to_string());
+        }
+    };
+
+    if subject.is_empty() {
+        writeln!(
+            buffer,
+            "Error: Commit {} has no subject line",
+            &git_sha[..12]
+        )?;
+        return Ok(String::from_utf8_lossy(&buffer).to_string());
+    }
+
+    writeln!(
+        buffer,
+        "Looking up commit: {} ({})",
+        commit_ish,
+        &git_sha[..12]
+    )?;
+    writeln!(buffer, "  Commit subject: {}\n", subject)?;
+
+    // Search lore emails by exact subject match (reuse database function)
+    let emails = db.search_lore_emails_by_subject(&subject, 100).await?;
+
+    if emails.is_empty() {
+        writeln!(buffer, "Info: No matching emails found")?;
+        return Ok(String::from_utf8_lossy(&buffer).to_string());
+    }
+
+    // Sort by date (newest first)
+    let mut sorted_emails = emails;
+    sorted_emails.sort_by(|a, b| b.date.cmp(&a.date));
+
+    writeln!(
+        buffer,
+        "Searching lore emails where subject matches pattern: {}",
+        subject
+    )?;
+
+    if show_all {
+        // Show all matching emails
+        writeln!(
+            buffer,
+            "\nResults: Found {} matching email(s):\n",
+            sorted_emails.len()
+        )?;
+
+        if show_thread {
+            // Show full threads - for now just show emails themselves
+            for (idx, email) in sorted_emails.iter().enumerate() {
+                if idx > 0 {
+                    writeln!(buffer, "\n{}\n", "=".repeat(80))?;
+                }
+                writeln!(
+                    buffer,
+                    "===> Thread {} of {} ({}):",
+                    idx + 1,
+                    sorted_emails.len(),
+                    email.date
+                )?;
+                write_email_to_buffer(email, verbose, &mut buffer)?;
+            }
+        } else {
+            // Show summary of all matching emails
+            for (idx, email) in sorted_emails.iter().enumerate() {
+                writeln!(buffer, "{}. {} - {}", idx + 1, email.date, email.subject)?;
+                writeln!(buffer, "   From: {}", email.from)?;
+                writeln!(buffer, "   Message-ID: {}", email.message_id)?;
+
+                if verbose >= 1 {
+                    writeln!(buffer, "\n   --- Message Body ---")?;
+                    for line in email.body.lines() {
+                        writeln!(buffer, "   {}", line)?;
+                    }
+                    writeln!(buffer, "   --- End Message ---")?;
+                }
+                writeln!(buffer)?;
+            }
+        }
+    } else {
+        // Show only most recent match
+        if let Some(most_recent) = sorted_emails.first() {
+            writeln!(
+                buffer,
+                "\nResults: Found {} matching email(s), showing most recent:\n",
+                sorted_emails.len()
+            )?;
+
+            if show_thread {
+                writeln!(buffer, "===> Most Recent Thread:")?;
+                write_email_to_buffer(most_recent, verbose, &mut buffer)?;
+            } else {
+                writeln!(buffer, "1. {} - {}", most_recent.date, most_recent.subject)?;
+                writeln!(buffer, "   From: {}", most_recent.from)?;
+                writeln!(buffer, "   Message-ID: {}", most_recent.message_id)?;
+
+                if verbose >= 1 {
+                    writeln!(buffer, "\n   --- Message Body ---")?;
+                    for line in most_recent.body.lines() {
+                        writeln!(buffer, "   {}", line)?;
+                    }
+                    writeln!(buffer, "   --- End Message ---")?;
+                }
+            }
+
+            if sorted_emails.len() > 1 {
+                writeln!(
+                    buffer,
+                    "\nNote: {} older match(es) not shown. Use show_all=true to see all.",
+                    sorted_emails.len() - 1
+                )?;
+            }
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+async fn mcp_vlore_similar_emails(
+    db: &DatabaseManager,
+    query_text: &str,
+    limit: usize,
+    from_patterns: &[String],
+    subject_patterns: &[String],
+    body_patterns: &[String],
+    symbols_patterns: &[String],
+    recipients_patterns: &[String],
+    model_path: &Option<String>,
+) -> Result<String> {
+    use semcode::CodeVectorizer;
+    use std::io::Write;
+
+    let mut buffer = Vec::new();
+
+    let has_filters = !from_patterns.is_empty()
+        || !subject_patterns.is_empty()
+        || !body_patterns.is_empty()
+        || !symbols_patterns.is_empty()
+        || !recipients_patterns.is_empty();
+    match has_filters {
+        true => {
+            let mut filter_parts = Vec::new();
+            if !from_patterns.is_empty() {
+                filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
+            }
+            if !subject_patterns.is_empty() {
+                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            }
+            if !body_patterns.is_empty() {
+                filter_parts.push(format!("{} body pattern(s)", body_patterns.len()));
+            }
+            if !symbols_patterns.is_empty() {
+                filter_parts.push(format!("{} symbols pattern(s)", symbols_patterns.len()));
+            }
+            if !recipients_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} recipients pattern(s)",
+                    recipients_patterns.len()
+                ));
+            }
+            let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
+            writeln!(
+                buffer,
+                "Searching for lore emails similar to: {} ({}, limit: {})",
+                query_text, filter_desc, limit
+            )?;
+        }
+        false => writeln!(
+            buffer,
+            "Searching for lore emails similar to: {} (limit: {})",
+            query_text, limit
+        )?,
+    }
+
+    // Initialize vectorizer
+    writeln!(buffer, "Initializing vectorizer...")?;
+    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            writeln!(buffer, "Error: Failed to initialize vectorizer: {}", e)?;
+            writeln!(
+                buffer,
+                "Make sure you have a model available. Use --model-path to specify a custom model."
+            )?;
+            return Ok(String::from_utf8_lossy(&buffer).to_string());
+        }
+    };
+
+    // Generate vector for query text
+    writeln!(buffer, "Generating query vector...")?;
+    let query_vector = match vectorizer.vectorize_code(query_text) {
+        Ok(v) => v,
+        Err(e) => {
+            writeln!(buffer, "Error: Failed to generate vector for query: {}", e)?;
+            return Ok(String::from_utf8_lossy(&buffer).to_string());
+        }
+    };
+
+    // Prepare filter patterns for database-level filtering
+    let from_filter = if !from_patterns.is_empty() {
+        Some(&from_patterns[..])
+    } else {
+        None
+    };
+
+    let subject_filter = if !subject_patterns.is_empty() {
+        Some(&subject_patterns[..])
+    } else {
+        None
+    };
+
+    let body_filter = if !body_patterns.is_empty() {
+        Some(&body_patterns[..])
+    } else {
+        None
+    };
+
+    let symbols_filter = if !symbols_patterns.is_empty() {
+        Some(&symbols_patterns[..])
+    } else {
+        None
+    };
+
+    let recipients_filter = if !recipients_patterns.is_empty() {
+        Some(&recipients_patterns[..])
+    } else {
+        None
+    };
+
+    // Search for similar lore emails with database-level filtering
+    match db
+        .search_similar_lore_emails(
+            &query_vector,
+            limit,
+            from_filter,
+            subject_filter,
+            body_filter,
+            symbols_filter,
+            recipients_filter,
+        )
+        .await
+    {
+        Ok(results) if results.is_empty() => {
+            writeln!(buffer, "Info: No similar lore emails found")?;
+            if has_filters {
+                writeln!(
+                    buffer,
+                    "Try adjusting the filters or removing the -f/-s/-b/-g options"
+                )?;
+            } else {
+                writeln!(buffer, "Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'")?;
+            }
+        }
+        Ok(final_results) => {
+            if final_results.is_empty() {
+                writeln!(buffer, "Info: No similar lore emails found")?;
+                if has_filters {
+                    writeln!(
+                        buffer,
+                        "Try adjusting the filters or removing the -f/-s/-b/-g options"
+                    )?;
+                } else {
+                    writeln!(
+                        buffer,
+                        "Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'"
+                    )?;
+                }
+                return Ok(String::from_utf8_lossy(&buffer).to_string());
+            }
+
+            writeln!(
+                buffer,
+                "\nResults: Found {} similar email(s):",
+                final_results.len()
+            )?;
+            writeln!(buffer, "{}", "=".repeat(80))?;
+
+            for (i, (email, similarity)) in final_results.iter().enumerate() {
+                writeln!(
+                    buffer,
+                    "\n{}. Similarity: {:.1}%",
+                    i + 1,
+                    similarity * 100.0
+                )?;
+                writeln!(buffer, "   Message-ID: {}", email.message_id)?;
+                writeln!(buffer, "   From: {}", email.from)?;
+                writeln!(buffer, "   Date: {}", email.date)?;
+                writeln!(buffer, "   Subject: {}", email.subject)?;
+
+                // Show first 10 lines of message body
+                writeln!(buffer, "   Message:")?;
+                for (idx, line) in email.body.lines().take(10).enumerate() {
+                    if idx == 0 {
+                        writeln!(buffer, "     {}", line)?;
+                    } else {
+                        writeln!(buffer, "     {}", line)?;
+                    }
+                }
+                if email.body.lines().count() > 10 {
+                    writeln!(buffer, "     ...")?;
+                }
+            }
+
+            writeln!(buffer, "\n{}", "=".repeat(80))?;
+            writeln!(
+                buffer,
+                "Tip: Use 'lore <message_id>' to see full details of a specific email"
+            )?;
+        }
+        Err(e) => {
+            writeln!(buffer, "Error: Lore email vector search failed: {}", e)?;
+            writeln!(buffer, "Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'")?;
         }
     }
 

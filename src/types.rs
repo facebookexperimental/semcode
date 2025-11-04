@@ -112,6 +112,22 @@ pub struct GitCommitInfo {
     pub files: Vec<String>,                 // List of files changed by this commit
 }
 
+/// Lore email information extracted from a commit's 'm' file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoreEmailInfo {
+    pub git_commit_sha: String,      // Git commit SHA containing this email
+    pub from: String,                // From header in the email
+    pub date: String,                // Date field
+    pub message_id: String,          // Message-ID header
+    pub in_reply_to: Option<String>, // In-Reply-To header (nullable)
+    pub subject: String,             // Subject line
+    pub references: Option<String>,  // Full list of References headers (nullable)
+    pub recipients: String,          // Full list of To/CC recipients
+    pub headers: String,             // Email headers (everything before first blank line)
+    pub body: String,                // Email body (everything after first blank line)
+    pub symbols: Vec<String>,        // List of symbols referenced in the email (empty for now)
+}
+
 /// Global type registry for cross-file type resolution
 #[derive(Debug, Clone)]
 pub struct GlobalTypeRegistry {
