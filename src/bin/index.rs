@@ -19,8 +19,8 @@ use tracing::{error, info, warn};
 #[command(name = "semcode-index")]
 #[command(about = "Index a codebase for semantic analysis", long_about = None)]
 struct Args {
-    /// Path to the codebase directory
-    #[arg(short, long)]
+    /// Path to the codebase directory (defaults to current directory)
+    #[arg(short, long, default_value = ".")]
     source: PathBuf,
 
     /// Path to database directory or parent directory containing .semcode.db (default: search source dir, then current dir)
