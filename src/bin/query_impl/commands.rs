@@ -667,12 +667,13 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: vlore [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [--limit <N=20>] <query_text>"
+                    "Usage: vlore [-v] [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-o <output_file>] [--limit <N=20>] <query_text>"
                         .red()
                 );
                 println!(
                     "  Search for lore emails similar to the provided text using semantic vectors"
                 );
+                println!("  -v: Show full message body (default shows first 10 lines)");
                 println!(
                     "  -f <regex>: Filter results by regex pattern on from field (can be used multiple times for OR logic)"
                 );
@@ -685,30 +686,37 @@ pub async fn handle_command(
                 println!(
                     "  -g <regex>: Filter results by regex pattern on symbols (can be used multiple times for OR logic)"
                 );
+                println!("  -o <file>: Write output to file instead of stdout");
                 println!("  --limit <N>: Limit number of results (default: 20, max: 100)");
                 println!("  Example: vlore \"memory leak fix\"");
-                println!("  Example: vlore --limit 10 \"performance optimization\"");
+                println!("  Example: vlore -v --limit 10 \"performance optimization\"");
                 println!("  Example: vlore -f \"torvalds\" \"merge pull request\"");
                 println!("  Example: vlore -s \"RFC\" -s \"PATCH\" \"new feature\"");
                 println!("  Example: vlore -b \"Signed-off-by.*Linus\" \"kernel patch\"");
                 println!("  Example: vlore -g \"malloc\" \"memory management\"");
                 println!("  Example: vlore -t \"netdev@vger.kernel.org\" \"network patch\"");
+                println!("  Example: vlore -v -o results.txt \"memory management\"");
                 println!(
                     "  Note: Requires lore vectors to be generated first with 'semcode-index --lore <url> --vectors'"
                 );
             } else {
-                // Parse -f, -s, -b, -g, -t, and --limit flags
+                // Parse -v, -f, -s, -b, -g, -t, -o, and --limit flags
+                let mut verbose = false;
                 let mut limit = 20; // default
                 let mut from_patterns = Vec::new();
                 let mut subject_patterns = Vec::new();
                 let mut body_patterns = Vec::new();
                 let mut symbols_patterns = Vec::new();
                 let mut recipients_patterns = Vec::new();
+                let mut output_file: Option<String> = None;
                 let mut query_parts = Vec::new();
                 let mut i = 1;
 
                 while i < parts.len() {
-                    if parts[i] == "--limit" && i + 1 < parts.len() {
+                    if parts[i] == "-v" {
+                        verbose = true;
+                        i += 1;
+                    } else if parts[i] == "--limit" && i + 1 < parts.len() {
                         match parts[i + 1].parse::<usize>() {
                             Ok(n) => {
                                 limit = n.min(100); // Cap at 100
@@ -738,6 +746,9 @@ pub async fn handle_command(
                     } else if parts[i] == "-t" && i + 1 < parts.len() {
                         recipients_patterns.push(parts[i + 1].to_string());
                         i += 2;
+                    } else if parts[i] == "-o" && i + 1 < parts.len() {
+                        output_file = Some(parts[i + 1].to_string());
+                        i += 2;
                     } else {
                         query_parts.extend_from_slice(&parts[i..]);
                         break;
@@ -747,23 +758,69 @@ pub async fn handle_command(
                 if query_parts.is_empty() {
                     println!(
                         "{}",
-                        "Usage: vlore [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-t <recipients_regex>] [--limit <N=20>] <query_text>"
+                        "Usage: vlore [-v] [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-t <recipients_regex>] [-o <output_file>] [--limit <N=20>] <query_text>"
                             .red()
                     );
                 } else {
                     let query_text = query_parts.join(" ");
-                    vlore_similar_emails(
-                        db,
-                        &query_text,
-                        limit,
-                        &from_patterns,
-                        &subject_patterns,
-                        &body_patterns,
-                        &symbols_patterns,
-                        &recipients_patterns,
-                        model_path,
-                    )
-                    .await?;
+
+                    // Handle output file if specified
+                    use std::fs::File;
+
+                    let mut file_writer: Option<File> = None;
+                    if let Some(ref path) = output_file {
+                        match File::create(path) {
+                            Ok(f) => {
+                                file_writer = Some(f);
+                                println!("Writing output to: {}", path);
+                            }
+                            Err(e) => {
+                                println!(
+                                    "{} Failed to create output file '{}': {}",
+                                    "Error:".red(),
+                                    path,
+                                    e
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    }
+
+                    if let Some(ref mut writer) = file_writer {
+                        vlore_similar_emails(
+                            db,
+                            &query_text,
+                            limit,
+                            &from_patterns,
+                            &subject_patterns,
+                            &body_patterns,
+                            &symbols_patterns,
+                            &recipients_patterns,
+                            model_path,
+                            verbose,
+                            writer,
+                        )
+                        .await?;
+                    } else {
+                        vlore_similar_emails(
+                            db,
+                            &query_text,
+                            limit,
+                            &from_patterns,
+                            &subject_patterns,
+                            &body_patterns,
+                            &symbols_patterns,
+                            &recipients_patterns,
+                            model_path,
+                            verbose,
+                            &mut anstream::stdout(),
+                        )
+                        .await?;
+                    }
+
+                    if file_writer.is_some() {
+                        println!("Output written to: {}", output_file.as_ref().unwrap());
+                    }
                 }
             }
         }
@@ -1056,7 +1113,7 @@ pub async fn handle_command(
         }
         "lore" => {
             if parts.len() < 2 {
-                println!("{}", "Usage: lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--thread] [-o <output_file>]".red());
+                println!("{}", "Usage: lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--thread] [--replies] [-o <output_file>]".red());
                 println!("  Search lore emails with regex filters");
                 println!("  Options:");
                 println!("    -v              Show full message body");
@@ -1075,7 +1132,10 @@ pub async fn handle_command(
                     "    -g <regex>      Filter by symbols field (can use multiple times for OR)"
                 );
                 println!("    --limit <N>     Limit number of results (0=unlimited, default: 100)");
-                println!("    --thread        Show full thread for each matching email");
+                println!("    --thread        Show full thread (root to all descendants) for each matching email");
+                println!(
+                    "    --replies       Show all replies/subthreads under each matching email"
+                );
                 println!("    -o <file>       Write output to file instead of stdout");
                 println!("  Multiple conditions:");
                 println!("    Same field (OR):   lore -f torvalds -f gregkh     - From torvalds OR gregkh");
@@ -1089,7 +1149,9 @@ pub async fn handle_command(
                 println!("    lore -g \"malloc\"");
                 println!("    lore -g \"struct.*page\"");
                 println!("    lore -m \"<20241201120000.12345@kernel.org>\"");
-                println!("    lore -v -f \"torvalds\" --thread");
+                println!("    lore -m \"<msg-id>\" --replies             - Show all replies under this message");
+                println!("    lore -v -f \"torvalds\" --thread            - Show full threads for matches");
+                println!("    lore -s \"memory leak\" --replies           - Show replies to matching messages");
                 println!("    lore -v -s \"memory leak\" --thread --limit 5");
                 println!("    lore -o results.txt -s \"memory leak\"");
                 println!("    lore -b btrfs -f clm@meta.com              - Body contains btrfs AND from clm@meta.com");
@@ -1098,7 +1160,7 @@ pub async fn handle_command(
                 println!("    dump-lore <file> - Export all emails to JSON");
                 println!("    dig <commit>     - Find emails for a git commit");
             } else {
-                // Parse flags: -v, -m, -f, -s, -b, -t, -g, --limit, --thread, -o
+                // Parse flags: -v, -m, -f, -s, -b, -t, -g, --limit, --thread, --replies, -o
                 let mut verbose: usize = 0;
                 let mut message_id: Option<String> = None;
                 let mut from_patterns = Vec::new();
@@ -1108,6 +1170,7 @@ pub async fn handle_command(
                 let mut symbols_patterns = Vec::new();
                 let mut limit = 100;
                 let mut show_thread = false;
+                let mut show_replies = false;
                 let mut output_file: Option<String> = None;
                 let mut i = 1;
 
@@ -1159,6 +1222,10 @@ pub async fn handle_command(
                             show_thread = true;
                             i += 1;
                         }
+                        "--replies" => {
+                            show_replies = true;
+                            i += 1;
+                        }
                         "-o" if i + 1 < parts.len() => {
                             output_file = Some(parts[i + 1].to_string());
                             i += 2;
@@ -1197,13 +1264,30 @@ pub async fn handle_command(
                     }
                 }
 
+                // Validate --replies and --thread are mutually exclusive
+                if show_replies && show_thread {
+                    println!(
+                        "{} Cannot use both --thread and --replies together",
+                        "Error:".red()
+                    );
+                    return Ok(false);
+                }
+
                 // Handle -m flag for exact message_id lookup
                 if let Some(msg_id) = message_id {
                     if let Some(ref mut writer) = file_writer {
-                        lore_get_by_message_id_to_writer(db, &msg_id, verbose, show_thread, writer)
-                            .await?;
+                        lore_get_by_message_id_to_writer(
+                            db,
+                            &msg_id,
+                            verbose,
+                            show_thread,
+                            show_replies,
+                            writer,
+                        )
+                        .await?;
                     } else {
-                        lore_get_by_message_id(db, &msg_id, verbose, show_thread).await?;
+                        lore_get_by_message_id(db, &msg_id, verbose, show_thread, show_replies)
+                            .await?;
                     }
                 } else {
                     // Build field_patterns from the collected patterns
@@ -1241,6 +1325,7 @@ pub async fn handle_command(
                                 limit,
                                 verbose,
                                 show_thread,
+                                show_replies,
                                 writer,
                             )
                             .await?;
@@ -1251,6 +1336,7 @@ pub async fn handle_command(
                                 limit,
                                 verbose,
                                 show_thread,
+                                show_replies,
                                 writer,
                             )
                             .await?;
@@ -1265,6 +1351,7 @@ pub async fn handle_command(
                                 limit,
                                 verbose,
                                 show_thread,
+                                show_replies,
                             )
                             .await?;
                         } else {
@@ -1274,6 +1361,7 @@ pub async fn handle_command(
                                 limit,
                                 verbose,
                                 show_thread,
+                                show_replies,
                             )
                             .await?;
                         }
@@ -2390,6 +2478,7 @@ async fn vcommit_similar_commits(
     Ok(())
 }
 
+/// Helper function for vlore that writes output to a generic writer
 async fn vlore_similar_emails(
     db: &DatabaseManager,
     query_text: &str,
@@ -2400,6 +2489,8 @@ async fn vlore_similar_emails(
     symbols_patterns: &[String],
     recipients_patterns: &[String],
     model_path: &Option<String>,
+    verbose: bool,
+    writer: &mut dyn std::io::Write,
 ) -> Result<()> {
     use semcode::CodeVectorizer;
 
@@ -2408,65 +2499,79 @@ async fn vlore_similar_emails(
         || !body_patterns.is_empty()
         || !symbols_patterns.is_empty()
         || !recipients_patterns.is_empty();
-    match has_filters {
-        true => {
-            let mut filter_parts = Vec::new();
-            if !from_patterns.is_empty() {
-                filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
-            }
-            if !subject_patterns.is_empty() {
-                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
-            }
-            if !body_patterns.is_empty() {
-                filter_parts.push(format!("{} body pattern(s)", body_patterns.len()));
-            }
-            if !symbols_patterns.is_empty() {
-                filter_parts.push(format!("{} symbols pattern(s)", symbols_patterns.len()));
-            }
-            if !recipients_patterns.is_empty() {
-                filter_parts.push(format!(
-                    "{} recipients pattern(s)",
-                    recipients_patterns.len()
-                ));
-            }
-            let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
-            println!(
-                "Searching for lore emails similar to: {} ({}, limit: {})",
-                query_text.yellow(),
-                filter_desc,
-                limit
-            );
+
+    if has_filters {
+        let mut filter_parts = Vec::new();
+        if !from_patterns.is_empty() {
+            filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
         }
-        false => println!(
-            "Searching for lore emails similar to: {} (limit: {})",
-            query_text.yellow(),
-            limit
-        ),
+        if !subject_patterns.is_empty() {
+            filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+        }
+        if !body_patterns.is_empty() {
+            filter_parts.push(format!("{} body pattern(s)", body_patterns.len()));
+        }
+        if !symbols_patterns.is_empty() {
+            filter_parts.push(format!("{} symbols pattern(s)", symbols_patterns.len()));
+        }
+        if !recipients_patterns.is_empty() {
+            filter_parts.push(format!(
+                "{} recipients pattern(s)",
+                recipients_patterns.len()
+            ));
+        }
+        let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
+        writeln!(
+            writer,
+            "{}",
+            format!(
+                "Searching for lore emails similar to: {} ({}, limit: {})",
+                query_text, filter_desc, limit
+            )
+            .yellow()
+        )?;
+    } else {
+        writeln!(
+            writer,
+            "{}",
+            format!(
+                "Searching for lore emails similar to: {} (limit: {})",
+                query_text, limit
+            )
+            .yellow()
+        )?;
     }
 
     // Initialize vectorizer
-    println!("Initializing vectorizer...");
+    writeln!(writer, "Initializing vectorizer...")?;
     let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
         Ok(v) => v,
         Err(e) => {
-            println!("{} Failed to initialize vectorizer: {}", "Error:".red(), e);
-            println!(
+            writeln!(
+                writer,
+                "{} Failed to initialize vectorizer: {}",
+                "Error:".red(),
+                e
+            )?;
+            writeln!(
+                writer,
                 "Make sure you have a model available. Use --model-path to specify a custom model."
-            );
+            )?;
             return Ok(());
         }
     };
 
     // Generate vector for query text
-    println!("Generating query vector...");
+    writeln!(writer, "Generating query vector...")?;
     let query_vector = match vectorizer.vectorize_code(query_text) {
         Ok(v) => v,
         Err(e) => {
-            println!(
+            writeln!(
+                writer,
                 "{} Failed to generate vector for query: {}",
                 "Error:".red(),
                 e
-            );
+            )?;
             return Ok(());
         }
     };
@@ -2516,73 +2621,104 @@ async fn vlore_similar_emails(
         .await
     {
         Ok(results) if results.is_empty() => {
-            println!("{} No similar lore emails found", "Info:".yellow());
+            writeln!(writer, "{} No similar lore emails found", "Info:".yellow())?;
             if has_filters {
-                println!("Try adjusting the filters or removing the -f/-s/-b/-g options");
+                writeln!(
+                    writer,
+                    "Try adjusting the filters or removing the -f/-s/-b/-g options"
+                )?;
             } else {
-                println!("Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'");
+                writeln!(
+                    writer,
+                    "Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'"
+                )?;
             }
         }
         Ok(final_results) => {
             if final_results.is_empty() {
-                println!("{} No similar lore emails found", "Info:".yellow());
+                writeln!(writer, "{} No similar lore emails found", "Info:".yellow())?;
                 if has_filters {
-                    println!("Try adjusting the filters or removing the -f/-s/-b/-g options");
+                    writeln!(
+                        writer,
+                        "Try adjusting the filters or removing the -f/-s/-b/-g options"
+                    )?;
                 } else {
-                    println!(
+                    writeln!(
+                        writer,
                         "Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'"
-                    );
+                    )?;
                 }
                 return Ok(());
             }
 
-            println!(
-                "\n{} Found {} similar email(s):",
-                "Results:".bold().green(),
-                final_results.len()
-            );
-            println!("{}", "=".repeat(80));
+            writeln!(
+                writer,
+                "{}",
+                format!("\nResults: Found {} similar email(s):", final_results.len())
+                    .bold()
+                    .green()
+            )?;
+            writeln!(writer, "{}", "=".repeat(80))?;
 
             for (i, (email, similarity)) in final_results.iter().enumerate() {
-                println!(
-                    "\n{}. {} {} {}%",
+                writeln!(
+                    writer,
+                    "\n{}. {} {}%",
                     (i + 1).to_string().yellow(),
                     "Similarity:".bold(),
-                    format!("{:.1}", similarity * 100.0).bright_green(),
-                    ""
-                );
-                println!(
+                    format!("{:.1}", similarity * 100.0).bright_green()
+                )?;
+
+                writeln!(
+                    writer,
                     "   {} {}",
                     "Message-ID:".bold(),
                     email.message_id.bright_black()
-                );
-                println!("   {} {}", "From:".bold(), email.from.cyan());
-                println!("   {} {}", "Date:".bold(), email.date.bright_black());
-                println!("   {} {}", "Subject:".bold(), email.subject.white());
+                )?;
+                writeln!(writer, "   {} {}", "From:".bold(), email.from.cyan())?;
+                writeln!(
+                    writer,
+                    "   {} {}",
+                    "Date:".bold(),
+                    email.date.bright_black()
+                )?;
+                writeln!(writer, "   {} {}", "Subject:".bold(), email.subject.white())?;
 
-                // Show first 10 lines of message body
-                println!("   {}:", "Message:".bold());
-                for (idx, line) in email.body.lines().take(10).enumerate() {
+                // Show message body (full if verbose, first 10 lines otherwise)
+                let line_limit = if verbose { usize::MAX } else { 10 };
+                let total_lines = email.body.lines().count();
+
+                writeln!(writer, "   {}:", "Message:".bold())?;
+                for (idx, line) in email.body.lines().take(line_limit).enumerate() {
                     if idx == 0 {
-                        println!("     {}", line.bright_white());
+                        writeln!(writer, "     {}", line.bright_white())?;
                     } else {
-                        println!("     {}", line);
+                        writeln!(writer, "     {}", line)?;
                     }
                 }
-                if email.body.lines().count() > 10 {
-                    println!("     {}", "...".bright_black());
+                if !verbose && total_lines > 10 {
+                    writeln!(writer, "     {}", "...".bright_black())?;
                 }
             }
 
-            println!("\n{}", "=".repeat(80));
-            println!(
+            writeln!(writer, "\n{}", "=".repeat(80))?;
+            writeln!(
+                writer,
                 "{} Use 'lore <message_id>' to see full details of a specific email",
                 "Tip:".bold().blue()
-            );
+            )?;
         }
         Err(e) => {
-            println!("{} Lore email vector search failed: {}", "Error:".red(), e);
-            println!("Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'");
+            writeln!(
+                writer,
+                "{} Lore email vector search failed: {}",
+                "Error:".red(),
+                e
+            )?;
+            writeln!(
+                writer,
+                "Make sure lore vectors have been generated with 'semcode-index --lore <url> --vectors'"
+            )?;
         }
     }
 

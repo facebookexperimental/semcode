@@ -141,12 +141,107 @@ pub async fn lore_show_thread_to_writer(
     Ok(())
 }
 
+/// Show all replies/subthreads under a given message (writer version)
+pub async fn lore_show_replies_to_writer(
+    db: &DatabaseManager,
+    message_id: &str,
+    verbose: usize,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use std::collections::{HashSet, VecDeque};
+
+    writeln!(writer, "Finding all replies to message: {}", message_id)?;
+
+    // Get the starting message
+    let root_email = match db.get_lore_email_by_message_id(message_id).await? {
+        Some(email) => email,
+        None => {
+            writeln!(
+                writer,
+                "Error: Email not found with message_id: {}",
+                message_id
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Collect all descendants (messages that reply to this message or its descendants)
+    let mut all_emails = Vec::new();
+    let mut seen_message_ids = HashSet::new();
+    let mut to_process = VecDeque::new();
+
+    // Start with the root message
+    seen_message_ids.insert(root_email.message_id.clone());
+    to_process.push_back(root_email.message_id.clone());
+    all_emails.push(root_email);
+
+    // Recursively find all messages that reply to messages in this subthread
+    while let Some(current_message_id) = to_process.pop_front() {
+        // Find all emails that reference this message
+        let referencing_emails = db.get_lore_emails_referencing(&current_message_id).await?;
+
+        for email in referencing_emails {
+            // Add to seen set immediately to avoid duplicate processing
+            if !seen_message_ids.insert(email.message_id.clone()) {
+                // Already seen this message, skip it
+                continue;
+            }
+
+            // Add to processing queue and results
+            to_process.push_back(email.message_id.clone());
+            all_emails.push(email);
+        }
+    }
+
+    if all_emails.len() == 1 {
+        // Only the root message, no replies
+        writeln!(writer, "\nInfo: No replies found")?;
+        return Ok(());
+    }
+
+    // Sort emails in thread order (respecting reply structure, then by date)
+    let sorted_emails = crate::search::sort_emails_by_thread_order(&all_emails);
+
+    writeln!(
+        writer,
+        "\nReplies: Found {} message(s) (including root):\n",
+        all_emails.len()
+    )?;
+
+    // Display all emails in the subthread
+    for (idx, email) in sorted_emails.iter().enumerate() {
+        writeln!(writer, "{}. {} - {}", idx + 1, email.date, email.subject)?;
+
+        // Always show database column headers
+        writeln!(writer, "   From: {}", email.from)?;
+        writeln!(writer, "   Message-ID: {}", email.message_id)?;
+
+        if let Some(ref in_reply_to) = email.in_reply_to {
+            writeln!(writer, "   In-Reply-To: {}", in_reply_to)?;
+        }
+
+        // Show full message body only when verbose
+        if verbose >= 1 {
+            writeln!(writer, "\n   --- Message Body ---")?;
+            for line in email.body.lines() {
+                writeln!(writer, "   {}", line)?;
+            }
+            writeln!(writer, "   --- End Message ---\n")?;
+        } else {
+            writeln!(writer)?; // Empty line between messages
+        }
+    }
+
+    Ok(())
+}
+
 /// Get email by message_id (writer version)
 pub async fn lore_get_by_message_id_to_writer(
     db: &DatabaseManager,
     message_id: &str,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(writer, "Looking up email with message_id: {}\n", message_id)?;
@@ -158,6 +253,9 @@ pub async fn lore_get_by_message_id_to_writer(
             if show_thread {
                 // Show the full thread for this message
                 lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
+            } else if show_replies {
+                // Show only replies/descendants
+                lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
             } else {
                 // Show just this single message
                 writeln!(writer, "Email found:\n")?;
@@ -206,6 +304,7 @@ pub async fn lore_search_with_thread_to_writer(
     limit: usize,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(
@@ -238,6 +337,24 @@ pub async fn lore_search_with_thread_to_writer(
             }
             writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
             lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
+        }
+        return Ok(());
+    }
+
+    if show_replies {
+        // Show replies for all matching emails
+        writeln!(
+            writer,
+            "\n{} matches found, showing replies:\n",
+            emails.len()
+        )?;
+
+        for (idx, email) in emails.iter().enumerate() {
+            if idx > 0 {
+                writeln!(writer, "\n{}\n", "=".repeat(80))?;
+            }
+            writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
+            lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
         }
         return Ok(());
     }
@@ -294,6 +411,7 @@ pub async fn lore_search_multi_field_to_writer(
     limit: usize,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(writer, "Searching lore emails with multiple filters:")?;
@@ -327,6 +445,24 @@ pub async fn lore_search_multi_field_to_writer(
             }
             writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
             lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
+        }
+        return Ok(());
+    }
+
+    if show_replies {
+        // Show replies for all matching emails
+        writeln!(
+            writer,
+            "\n{} matches found, showing replies:\n",
+            emails.len()
+        )?;
+
+        for (idx, email) in emails.iter().enumerate() {
+            if idx > 0 {
+                writeln!(writer, "\n{}\n", "=".repeat(80))?;
+            }
+            writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
+            lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
         }
         return Ok(());
     }

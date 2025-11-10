@@ -2097,6 +2097,11 @@ impl McpServer {
                                 "description": "Show full email thread for each match (default: false)",
                                 "default": false
                             },
+                            "show_replies": {
+                                "type": "boolean",
+                                "description": "Show all replies/subthreads under each match (default: false, mutually exclusive with show_thread)",
+                                "default": false
+                            },
                             "limit": {
                                 "type": "integer",
                                 "description": "Maximum number of results (default: 100, 0 = unlimited)",
@@ -2134,6 +2139,11 @@ impl McpServer {
                             "show_thread": {
                                 "type": "boolean",
                                 "description": "Show full thread for each result (use with show_all, equivalent to --thread flag in query tool)",
+                                "default": false
+                            },
+                            "show_replies": {
+                                "type": "boolean",
+                                "description": "Show all replies/subthreads under each result (use with show_all, mutually exclusive with show_thread)",
                                 "default": false
                             },
                             "page": {
@@ -2613,6 +2623,7 @@ impl McpServer {
     async fn handle_lore_search(&self, args: &Value) -> Value {
         let verbose = args["verbose"].as_bool().unwrap_or(false) as usize; // Convert to usize for function signature
         let show_thread = args["show_thread"].as_bool().unwrap_or(false);
+        let show_replies = args["show_replies"].as_bool().unwrap_or(false);
         let limit = args["limit"].as_u64().unwrap_or(100) as usize;
         let page = args["page"].as_u64().map(|p| p as usize);
 
@@ -2666,7 +2677,7 @@ impl McpServer {
 
         // Generate a query key for caching
         let query_key = format!(
-            "lore:{}:{}:{}:{}:{}:{}:{}:{}",
+            "lore:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             from_patterns.join("|"),
             subject_patterns.join("|"),
             body_patterns.join("|"),
@@ -2674,12 +2685,15 @@ impl McpServer {
             recipients_patterns.join("|"),
             message_id.unwrap_or(""),
             verbose,
-            show_thread
+            show_thread,
+            show_replies
         );
 
         // Handle message_id lookup (same as query tool's -m flag)
         if let Some(msg_id) = message_id {
-            match mcp_lore_get_by_message_id(&self.db, msg_id, verbose, show_thread).await {
+            match mcp_lore_get_by_message_id(&self.db, msg_id, verbose, show_thread, show_replies)
+                .await
+            {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -2703,6 +2717,7 @@ impl McpServer {
                 limit,
                 verbose,
                 show_thread,
+                show_replies,
             )
             .await
             {
@@ -2725,10 +2740,14 @@ impl McpServer {
         let verbose = args["verbose"].as_bool().unwrap_or(false) as usize;
         let show_all = args["show_all"].as_bool().unwrap_or(false);
         let show_thread = args["show_thread"].as_bool().unwrap_or(false);
+        let show_replies = args["show_replies"].as_bool().unwrap_or(false);
         let page = args["page"].as_u64().map(|p| p as usize);
 
         // Generate a query key for caching
-        let query_key = format!("dig:{}:{}:{}:{}", commit, verbose, show_all, show_thread);
+        let query_key = format!(
+            "dig:{}:{}:{}:{}:{}",
+            commit, verbose, show_all, show_thread, show_replies
+        );
 
         let git_repo_path = "."; // MCP server typically runs in the repo directory
 
@@ -2739,6 +2758,7 @@ impl McpServer {
             verbose,
             show_all,
             show_thread,
+            show_replies,
         )
         .await
         {
@@ -3267,6 +3287,7 @@ async fn mcp_lore_get_by_message_id(
     message_id: &str,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
@@ -3276,6 +3297,7 @@ async fn mcp_lore_get_by_message_id(
         message_id,
         verbose,
         show_thread,
+        show_replies,
         &mut buffer,
     )
     .await?;
@@ -3294,6 +3316,7 @@ async fn mcp_lore_search_multi_field(
     limit: usize,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
@@ -3332,49 +3355,13 @@ async fn mcp_lore_search_multi_field(
         limit,
         verbose,
         show_thread,
+        show_replies,
         &mut buffer,
     )
     .await?;
 
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
-
-/// Helper function to write an email to a buffer
-fn write_email_to_buffer(
-    email: &semcode::LoreEmailInfo,
-    verbose: usize,
-    buffer: &mut Vec<u8>,
-) -> Result<()> {
-    use std::io::Write;
-
-    writeln!(buffer, "From: {}", email.from)?;
-    writeln!(buffer, "Date: {}", email.date)?;
-    writeln!(buffer, "Subject: {}", email.subject)?;
-    writeln!(buffer, "Message-ID: {}", email.message_id)?;
-
-    if let Some(ref in_reply_to) = email.in_reply_to {
-        writeln!(buffer, "In-Reply-To: {}", in_reply_to)?;
-    }
-
-    if let Some(ref references) = email.references {
-        writeln!(buffer, "References: {}", references)?;
-    }
-
-    if !email.recipients.is_empty() {
-        writeln!(buffer, "Recipients: {}", email.recipients)?;
-    }
-
-    if verbose >= 1 {
-        writeln!(buffer, "\n--- Message Body ---")?;
-        for line in email.body.lines() {
-            writeln!(buffer, "{}", line)?;
-        }
-        writeln!(buffer, "--- End Message ---")?;
-    }
-
-    Ok(())
-}
-
 /// Search for lore emails related to a git commit (dig command)
 async fn mcp_dig_lore_by_commit(
     db: &DatabaseManager,
@@ -3383,6 +3370,7 @@ async fn mcp_dig_lore_by_commit(
     verbose: usize,
     show_all: bool,
     show_thread: bool,
+    show_replies: bool,
 ) -> Result<String> {
     use std::io::Write;
 
@@ -3400,6 +3388,9 @@ async fn mcp_dig_lore_by_commit(
     }
     if show_thread {
         writeln!(buffer, "  (with full threads)")?;
+    }
+    if show_replies {
+        writeln!(buffer, "  (with all replies)")?;
     }
 
     // Resolve git commit-ish to full SHA and get commit info (reuse git resolution logic)
@@ -3478,7 +3469,7 @@ async fn mcp_dig_lore_by_commit(
         )?;
 
         if show_thread {
-            // Show full threads - for now just show emails themselves
+            // Show full threads
             for (idx, email) in sorted_emails.iter().enumerate() {
                 if idx > 0 {
                     writeln!(buffer, "\n{}\n", "=".repeat(80))?;
@@ -3490,7 +3481,34 @@ async fn mcp_dig_lore_by_commit(
                     sorted_emails.len(),
                     email.date
                 )?;
-                write_email_to_buffer(email, verbose, &mut buffer)?;
+                semcode::lore_writers::lore_show_thread_to_writer(
+                    db,
+                    &email.message_id,
+                    verbose,
+                    &mut buffer,
+                )
+                .await?;
+            }
+        } else if show_replies {
+            // Show all replies
+            for (idx, email) in sorted_emails.iter().enumerate() {
+                if idx > 0 {
+                    writeln!(buffer, "\n{}\n", "=".repeat(80))?;
+                }
+                writeln!(
+                    buffer,
+                    "===> Replies {} of {} ({}):",
+                    idx + 1,
+                    sorted_emails.len(),
+                    email.date
+                )?;
+                semcode::lore_writers::lore_show_replies_to_writer(
+                    db,
+                    &email.message_id,
+                    verbose,
+                    &mut buffer,
+                )
+                .await?;
             }
         } else {
             // Show summary of all matching emails
@@ -3520,7 +3538,22 @@ async fn mcp_dig_lore_by_commit(
 
             if show_thread {
                 writeln!(buffer, "===> Most Recent Thread:")?;
-                write_email_to_buffer(most_recent, verbose, &mut buffer)?;
+                semcode::lore_writers::lore_show_thread_to_writer(
+                    db,
+                    &most_recent.message_id,
+                    verbose,
+                    &mut buffer,
+                )
+                .await?;
+            } else if show_replies {
+                writeln!(buffer, "===> Replies to Most Recent:")?;
+                semcode::lore_writers::lore_show_replies_to_writer(
+                    db,
+                    &most_recent.message_id,
+                    verbose,
+                    &mut buffer,
+                )
+                .await?;
             } else {
                 writeln!(buffer, "1. {} - {}", most_recent.date, most_recent.subject)?;
                 writeln!(buffer, "   From: {}", most_recent.from)?;

@@ -51,7 +51,7 @@ Search lore emails using regex patterns on different fields (from, subject, body
 
 **Syntax:**
 ```
-lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--thread] [-o <output_file>]
+lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--thread] [--replies] [-o <output_file>]
 ```
 
 **Options:**
@@ -63,8 +63,11 @@ lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] 
 - `-t <regex>` - Filter by recipients (To/Cc) (can be specified multiple times)
 - `-g <regex>` - Filter by symbols mentioned in any patches (can be specified multiple times)
 - `--limit <N>` - Maximum number of results (default: 100)
-- `--thread` - Show full email threads for each match
+- `--thread` - Show full email threads for each match (walks up to root, then shows all descendants)
+- `--replies` - Show all replies/subthreads under each match (shows descendants only, not ancestors)
 - `-o <output_file>` - Write output to file instead of stdout
+
+**Note:** `--thread` and `--replies` are mutually exclusive.
 
 **Filter Logic:**
 - Multiple filters for the **same field** are combined with **OR** logic
@@ -103,9 +106,13 @@ lore -g "struct.*page"
 # Look up specific email by Message-ID
 lore -m "<20241201120000.12345@kernel.org>"
 
-# Show threads
+# Show threads (full thread including ancestors)
 lore -v -f "torvalds" --thread
 lore -v -s "memory leak" --thread --limit 5
+
+# Show replies only (descendants, not ancestors)
+lore -v -s "RFC" --replies
+lore -m "<message.id@example.com>" --replies
 
 # Combine filters (AND across fields)
 lore -b btrfs -f clm@meta.com              # Body contains btrfs AND from clm@meta.com
@@ -120,7 +127,8 @@ lore -f torvalds --thread -o threads.txt   # Save thread view to file
 **Output Format:**
 - Summary view (default): Date, subject, from, Message-ID, and threading info
 - Verbose view (`-v`): Includes full message body
-- Thread view (`--thread`): Shows complete email threads in chronological order
+- Thread view (`--thread`): Shows complete email threads in chronological order (walks up to root, then shows entire thread)
+- Replies view (`--replies`): Shows all replies/subthreads under each match (descendants only, useful for seeing discussion that followed)
 
 ---
 
@@ -130,14 +138,17 @@ Search for lore emails related to a specific git commit by matching the commit's
 
 **Syntax:**
 ```
-dig [-v] [-a] [--thread] <commit>
+dig [-v] [-a] [--thread] [--replies] <commit>
 ```
 
 **Options:**
 - `-v` - Verbose mode: show full message bodies
 - `-a` - Show all matching emails (default: only most recent)
 - `--thread` - Show full email threads for each match
+- `--replies` - Show all replies/subthreads under each match
 - `<commit>` - Any git reference (SHA, short SHA, branch name, HEAD, etc.)
+
+**Note:** `--thread` and `--replies` are mutually exclusive.
 
 **Examples:**
 
@@ -156,6 +167,12 @@ dig -a --thread HEAD
 
 # Show all matches with threads and bodies
 dig -v -a --thread abc123
+
+# Show all matches with just replies (no ancestors)
+dig -a --replies HEAD
+
+# Show replies to most recent match
+dig --replies abc123
 ```
 
 **How It Works:**
@@ -264,6 +281,7 @@ Search lore emails with regex filters. Same functionality as the query tool's `l
 - `limit` (number, optional) - Maximum results (default: 100)
 - `verbose` (boolean, optional) - Show full message bodies (default: false)
 - `show_thread` (boolean, optional) - Show full threads (default: false)
+- `show_replies` (boolean, optional) - Show all replies/subthreads (default: false, mutually exclusive with show_thread)
 
 **Example Usage in Claude Desktop:**
 
@@ -286,6 +304,7 @@ Search for lore emails related to a git commit. Same functionality as the query 
 - `verbose` (boolean, optional) - Show full message bodies (default: false)
 - `show_all` (boolean, optional) - Show all matches vs most recent (default: false)
 - `show_thread` (boolean, optional) - Show full threads (default: false)
+- `show_replies` (boolean, optional) - Show all replies/subthreads (default: false, mutually exclusive with show_thread)
 
 **Example Usage in Claude Desktop:**
 
@@ -362,6 +381,9 @@ lore -f "torvalds@" -b "btrfs"
 
 # Show full threads
 lore -f "torvalds@" -b "btrfs" --thread
+
+# Show just the replies to see discussion that followed
+lore -f "torvalds@" -b "btrfs" --replies
 ```
 
 ### Research Topic History
@@ -380,6 +402,9 @@ lore -s "\[PATCH.*\]" -f "developer@example.com" --limit 50
 
 # Show as threads to see review flow
 lore -s "\[PATCH v2" --thread
+
+# Show just the replies to see what reviewers said
+lore -s "\[PATCH v2" --replies
 ```
 
 ### Finding Patches by Symbol
@@ -406,15 +431,20 @@ lore -g "kmalloc" -g "kfree" -g "vmalloc"
 
 2. **Use threading wisely**: The `--thread` flag is powerful but verbose. Use it when you need full context, not for initial exploration
 
-3. **Leverage git integration**: The `dig` command is the easiest way to find discussion about commits you're already looking at in git
+3. **Choose between --thread and --replies**:
+   - Use `--thread` when you want to see the complete discussion from the beginning (includes ancestors)
+   - Use `--replies` when you want to see only the responses to a specific email (excludes ancestors)
+   - Example: For a patch email, `--replies` shows you what reviewers said without the full version history
 
-4. **Combine filters effectively**: Remember that same-field filters use OR logic, while different-field filters use AND logic
+4. **Leverage git integration**: The `dig` command is the easiest way to find discussion about commits you're already looking at in git
 
-5. **Watch your limits**: Large result sets can be overwhelming. Use `--limit` to control output size
+5. **Combine filters effectively**: Remember that same-field filters use OR logic, while different-field filters use AND logic
 
-6. **Message-ID lookups**: If you see an interesting Message-ID in results, use `lore -m <message_id>` to view the full email
+6. **Watch your limits**: Large result sets can be overwhelming. Use `--limit` to control output size
 
-7. **Export for analysis**: Use `dump-lore` when you need to process emails with external tools or scripts
+7. **Message-ID lookups**: If you see an interesting Message-ID in results, use `lore -m <message_id>` to view the full email
+
+8. **Export for analysis**: Use `dump-lore` when you need to process emails with external tools or scripts
 
 ---
 

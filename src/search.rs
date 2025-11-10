@@ -453,7 +453,7 @@ pub async fn lore_search(
     limit: usize,
     verbose: usize,
 ) -> Result<()> {
-    lore_search_with_thread(db, field, pattern, limit, verbose, false).await
+    lore_search_with_thread(db, field, pattern, limit, verbose, false, false).await
 }
 
 pub async fn lore_search_multi_field(
@@ -462,6 +462,7 @@ pub async fn lore_search_multi_field(
     limit: usize,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
 ) -> Result<()> {
     // Build description of the search
     use std::collections::HashMap;
@@ -514,6 +515,28 @@ pub async fn lore_search_multi_field(
         return Ok(());
     }
 
+    if show_replies {
+        // Show replies for all matching emails
+        println!(
+            "\n{} matches found, showing replies:\n",
+            emails.len().to_string().green()
+        );
+
+        for (idx, email) in emails.iter().enumerate() {
+            if idx > 0 {
+                println!("\n{}\n", "=".repeat(80).bright_black());
+            }
+            println!(
+                "{} Replies {} of {}:",
+                "===>".bold().cyan(),
+                idx + 1,
+                emails.len()
+            );
+            lore_show_replies(db, &email.message_id, verbose).await?;
+        }
+        return Ok(());
+    }
+
     println!("\n{} matches found:\n", emails.len().to_string().green());
 
     for (idx, email) in emails.iter().enumerate() {
@@ -553,6 +576,7 @@ pub async fn lore_search_with_thread(
     limit: usize,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
 ) -> Result<()> {
     println!(
         "Searching lore emails where {} matches pattern: {}",
@@ -588,6 +612,28 @@ pub async fn lore_search_with_thread(
                 emails.len()
             );
             lore_show_thread(db, &email.message_id, verbose).await?;
+        }
+        return Ok(());
+    }
+
+    if show_replies {
+        // Show replies for all matching emails
+        println!(
+            "\n{} matches found, showing replies:\n",
+            emails.len().to_string().green()
+        );
+
+        for (idx, email) in emails.iter().enumerate() {
+            if idx > 0 {
+                println!("\n{}\n", "=".repeat(80).bright_black());
+            }
+            println!(
+                "{} Replies {} of {}:",
+                "===>".bold().cyan(),
+                idx + 1,
+                emails.len()
+            );
+            lore_show_replies(db, &email.message_id, verbose).await?;
         }
         return Ok(());
     }
@@ -647,6 +693,7 @@ pub async fn lore_get_by_message_id(
     message_id: &str,
     verbose: usize,
     show_thread: bool,
+    show_replies: bool,
 ) -> Result<()> {
     println!("Looking up email with message_id: {}", message_id.cyan());
 
@@ -658,6 +705,10 @@ pub async fn lore_get_by_message_id(
                 // Show the full thread for this message
                 println!();
                 lore_show_thread(db, &email.message_id, verbose).await?;
+            } else if show_replies {
+                // Show only replies/descendants
+                println!();
+                lore_show_replies(db, &email.message_id, verbose).await?;
             } else {
                 // Show just this single message
                 println!("\n{}\n", "Email found:".green());
@@ -895,6 +946,104 @@ pub async fn lore_show_thread(
         }
 
         println!();
+    }
+
+    Ok(())
+}
+
+/// Show all replies/subthreads under a given message (descendants only, not ancestors)
+pub async fn lore_show_replies(
+    db: &DatabaseManager,
+    message_id: &str,
+    verbose: usize,
+) -> Result<()> {
+    use std::collections::{HashSet, VecDeque};
+
+    println!("Finding all replies to message: {}", message_id.cyan());
+
+    // Get the starting message
+    let root_email = match db.get_lore_email_by_message_id(message_id).await? {
+        Some(email) => email,
+        None => {
+            println!(
+                "{} Email not found with message_id: {}",
+                "Error:".red(),
+                message_id
+            );
+            return Ok(());
+        }
+    };
+
+    // Collect all descendants (messages that reply to this message or its descendants)
+    let mut all_emails = Vec::new();
+    let mut seen_message_ids = HashSet::new();
+    let mut to_process = VecDeque::new();
+
+    // Start with the root message
+    seen_message_ids.insert(root_email.message_id.clone());
+    to_process.push_back(root_email.message_id.clone());
+    all_emails.push(root_email);
+
+    // Recursively find all messages that reply to messages in this subthread
+    while let Some(current_message_id) = to_process.pop_front() {
+        // Find all emails that reference this message
+        let referencing_emails = db.get_lore_emails_referencing(&current_message_id).await?;
+
+        for email in referencing_emails {
+            // Add to seen set immediately to avoid duplicate processing
+            if !seen_message_ids.insert(email.message_id.clone()) {
+                // Already seen this message, skip it
+                continue;
+            }
+
+            // Add to processing queue and results
+            to_process.push_back(email.message_id.clone());
+            all_emails.push(email);
+        }
+    }
+
+    if all_emails.len() == 1 {
+        // Only the root message, no replies
+        println!("\n{} No replies found", "Info:".yellow());
+        return Ok(());
+    }
+
+    // Sort emails in thread order (respecting reply structure, then by date)
+    let sorted_emails = sort_emails_by_thread_order(&all_emails);
+
+    println!(
+        "\n{} Found {} message(s) (including root):\n",
+        "Replies:".bold().green(),
+        all_emails.len()
+    );
+
+    // Display all emails in the subthread
+    for (idx, email) in sorted_emails.iter().enumerate() {
+        println!(
+            "{}. {} - {}",
+            (idx + 1).to_string().bright_black(),
+            email.date.bright_black(),
+            email.subject.cyan()
+        );
+
+        // Always show database column headers
+        println!("   From: {}", email.from.yellow());
+        println!("   Message-ID: {}", email.message_id.bright_black());
+
+        if let Some(ref in_reply_to) = email.in_reply_to {
+            println!("   In-Reply-To: {}", in_reply_to.bright_black());
+        }
+
+        // Show full message body only when verbose
+        if verbose >= 1 {
+            println!("\n{}", "   --- Message Body ---".bright_black());
+            for line in email.body.lines() {
+                println!("   {}", line);
+            }
+            println!("{}\n", "   --- End Message ---".bright_black());
+        } else {
+            println!(); // Empty line between messages
+        }
     }
 
     Ok(())
