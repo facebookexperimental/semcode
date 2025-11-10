@@ -6,6 +6,10 @@ both exact matches and semantic similarity.
 
 ## News
 
+Now with lore indexing!  semcode-index --lore lkml (or any list name) will
+pull down the latest git archive from that list.  See [the lore documentation](docs/lore.md)
+for more details.  This is a database schema change, so you'll need to reindex.
+
 Recent commits introduced indexes for git commit history, as well as
 performance improvements.  Unfortunately, these are a schema change and
 you'll need to reindex your database.
