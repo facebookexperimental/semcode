@@ -486,7 +486,7 @@ pub async fn lore_search_multi_field(
         }
     }
 
-    let emails = db
+    let mut emails = db
         .search_lore_emails_multi_field(field_patterns, limit)
         .await?;
 
@@ -494,6 +494,9 @@ pub async fn lore_search_multi_field(
         println!("{} No matching emails found", "Info:".yellow());
         return Ok(());
     }
+
+    // Sort by date (oldest first)
+    crate::lore_writers::sort_emails_by_date(&mut emails);
 
     if show_thread {
         // Show full threads for all matching emails
@@ -557,12 +560,15 @@ pub async fn lore_search_with_thread(
         pattern.yellow()
     );
 
-    let emails = db.search_lore_emails(field, pattern, limit).await?;
+    let mut emails = db.search_lore_emails(field, pattern, limit).await?;
 
     if emails.is_empty() {
         println!("{} No matching emails found", "Info:".yellow());
         return Ok(());
     }
+
+    // Sort by date (oldest first)
+    crate::lore_writers::sort_emails_by_date(&mut emails);
 
     if show_thread {
         // Show full threads for all matching emails

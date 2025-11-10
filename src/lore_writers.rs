@@ -8,6 +8,21 @@ use std::io::Write;
 
 use crate::DatabaseManager;
 
+/// Sort emails by date (oldest first) using RFC 2822 date parsing
+pub fn sort_emails_by_date(emails: &mut [crate::types::LoreEmailInfo]) {
+    emails.sort_by(|a, b| {
+        use chrono::DateTime;
+        let a_parsed = DateTime::parse_from_rfc2822(&a.date);
+        let b_parsed = DateTime::parse_from_rfc2822(&b.date);
+
+        match (a_parsed, b_parsed) {
+            (Ok(a_time), Ok(b_time)) => a_time.cmp(&b_time),
+            // If parsing fails, fall back to string comparison
+            _ => a.date.cmp(&b.date),
+        }
+    });
+}
+
 /// Show full email thread for a given message_id (writer version)
 pub async fn lore_show_thread_to_writer(
     db: &DatabaseManager,
@@ -199,12 +214,15 @@ pub async fn lore_search_with_thread_to_writer(
         field, pattern
     )?;
 
-    let emails = db.search_lore_emails(field, pattern, limit).await?;
+    let mut emails = db.search_lore_emails(field, pattern, limit).await?;
 
     if emails.is_empty() {
         writeln!(writer, "Info: No matching emails found")?;
         return Ok(());
     }
+
+    // Sort by date (oldest first)
+    sort_emails_by_date(&mut emails);
 
     if show_thread {
         // Show full threads for all matching emails
@@ -283,7 +301,7 @@ pub async fn lore_search_multi_field_to_writer(
         writeln!(writer, "  {} matches pattern: {}", field, pattern)?;
     }
 
-    let emails = db
+    let mut emails = db
         .search_lore_emails_multi_field(field_patterns, limit)
         .await?;
 
@@ -291,6 +309,9 @@ pub async fn lore_search_multi_field_to_writer(
         writeln!(writer, "Info: No matching emails found")?;
         return Ok(());
     }
+
+    // Sort by date (oldest first)
+    sort_emails_by_date(&mut emails);
 
     if show_thread {
         // Show full threads for all matching emails

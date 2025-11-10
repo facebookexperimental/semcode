@@ -51,6 +51,7 @@ similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for 
 shlex = "1.3"           # Shell-like parsing for quoted strings in CLI
 reqwest = { version = "0.11", features = ["blocking", "gzip"] }  # HTTP client for manifest downloads
 flate2 = "1.0"          # gzip compression/decompression
+chrono = "0.4.42"
 
 [[bin]]
 name = "semcode-index"
