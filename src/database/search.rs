@@ -3443,6 +3443,10 @@ impl VectorSearchManager {
             }
         }
 
+        // Deduplicate results by message_id (keep highest score for each message)
+        let mut seen_ids = std::collections::HashSet::new();
+        final_results.retain(|(email, _score)| seen_ids.insert(email.message_id.clone()));
+
         // Sort by similarity score and truncate
         final_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         final_results.truncate(limit);
