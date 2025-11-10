@@ -75,6 +75,7 @@ pub mod logging {
                 .add_directive("lancedb=warn".parse().unwrap())
                 .add_directive("lance=warn".parse().unwrap())
                 .add_directive("lance_index=warn".parse().unwrap())
+                .add_directive("lance::index::vector::builder=error".parse().unwrap()) // Suppress "empty partition" warnings during IVF index building
                 .add_directive("DatasetRecordBatchStream=error".parse().unwrap());
         }
 
