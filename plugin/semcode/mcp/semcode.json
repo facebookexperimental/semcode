@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "semcode": {
+      "type": "stdio",
+      "command": "semcode-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
