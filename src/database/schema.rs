@@ -380,14 +380,6 @@ impl SchemaManager {
             self.try_create_index(&table, &["body_hash"], "BTree index on functions.body_hash")
                 .await;
 
-            // Index on calls for function call relationship queries
-            self.try_create_index(&table, &["calls"], "BTree index on functions.calls")
-                .await;
-
-            // Index on types for type relationship queries
-            self.try_create_index(&table, &["types"], "BTree index on functions.types")
-                .await;
-
             // Index on line_start for line-based queries and sorting
             self.try_create_index(
                 &table,
@@ -529,10 +521,6 @@ impl SchemaManager {
             self.try_create_index(&table, &["references"], "BTree index on lore.references")
                 .await;
 
-            // Index on headers (large text field)
-            self.try_create_index(&table, &["headers"], "BTree index on lore.headers")
-                .await;
-
             // Note: FTS indices for lore table are created separately after data is inserted
             // via create_lore_fts_indices() - see process_lore_commits_pipeline completion
             // BTree indices on body, recipients, and symbols removed - FTS indices used instead
@@ -627,26 +615,6 @@ impl SchemaManager {
             // Index on subject for subject searches
             self.try_create_index(&table, &["subject"], "BTree index on git_commits.subject")
                 .await;
-
-            // Index on message for message searches
-            self.try_create_index(&table, &["message"], "BTree index on git_commits.message")
-                .await;
-
-            // Index on tags for tag-based queries
-            self.try_create_index(&table, &["tags"], "BTree index on git_commits.tags")
-                .await;
-
-            // Index on diff for diff searches
-            self.try_create_index(&table, &["diff"], "BTree index on git_commits.diff")
-                .await;
-
-            // Index on symbols for symbol-based queries
-            self.try_create_index(&table, &["symbols"], "BTree index on git_commits.symbols")
-                .await;
-
-            // Index on files for file-based queries
-            self.try_create_index(&table, &["files"], "BTree index on git_commits.files")
-                .await;
         }
 
         // Create indices for lore table
@@ -685,10 +653,6 @@ impl SchemaManager {
             self.try_create_index(&table, &["references"], "BTree index on lore.references")
                 .await;
 
-            // Index on headers for header searches
-            self.try_create_index(&table, &["headers"], "BTree index on lore.headers")
-                .await;
-
             // Note: BTree indices on body, recipients, and symbols removed - FTS used instead
         }
 
@@ -703,14 +667,6 @@ impl SchemaManager {
                     &table,
                     &["blake3_hash"],
                     &format!("BTree index on {table_name}.blake3_hash"),
-                )
-                .await;
-
-                // Index on content for text searches and pattern matching
-                self.try_create_index(
-                    &table,
-                    &["content"],
-                    &format!("BTree index on {table_name}.content"),
                 )
                 .await;
             }

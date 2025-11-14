@@ -406,16 +406,6 @@ async fn main() -> Result<()> {
     // Suppress ORT verbose logging
     std::env::set_var("ORT_LOG_LEVEL", "ERROR");
 
-    // Limit FTS indexing parallelism to avoid excessive memory usage
-    // Default would be num_cpus - 2, which on a 316-core system = 314 workers per index
-    // Cap at 32 to prevent memory exhaustion when running 5 indices in parallel
-    if std::env::var("LANCE_FTS_NUM_SHARDS").is_err() {
-        let num_cpus = num_cpus::get();
-        let default_shards = num_cpus.saturating_sub(2).max(1);
-        let capped_shards = default_shards.min(32);
-        std::env::set_var("LANCE_FTS_NUM_SHARDS", capped_shards.to_string());
-    }
-
     let args = Args::parse();
 
     // Enable performance monitoring if --perf flag is set
@@ -455,10 +445,10 @@ async fn main() -> Result<()> {
         0
     };
 
-    // Use all CPU cores if 0 or not specified, but leave one for system/IO and cap at 32
+    // Use all CPU cores if 0 or not specified, but leave one for system/IO
     let num_threads = if num_analysis_threads == 0 {
         // Leave at least one core for system/IO operations for better overall performance
-        num_cpus::get().saturating_sub(1).max(1).min(32)
+        num_cpus::get().saturating_sub(1).max(1)
     } else {
         num_analysis_threads
     };

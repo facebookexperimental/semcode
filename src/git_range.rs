@@ -258,9 +258,11 @@ fn tuple_worker_shared(
     batches_sent: Arc<AtomicUsize>,
     accumulate_lock: Arc<std::sync::Mutex<()>>,
 ) {
-    // Open repository ONCE per worker thread and reuse for all tuples
-    let thread_repo = match gix::discover(&repo_path) {
-        Ok(repo) => repo,
+    // Open repository ONCE per worker and convert to thread-safe version for sharing across rayon threads
+    let thread_safe_repo = match gix::discover(&repo_path) {
+        Ok(repo) => match repo.into_sync() {
+            repo_sync => repo_sync,
+        },
         Err(e) => {
             tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
             return;
@@ -330,25 +332,52 @@ fn tuple_worker_shared(
         // Step 3: Release lock so next worker can start accumulating
         drop(_guard);
 
-        // Step 2: Process exactly DB_BATCH_SIZE files
+        // Step 4: Process exactly DB_BATCH_SIZE files IN PARALLEL using rayon
+        // Share the thread-safe repository across all Rayon threads
         let mut batch = GitTupleResults::default();
         let tuples_to_process_now: Vec<_> = tuples_to_process
             .drain(..DB_BATCH_SIZE.min(tuples_to_process.len()))
             .collect();
 
-        for tuple in tuples_to_process_now {
-            match process_git_file_tuple_with_repo(&tuple, &thread_repo, &source_root, no_macros) {
+        // Process files in parallel using rayon with shared thread-safe repo
+        // Each Rayon worker thread converts it to a thread-local handle once
+        use rayon::prelude::*;
+
+        let processed_count_clone = processed_count.clone();
+        let results: Vec<Result<GitTupleResults>> = tuples_to_process_now
+            .par_iter()
+            .map_init(
+                || {
+                    // Initialize: convert thread-safe repo to thread-local once per Rayon worker thread
+                    thread_safe_repo.to_thread_local()
+                },
+                |thread_local_repo, tuple| {
+                    // Process each file using the thread-local repo handle
+                    let result = process_git_file_tuple_with_repo(
+                        tuple,
+                        thread_local_repo,
+                        &source_root,
+                        no_macros,
+                    );
+
+                    // Update progress counter immediately after processing each file
+                    if result.is_ok() {
+                        processed_count_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    result
+                },
+            )
+            .collect();
+
+        // Merge all successful results
+        for result in results {
+            match result {
                 Ok(tuple_result) => {
                     batch.merge(tuple_result);
-                    processed_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Worker {} failed to process tuple {}: {}",
-                        worker_id,
-                        tuple.file_path.display(),
-                        e
-                    );
+                    tracing::warn!("Worker {} failed to process tuple: {}", worker_id, e);
                 }
             }
         }
@@ -778,7 +807,7 @@ pub async fn process_git_range(
 
     // Step 2: Determine number of workers
     // Since generators are I/O bound and workers are CPU bound, use a balanced approach
-    let num_workers = (num_cpus::get() / 2).max(1);
+    let num_workers = (num_cpus::get()).max(1);
     info!(
         "Starting streaming pipeline with up to 32 generator threads and {} worker threads",
         num_workers
