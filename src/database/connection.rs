@@ -2675,7 +2675,7 @@ impl DatabaseManager {
         // Only escape single quotes for SQL string literal - preserve backslashes for regex
         let escaped_pattern = pattern.replace("'", "''");
 
-        let where_clause = format!("regexp_match(content, '{escaped_pattern}')");
+        let where_clause = format!("regexp_like(content, '{escaped_pattern}')");
 
         // Collect matching blake3 hashes from all content shards (content_0 through content_15)
         let mut matching_hashes: Vec<String> = Vec::new();
@@ -4403,7 +4403,7 @@ impl DatabaseManager {
         let batches1: Vec<_> = stream1.try_collect().await?;
 
         // Query 2: Find emails where references contains the message-id
-        let filter2 = format!("regexp_match(`references`, '{}')", escaped_message_id);
+        let filter2 = format!("regexp_like(`references`, '{}')", escaped_message_id);
         let stream2 = table.query().only_if(&filter2).execute().await?;
         let batches2: Vec<_> = stream2.try_collect().await?;
 

@@ -1003,7 +1003,7 @@ impl SearchManager {
         // Only escape single quotes for SQL string literal - preserve backslashes for regex
         let escaped_pattern = pattern.replace("'", "''");
 
-        let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
+        let where_clause = format!("regexp_like(name, '{escaped_pattern}')");
         let results = table
             .query()
             .only_if(&where_clause)
@@ -1099,7 +1099,7 @@ impl SearchManager {
         let table = self.connection.open_table("types").execute().await?;
         let escaped_pattern = pattern.replace("'", "''");
 
-        let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
+        let where_clause = format!("regexp_like(name, '{escaped_pattern}')");
         let initial_results = table
             .query()
             .only_if(&where_clause)
@@ -1139,7 +1139,7 @@ impl SearchManager {
             return Ok(Vec::new());
         }
 
-        // Query with specific git_file_hashes using regexp_match
+        // Query with specific git_file_hashes using regexp_like
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
 
         let mut types = Vec::new();
@@ -1253,7 +1253,7 @@ impl SearchManager {
         // Only escape single quotes for SQL string literal - preserve backslashes for regex
         let escaped_pattern = pattern.replace("'", "''");
 
-        let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
+        let where_clause = format!("regexp_like(name, '{escaped_pattern}')");
         let results = table
             .query()
             .only_if(&where_clause)
@@ -1344,7 +1344,7 @@ impl SearchManager {
         let table = self.connection.open_table("types").execute().await?;
         let escaped_pattern = pattern.replace("'", "''");
 
-        let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
+        let where_clause = format!("regexp_like(name, '{escaped_pattern}')");
         let initial_results = table
             .query()
             .only_if(&where_clause)
@@ -1384,7 +1384,7 @@ impl SearchManager {
             return Ok(Vec::new());
         }
 
-        // Query with specific git_file_hashes using regexp_match for typedefs
+        // Query with specific git_file_hashes using regexp_like for typedefs
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
 
         let mut typedefs = Vec::new();
@@ -1481,7 +1481,7 @@ impl SearchManager {
         // Only escape single quotes for SQL string literal - preserve backslashes for regex
         let escaped_pattern = pattern.replace("'", "''");
 
-        let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
+        let where_clause = format!("regexp_like(name, '{escaped_pattern}')");
         let results = table
             .query()
             .only_if(&where_clause)
@@ -1593,7 +1593,7 @@ impl SearchManager {
         let table = self.connection.open_table("functions").execute().await?;
         let escaped_pattern = pattern.replace("'", "''");
 
-        let where_clause = format!("regexp_match(name, '{escaped_pattern}')");
+        let where_clause = format!("regexp_like(name, '{escaped_pattern}')");
         let initial_results = table
             .query()
             .only_if(&where_clause)
