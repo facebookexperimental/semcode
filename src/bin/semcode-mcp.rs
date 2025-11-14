@@ -489,6 +489,8 @@ async fn mcp_show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
     verbose: bool,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -604,12 +606,85 @@ async fn mcp_show_commit_metadata(
         }
     }
 
+    // Step 2c: Apply author filters if provided (ANY must match - OR logic)
+    if !author_patterns.is_empty() {
+        let mut author_regexes = Vec::new();
+        for pattern in author_patterns {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => author_regexes.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid author regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+
+        // Check if ANY author pattern matches
+        let matches_any = author_regexes.iter().any(|re| re.is_match(&commit_author));
+        if !matches_any {
+            writeln!(
+                buffer,
+                "Info: Commit {} does not match any of {} author pattern(s): {}",
+                resolved_sha,
+                author_patterns.len(),
+                author_patterns.join(", ")
+            )?;
+            return Ok(String::from_utf8_lossy(&buffer).to_string());
+        }
+    }
+
+    // Step 2d: Apply subject filters if provided (ANY must match - OR logic)
+    if !subject_patterns.is_empty() {
+        let mut subject_regexes = Vec::new();
+        for pattern in subject_patterns {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => subject_regexes.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid subject regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+
+        // Check if ANY subject pattern matches
+        let matches_any = subject_regexes
+            .iter()
+            .any(|re| re.is_match(&commit_subject));
+        if !matches_any {
+            writeln!(
+                buffer,
+                "Info: Commit {} does not match any of {} subject pattern(s): {}",
+                resolved_sha,
+                subject_patterns.len(),
+                subject_patterns.join(", ")
+            )?;
+            return Ok(String::from_utf8_lossy(&buffer).to_string());
+        }
+    }
+
     // Step 3: Apply regex filters if provided (ALL must match)
     if !regex_patterns.is_empty() {
-        // Compile all regex patterns
+        // Compile all regex patterns (case-insensitive)
         let mut regexes = Vec::new();
         for pattern in regex_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => regexes.push(re),
                 Err(e) => {
                     writeln!(buffer, "Error: Invalid regex pattern '{}': {}", pattern, e)?;
@@ -641,10 +716,13 @@ async fn mcp_show_commit_metadata(
 
     // Step 3b: Apply symbol filters if provided (ALL must match)
     if !symbol_patterns.is_empty() {
-        // Compile all symbol regex patterns
+        // Compile all symbol regex patterns (case-insensitive)
         let mut symbol_regexes = Vec::new();
         for pattern in symbol_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => symbol_regexes.push(re),
                 Err(e) => {
                     writeln!(
@@ -681,10 +759,13 @@ async fn mcp_show_commit_metadata(
 
     // Step 3c: Apply path filters if provided (ANY must match - OR logic)
     if !path_patterns.is_empty() {
-        // Compile all path regex patterns
+        // Compile all path regex patterns (case-insensitive)
         let mut path_regexes = Vec::new();
         for pattern in path_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => path_regexes.push(re),
                 Err(e) => {
                     writeln!(
@@ -782,6 +863,8 @@ async fn mcp_show_commit_range(
     db: &DatabaseManager,
     range: &str,
     verbose: bool,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -907,11 +990,56 @@ async fn mcp_show_commit_range(
         return Ok(String::from_utf8_lossy(&buffer).to_string());
     }
 
+    // Step 2a: Compile author filters if provided (ANY must match - OR logic)
+    let mut author_filters = Vec::new();
+    if !author_patterns.is_empty() {
+        for pattern in author_patterns {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => author_filters.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid author regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+    }
+
+    // Step 2b: Compile subject filters if provided (ANY must match - OR logic)
+    let mut subject_filters = Vec::new();
+    if !subject_patterns.is_empty() {
+        for pattern in subject_patterns {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => subject_filters.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid subject regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+    }
+
     // Step 2: Compile regex filters if provided (ALL must match)
     let mut regex_filters = Vec::new();
     if !regex_patterns.is_empty() {
         for pattern in regex_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => regex_filters.push(re),
                 Err(e) => {
                     writeln!(buffer, "Error: Invalid regex pattern '{}': {}", pattern, e)?;
@@ -925,7 +1053,10 @@ async fn mcp_show_commit_range(
     let mut symbol_filters = Vec::new();
     if !symbol_patterns.is_empty() {
         for pattern in symbol_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => symbol_filters.push(re),
                 Err(e) => {
                     writeln!(
@@ -943,7 +1074,10 @@ async fn mcp_show_commit_range(
     let mut path_filters = Vec::new();
     if !path_patterns.is_empty() {
         for pattern in path_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => path_filters.push(re),
                 Err(e) => {
                     writeln!(
@@ -989,8 +1123,26 @@ async fn mcp_show_commit_range(
             .query_commits_chunk_filtered(chunk, &regex_filter_patterns, &symbol_filter_patterns)
             .await?;
 
-        // Apply path filtering to chunk results
+        // Apply author, subject, and path filtering to chunk results
         for commit in chunk_results {
+            // Apply author filters (ANY must match - OR logic)
+            if !author_filters.is_empty() {
+                let matches_any = author_filters.iter().any(|re| re.is_match(&commit.author));
+                if !matches_any {
+                    continue;
+                }
+            }
+
+            // Apply subject filters (ANY must match - OR logic)
+            if !subject_filters.is_empty() {
+                let matches_any = subject_filters
+                    .iter()
+                    .any(|re| re.is_match(&commit.subject));
+                if !matches_any {
+                    continue;
+                }
+            }
+
             // Apply path filters (ANY must match - OR logic)
             if !path_filters.is_empty() {
                 let matches_any_pattern = path_filters
@@ -1158,6 +1310,8 @@ async fn mcp_show_commit_range(
 async fn mcp_show_all_commits(
     db: &DatabaseManager,
     verbose: bool,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -1176,11 +1330,56 @@ async fn mcp_show_all_commits(
         return Ok(String::from_utf8_lossy(&buffer).to_string());
     }
 
+    // Step 2a: Compile author filters if provided (ANY must match - OR logic)
+    let mut author_filters = Vec::new();
+    if !author_patterns.is_empty() {
+        for pattern in author_patterns {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => author_filters.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid author regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+    }
+
+    // Step 2b: Compile subject filters if provided (ANY must match - OR logic)
+    let mut subject_filters = Vec::new();
+    if !subject_patterns.is_empty() {
+        for pattern in subject_patterns {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => subject_filters.push(re),
+                Err(e) => {
+                    writeln!(
+                        buffer,
+                        "Error: Invalid subject regex pattern '{}': {}",
+                        pattern, e
+                    )?;
+                    return Ok(String::from_utf8_lossy(&buffer).to_string());
+                }
+            }
+        }
+    }
+
     // Step 2: Compile regex filters if provided (ALL must match)
     let mut regex_filters = Vec::new();
     if !regex_patterns.is_empty() {
         for pattern in regex_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => regex_filters.push(re),
                 Err(e) => {
                     writeln!(buffer, "Error: Invalid regex pattern '{}': {}", pattern, e)?;
@@ -1194,7 +1393,10 @@ async fn mcp_show_all_commits(
     let mut symbol_filters = Vec::new();
     if !symbol_patterns.is_empty() {
         for pattern in symbol_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => symbol_filters.push(re),
                 Err(e) => {
                     writeln!(
@@ -1212,7 +1414,10 @@ async fn mcp_show_all_commits(
     let mut path_filters = Vec::new();
     if !path_patterns.is_empty() {
         for pattern in path_patterns {
-            match regex::Regex::new(pattern) {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(re) => path_filters.push(re),
                 Err(e) => {
                     writeln!(
@@ -1233,10 +1438,28 @@ async fn mcp_show_all_commits(
     )?;
     writeln!(buffer, "{}", "=".repeat(80))?;
 
-    // Step 3: Apply regex/symbol/path filters first
+    // Step 3: Apply author/subject/regex/symbol/path filters first
     let filtered_commits: Vec<_> = all_commits
         .iter()
         .filter(|commit| {
+            // Apply author filters if provided (ANY must match - OR logic)
+            if !author_filters.is_empty() {
+                let matches_any = author_filters.iter().any(|re| re.is_match(&commit.author));
+                if !matches_any {
+                    return false;
+                }
+            }
+
+            // Apply subject filters if provided (ANY must match - OR logic)
+            if !subject_filters.is_empty() {
+                let matches_any = subject_filters
+                    .iter()
+                    .any(|re| re.is_match(&commit.subject));
+                if !matches_any {
+                    return false;
+                }
+            }
+
             // Apply regex filters if provided (ALL must match)
             if !regex_filters.is_empty() {
                 let combined = format!("{}\n\n{}", commit.message, commit.diff);
@@ -1937,7 +2160,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_commit",
-                    "description": "Find and display metadata for a git commit or range of commits. Accepts flexible git references like SHA, short SHA, branch names, HEAD, or git ranges. Supports regex filtering on commit message and diff - multiple patterns can be provided and ALL must match. Also supports filtering on symbol list and file paths. Results can be paginated with 50 lines per page.",
+                    "description": "Find and display metadata for a git commit or range of commits. Accepts flexible git references like SHA, short SHA, branch names, HEAD, or git ranges. Supports filtering by author name/email (OR logic), subject (OR logic), commit message and diff (AND logic), symbol list (AND logic), and file paths (OR logic). Results can be paginated with 50 lines per page.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1949,26 +2172,40 @@ impl McpServer {
                                 "type": "string",
                                 "description": "Optional git range to show multiple commits (e.g., 'HEAD~10..HEAD', 'abc123..def456'). Mutually exclusive with git_ref."
                             },
+                            "author_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter commits by author name/email - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
+                            },
+                            "subject_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter commits by subject line - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
+                            },
                             "regex_patterns": {
                                 "type": "array",
                                 "items": {
                                     "type": "string"
                                 },
-                                "description": "Optional array of regex patterns to filter commits - ALL patterns must match against the combined commit message and unified diff. Equivalent to passing -r multiple times."
+                                "description": "Optional array of regex patterns to filter commits - ALL patterns must match against the combined commit message and unified diff (AND logic). Equivalent to passing -r multiple times."
                             },
                             "symbol_patterns": {
                                 "type": "array",
                                 "items": {
                                     "type": "string"
                                 },
-                                "description": "Optional array of regex patterns to filter commits by symbols - ALL patterns must match at least one symbol in the commit. Equivalent to passing -s multiple times."
+                                "description": "Optional array of regex patterns to filter commits by symbols - ALL patterns must match at least one symbol in the commit (AND logic). Equivalent to passing -g multiple times."
                             },
                             "path_patterns": {
                                 "type": "array",
                                 "items": {
                                     "type": "string"
                                 },
-                                "description": "Optional array of regex patterns to filter commits by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
+                                "description": "Optional array of regex patterns to filter commits by file paths - ANY pattern must match at least one file path in the commit (OR logic). Equivalent to passing -p multiple times."
                             },
                             "reachable_sha": {
                                 "type": "string",
@@ -1989,7 +2226,7 @@ impl McpServer {
                 },
                 {
                     "name": "vcommit_similar_commits",
-                    "description": "Search for commits similar to the provided text using semantic vector embeddings. Requires commit vectors to be generated first with 'semcode-index --vectors'. Supports multiple regex filters on message/diff, symbol filters, and path filters - ALL must match. Results can be paginated with 50 lines per page.",
+                    "description": "Search for commits similar to the provided text using semantic vector embeddings. Requires commit vectors to be generated first with 'semcode-index --vectors'. Supports filtering by author name/email (OR logic), subject (OR logic), message/diff (AND logic), symbols (AND logic), and paths (OR logic). Results can be paginated with 50 lines per page.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2001,19 +2238,33 @@ impl McpServer {
                                 "type": "string",
                                 "description": "Optional git range to filter results (e.g., 'HEAD~100..HEAD', 'main~50..HEAD')"
                             },
+                            "author_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter results by author name/email - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
+                            },
+                            "subject_patterns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Optional array of regex patterns to filter results by subject line - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
+                            },
                             "regex_patterns": {
                                 "type": "array",
                                 "items": {
                                     "type": "string"
                                 },
-                                "description": "Optional array of regex patterns to filter results by commit message and diff - ALL patterns must match. Equivalent to passing -r multiple times."
+                                "description": "Optional array of regex patterns to filter results by commit message and diff - ALL patterns must match (AND logic). Equivalent to passing -r multiple times."
                             },
                             "symbol_patterns": {
                                 "type": "array",
                                 "items": {
                                     "type": "string"
                                 },
-                                "description": "Optional array of regex patterns to filter results by symbols - ALL patterns must match at least one symbol in the commit. Equivalent to passing -s multiple times."
+                                "description": "Optional array of regex patterns to filter results by symbols - ALL patterns must match at least one symbol in the commit (AND logic). Equivalent to passing -g multiple times."
                             },
                             "path_patterns": {
                                 "type": "array",
@@ -2435,6 +2686,26 @@ impl McpServer {
         let git_ref = args["git_ref"].as_str();
         let git_range = args["git_range"].as_str();
 
+        // Extract author_patterns array
+        let author_patterns: Vec<String> = args["author_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract subject_patterns array
+        let subject_patterns: Vec<String> = args["subject_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // Extract regex_patterns array
         let regex_patterns: Vec<String> = args["regex_patterns"]
             .as_array()
@@ -2471,9 +2742,11 @@ impl McpServer {
 
         // Generate a query key for caching
         let query_key = format!(
-            "commit:{}:{}:{}:{}:{}:{}:{}",
+            "commit:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             git_ref.unwrap_or(""),
             git_range.unwrap_or(""),
+            author_patterns.join("|"),
+            subject_patterns.join("|"),
             regex_patterns.join("|"),
             symbol_patterns.join("|"),
             path_patterns.join("|"),
@@ -2492,6 +2765,8 @@ impl McpServer {
                 &self.db,
                 range,
                 verbose,
+                &author_patterns,
+                &subject_patterns,
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
@@ -2517,6 +2792,8 @@ impl McpServer {
                 &self.db,
                 git_ref_str,
                 verbose,
+                &author_patterns,
+                &subject_patterns,
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
@@ -2541,6 +2818,8 @@ impl McpServer {
             match mcp_show_all_commits(
                 &self.db,
                 verbose,
+                &author_patterns,
+                &subject_patterns,
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
@@ -2566,6 +2845,26 @@ impl McpServer {
     async fn handle_vcommit_similar_commits(&self, args: &Value) -> Value {
         let query_text = args["query_text"].as_str().unwrap_or("");
         let git_range = args["git_range"].as_str();
+
+        // Extract author_patterns array
+        let author_patterns: Vec<String> = args["author_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract subject_patterns array
+        let subject_patterns: Vec<String> = args["subject_patterns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Extract regex_patterns array
         let regex_patterns: Vec<String> = args["regex_patterns"]
@@ -2603,9 +2902,11 @@ impl McpServer {
 
         // Generate a query key for caching
         let query_key = format!(
-            "vcommit:{}:{}:{}:{}:{}:{}:{}",
+            "vcommit:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             query_text,
             git_range.unwrap_or(""),
+            author_patterns.join("|"),
+            subject_patterns.join("|"),
             regex_patterns.join("|"),
             symbol_patterns.join("|"),
             path_patterns.join("|"),
@@ -2621,6 +2922,8 @@ impl McpServer {
             &self.db,
             query_text,
             limit,
+            &author_patterns,
+            &subject_patterns,
             &regex_patterns,
             &symbol_patterns,
             &path_patterns,
@@ -3738,6 +4041,8 @@ async fn mcp_vcommit_similar_commits(
     db: &DatabaseManager,
     query_text: &str,
     limit: usize,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -3752,8 +4057,11 @@ async fn mcp_vcommit_similar_commits(
     let mut buffer = Vec::new();
 
     // Show search parameters
-    let has_filters =
-        !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty();
+    let has_filters = !author_patterns.is_empty()
+        || !subject_patterns.is_empty()
+        || !regex_patterns.is_empty()
+        || !symbol_patterns.is_empty()
+        || !path_patterns.is_empty();
     match (git_range, has_filters) {
         (Some(range), true) => {
             let mut filter_parts = Vec::new();
@@ -3975,10 +4283,13 @@ async fn mcp_vcommit_similar_commits(
 
             // Apply regex filtering if provided (ALL patterns must match)
             let filtered_by_regex = if !regex_patterns.is_empty() {
-                // Compile all regex patterns
+                // Compile all regex patterns (case-insensitive)
                 let mut regexes = Vec::new();
                 for pattern in regex_patterns {
-                    match regex::Regex::new(pattern) {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(re) => regexes.push(re),
                         Err(e) => {
                             writeln!(buffer, "Error: Invalid regex pattern '{}': {}", pattern, e)?;
@@ -4013,10 +4324,13 @@ async fn mcp_vcommit_similar_commits(
 
             // Apply symbol filtering if provided (ALL patterns must match)
             let filtered_by_symbol = if !symbol_patterns.is_empty() {
-                // Compile all symbol regex patterns
+                // Compile all symbol regex patterns (case-insensitive)
                 let mut symbol_regexes = Vec::new();
                 for pattern in symbol_patterns {
-                    match regex::Regex::new(pattern) {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(re) => symbol_regexes.push(re),
                         Err(e) => {
                             writeln!(
@@ -4055,10 +4369,13 @@ async fn mcp_vcommit_similar_commits(
 
             // Apply path filtering if provided (ANY must match - OR logic)
             let filtered_by_path = if !path_patterns.is_empty() {
-                // Compile all path regex patterns
+                // Compile all path regex patterns (case-insensitive)
                 let mut path_regexes = Vec::new();
                 for pattern in path_patterns {
-                    match regex::Regex::new(pattern) {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(re) => path_regexes.push(re),
                         Err(e) => {
                             writeln!(

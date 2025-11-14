@@ -133,10 +133,12 @@ lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] 
   - Example: `-f torvalds -b btrfs` matches emails from torvalds AND body contains btrfs
 
 **Regex Tips:**
+- **Case-insensitive by default**: All regex patterns are automatically case-insensitive
+  - Example: `-s 'patch'` matches "patch", "PATCH", "Patch", etc.
+  - No need to use the `(?i)` flag
 - For multiline matching (e.g., matching start of line within email body), use the `(?m)` flag
   - Example: `-b '(?m)^Signed-off-by'` matches "Signed-off-by" at the start of any line
   - Without `(?m)`, `^` and `$` only match the start/end of the entire field
-- Use `(?i)` for case-insensitive matching: `-s '(?i)patch'` matches "patch", "PATCH", "Patch"
 
 **Examples:**
 

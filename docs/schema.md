@@ -224,6 +224,72 @@ vector              (FixedSizeList[Float32, 256], NOT NULL)  - Embedding vector 
 
 Stores git commit metadata including unified diffs and symbols changed in each commit. Enables commit-level analysis and tracking code evolution across git history.
 
+**Schema:**
+```
+git_sha             (Utf8, NOT NULL)     - Git commit SHA
+parent_sha          (Utf8, NOT NULL)     - Parent commit SHAs (JSON array)
+author              (Utf8, NOT NULL)     - Author name and email
+subject             (Utf8, NOT NULL)     - Single line commit title
+message             (Utf8, NOT NULL)     - Full commit message
+tags                (Utf8, NOT NULL)     - JSON object of tags (Signed-off-by, Reviewed-by, etc.)
+diff                (Utf8, NOT NULL)     - Full unified diff with enhanced hunk headers
+symbols             (Utf8, NOT NULL)     - JSON array of changed symbols (functions, types, macros)
+files               (Utf8, NOT NULL)     - JSON array of changed file paths
+```
+
+**Symbol Extraction:**
+- Walk-back algorithm identifies changed functions, types, and macros from diff hunks
+- Analyzes both additions (+) and deletions (-) for comprehensive symbol coverage
+- Fast O(modified_lines × 50) performance using Tree-sitter parser
+- Enhanced git-style hunk headers include symbol context: `@@ ... @@ symbol_name`
+
+**Tag Parsing:**
+Structured metadata extracted from commit messages including:
+- Signed-off-by
+- Reviewed-by
+- Tested-by
+- Acked-by
+- Reported-by
+- Fixes
+- Cc
+- And other common git trailer tags
+
+**Example JSON columns:**
+```json
+// parent_sha column (single parent)
+["abc123def456..."]
+
+// parent_sha column (merge commit with multiple parents)
+["abc123def456...", "789012fed321..."]
+
+// symbols column
+["mm_fault_error()", "struct vm_area_struct", "handle_mm_fault()"]
+
+// files column
+["mm/memory.c", "include/linux/mm.h"]
+
+// tags column
+{
+  "Signed-off-by": ["John Doe <john@example.com>"],
+  "Reviewed-by": ["Jane Smith <jane@example.com>"],
+  "Fixes": ["a1b2c3d4 (\"Fix memory leak in handler\")"]
+}
+```
+
+**Indices:**
+- BTree on `git_sha` (fast commit lookups)
+- BTree on `parent_sha` (parent commit lookups and history traversal)
+- BTree on `author` (author-based queries)
+- BTree on `subject` (subject searches)
+
+**Use Cases:**
+- Commit history analysis and evolution tracking
+- Find commits that modified specific functions or types
+- Analyze code review patterns via tags
+- Track file change history
+- Git history search with semantic or regex filters
+- Review assistance and code archaeology
+
 ---
 
 ### 8. lore

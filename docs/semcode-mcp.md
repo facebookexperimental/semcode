@@ -3,6 +3,8 @@
 All semcode functions are git aware and default to lookups on the current
 commit.  You can also pass a specific commit you're interested in.
 
+**Note on Regex Patterns**: All regex patterns in semcode are **case-insensitive by default**. This applies to all pattern matching including function names, commit messages, symbols, and lore email searches. You don't need to use the `(?i)` flag.
+
 **find_function**: search for functions and macros
   - git_sha: indicates which commit to search (default: current)
   - name: function/macro name, or a regex

@@ -4017,7 +4017,9 @@ impl DatabaseManager {
                 field_name
             );
 
-            let regex = regex::Regex::new(&pattern)?;
+            let regex = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()?;
             let mut message_ids = HashSet::new();
             let mut first_candidate_logged = false;
 

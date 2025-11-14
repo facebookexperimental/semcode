@@ -118,6 +118,8 @@ You can search through all the commits, or through commit ranges.  There
 are options for path regex (-p), symbol regex (-s) and verbose dumping of
 the commit diff (-v).
 
+**Note**: All regex patterns in semcode are **case-insensitive by default**, including commit message searches, symbol patterns, and path patterns.
+
 ```
 semcode> commit HEAD                      # show the HEAD commit
 semcode> commit --git v6.16..v6.17 -s kmalloc # search for kmalloc in range

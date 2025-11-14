@@ -280,9 +280,75 @@ pub async fn handle_command(
 ) -> Result<bool> {
     // Handle commit command first (before parse_git_sha) since it uses --git differently
     if parts[0] == "commit" {
-        // Parse -v, --git, -r, -s, -p, --limit, and --reachable flags
+        // Check for help flag first
+        if parts.len() > 1 && (parts[1] == "-h" || parts[1] == "--help") {
+            println!("{}", "Usage: commit [-v] [--git <range>] [-f <regex>] [-s <regex>] [-r <regex>] [-g <regex>] [-p <path_regex>] [--limit <N>] [--reachable <sha>] [<git_ref>]".cyan());
+            println!("  Query git commit metadata from the database\n");
+            println!("{}", "Modes:".bold());
+            println!("  commit                    - Show all commits from database");
+            println!(
+                "  commit --git <range>      - Show commits in git range (e.g., HEAD~10..HEAD)"
+            );
+            println!(
+                "  commit <git_ref>          - Show specific commit (e.g., HEAD, abc123, v1.0)\n"
+            );
+            println!("{}", "Options:".bold());
+            println!("  -v                        - Show verbose output with full diff");
+            println!("  -f <regex>                - Filter by regex pattern on author name/email");
+            println!("                              (can be used multiple times for OR logic)");
+            println!("  -s <regex>                - Filter by regex pattern on subject");
+            println!("                              (can be used multiple times for OR logic)");
+            println!("  -r <regex>                - Filter by regex pattern on message + diff");
+            println!("                              (can be used multiple times for AND logic)");
+            println!("  -g <regex>                - Filter by regex pattern on symbol list");
+            println!("                              (can be used multiple times for AND logic)");
+            println!("  -p <path_regex>           - Filter by regex pattern on file paths");
+            println!("                              (can be used multiple times for OR logic)");
+            println!("  --limit <N>               - Limit number of results (default: 50, 0 = unlimited)");
+            println!(
+                "  --reachable <sha>         - Filter to commits reachable from the given SHA"
+            );
+            println!("  -h, --help                - Show this help message\n");
+            println!("{}", "Examples:".bold());
+            println!(
+                "  commit                                      # Show all commits (limited to 50)"
+            );
+            println!("  commit --limit 100                          # Show first 100 commits");
+            println!(
+                "  commit --limit 0                            # Show all commits (unlimited)"
+            );
+            println!("  commit HEAD                                 # Show HEAD commit metadata");
+            println!("  commit abc123                               # Show specific commit");
+            println!("  commit -v HEAD                              # Show HEAD with full diff");
+            println!("  commit --git HEAD~10..HEAD                  # Show commits in range");
+            println!(
+                "  commit -f \"torvalds\"                        # Show commits by Linus Torvalds"
+            );
+            println!("  commit -f \"@kernel.org\"                     # Show commits from kernel.org authors");
+            println!("  commit -s \"fix\"                             # Show commits with 'fix' in subject");
+            println!("  commit --git HEAD~100..HEAD -r \"malloc\"     # Filter range by regex");
+            println!("  commit -r \"bug\" -r \"fix\"                     # Show commits matching both patterns");
+            println!("  commit -g \"malloc\" -g \"free\"                # Show commits with both symbols");
+            println!("  commit -p \"mm/.*\\.c\"                        # Show commits touching mm/*.c files");
+            println!(
+                "  commit --reachable HEAD                     # Show commits reachable from HEAD"
+            );
+            println!("  commit --git HEAD~50..HEAD -r \"memory leak\" # Filter range by pattern");
+            println!("\n{}", "Notes:".bold());
+            println!("  - Author filters (-f): ANY pattern must match (OR logic)");
+            println!("  - Subject filters (-s): ANY pattern must match (OR logic)");
+            println!("  - Regex filters (-r): ALL patterns must match (AND logic)");
+            println!("  - Symbol filters (-g): ALL patterns must match (AND logic)");
+            println!("  - Path filters (-p): ANY pattern must match (OR logic)");
+            println!("  - Use --limit 0 for unlimited results");
+            return Ok(false);
+        }
+
+        // Parse -v, --git, -f, -s, -r, -g, -p, --limit, and --reachable flags
         let mut verbose = false;
         let mut git_range = None;
+        let mut author_patterns = Vec::new();
+        let mut subject_patterns = Vec::new();
         let mut regex_patterns = Vec::new();
         let mut symbol_patterns = Vec::new();
         let mut path_patterns = Vec::new();
@@ -298,10 +364,16 @@ pub async fn handle_command(
             } else if parts[i] == "--git" && i + 1 < parts.len() {
                 git_range = Some(parts[i + 1].to_string());
                 i += 2;
+            } else if parts[i] == "-f" && i + 1 < parts.len() {
+                author_patterns.push(parts[i + 1].to_string());
+                i += 2;
+            } else if parts[i] == "-s" && i + 1 < parts.len() {
+                subject_patterns.push(parts[i + 1].to_string());
+                i += 2;
             } else if parts[i] == "-r" && i + 1 < parts.len() {
                 regex_patterns.push(parts[i + 1].to_string());
                 i += 2;
-            } else if parts[i] == "-s" && i + 1 < parts.len() {
+            } else if parts[i] == "-g" && i + 1 < parts.len() {
                 symbol_patterns.push(parts[i + 1].to_string());
                 i += 2;
             } else if parts[i] == "-p" && i + 1 < parts.len() {
@@ -332,6 +404,8 @@ pub async fn handle_command(
             show_all_commits(
                 db,
                 verbose,
+                &author_patterns,
+                &subject_patterns,
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
@@ -345,6 +419,8 @@ pub async fn handle_command(
                 db,
                 &range,
                 verbose,
+                &author_patterns,
+                &subject_patterns,
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
@@ -359,6 +435,8 @@ pub async fn handle_command(
                 db,
                 &git_ref,
                 verbose,
+                &author_patterns,
+                &subject_patterns,
                 &regex_patterns,
                 &symbol_patterns,
                 &path_patterns,
@@ -569,21 +647,25 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>".red()
+                    "Usage: vcommit [--git <range>] [-f <regex>] [-s <regex>] [-r <regex>] [-g <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>".red()
                 );
                 println!(
                     "  Search for commits similar to the provided text using semantic vectors"
                 );
                 println!("  --git <range>: Filter to commits in git range (e.g., HEAD~100..HEAD)");
+                println!("  -f <regex>: Filter results by regex pattern on author name/email (can be used multiple times for OR logic)");
+                println!("  -s <regex>: Filter results by regex pattern on subject (can be used multiple times for OR logic)");
                 println!("  -r <regex>: Filter results by regex pattern on message + diff (can be used multiple times for AND logic)");
-                println!("  -s <regex>: Filter results by regex pattern on symbol list (can be used multiple times for AND logic)");
+                println!("  -g <regex>: Filter results by regex pattern on symbol list (can be used multiple times for AND logic)");
                 println!("  -p <path_regex>: Filter results by regex pattern on file paths (can be used multiple times for OR logic)");
                 println!("  --limit <N>: Limit number of results (default: 200, max: 500)");
                 println!("  --reachable <sha>: Filter to commits reachable from the given SHA");
                 println!("  Example: vcommit \"fix memory leak\"");
                 println!("  Example: vcommit --limit 5 \"refactor parser\"");
+                println!("  Example: vcommit -f \"torvalds\" \"kernel patch\"");
+                println!("  Example: vcommit -s \"fix\" \"bug fix\"");
                 println!("  Example: vcommit -r \"buffer.*overflow\" \"security fix\"");
-                println!("  Example: vcommit -s \"malloc\" -s \"free\" \"memory management\"  # Both symbols must be in commit");
+                println!("  Example: vcommit -g \"malloc\" -g \"free\" \"memory management\"  # Both symbols must be in commit");
                 println!("  Example: vcommit -p \"mm/.*\\\\.c\" \"memory subsystem changes\"  # Only commits touching mm/*.c files");
                 println!("  Example: vcommit --git HEAD~50..HEAD \"performance\"");
                 println!("  Example: vcommit --reachable HEAD \"performance\"  # Only commits reachable from HEAD");
@@ -592,8 +674,10 @@ pub async fn handle_command(
                     "  Note: Requires commit vectors to be generated first with 'semcode-index --vectors'"
                 );
             } else {
-                // Parse --git, --limit, -r, -s, -p, and --reachable flags
+                // Parse --git, --limit, -f, -s, -r, -g, -p, and --reachable flags
                 let mut limit = 200; // default
+                let mut author_patterns = Vec::new();
+                let mut subject_patterns = Vec::new();
                 let mut regex_patterns = Vec::new();
                 let mut symbol_patterns = Vec::new();
                 let mut path_patterns = Vec::new();
@@ -618,10 +702,16 @@ pub async fn handle_command(
                                 return Ok(false);
                             }
                         }
+                    } else if parts[i] == "-f" && i + 1 < parts.len() {
+                        author_patterns.push(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "-s" && i + 1 < parts.len() {
+                        subject_patterns.push(parts[i + 1].to_string());
+                        i += 2;
                     } else if parts[i] == "-r" && i + 1 < parts.len() {
                         regex_patterns.push(parts[i + 1].to_string());
                         i += 2;
-                    } else if parts[i] == "-s" && i + 1 < parts.len() {
+                    } else if parts[i] == "-g" && i + 1 < parts.len() {
                         symbol_patterns.push(parts[i + 1].to_string());
                         i += 2;
                     } else if parts[i] == "-p" && i + 1 < parts.len() {
@@ -642,7 +732,7 @@ pub async fn handle_command(
                 if query_parts.is_empty() {
                     println!(
                         "{}",
-                        "Usage: vcommit [--git <range>] [-r <regex>] [-s <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>"
+                        "Usage: vcommit [--git <range>] [-f <regex>] [-s <regex>] [-r <regex>] [-g <regex>] [-p <path_regex>] [--limit <N=200>] [--reachable <sha>] <query_text>"
                             .red()
                     );
                 } else {
@@ -651,6 +741,8 @@ pub async fn handle_command(
                         db,
                         &query_text,
                         limit,
+                        &author_patterns,
+                        &subject_patterns,
                         &regex_patterns,
                         &symbol_patterns,
                         &path_patterns,
@@ -2104,6 +2196,8 @@ async fn vcommit_similar_commits(
     db: &DatabaseManager,
     query_text: &str,
     limit: usize,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -2114,11 +2208,20 @@ async fn vcommit_similar_commits(
 ) -> Result<()> {
     use semcode::CodeVectorizer;
 
-    let has_filters =
-        !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty();
+    let has_filters = !author_patterns.is_empty()
+        || !subject_patterns.is_empty()
+        || !regex_patterns.is_empty()
+        || !symbol_patterns.is_empty()
+        || !path_patterns.is_empty();
     match (git_range, has_filters) {
         (Some(range), true) => {
             let mut filter_parts = Vec::new();
+            if !author_patterns.is_empty() {
+                filter_parts.push(format!("{} author pattern(s)", author_patterns.len()));
+            }
+            if !subject_patterns.is_empty() {
+                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            }
             if !regex_patterns.is_empty() {
                 filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
             }
@@ -2145,6 +2248,12 @@ async fn vcommit_similar_commits(
         ),
         (None, true) => {
             let mut filter_parts = Vec::new();
+            if !author_patterns.is_empty() {
+                filter_parts.push(format!("{} author pattern(s)", author_patterns.len()));
+            }
+            if !subject_patterns.is_empty() {
+                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            }
             if !regex_patterns.is_empty() {
                 filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
             }
@@ -2306,13 +2415,15 @@ async fn vcommit_similar_commits(
     };
 
     // Search for similar commits with higher limit if filtering
-    let search_limit = if !regex_patterns.is_empty()
+    let search_limit = if !author_patterns.is_empty()
+        || !subject_patterns.is_empty()
+        || !regex_patterns.is_empty()
         || !symbol_patterns.is_empty()
         || !path_patterns.is_empty()
         || git_range.is_some()
         || reachable_sha.is_some()
     {
-        // When filtering (regex, symbols, paths, git range, or reachability), always fetch many results since we'll filter them down
+        // When filtering (author, subject, regex, symbols, paths, git range, or reachability), always fetch many results since we'll filter them down
         // Use a large limit to ensure we find enough matches after filtering
         // Increased to 2M to handle very large repositories like Linux kernel (~1.2M commits)
         2_000_000
@@ -2346,12 +2457,103 @@ async fn vcommit_similar_commits(
                 results
             };
 
+            // Apply author filtering if provided (ANY must match - OR logic)
+            let filtered_by_author = if !author_patterns.is_empty() {
+                // Compile all author regex patterns (case-insensitive)
+                let mut author_regexes = Vec::new();
+                for pattern in author_patterns {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
+                        Ok(re) => author_regexes.push(re),
+                        Err(e) => {
+                            println!(
+                                "{} Invalid author regex pattern '{}': {}",
+                                "Error:".red(),
+                                pattern,
+                                e
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
+                let original_count = filtered_by_range.len();
+                let filtered: Vec<_> = filtered_by_range
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        // Check if ANY author pattern matches
+                        author_regexes.iter().any(|re| re.is_match(&commit.author))
+                    })
+                    .collect();
+
+                tracing::info!(
+                    "Author filters ({} pattern(s)) reduced results from {} to {} commits",
+                    author_patterns.len(),
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                filtered_by_range
+            };
+
+            // Apply subject filtering if provided (ANY must match - OR logic)
+            let filtered_by_subject = if !subject_patterns.is_empty() {
+                // Compile all subject regex patterns (case-insensitive)
+                let mut subject_regexes = Vec::new();
+                for pattern in subject_patterns {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
+                        Ok(re) => subject_regexes.push(re),
+                        Err(e) => {
+                            println!(
+                                "{} Invalid subject regex pattern '{}': {}",
+                                "Error:".red(),
+                                pattern,
+                                e
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
+                let original_count = filtered_by_author.len();
+                let filtered: Vec<_> = filtered_by_author
+                    .into_iter()
+                    .filter(|(commit, _)| {
+                        // Check if ANY subject pattern matches
+                        subject_regexes
+                            .iter()
+                            .any(|re| re.is_match(&commit.subject))
+                    })
+                    .collect();
+
+                tracing::info!(
+                    "Subject filters ({} pattern(s)) reduced results from {} to {} commits",
+                    subject_patterns.len(),
+                    original_count,
+                    filtered.len()
+                );
+
+                filtered
+            } else {
+                filtered_by_author
+            };
+
             // Apply regex filtering if provided (ALL patterns must match)
             let filtered_by_regex = if !regex_patterns.is_empty() {
-                // Compile all regex patterns
+                // Compile all regex patterns (case-insensitive)
                 let mut regexes = Vec::new();
                 for pattern in regex_patterns {
-                    match regex::Regex::new(pattern) {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(re) => regexes.push(re),
                         Err(e) => {
                             println!(
@@ -2365,8 +2567,8 @@ async fn vcommit_similar_commits(
                     }
                 }
 
-                let original_count = filtered_by_range.len();
-                let filtered: Vec<_> = filtered_by_range
+                let original_count = filtered_by_subject.len();
+                let filtered: Vec<_> = filtered_by_subject
                     .into_iter()
                     .filter(|(commit, _)| {
                         // Combine message and diff for regex matching
@@ -2385,15 +2587,18 @@ async fn vcommit_similar_commits(
 
                 filtered
             } else {
-                filtered_by_range
+                filtered_by_subject
             };
 
             // Apply symbol filtering if provided (ALL patterns must match)
             let filtered_by_symbol = if !symbol_patterns.is_empty() {
-                // Compile all symbol regex patterns
+                // Compile all symbol regex patterns (case-insensitive)
                 let mut symbol_regexes = Vec::new();
                 for pattern in symbol_patterns {
-                    match regex::Regex::new(pattern) {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(re) => symbol_regexes.push(re),
                         Err(e) => {
                             println!(
@@ -2432,10 +2637,13 @@ async fn vcommit_similar_commits(
 
             // Apply path filtering if provided (ANY pattern must match - OR logic)
             let filtered_by_path = if !path_patterns.is_empty() {
-                // Compile all path regex patterns
+                // Compile all path regex patterns (case-insensitive)
                 let mut path_regexes = Vec::new();
                 for pattern in path_patterns {
-                    match regex::Regex::new(pattern) {
+                    match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(re) => path_regexes.push(re),
                         Err(e) => {
                             println!(
@@ -2553,12 +2761,16 @@ async fn vcommit_similar_commits(
 
             if final_results.is_empty() {
                 println!("{} No similar commits found", "Info:".yellow());
-                if !regex_patterns.is_empty()
+                if !author_patterns.is_empty()
+                    || !subject_patterns.is_empty()
+                    || !regex_patterns.is_empty()
                     || !symbol_patterns.is_empty()
                     || !path_patterns.is_empty()
                     || git_range.is_some()
                 {
-                    println!("Try adjusting the filters or removing the -r/-s/-p/--git options");
+                    println!(
+                        "Try adjusting the filters or removing the -f/-s/-r/-g/-p/--git options"
+                    );
                 } else {
                     println!(
                         "Make sure commit vectors have been generated with 'semcode-index --vectors'"
@@ -2900,11 +3112,14 @@ async fn vlore_similar_emails(
     Ok(())
 }
 
-/// Compile regex filters from patterns
+/// Compile regex filters from patterns (case-insensitive)
 fn compile_regex_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
     let mut filters = Vec::new();
     for pattern in patterns {
-        match regex::Regex::new(pattern) {
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        {
             Ok(re) => filters.push(re),
             Err(e) => {
                 println!(
@@ -2920,11 +3135,14 @@ fn compile_regex_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
     Ok(filters)
 }
 
-/// Compile symbol regex filters from patterns
+/// Compile symbol regex filters from patterns (case-insensitive)
 fn compile_symbol_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
     let mut filters = Vec::new();
     for pattern in patterns {
-        match regex::Regex::new(pattern) {
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        {
             Ok(re) => filters.push(re),
             Err(e) => {
                 println!(
@@ -2940,11 +3158,14 @@ fn compile_symbol_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
     Ok(filters)
 }
 
-/// Compile path regex filters from patterns
+/// Compile path regex filters from patterns (case-insensitive)
 fn compile_path_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
     let mut filters = Vec::new();
     for pattern in patterns {
-        match regex::Regex::new(pattern) {
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        {
             Ok(re) => filters.push(re),
             Err(e) => {
                 println!(
@@ -2960,13 +3181,33 @@ fn compile_path_filters(patterns: &[String]) -> Result<Vec<regex::Regex>> {
     Ok(filters)
 }
 
-/// Check if a commit matches all regex, symbol, and path filters
+/// Check if a commit matches all author, subject, regex, symbol, and path filters
 fn commit_matches_filters(
     commit: &semcode::GitCommitInfo,
+    author_filters: &[regex::Regex],
+    subject_filters: &[regex::Regex],
     regex_filters: &[regex::Regex],
     symbol_filters: &[regex::Regex],
     path_filters: &[regex::Regex],
 ) -> bool {
+    // Apply author filters (ANY must match - OR logic)
+    if !author_filters.is_empty() {
+        let matches_any = author_filters.iter().any(|re| re.is_match(&commit.author));
+        if !matches_any {
+            return false;
+        }
+    }
+
+    // Apply subject filters (ANY must match - OR logic)
+    if !subject_filters.is_empty() {
+        let matches_any = subject_filters
+            .iter()
+            .any(|re| re.is_match(&commit.subject));
+        if !matches_any {
+            return false;
+        }
+    }
+
     // Apply regex filters (ALL must match)
     if !regex_filters.is_empty() {
         let combined = format!("{}\n\n{}", commit.message, commit.diff);
@@ -3067,6 +3308,8 @@ fn show_commit_summary(
     matched_count: usize,
     displayed_count: usize,
     limit: usize,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -3074,14 +3317,21 @@ fn show_commit_summary(
     println!("\n{}", "=".repeat(80));
 
     // Show summary with filtering/limiting info
-    if !regex_patterns.is_empty()
+    if !author_patterns.is_empty()
+        || !subject_patterns.is_empty()
+        || !regex_patterns.is_empty()
         || !symbol_patterns.is_empty()
         || !path_patterns.is_empty()
         || limit > 0
     {
         println!("{} ", "Summary:".bold().green());
         println!("  Total commits: {}", total_commits);
-        if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty() {
+        if !author_patterns.is_empty()
+            || !subject_patterns.is_empty()
+            || !regex_patterns.is_empty()
+            || !symbol_patterns.is_empty()
+            || !path_patterns.is_empty()
+        {
             println!("  Matched by filters: {}", matched_count);
         }
         println!("  Displayed: {}", displayed_count);
@@ -3102,12 +3352,20 @@ fn show_commit_summary(
     }
 
     if displayed_count == 0 {
-        let filter_count = (!regex_patterns.is_empty() as usize)
+        let filter_count = (!author_patterns.is_empty() as usize)
+            + (!subject_patterns.is_empty() as usize)
+            + (!regex_patterns.is_empty() as usize)
             + (!symbol_patterns.is_empty() as usize)
             + (!path_patterns.is_empty() as usize);
 
         if filter_count >= 2 {
             let mut filter_types = Vec::new();
+            if !author_patterns.is_empty() {
+                filter_types.push(format!("{} author pattern(s)", author_patterns.len()));
+            }
+            if !subject_patterns.is_empty() {
+                filter_types.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            }
             if !regex_patterns.is_empty() {
                 filter_types.push(format!("{} regex pattern(s)", regex_patterns.len()));
             }
@@ -3121,6 +3379,20 @@ fn show_commit_summary(
                 "\n{} No commits matched ALL {}",
                 "Info:".yellow(),
                 filter_types.join(" and ")
+            );
+        } else if !author_patterns.is_empty() {
+            println!(
+                "\n{} No commits matched ANY {} author pattern(s): {}",
+                "Info:".yellow(),
+                author_patterns.len(),
+                author_patterns.join(", ")
+            );
+        } else if !subject_patterns.is_empty() {
+            println!(
+                "\n{} No commits matched ANY {} subject pattern(s): {}",
+                "Info:".yellow(),
+                subject_patterns.len(),
+                subject_patterns.join(", ")
             );
         } else if !regex_patterns.is_empty() {
             println!(
@@ -3151,6 +3423,8 @@ fn show_commit_summary(
 async fn show_all_commits(
     db: &DatabaseManager,
     verbose: bool,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -3167,6 +3441,18 @@ async fn show_all_commits(
     }
 
     // Step 2: Compile filters
+    let author_filters = if !author_patterns.is_empty() {
+        compile_regex_filters(author_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    let subject_filters = if !subject_patterns.is_empty() {
+        compile_regex_filters(subject_patterns)?
+    } else {
+        Vec::new()
+    };
+
     let regex_filters = if !regex_patterns.is_empty() {
         compile_regex_filters(regex_patterns)?
     } else {
@@ -3192,11 +3478,18 @@ async fn show_all_commits(
     );
     println!("{}", "=".repeat(80));
 
-    // Step 3: Apply regex/symbol/path filters first
+    // Step 3: Apply author/subject/regex/symbol/path filters first
     let filtered_commits: Vec<_> = all_commits
         .iter()
         .filter(|commit| {
-            commit_matches_filters(commit, &regex_filters, &symbol_filters, &path_filters)
+            commit_matches_filters(
+                commit,
+                &author_filters,
+                &subject_filters,
+                &regex_filters,
+                &symbol_filters,
+                &path_filters,
+            )
         })
         .collect();
 
@@ -3269,6 +3562,8 @@ async fn show_all_commits(
         matched_count,
         displayed_count,
         limit,
+        author_patterns,
+        subject_patterns,
         regex_patterns,
         symbol_patterns,
         path_patterns,
@@ -3282,6 +3577,8 @@ async fn show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
     verbose: bool,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -3406,6 +3703,72 @@ async fn show_commit_metadata(
                 println!("{} Failed to check reachability: {}", "Error:".red(), e);
                 return Ok(());
             }
+        }
+    }
+
+    // Step 2c: Apply author filters if provided (ANY must match - OR logic)
+    if !author_patterns.is_empty() {
+        let mut author_regexes = Vec::new();
+        for pattern in author_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => author_regexes.push(re),
+                Err(e) => {
+                    println!(
+                        "{} Invalid author regex pattern '{}': {}",
+                        "Error:".red(),
+                        pattern,
+                        e
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Check if ANY author pattern matches
+        let matches_any = author_regexes.iter().any(|re| re.is_match(&commit_author));
+        if !matches_any {
+            println!(
+                "{} Commit {} does not match any of {} author pattern(s): {}",
+                "Info:".yellow(),
+                resolved_sha.bright_black(),
+                author_patterns.len(),
+                author_patterns.join(", ")
+            );
+            return Ok(());
+        }
+    }
+
+    // Step 2d: Apply subject filters if provided (ANY must match - OR logic)
+    if !subject_patterns.is_empty() {
+        let mut subject_regexes = Vec::new();
+        for pattern in subject_patterns {
+            match regex::Regex::new(pattern) {
+                Ok(re) => subject_regexes.push(re),
+                Err(e) => {
+                    println!(
+                        "{} Invalid subject regex pattern '{}': {}",
+                        "Error:".red(),
+                        pattern,
+                        e
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Check if ANY subject pattern matches
+        let matches_any = subject_regexes
+            .iter()
+            .any(|re| re.is_match(&commit_subject));
+        if !matches_any {
+            println!(
+                "{} Commit {} does not match any of {} subject pattern(s): {}",
+                "Info:".yellow(),
+                resolved_sha.bright_black(),
+                subject_patterns.len(),
+                subject_patterns.join(", ")
+            );
+            return Ok(());
         }
     }
 
@@ -3598,6 +3961,8 @@ async fn show_commit_range(
     db: &DatabaseManager,
     range: &str,
     verbose: bool,
+    author_patterns: &[String],
+    subject_patterns: &[String],
     regex_patterns: &[String],
     symbol_patterns: &[String],
     path_patterns: &[String],
@@ -3681,8 +4046,12 @@ async fn show_commit_range(
             {
                 Ok(walk) => {
                     let mut commits = Vec::new();
-                    // Higher limit when regex or symbol filtering is active, since results will be filtered down
-                    let max_commits = if !regex_patterns.is_empty() || !symbol_patterns.is_empty() {
+                    // Higher limit when any filtering is active, since results will be filtered down
+                    let max_commits = if !author_patterns.is_empty()
+                        || !subject_patterns.is_empty()
+                        || !regex_patterns.is_empty()
+                        || !symbol_patterns.is_empty()
+                    {
                         1_000_000 // Allow larger ranges when filtering
                     } else {
                         10_000 // Standard safety limit
@@ -3698,9 +4067,13 @@ async fn show_commit_range(
                                         range,
                                         max_commits
                                     );
-                                    if regex_patterns.is_empty() && symbol_patterns.is_empty() {
+                                    if author_patterns.is_empty()
+                                        && subject_patterns.is_empty()
+                                        && regex_patterns.is_empty()
+                                        && symbol_patterns.is_empty()
+                                    {
                                         println!(
-                                            "{} Try using -r <regex> or -s <regex> to filter results, or use a smaller range",
+                                            "{} Try using -f, -s, -r, or -g <regex> to filter results, or use a smaller range",
                                             "Hint:".yellow()
                                         );
                                     } else {
@@ -3742,6 +4115,18 @@ async fn show_commit_range(
     }
 
     // Step 2: Compile filters
+    let author_filters = if !author_patterns.is_empty() {
+        compile_regex_filters(author_patterns)?
+    } else {
+        Vec::new()
+    };
+
+    let subject_filters = if !subject_patterns.is_empty() {
+        compile_regex_filters(subject_patterns)?
+    } else {
+        Vec::new()
+    };
+
     let regex_filters = if !regex_patterns.is_empty() {
         compile_regex_filters(regex_patterns)?
     } else {
@@ -3792,8 +4177,26 @@ async fn show_commit_range(
             .query_commits_chunk_filtered(chunk, &regex_filter_patterns, &symbol_filter_patterns)
             .await?;
 
-        // Apply path filtering to chunk results
+        // Apply author, subject, and path filtering to chunk results
         for commit in chunk_results {
+            // Apply author filters (ANY must match - OR logic)
+            if !author_filters.is_empty() {
+                let matches_any = author_filters.iter().any(|re| re.is_match(&commit.author));
+                if !matches_any {
+                    continue;
+                }
+            }
+
+            // Apply subject filters (ANY must match - OR logic)
+            if !subject_filters.is_empty() {
+                let matches_any = subject_filters
+                    .iter()
+                    .any(|re| re.is_match(&commit.subject));
+                if !matches_any {
+                    continue;
+                }
+            }
+
             // Apply path filters (ANY must match - OR logic)
             if !path_filters.is_empty() {
                 let matches_any_pattern = path_filters
@@ -3876,6 +4279,8 @@ async fn show_commit_range(
         matched_count,
         displayed_count,
         limit,
+        author_patterns,
+        subject_patterns,
         regex_patterns,
         symbol_patterns,
         path_patterns,
