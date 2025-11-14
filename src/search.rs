@@ -453,7 +453,7 @@ pub async fn lore_search(
     limit: usize,
     verbose: usize,
 ) -> Result<()> {
-    lore_search_with_thread(db, field, pattern, limit, verbose, false, false).await
+    lore_search_with_thread(db, field, pattern, limit, verbose, false, false, None, None).await
 }
 
 pub async fn lore_search_multi_field(
@@ -463,6 +463,8 @@ pub async fn lore_search_multi_field(
     verbose: usize,
     show_thread: bool,
     show_replies: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
 ) -> Result<()> {
     // Build description of the search
     use std::collections::HashMap;
@@ -488,7 +490,7 @@ pub async fn lore_search_multi_field(
     }
 
     let mut emails = db
-        .search_lore_emails_multi_field(field_patterns, limit)
+        .search_lore_emails_multi_field(field_patterns, limit, since_date, until_date)
         .await?;
 
     if emails.is_empty() {
@@ -577,6 +579,8 @@ pub async fn lore_search_with_thread(
     verbose: usize,
     show_thread: bool,
     show_replies: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
 ) -> Result<()> {
     println!(
         "Searching lore emails where {} matches pattern: {}",
@@ -584,7 +588,9 @@ pub async fn lore_search_with_thread(
         pattern.yellow()
     );
 
-    let mut emails = db.search_lore_emails(field, pattern, limit).await?;
+    let mut emails = db
+        .search_lore_emails(field, pattern, limit, since_date, until_date)
+        .await?;
 
     if emails.is_empty() {
         println!("{} No matching emails found", "Info:".yellow());
@@ -1058,151 +1064,25 @@ pub async fn lore_search_by_commit(
     verbose: usize,
     show_all: bool,
     show_thread: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
 ) -> Result<()> {
-    use crate::git;
+    use anstream::stdout;
 
-    // Resolve git commit-ish to full SHA and get commit info
-    let (git_sha, subject) = match gix::discover(git_repo_path) {
-        Ok(repo) => match git::resolve_to_commit(&repo, git_commit_ish) {
-            Ok(commit) => {
-                let sha = commit.id().to_string();
-                // Get the commit message and extract first line (subject)
-                let message = commit.message_raw().ok().and_then(|msg| {
-                    std::str::from_utf8(msg.as_ref())
-                        .ok()
-                        .map(|s| s.to_string())
-                });
-                let subject = message
-                    .as_ref()
-                    .and_then(|m| m.lines().next())
-                    .unwrap_or("")
-                    .to_string();
-                (sha, subject)
-            }
-            Err(e) => {
-                println!(
-                    "{} Failed to resolve git reference '{}': {}",
-                    "Error:".red(),
-                    git_commit_ish,
-                    e
-                );
-                return Ok(());
-            }
-        },
-        Err(e) => {
-            println!("{} Not in a git repository: {}", "Error:".red(), e);
-            return Ok(());
-        }
-    };
-
-    if subject.is_empty() {
-        println!(
-            "{} Commit {} has no subject line",
-            "Error:".red(),
-            git_sha[..12].to_string()
-        );
-        return Ok(());
-    }
-
-    println!(
-        "Looking up commit: {} ({})",
-        git_commit_ish.cyan(),
-        git_sha[..12].to_string().bright_black()
-    );
-    println!("  Commit subject: {}\n", subject.cyan());
-
-    // Search lore emails by exact subject match
-    let emails = db.search_lore_emails_by_subject(&subject, 100).await?;
-
-    if emails.is_empty() {
-        println!("{} No matching emails found", "Info:".yellow());
-        return Ok(());
-    }
-
-    // Sort by date (newest first)
-    let mut sorted_emails = emails;
-    sorted_emails.sort_by(|a, b| b.date.cmp(&a.date));
-
-    println!(
-        "Searching lore emails where subject matches pattern: {}",
-        subject.yellow()
-    );
-
-    if show_all {
-        // Show all matching emails
-        println!(
-            "\n{} Found {} matching email(s):\n",
-            "Results:".green(),
-            sorted_emails.len()
-        );
-
-        if show_thread {
-            // Show full threads for all matching emails
-            for (idx, email) in sorted_emails.iter().enumerate() {
-                if idx > 0 {
-                    println!("\n{}\n", "=".repeat(80).bright_black());
-                }
-                println!(
-                    "{} Thread {} of {} ({}):",
-                    "===>".bold().cyan(),
-                    idx + 1,
-                    sorted_emails.len(),
-                    email.date.bright_black()
-                );
-                lore_show_thread(db, &email.message_id, verbose).await?;
-            }
-        } else {
-            // Show summary of all matching emails
-            for (idx, email) in sorted_emails.iter().enumerate() {
-                println!(
-                    "{}. {} - {}",
-                    (idx + 1).to_string().bright_black(),
-                    email.date.bright_black(),
-                    email.subject.cyan()
-                );
-                println!("   From: {}", email.from.yellow());
-                println!("   Message-ID: {}", email.message_id.bright_black());
-
-                if let Some(ref in_reply_to) = email.in_reply_to {
-                    println!("   In-Reply-To: {}", in_reply_to.bright_black());
-                }
-
-                if verbose >= 1 {
-                    println!("\n{}", "   --- Message Body ---".bright_black());
-                    for line in email.body.lines() {
-                        println!("   {}", line);
-                    }
-                    println!("{}", "   --- End Message ---".bright_black());
-                }
-
-                println!();
-            }
-        }
-    } else {
-        // Show only the most recent email (default behavior)
-        if sorted_emails.len() > 1 {
-            println!(
-                "{} Found {} matching email(s), using most recent ({})\n",
-                "Info:".yellow(),
-                sorted_emails.len(),
-                sorted_emails[0].date.bright_black()
-            );
-        } else {
-            println!(
-                "\n{} Found {} matching email:\n",
-                "Results:".green(),
-                sorted_emails.len()
-            );
-        }
-
-        // Get the most recent email
-        let most_recent_email = &sorted_emails[0];
-
-        // Show the full thread for the most recent email
-        lore_show_thread(db, &most_recent_email.message_id, verbose).await?;
-    }
-
-    Ok(())
+    // Use shared writer function for consistent behavior with MCP
+    crate::lore_writers::dig_lore_by_commit_to_writer(
+        db,
+        git_commit_ish,
+        git_repo_path,
+        verbose,
+        show_all,
+        show_thread,
+        false, // show_replies (not used in CLI version currently)
+        since_date,
+        until_date,
+        &mut stdout(),
+    )
+    .await
 }
 
 // Writer-based versions of search functions for both CLI and MCP usage

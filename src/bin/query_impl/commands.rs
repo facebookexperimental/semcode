@@ -667,7 +667,7 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: vlore [-v] [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-o <output_file>] [--limit <N=20>] <query_text>"
+                    "Usage: vlore [-v] [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-o <output_file>] [--limit <N=20>] [--since <date>] [--until <date>] <query_text>"
                         .red()
                 );
                 println!(
@@ -688,9 +688,16 @@ pub async fn handle_command(
                 );
                 println!("  -o <file>: Write output to file instead of stdout");
                 println!("  --limit <N>: Limit number of results (default: 20, max: 100)");
+                println!("  --since <date>: Only show emails from this date onwards");
+                println!("  --until <date>: Only show emails up to this date");
+                println!("  Date formats: 'yesterday', 'N days ago', 'N weeks ago', 'YYYY-MM-DD'");
                 println!("  Example: vlore \"memory leak fix\"");
                 println!("  Example: vlore -v --limit 10 \"performance optimization\"");
                 println!("  Example: vlore -f \"torvalds\" \"merge pull request\"");
+                println!("  Example: vlore --since \"1 week ago\" \"kernel patch\"");
+                println!(
+                    "  Example: vlore --since \"2024-01-01\" --until \"2024-11-13\" \"bug fix\""
+                );
                 println!("  Example: vlore -s \"RFC\" -s \"PATCH\" \"new feature\"");
                 println!("  Example: vlore -b \"Signed-off-by.*Linus\" \"kernel patch\"");
                 println!("  Example: vlore -g \"malloc\" \"memory management\"");
@@ -700,7 +707,7 @@ pub async fn handle_command(
                     "  Note: Requires lore vectors to be generated first with 'semcode-index --lore <url> --vectors'"
                 );
             } else {
-                // Parse -v, -f, -s, -b, -g, -t, -o, and --limit flags
+                // Parse -v, -f, -s, -b, -g, -t, -o, --limit, --since, and --until flags
                 let mut verbose = false;
                 let mut limit = 20; // default
                 let mut from_patterns = Vec::new();
@@ -709,6 +716,8 @@ pub async fn handle_command(
                 let mut symbols_patterns = Vec::new();
                 let mut recipients_patterns = Vec::new();
                 let mut output_file: Option<String> = None;
+                let mut since_date_str: Option<String> = None;
+                let mut until_date_str: Option<String> = None;
                 let mut query_parts = Vec::new();
                 let mut i = 1;
 
@@ -731,6 +740,12 @@ pub async fn handle_command(
                                 return Ok(false);
                             }
                         }
+                    } else if parts[i] == "--since" && i + 1 < parts.len() {
+                        since_date_str = Some(parts[i + 1].to_string());
+                        i += 2;
+                    } else if parts[i] == "--until" && i + 1 < parts.len() {
+                        until_date_str = Some(parts[i + 1].to_string());
+                        i += 2;
                     } else if parts[i] == "-f" && i + 1 < parts.len() {
                         from_patterns.push(parts[i + 1].to_string());
                         i += 2;
@@ -763,6 +778,37 @@ pub async fn handle_command(
                     );
                 } else {
                     let query_text = query_parts.join(" ");
+
+                    // Parse date strings if provided
+                    let since_date = if let Some(ref date_str) = since_date_str {
+                        match semcode::date_utils::parse_date(date_str) {
+                            Ok(parsed) => {
+                                println!("Parsed --since '{}' to '{}'", date_str, parsed);
+                                Some(parsed)
+                            }
+                            Err(e) => {
+                                println!("{} Invalid --since date: {}", "Error:".red(), e);
+                                return Ok(false);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let until_date = if let Some(ref date_str) = until_date_str {
+                        match semcode::date_utils::parse_date(date_str) {
+                            Ok(parsed) => {
+                                println!("Parsed --until '{}' to '{}'", date_str, parsed);
+                                Some(parsed)
+                            }
+                            Err(e) => {
+                                println!("{} Invalid --until date: {}", "Error:".red(), e);
+                                return Ok(false);
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                     // Handle output file if specified
                     use std::fs::File;
@@ -799,6 +845,8 @@ pub async fn handle_command(
                             model_path,
                             verbose,
                             writer,
+                            since_date.as_deref(),
+                            until_date.as_deref(),
                         )
                         .await?;
                     } else {
@@ -814,6 +862,8 @@ pub async fn handle_command(
                             model_path,
                             verbose,
                             &mut anstream::stdout(),
+                            since_date.as_deref(),
+                            until_date.as_deref(),
                         )
                         .await?;
                     }
@@ -1059,13 +1109,20 @@ pub async fn handle_command(
         }
         "dig" => {
             if parts.len() < 2 {
-                println!("{}", "Usage: dig [-v] [-a] [--thread] <commit>".red());
+                println!(
+                    "{}",
+                    "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] <commit>"
+                        .red()
+                );
                 println!("  Search for lore emails related to a git commit");
                 println!("  Orders results by date, newest first");
                 println!("  Options:");
                 println!("    -v              Show full message body");
                 println!("    -a              Show all duplicate results (not just most recent)");
                 println!("    --thread        Show full thread for each result (use with -a)");
+                println!("    --since <date>  Only show emails from this date onwards");
+                println!("    --until <date>  Only show emails up to this date");
+                println!("  Date formats: 'yesterday', 'N days ago', 'N weeks ago', 'YYYY-MM-DD'");
                 println!("  Examples:");
                 println!("    dig HEAD                    # Show most recent match thread");
                 println!("    dig -v abc123               # Show most recent match with body");
@@ -1074,38 +1131,97 @@ pub async fn handle_command(
                 println!(
                     "    dig -v -a --thread abc123   # Show all matches with threads and bodies"
                 );
+                println!(
+                    "    dig --since \"1 week ago\" HEAD  # Show recent emails for HEAD commit"
+                );
             } else {
-                // Parse flags
-                let (remaining_parts, verbose) = parse_verbose_flag(&parts);
-                let verbose_level = if verbose { 1 } else { 0 };
-
-                // Parse -a flag (show all)
+                // Parse flags directly in a loop
+                let mut verbose_level = 0;
                 let mut show_all = false;
-                let mut remaining_parts_vec = remaining_parts;
-                if let Some(pos) = remaining_parts_vec.iter().position(|&x| x == "-a") {
-                    show_all = true;
-                    remaining_parts_vec.remove(pos);
-                }
-
-                // Parse --thread flag
                 let mut show_thread = false;
-                if let Some(pos) = remaining_parts_vec.iter().position(|&x| x == "--thread") {
-                    show_thread = true;
-                    remaining_parts_vec.remove(pos);
+                let mut since_date_str: Option<String> = None;
+                let mut until_date_str: Option<String> = None;
+                let mut commit_ish: Option<&str> = None;
+                let mut i = 1;
+
+                while i < parts.len() {
+                    match parts[i] {
+                        "-v" => {
+                            verbose_level = 1;
+                            i += 1;
+                        }
+                        "-a" => {
+                            show_all = true;
+                            i += 1;
+                        }
+                        "--thread" => {
+                            show_thread = true;
+                            i += 1;
+                        }
+                        "--since" if i + 1 < parts.len() => {
+                            since_date_str = Some(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "--until" if i + 1 < parts.len() => {
+                            until_date_str = Some(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        _ => {
+                            // Assume it's the commit argument
+                            commit_ish = Some(parts[i]);
+                            i += 1;
+                        }
+                    }
                 }
 
-                if remaining_parts_vec.len() < 2 {
-                    println!("{}", "Usage: dig [-v] [-a] [--thread] <commit>".red());
+                if commit_ish.is_none() {
+                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] <commit>".red());
                     println!("  Missing commit argument");
                 } else {
-                    let commit_ish = remaining_parts_vec[1];
+                    // Parse dates using the date_utils module
+                    let since_date = if let Some(date_str) = since_date_str {
+                        match semcode::date_utils::parse_date(&date_str) {
+                            Ok(parsed) => Some(parsed),
+                            Err(e) => {
+                                println!(
+                                    "{} Invalid --since date '{}': {}",
+                                    "Error:".red(),
+                                    date_str,
+                                    e
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let until_date = if let Some(date_str) = until_date_str {
+                        match semcode::date_utils::parse_date(&date_str) {
+                            Ok(parsed) => Some(parsed),
+                            Err(e) => {
+                                println!(
+                                    "{} Invalid --until date '{}': {}",
+                                    "Error:".red(),
+                                    date_str,
+                                    e
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     lore_search_by_commit(
                         db,
-                        commit_ish,
+                        commit_ish.unwrap(),
                         git_repo_path,
                         verbose_level,
                         show_all,
                         show_thread,
+                        since_date.as_deref(),
+                        until_date.as_deref(),
                     )
                     .await?;
                 }
@@ -1113,7 +1229,7 @@ pub async fn handle_command(
         }
         "lore" => {
             if parts.len() < 2 {
-                println!("{}", "Usage: lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--thread] [--replies] [-o <output_file>]".red());
+                println!("{}", "Usage: lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--since <date>] [--until <date>] [--thread] [--replies] [-o <output_file>]".red());
                 println!("  Search lore emails with regex filters");
                 println!("  Options:");
                 println!("    -v              Show full message body");
@@ -1132,17 +1248,22 @@ pub async fn handle_command(
                     "    -g <regex>      Filter by symbols field (can use multiple times for OR)"
                 );
                 println!("    --limit <N>     Limit number of results (0=unlimited, default: 100)");
+                println!("    --since <date>  Only show emails from this date onwards");
+                println!("    --until <date>  Only show emails up to this date");
                 println!("    --thread        Show full thread (root to all descendants) for each matching email");
                 println!(
                     "    --replies       Show all replies/subthreads under each matching email"
                 );
                 println!("    -o <file>       Write output to file instead of stdout");
+                println!("  Date formats: 'yesterday', 'N days ago', 'N weeks ago', 'YYYY-MM-DD'");
                 println!("  Multiple conditions:");
                 println!("    Same field (OR):   lore -f torvalds -f gregkh     - From torvalds OR gregkh");
                 println!("    Different fields:  lore -f torvalds -b btrfs      - From torvalds AND body contains btrfs");
                 println!("  Examples:");
                 println!("    lore -s \"memory leak\"");
                 println!("    lore -v -s \"performance\" --limit 50");
+                println!("    lore --since \"1 week ago\" -s \"PATCH\"");
+                println!("    lore --since \"2024-01-01\" --until \"2024-11-13\" -b \"bug fix\"");
                 println!("    lore -f \"torvalds@linux-foundation.org\"");
                 println!("    lore -t \"netdev@vger.kernel.org\"");
                 println!("    lore -b \"Signed-off-by.*Linus\"");
@@ -1160,7 +1281,7 @@ pub async fn handle_command(
                 println!("    dump-lore <file> - Export all emails to JSON");
                 println!("    dig <commit>     - Find emails for a git commit");
             } else {
-                // Parse flags: -v, -m, -f, -s, -b, -t, -g, --limit, --thread, --replies, -o
+                // Parse flags: -v, -m, -f, -s, -b, -t, -g, --limit, --since, --until, --thread, --replies, -o
                 let mut verbose: usize = 0;
                 let mut message_id: Option<String> = None;
                 let mut from_patterns = Vec::new();
@@ -1169,6 +1290,8 @@ pub async fn handle_command(
                 let mut recipients_patterns = Vec::new();
                 let mut symbols_patterns = Vec::new();
                 let mut limit = 100;
+                let mut since_date_str: Option<String> = None;
+                let mut until_date_str: Option<String> = None;
                 let mut show_thread = false;
                 let mut show_replies = false;
                 let mut output_file: Option<String> = None;
@@ -1218,6 +1341,14 @@ pub async fn handle_command(
                             }
                             i += 2;
                         }
+                        "--since" if i + 1 < parts.len() => {
+                            since_date_str = Some(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "--until" if i + 1 < parts.len() => {
+                            until_date_str = Some(parts[i + 1].to_string());
+                            i += 2;
+                        }
                         "--thread" => {
                             show_thread = true;
                             i += 1;
@@ -1241,6 +1372,37 @@ pub async fn handle_command(
                         }
                     }
                 }
+
+                // Parse date strings if provided
+                let since_date = if let Some(ref date_str) = since_date_str {
+                    match semcode::date_utils::parse_date(date_str) {
+                        Ok(parsed) => {
+                            println!("Parsed --since '{}' to '{}'", date_str, parsed);
+                            Some(parsed)
+                        }
+                        Err(e) => {
+                            println!("{} Invalid --since date: {}", "Error:".red(), e);
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let until_date = if let Some(ref date_str) = until_date_str {
+                    match semcode::date_utils::parse_date(date_str) {
+                        Ok(parsed) => {
+                            println!("Parsed --until '{}' to '{}'", date_str, parsed);
+                            Some(parsed)
+                        }
+                        Err(e) => {
+                            println!("{} Invalid --until date: {}", "Error:".red(), e);
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 // Handle output file if specified
                 use std::fs::File;
@@ -1326,6 +1488,8 @@ pub async fn handle_command(
                                 verbose,
                                 show_thread,
                                 show_replies,
+                                since_date.as_deref(),
+                                until_date.as_deref(),
                                 writer,
                             )
                             .await?;
@@ -1337,6 +1501,8 @@ pub async fn handle_command(
                                 verbose,
                                 show_thread,
                                 show_replies,
+                                since_date.as_deref(),
+                                until_date.as_deref(),
                                 writer,
                             )
                             .await?;
@@ -1352,6 +1518,8 @@ pub async fn handle_command(
                                 verbose,
                                 show_thread,
                                 show_replies,
+                                since_date.as_deref(),
+                                until_date.as_deref(),
                             )
                             .await?;
                         } else {
@@ -1362,6 +1530,8 @@ pub async fn handle_command(
                                 verbose,
                                 show_thread,
                                 show_replies,
+                                since_date.as_deref(),
+                                until_date.as_deref(),
                             )
                             .await?;
                         }
@@ -2491,6 +2661,8 @@ async fn vlore_similar_emails(
     model_path: &Option<String>,
     verbose: bool,
     writer: &mut dyn std::io::Write,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
 ) -> Result<()> {
     use semcode::CodeVectorizer;
 
@@ -2500,7 +2672,8 @@ async fn vlore_similar_emails(
         || !symbols_patterns.is_empty()
         || !recipients_patterns.is_empty();
 
-    if has_filters {
+    // Note: since_date and until_date are applied at SQL level, not as FTS filters
+    if has_filters || since_date.is_some() || until_date.is_some() {
         let mut filter_parts = Vec::new();
         if !from_patterns.is_empty() {
             filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
@@ -2617,6 +2790,8 @@ async fn vlore_similar_emails(
             body_filter,
             symbols_filter,
             recipients_filter,
+            since_date,
+            until_date,
         )
         .await
     {

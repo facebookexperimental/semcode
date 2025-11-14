@@ -305,6 +305,8 @@ pub async fn lore_search_with_thread_to_writer(
     verbose: usize,
     show_thread: bool,
     show_replies: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(
@@ -313,7 +315,9 @@ pub async fn lore_search_with_thread_to_writer(
         field, pattern
     )?;
 
-    let mut emails = db.search_lore_emails(field, pattern, limit).await?;
+    let mut emails = db
+        .search_lore_emails(field, pattern, limit, since_date, until_date)
+        .await?;
 
     if emails.is_empty() {
         writeln!(writer, "Info: No matching emails found")?;
@@ -412,6 +416,8 @@ pub async fn lore_search_multi_field_to_writer(
     verbose: usize,
     show_thread: bool,
     show_replies: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(writer, "Searching lore emails with multiple filters:")?;
@@ -420,7 +426,7 @@ pub async fn lore_search_multi_field_to_writer(
     }
 
     let mut emails = db
-        .search_lore_emails_multi_field(field_patterns, limit)
+        .search_lore_emails_multi_field(field_patterns, limit, since_date, until_date)
         .await?;
 
     if emails.is_empty() {
@@ -507,6 +513,205 @@ pub async fn lore_search_multi_field_to_writer(
             "Note: Result limit of {} reached. There may be more matches.",
             limit
         )?;
+    }
+
+    Ok(())
+}
+
+/// Search for lore emails related to a git commit (dig command) - writer version
+/// Takes a commit from the main git repo, extracts its subject, and searches lore emails
+pub async fn dig_lore_by_commit_to_writer(
+    db: &DatabaseManager,
+    commit_ish: &str,
+    git_repo_path: &str,
+    verbose: usize,
+    show_all: bool,
+    show_thread: bool,
+    show_replies: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use crate::git;
+
+    writeln!(
+        writer,
+        "Searching for lore emails related to git commit: {}",
+        commit_ish
+    )?;
+    if show_all {
+        writeln!(writer, "  (showing all matches)")?;
+    } else {
+        writeln!(writer, "  (showing most recent match only)")?;
+    }
+    if show_thread {
+        writeln!(writer, "  (with full threads)")?;
+    }
+    if show_replies {
+        writeln!(writer, "  (with all replies)")?;
+    }
+
+    // Resolve git commit-ish to full SHA and get commit info (reuse git resolution logic)
+    let (git_sha, subject) = match gix::discover(git_repo_path) {
+        Ok(repo) => match git::resolve_to_commit(&repo, commit_ish) {
+            Ok(commit) => {
+                let sha = commit.id().to_string();
+                let message = commit.message_raw().ok().and_then(|msg| {
+                    std::str::from_utf8(msg.as_ref())
+                        .ok()
+                        .map(|s| s.to_string())
+                });
+                let subject = message
+                    .as_ref()
+                    .and_then(|m| m.lines().next())
+                    .unwrap_or("")
+                    .to_string();
+                (sha, subject)
+            }
+            Err(e) => {
+                writeln!(
+                    writer,
+                    "Error: Failed to resolve git reference '{}': {}",
+                    commit_ish, e
+                )?;
+                return Ok(());
+            }
+        },
+        Err(e) => {
+            writeln!(writer, "Error: Not in a git repository: {}", e)?;
+            return Ok(());
+        }
+    };
+
+    if subject.is_empty() {
+        writeln!(
+            writer,
+            "Error: Commit {} has no subject line",
+            &git_sha[..12]
+        )?;
+        return Ok(());
+    }
+
+    writeln!(
+        writer,
+        "Looking up commit: {} ({})",
+        commit_ish,
+        &git_sha[..12]
+    )?;
+    writeln!(writer, "  Commit subject: {}\n", subject)?;
+
+    // Search lore emails by exact subject match (reuse database function)
+    let emails = db
+        .search_lore_emails_by_subject(&subject, 100, since_date, until_date)
+        .await?;
+
+    if emails.is_empty() {
+        writeln!(writer, "Info: No matching emails found")?;
+        return Ok(());
+    }
+
+    // Sort by date (newest first)
+    let mut sorted_emails = emails;
+    sorted_emails.sort_by(|a, b| b.date.cmp(&a.date));
+
+    writeln!(
+        writer,
+        "Searching lore emails where subject matches pattern: {}",
+        subject
+    )?;
+
+    if show_all {
+        // Show all matching emails
+        writeln!(
+            writer,
+            "\nResults: Found {} matching email(s):\n",
+            sorted_emails.len()
+        )?;
+
+        if show_thread {
+            // Show full threads
+            for (idx, email) in sorted_emails.iter().enumerate() {
+                if idx > 0 {
+                    writeln!(writer, "\n{}\n", "=".repeat(80))?;
+                }
+                writeln!(
+                    writer,
+                    "===> Thread {} of {} ({}):",
+                    idx + 1,
+                    sorted_emails.len(),
+                    email.date
+                )?;
+                lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
+            }
+        } else if show_replies {
+            // Show all replies
+            for (idx, email) in sorted_emails.iter().enumerate() {
+                if idx > 0 {
+                    writeln!(writer, "\n{}\n", "=".repeat(80))?;
+                }
+                writeln!(
+                    writer,
+                    "===> Replies {} of {} ({}):",
+                    idx + 1,
+                    sorted_emails.len(),
+                    email.date
+                )?;
+                lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
+            }
+        } else {
+            // Show summary of all matching emails
+            for (idx, email) in sorted_emails.iter().enumerate() {
+                writeln!(writer, "{}. {} - {}", idx + 1, email.date, email.subject)?;
+                writeln!(writer, "   From: {}", email.from)?;
+                writeln!(writer, "   Message-ID: {}", email.message_id)?;
+
+                if verbose >= 1 {
+                    writeln!(writer, "\n   --- Message Body ---")?;
+                    for line in email.body.lines() {
+                        writeln!(writer, "   {}", line)?;
+                    }
+                    writeln!(writer, "   --- End Message ---")?;
+                }
+                writeln!(writer)?;
+            }
+        }
+    } else {
+        // Show only most recent match
+        if let Some(most_recent) = sorted_emails.first() {
+            writeln!(
+                writer,
+                "\nResults: Found {} matching email(s), showing most recent:\n",
+                sorted_emails.len()
+            )?;
+
+            if show_thread {
+                writeln!(writer, "===> Most Recent Thread:")?;
+                lore_show_thread_to_writer(db, &most_recent.message_id, verbose, writer).await?;
+            } else if show_replies {
+                writeln!(writer, "===> Replies to Most Recent:")?;
+                lore_show_replies_to_writer(db, &most_recent.message_id, verbose, writer).await?;
+            } else {
+                writeln!(writer, "1. {} - {}", most_recent.date, most_recent.subject)?;
+                writeln!(writer, "   From: {}", most_recent.from)?;
+                writeln!(writer, "   Message-ID: {}", most_recent.message_id)?;
+
+                if verbose >= 1 {
+                    writeln!(writer, "\n   --- Message Body ---")?;
+                    for line in most_recent.body.lines() {
+                        writeln!(writer, "   {}", line)?;
+                    }
+                    writeln!(writer, "   --- End Message ---")?;
+                }
+            }
+
+            if sorted_emails.len() > 1 {
+                writeln!(
+                    writer,
+                    "\nNote: {} older match(es) not shown. Use -a flag to see all.",
+                    sorted_emails.len() - 1
+                )?;
+            }
+        }
     }
 
     Ok(())

@@ -2108,6 +2108,14 @@ impl McpServer {
                                 "default": 100,
                                 "minimum": 0
                             },
+                            "since_date": {
+                                "type": "string",
+                                "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                            },
+                            "until_date": {
+                                "type": "string",
+                                "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                            },
                             "page": {
                                 "type": "integer",
                                 "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
@@ -2150,6 +2158,14 @@ impl McpServer {
                                 "type": "integer",
                                 "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
                                 "minimum": 1
+                            },
+                            "since_date": {
+                                "type": "string",
+                                "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                            },
+                            "until_date": {
+                                "type": "string",
+                                "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
                             }
                         },
                         "required": ["commit"]
@@ -2206,6 +2222,14 @@ impl McpServer {
                                 "default": 20,
                                 "minimum": 1,
                                 "maximum": 100
+                            },
+                            "since_date": {
+                                "type": "string",
+                                "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                            },
+                            "until_date": {
+                                "type": "string",
+                                "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
                             },
                             "page": {
                                 "type": "integer",
@@ -2627,6 +2651,38 @@ impl McpServer {
         let limit = args["limit"].as_u64().unwrap_or(100) as usize;
         let page = args["page"].as_u64().map(|p| p as usize);
 
+        // Parse date filters if provided
+        let since_date_str = args["since_date"].as_str();
+        let until_date_str = args["until_date"].as_str();
+
+        let since_date = if let Some(date_str) = since_date_str {
+            match semcode::date_utils::parse_date(date_str) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    return json!({
+                        "error": format!("Invalid --since date '{}': {}", date_str, e),
+                        "isError": true
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        let until_date = if let Some(date_str) = until_date_str {
+            match semcode::date_utils::parse_date(date_str) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    return json!({
+                        "error": format!("Invalid --until date '{}': {}", date_str, e),
+                        "isError": true
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         // Extract pattern arrays (same logic as query tool)
         let from_patterns: Vec<String> = args["from_patterns"]
             .as_array()
@@ -2718,6 +2774,8 @@ impl McpServer {
                 verbose,
                 show_thread,
                 show_replies,
+                since_date.as_deref(),
+                until_date.as_deref(),
             )
             .await
             {
@@ -2743,10 +2801,48 @@ impl McpServer {
         let show_replies = args["show_replies"].as_bool().unwrap_or(false);
         let page = args["page"].as_u64().map(|p| p as usize);
 
+        // Parse date filters if provided
+        let since_date_str = args["since_date"].as_str();
+        let until_date_str = args["until_date"].as_str();
+
+        let since_date = if let Some(date_str) = since_date_str {
+            match semcode::date_utils::parse_date(date_str) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    return json!({
+                        "error": format!("Invalid --since date '{}': {}", date_str, e),
+                        "isError": true
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        let until_date = if let Some(date_str) = until_date_str {
+            match semcode::date_utils::parse_date(date_str) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    return json!({
+                        "error": format!("Invalid --until date '{}': {}", date_str, e),
+                        "isError": true
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         // Generate a query key for caching
         let query_key = format!(
-            "dig:{}:{}:{}:{}:{}",
-            commit, verbose, show_all, show_thread, show_replies
+            "dig:{}:{}:{}:{}:{}:{}:{}",
+            commit,
+            verbose,
+            show_all,
+            show_thread,
+            show_replies,
+            since_date.as_deref().unwrap_or(""),
+            until_date.as_deref().unwrap_or("")
         );
 
         let git_repo_path = "."; // MCP server typically runs in the repo directory
@@ -2759,6 +2855,8 @@ impl McpServer {
             show_all,
             show_thread,
             show_replies,
+            since_date.as_deref(),
+            until_date.as_deref(),
         )
         .await
         {
@@ -2831,6 +2929,38 @@ impl McpServer {
         let limit = args["limit"].as_u64().unwrap_or(20) as usize;
         let page = args["page"].as_u64().map(|p| p as usize);
 
+        // Parse date filters if provided
+        let since_date_str = args["since_date"].as_str();
+        let until_date_str = args["until_date"].as_str();
+
+        let since_date = if let Some(date_str) = since_date_str {
+            match semcode::date_utils::parse_date(date_str) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    return json!({
+                        "error": format!("Invalid --since date '{}': {}", date_str, e),
+                        "isError": true
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        let until_date = if let Some(date_str) = until_date_str {
+            match semcode::date_utils::parse_date(date_str) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    return json!({
+                        "error": format!("Invalid --until date '{}': {}", date_str, e),
+                        "isError": true
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         // Generate a query key for caching
         let query_key = format!(
             "vlore:{}:{}:{}:{}:{}:{}:{}",
@@ -2852,6 +2982,8 @@ impl McpServer {
             &body_patterns,
             &symbols_patterns,
             &recipients_patterns,
+            since_date.as_deref(),
+            until_date.as_deref(),
             &self.model_path,
         )
         .await
@@ -3317,6 +3449,8 @@ async fn mcp_lore_search_multi_field(
     verbose: usize,
     show_thread: bool,
     show_replies: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
@@ -3356,6 +3490,8 @@ async fn mcp_lore_search_multi_field(
         verbose,
         show_thread,
         show_replies,
+        since_date,
+        until_date,
         &mut buffer,
     )
     .await?;
@@ -3371,212 +3507,25 @@ async fn mcp_dig_lore_by_commit(
     show_all: bool,
     show_thread: bool,
     show_replies: bool,
+    since_date: Option<&str>,
+    until_date: Option<&str>,
 ) -> Result<String> {
-    use std::io::Write;
-
     let mut buffer = Vec::new();
 
-    writeln!(
-        buffer,
-        "Searching for lore emails related to git commit: {}",
-        commit_ish
-    )?;
-    if show_all {
-        writeln!(buffer, "  (showing all matches)")?;
-    } else {
-        writeln!(buffer, "  (showing most recent match only)")?;
-    }
-    if show_thread {
-        writeln!(buffer, "  (with full threads)")?;
-    }
-    if show_replies {
-        writeln!(buffer, "  (with all replies)")?;
-    }
-
-    // Resolve git commit-ish to full SHA and get commit info (reuse git resolution logic)
-    let (git_sha, subject) = match gix::discover(git_repo_path) {
-        Ok(repo) => match semcode::git::resolve_to_commit(&repo, commit_ish) {
-            Ok(commit) => {
-                let sha = commit.id().to_string();
-                let message = commit.message_raw().ok().and_then(|msg| {
-                    std::str::from_utf8(msg.as_ref())
-                        .ok()
-                        .map(|s| s.to_string())
-                });
-                let subject = message
-                    .as_ref()
-                    .and_then(|m| m.lines().next())
-                    .unwrap_or("")
-                    .to_string();
-                (sha, subject)
-            }
-            Err(e) => {
-                writeln!(
-                    buffer,
-                    "Error: Failed to resolve git reference '{}': {}",
-                    commit_ish, e
-                )?;
-                return Ok(String::from_utf8_lossy(&buffer).to_string());
-            }
-        },
-        Err(e) => {
-            writeln!(buffer, "Error: Not in a git repository: {}", e)?;
-            return Ok(String::from_utf8_lossy(&buffer).to_string());
-        }
-    };
-
-    if subject.is_empty() {
-        writeln!(
-            buffer,
-            "Error: Commit {} has no subject line",
-            &git_sha[..12]
-        )?;
-        return Ok(String::from_utf8_lossy(&buffer).to_string());
-    }
-
-    writeln!(
-        buffer,
-        "Looking up commit: {} ({})",
+    // Use shared writer function for consistent behavior with CLI
+    semcode::lore_writers::dig_lore_by_commit_to_writer(
+        db,
         commit_ish,
-        &git_sha[..12]
-    )?;
-    writeln!(buffer, "  Commit subject: {}\n", subject)?;
-
-    // Search lore emails by exact subject match (reuse database function)
-    let emails = db.search_lore_emails_by_subject(&subject, 100).await?;
-
-    if emails.is_empty() {
-        writeln!(buffer, "Info: No matching emails found")?;
-        return Ok(String::from_utf8_lossy(&buffer).to_string());
-    }
-
-    // Sort by date (newest first)
-    let mut sorted_emails = emails;
-    sorted_emails.sort_by(|a, b| b.date.cmp(&a.date));
-
-    writeln!(
-        buffer,
-        "Searching lore emails where subject matches pattern: {}",
-        subject
-    )?;
-
-    if show_all {
-        // Show all matching emails
-        writeln!(
-            buffer,
-            "\nResults: Found {} matching email(s):\n",
-            sorted_emails.len()
-        )?;
-
-        if show_thread {
-            // Show full threads
-            for (idx, email) in sorted_emails.iter().enumerate() {
-                if idx > 0 {
-                    writeln!(buffer, "\n{}\n", "=".repeat(80))?;
-                }
-                writeln!(
-                    buffer,
-                    "===> Thread {} of {} ({}):",
-                    idx + 1,
-                    sorted_emails.len(),
-                    email.date
-                )?;
-                semcode::lore_writers::lore_show_thread_to_writer(
-                    db,
-                    &email.message_id,
-                    verbose,
-                    &mut buffer,
-                )
-                .await?;
-            }
-        } else if show_replies {
-            // Show all replies
-            for (idx, email) in sorted_emails.iter().enumerate() {
-                if idx > 0 {
-                    writeln!(buffer, "\n{}\n", "=".repeat(80))?;
-                }
-                writeln!(
-                    buffer,
-                    "===> Replies {} of {} ({}):",
-                    idx + 1,
-                    sorted_emails.len(),
-                    email.date
-                )?;
-                semcode::lore_writers::lore_show_replies_to_writer(
-                    db,
-                    &email.message_id,
-                    verbose,
-                    &mut buffer,
-                )
-                .await?;
-            }
-        } else {
-            // Show summary of all matching emails
-            for (idx, email) in sorted_emails.iter().enumerate() {
-                writeln!(buffer, "{}. {} - {}", idx + 1, email.date, email.subject)?;
-                writeln!(buffer, "   From: {}", email.from)?;
-                writeln!(buffer, "   Message-ID: {}", email.message_id)?;
-
-                if verbose >= 1 {
-                    writeln!(buffer, "\n   --- Message Body ---")?;
-                    for line in email.body.lines() {
-                        writeln!(buffer, "   {}", line)?;
-                    }
-                    writeln!(buffer, "   --- End Message ---")?;
-                }
-                writeln!(buffer)?;
-            }
-        }
-    } else {
-        // Show only most recent match
-        if let Some(most_recent) = sorted_emails.first() {
-            writeln!(
-                buffer,
-                "\nResults: Found {} matching email(s), showing most recent:\n",
-                sorted_emails.len()
-            )?;
-
-            if show_thread {
-                writeln!(buffer, "===> Most Recent Thread:")?;
-                semcode::lore_writers::lore_show_thread_to_writer(
-                    db,
-                    &most_recent.message_id,
-                    verbose,
-                    &mut buffer,
-                )
-                .await?;
-            } else if show_replies {
-                writeln!(buffer, "===> Replies to Most Recent:")?;
-                semcode::lore_writers::lore_show_replies_to_writer(
-                    db,
-                    &most_recent.message_id,
-                    verbose,
-                    &mut buffer,
-                )
-                .await?;
-            } else {
-                writeln!(buffer, "1. {} - {}", most_recent.date, most_recent.subject)?;
-                writeln!(buffer, "   From: {}", most_recent.from)?;
-                writeln!(buffer, "   Message-ID: {}", most_recent.message_id)?;
-
-                if verbose >= 1 {
-                    writeln!(buffer, "\n   --- Message Body ---")?;
-                    for line in most_recent.body.lines() {
-                        writeln!(buffer, "   {}", line)?;
-                    }
-                    writeln!(buffer, "   --- End Message ---")?;
-                }
-            }
-
-            if sorted_emails.len() > 1 {
-                writeln!(
-                    buffer,
-                    "\nNote: {} older match(es) not shown. Use show_all=true to see all.",
-                    sorted_emails.len() - 1
-                )?;
-            }
-        }
-    }
+        git_repo_path,
+        verbose,
+        show_all,
+        show_thread,
+        show_replies,
+        since_date,
+        until_date,
+        &mut buffer,
+    )
+    .await?;
 
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
@@ -3590,6 +3539,8 @@ async fn mcp_vlore_similar_emails(
     body_patterns: &[String],
     symbols_patterns: &[String],
     recipients_patterns: &[String],
+    since_date: Option<&str>,
+    until_date: Option<&str>,
     model_path: &Option<String>,
 ) -> Result<String> {
     use semcode::CodeVectorizer;
@@ -3702,6 +3653,8 @@ async fn mcp_vlore_similar_emails(
             body_filter,
             symbols_filter,
             recipients_filter,
+            since_date,
+            until_date,
         )
         .await
     {

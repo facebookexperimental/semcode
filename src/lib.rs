@@ -2,6 +2,7 @@
 // Module declarations
 mod database;
 pub mod database_utils;
+pub mod date_utils;
 pub mod git;
 pub mod git_range;
 pub mod hash;

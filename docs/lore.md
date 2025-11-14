@@ -20,6 +20,61 @@ All lore searches use a two-phase approach for fast, precise results:
    - Ensures exact matching (e.g., `"clm@meta.com"` matches exactly)
    - Fast because operating on small FTS result set
 
+## Date Filtering
+
+All lore search commands (`lore`, `dig`, `vlore`) support date filtering with `--since` and `--until` flags to restrict results to specific time ranges.
+
+### Supported Date Formats
+
+The date filters accept flexible formats for user convenience:
+
+**Absolute Dates:**
+- `YYYY-MM-DD` format (e.g., `"2024-01-15"`)
+- Times are assumed to be midnight (00:00:00) UTC
+
+**Relative Dates:**
+- `"today"` - Start of current day (00:00:00 UTC)
+- `"yesterday"` - Start of previous day (00:00:00 UTC)
+- `"N days ago"` - N days before current time (e.g., `"7 days ago"`, `"30 days ago"`)
+- `"N weeks ago"` - N weeks before current time (e.g., `"2 weeks ago"`)
+- `"N months ago"` - N months before current time (e.g., `"3 months ago"`)
+
+### How Date Filtering Works
+
+1. **RFC 2822 Format**: Email dates are stored in RFC 2822 format (e.g., `"Thu, 21 Nov 2019 14:22:24 -0800"`)
+2. **Temporal Comparison**: Dates are parsed and compared as datetime objects (not string comparison)
+3. **Inclusive Ranges**:
+   - `--since` includes emails from that date onwards (≥)
+   - `--until` includes emails up to and including that date (≤)
+4. **Combine Both**: Use both flags to define a specific date range
+
+### Date Filter Examples
+
+```bash
+# Recent activity
+lore -s "PATCH" --since "7 days ago"          # Patches from last week
+vlore --since "today" "memory leak"           # Today's emails about memory leaks
+
+# Specific time periods
+lore -f torvalds --since "2024-01-01" --until "2024-03-31"  # Q1 2024
+dig --since "2023-01-01" --until "2023-12-31" HEAD          # All of 2023
+
+# Open-ended ranges
+lore -b btrfs --since "2024-01-01"            # From 2024 onwards
+lore -g malloc --until "2023-12-31"           # Before 2024
+
+# Relative dates for recent searches
+vlore --since "yesterday" "kernel bug"        # Yesterday and today
+dig --since "30 days ago" abc123              # Last month of discussion
+```
+
+### Use Cases for Date Filtering
+
+- **Recent activity**: Find current discussions with `--since "7 days ago"`
+- **Historical research**: Study specific time periods with `--since YYYY-MM-DD --until YYYY-MM-DD`
+- **Version tracking**: Filter by release dates to see discussion before/after a release
+- **Performance**: Reduce result sets by limiting to relevant time periods
+
 ## Setup: Indexing a Lore Archive
 
 Before searching, you need to clone and index a lore archive:
@@ -51,7 +106,7 @@ Search lore emails using regex patterns on different fields (from, subject, body
 
 **Syntax:**
 ```
-lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--thread] [--replies] [-o <output_file>]
+lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--since <date>] [--until <date>] [--thread] [--replies] [-o <output_file>]
 ```
 
 **Options:**
@@ -63,6 +118,8 @@ lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] 
 - `-t <regex>` - Filter by recipients (To/Cc) (can be specified multiple times)
 - `-g <regex>` - Filter by symbols mentioned in any patches (can be specified multiple times)
 - `--limit <N>` - Maximum number of results (default: 100)
+- `--since <date>` - Only show emails from this date onwards (see Date Filtering section below)
+- `--until <date>` - Only show emails up to this date (see Date Filtering section below)
 - `--thread` - Show full email threads for each match (walks up to root, then shows all descendants)
 - `--replies` - Show all replies/subthreads under each match (shows descendants only, not ancestors)
 - `-o <output_file>` - Write output to file instead of stdout
@@ -122,6 +179,13 @@ lore -g "schedule.*" -f "torvalds"         # Symbols match schedule.* AND from t
 # Write output to file
 lore -v -s "memory leak" -o results.txt    # Save verbose results to file
 lore -f torvalds --thread -o threads.txt   # Save thread view to file
+
+# Date filtering
+lore -s "memory leak" --since "2024-01-01"        # Emails from Jan 1, 2024 onwards
+lore -f torvalds --until "2023-12-31"              # Emails up to Dec 31, 2023
+lore -b btrfs --since "7 days ago"                 # Emails from last week
+lore -s "PATCH" --since "yesterday"                # Emails from yesterday onwards
+lore -g malloc --since "2024-01-01" --until "2024-06-30"  # First half of 2024
 ```
 
 **Output Format:**
@@ -138,12 +202,14 @@ Search for lore emails related to a specific git commit by matching the commit's
 
 **Syntax:**
 ```
-dig [-v] [-a] [--thread] [--replies] <commit>
+dig [-v] [-a] [--since <date>] [--until <date>] [--thread] [--replies] <commit>
 ```
 
 **Options:**
 - `-v` - Verbose mode: show full message bodies
 - `-a` - Show all matching emails (default: only most recent)
+- `--since <date>` - Only show emails from this date onwards (see Date Filtering section below)
+- `--until <date>` - Only show emails up to this date (see Date Filtering section below)
 - `--thread` - Show full email threads for each match
 - `--replies` - Show all replies/subthreads under each match
 - `<commit>` - Any git reference (SHA, short SHA, branch name, HEAD, etc.)
@@ -173,6 +239,12 @@ dig -a --replies HEAD
 
 # Show replies to most recent match
 dig --replies abc123
+
+# Date filtering
+dig --since "2024-01-01" HEAD                  # Only emails from 2024 onwards
+dig --until "2023-12-31" abc123                # Only emails from before 2024
+dig -a --since "30 days ago" HEAD              # All matches from last 30 days
+dig --since "2024-01-01" --until "2024-06-30" v6.5  # First half of 2024
 ```
 
 **How It Works:**
@@ -195,7 +267,7 @@ Search for lore emails similar to the provided text using semantic vector embedd
 
 **Syntax:**
 ```
-vlore [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-t <recipients_regex>] [--limit <N>] <query_text>
+vlore [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_regex>] [-t <recipients_regex>] [--limit <N>] [--since <date>] [--until <date>] <query_text>
 ```
 
 **Options:**
@@ -205,6 +277,8 @@ vlore [-f <from_regex>] [-s <subject_regex>] [-b <body_regex>] [-g <symbols_rege
 - `-g <symbols_regex>` - Filter results by symbols mentioned in patches (can be specified multiple times)
 - `-t <recipients_regex>` - Filter results by Recipients/To/Cc (can be specified multiple times)
 - `--limit <N>` - Maximum number of results (default: 20, max: 100)
+- `--since <date>` - Only show emails from this date onwards (see Date Filtering section below)
+- `--until <date>` - Only show emails up to this date (see Date Filtering section below)
 - `<query_text>` - Search query (required)
 
 **Prerequisites:**
@@ -236,6 +310,12 @@ vlore -g "malloc" "memory management"
 
 # Recipients filter
 vlore -t "netdev@vger.kernel.org" "network patch"
+
+# Date filtering
+vlore --since "2024-01-01" "memory leak fix"             # Emails from 2024 onwards
+vlore --until "2023-12-31" "performance optimization"    # Emails from before 2024
+vlore --since "30 days ago" "kernel bug"                 # Recent emails from last month
+vlore --since "2024-01-01" --until "2024-06-30" "btrfs"  # First half of 2024
 ```
 
 **When to Use Semantic vs Regex Search:**
@@ -279,6 +359,8 @@ Search lore emails with regex filters. Same functionality as the query tool's `l
 - `recipient_patterns` (array of strings, optional) - Recipient regex patterns (OR logic)
 - `symbols_patterns` (array of strings, optional) - Symbols regex patterns (OR logic)
 - `limit` (number, optional) - Maximum results (default: 100)
+- `since_date` (string, optional) - Only show emails from this date onwards (see Date Filtering section below)
+- `until_date` (string, optional) - Only show emails up to this date (see Date Filtering section below)
 - `verbose` (boolean, optional) - Show full message bodies (default: false)
 - `show_thread` (boolean, optional) - Show full threads (default: false)
 - `show_replies` (boolean, optional) - Show all replies/subthreads (default: false, mutually exclusive with show_thread)
@@ -303,6 +385,8 @@ Search for lore emails related to a git commit. Same functionality as the query 
 - `commit` (string, required) - Git reference (SHA, short SHA, branch, HEAD, etc.)
 - `verbose` (boolean, optional) - Show full message bodies (default: false)
 - `show_all` (boolean, optional) - Show all matches vs most recent (default: false)
+- `since_date` (string, optional) - Only show emails from this date onwards (see Date Filtering section below)
+- `until_date` (string, optional) - Only show emails up to this date (see Date Filtering section below)
 - `show_thread` (boolean, optional) - Show full threads (default: false)
 - `show_replies` (boolean, optional) - Show all replies/subthreads (default: false, mutually exclusive with show_thread)
 
@@ -327,6 +411,8 @@ Semantic vector search for similar lore emails. Same functionality as the query 
 - `symbols_patterns` (array of strings, optional) - Symbols filters
 - `recipients_patterns` (array of strings, optional) - Recipients/To/Cc filters
 - `limit` (number, optional) - Maximum results (default: 20, max: 100)
+- `since_date` (string, optional) - Only show emails from this date onwards (see Date Filtering section below)
+- `until_date` (string, optional) - Only show emails up to this date (see Date Filtering section below)
 - `verbose` (boolean, optional) - Show full message bodies (default: false)
 
 **Prerequisites:**

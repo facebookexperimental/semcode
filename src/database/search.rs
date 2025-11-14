@@ -3262,8 +3262,18 @@ impl VectorSearchManager {
         body_patterns: Option<&[String]>,
         symbols_patterns: Option<&[String]>,
         recipients_patterns: Option<&[String]>,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
-        let has_filters = from_patterns.is_some()
+        tracing::info!(
+            "vlore: search_similar_lore_emails called with since_date={:?}, until_date={:?}",
+            since_date,
+            until_date
+        );
+
+        // Separate field filters from date filters
+        // Field filters affect which emails to search (FTS/regex), date filters affect final results
+        let has_field_filters = from_patterns.is_some()
             || subject_patterns.is_some()
             || body_patterns.is_some()
             || symbols_patterns.is_some()
@@ -3272,14 +3282,50 @@ impl VectorSearchManager {
         let lore_vectors_table = self.connection.open_table("lore_vectors").execute().await?;
         let lore_table = self.connection.open_table("lore").execute().await?;
 
-        // No filters: simple vector search
-        if !has_filters {
+        // Build date filter clause if needed
+        let date_filter = match (since_date, until_date) {
+            (Some(since), Some(until)) => {
+                let escaped_since = since.replace("'", "''");
+                let escaped_until = until.replace("'", "''");
+                Some(format!(
+                    "date >= '{}' AND date <= '{}'",
+                    escaped_since, escaped_until
+                ))
+            }
+            (Some(since), None) => {
+                let escaped_since = since.replace("'", "''");
+                Some(format!("date >= '{}'", escaped_since))
+            }
+            (None, Some(until)) => {
+                let escaped_until = until.replace("'", "''");
+                Some(format!("date <= '{}'", escaped_until))
+            }
+            (None, None) => None,
+        };
+
+        if let Some(ref filter) = date_filter {
+            tracing::info!(
+                "vlore: Date filter will be applied during email fetch: {}",
+                filter
+            );
+        }
+
+        // No field filters (but may have date filter): simple vector search
+        if !has_field_filters {
+            // Note: LanceDB vector search on lore_vectors table doesn't have date column
+            // We must fetch more candidates and filter in fetch_emails_by_ids
+            let fetch_multiplier = if date_filter.is_some() {
+                50 // Significantly increase to ensure we get enough results after date filtering
+            } else {
+                2
+            };
+
             let vector_results = lore_vectors_table
                 .query()
                 .nearest_to(query_vector)?
                 .refine_factor(5)
                 .nprobes(10)
-                .limit(limit * 2)
+                .limit(limit * fetch_multiplier)
                 .execute()
                 .await?
                 .try_collect::<Vec<_>>()
@@ -3309,7 +3355,14 @@ impl VectorSearchManager {
             }
 
             return self
-                .fetch_emails_by_ids(&message_ids, &score_map, lore_table, limit)
+                .fetch_emails_by_ids(
+                    &message_ids,
+                    &score_map,
+                    lore_table,
+                    limit,
+                    since_date,
+                    until_date,
+                )
                 .await;
         }
 
@@ -3426,7 +3479,14 @@ impl VectorSearchManager {
                 .collect();
 
             let fetched_emails = self
-                .fetch_emails_by_ids(&ids_to_fetch, &score_map, lore_table.clone(), limit)
+                .fetch_emails_by_ids(
+                    &ids_to_fetch,
+                    &score_map,
+                    lore_table.clone(),
+                    limit,
+                    since_date,
+                    until_date,
+                )
                 .await?;
 
             final_results.extend(fetched_emails);
@@ -3461,9 +3521,27 @@ impl VectorSearchManager {
         score_map: &HashMap<String, f32>,
         lore_table: lancedb::Table,
         limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
         let mut results = Vec::new();
         let chunk_size = 500;
+
+        // Parse filter dates once (they're in RFC 2822 format)
+        let since_datetime = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_datetime = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        tracing::info!(
+            "fetch_emails_by_ids: Processing {} message_ids, limit={}, since={:?}, until={:?}",
+            message_ids.len(),
+            limit,
+            since_datetime,
+            until_datetime
+        );
 
         for chunk in message_ids.chunks(chunk_size) {
             if results.len() >= limit {
@@ -3474,7 +3552,11 @@ impl VectorSearchManager {
                 .iter()
                 .map(|id| format!("message_id = '{}'", id.replace("'", "''")))
                 .collect();
-            let filter = conditions.join(" OR ");
+            let filter = format!("({})", conditions.join(" OR "));
+
+            // Note: We do NOT use SQL date filtering because RFC 2822 dates are not
+            // comparable as strings. We'll filter in Rust after fetching.
+            tracing::info!("vlore: Fetching emails with filter: {}", filter);
 
             let batches = lore_table
                 .query()
@@ -3547,7 +3629,53 @@ impl VectorSearchManager {
                     }
 
                     let message_id = message_id_array.value(i).to_string();
+                    let email_date_str = date_array.value(i).to_string();
                     let similarity = score_map.get(&message_id).copied().unwrap_or(0.0);
+
+                    // Parse email date for filtering (dates are in RFC 2822 format)
+                    let email_datetime = match chrono::DateTime::parse_from_rfc2822(&email_date_str)
+                    {
+                        Ok(dt) => dt.with_timezone(&chrono::Utc),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse email date '{}': {}, skipping",
+                                email_date_str,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Apply date filtering in Rust (proper temporal comparison)
+                    if let Some(since) = since_datetime {
+                        if email_datetime < since {
+                            tracing::debug!(
+                                "Email {} dated {} is before since filter {}, skipping",
+                                message_id,
+                                email_datetime,
+                                since
+                            );
+                            continue;
+                        }
+                    }
+                    if let Some(until) = until_datetime {
+                        if email_datetime > until {
+                            tracing::debug!(
+                                "Email {} dated {} is after until filter {}, skipping",
+                                message_id,
+                                email_datetime,
+                                until
+                            );
+                            continue;
+                        }
+                    }
+
+                    tracing::info!(
+                        "vlore: Including email message_id={} date={} similarity={}",
+                        message_id,
+                        email_date_str,
+                        similarity
+                    );
 
                     // Parse JSON symbols array
                     let symbols_json = symbols_array.value(i);
@@ -3559,7 +3687,7 @@ impl VectorSearchManager {
                             git_commit_sha: git_commit_sha_array.value(i).to_string(),
                             message_id,
                             from: from_array.value(i).to_string(),
-                            date: date_array.value(i).to_string(),
+                            date: email_date_str,
                             subject: subject_array.value(i).to_string(),
                             in_reply_to: if in_reply_to_array.is_null(i) {
                                 None

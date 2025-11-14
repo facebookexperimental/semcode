@@ -968,6 +968,8 @@ impl DatabaseManager {
         body_patterns: Option<&[String]>,
         symbols_patterns: Option<&[String]>,
         recipients_patterns: Option<&[String]>,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
         self.vector_search_manager
             .search_similar_lore_emails(
@@ -978,6 +980,8 @@ impl DatabaseManager {
                 body_patterns,
                 symbols_patterns,
                 recipients_patterns,
+                since_date,
+                until_date,
             )
             .await
     }
@@ -3701,9 +3705,27 @@ impl DatabaseManager {
         field: &str,
         pattern: &str,
         limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<Vec<crate::types::LoreEmailInfo>> {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
+
+        // Parse filter dates once (they're in RFC 2822 format)
+        let since_datetime = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_datetime = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        tracing::info!(
+            "lore search: field='{}' pattern='{}' since={:?} until={:?}",
+            field,
+            pattern,
+            since_datetime,
+            until_datetime
+        );
 
         let table = self.connection.open_table("lore").execute().await?;
 
@@ -3808,6 +3830,44 @@ impl DatabaseManager {
                     // Apply regex filter (case-insensitive for better matching)
                     if !regex.is_match(field_value) {
                         continue;
+                    }
+
+                    // Apply date filtering with proper temporal comparison
+                    let email_date_str = dates.value(i);
+                    let email_datetime = match chrono::DateTime::parse_from_rfc2822(email_date_str)
+                    {
+                        Ok(dt) => dt.with_timezone(&chrono::Utc),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse email date '{}': {}, skipping",
+                                email_date_str,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    if let Some(since) = since_datetime {
+                        if email_datetime < since {
+                            tracing::debug!(
+                                "Email {} dated {} is before since filter {}, skipping",
+                                message_ids.value(i),
+                                email_datetime,
+                                since
+                            );
+                            continue;
+                        }
+                    }
+                    if let Some(until) = until_datetime {
+                        if email_datetime > until {
+                            tracing::debug!(
+                                "Email {} dated {} is after until filter {}, skipping",
+                                message_ids.value(i),
+                                email_datetime,
+                                until
+                            );
+                            continue;
+                        }
                     }
 
                     // Check limit
@@ -4104,6 +4164,8 @@ impl DatabaseManager {
         &self,
         field_patterns: Vec<(&str, &str)>,
         limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<Vec<crate::types::LoreEmailInfo>> {
         use std::collections::HashMap;
 
@@ -4143,12 +4205,62 @@ impl DatabaseManager {
             return Ok(Vec::new());
         }
 
+        // Parse filter dates once (they're in RFC 2822 format)
+        let since_datetime = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_datetime = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        tracing::info!(
+            "lore multi_field search: since={:?} until={:?}",
+            since_datetime,
+            until_datetime
+        );
+
         // Fetch full email records for the intersection
         let mut final_emails = Vec::new();
         let count_limit = if limit > 0 { limit } else { intersection.len() };
 
         for message_id in intersection.iter().take(count_limit) {
             if let Some(email) = self.get_lore_email_by_message_id(message_id).await? {
+                // Apply date filtering with proper temporal comparison
+                let email_datetime = match chrono::DateTime::parse_from_rfc2822(&email.date) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse email date '{}': {}, skipping",
+                            email.date,
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                if let Some(since) = since_datetime {
+                    if email_datetime < since {
+                        tracing::debug!(
+                            "Email {} dated {} is before since filter {}, skipping",
+                            email.message_id,
+                            email_datetime,
+                            since
+                        );
+                        continue;
+                    }
+                }
+                if let Some(until) = until_datetime {
+                    if email_datetime > until {
+                        tracing::debug!(
+                            "Email {} dated {} is after until filter {}, skipping",
+                            email.message_id,
+                            email_datetime,
+                            until
+                        );
+                        continue;
+                    }
+                }
+
                 final_emails.push(email);
             } else {
                 tracing::warn!("Message ID in intersection not found: {}", message_id);
@@ -4398,9 +4510,19 @@ impl DatabaseManager {
         &self,
         subject: &str,
         limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<Vec<crate::types::LoreEmailInfo>> {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
+
+        // Parse filter dates once (they're in RFC 2822 format)
+        let since_datetime = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_datetime = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
 
         // Escape SQL string literal
         let escaped_subject = subject.replace("'", "''");
@@ -4497,6 +4619,35 @@ impl DatabaseManager {
                     body: bodies.value(i).to_string(),
                     symbols,
                 };
+
+                // Apply date filtering (dates are in RFC 2822 format)
+                if since_datetime.is_some() || until_datetime.is_some() {
+                    let email_date_str = &email.date;
+                    let email_datetime = match chrono::DateTime::parse_from_rfc2822(email_date_str)
+                    {
+                        Ok(dt) => dt.with_timezone(&chrono::Utc),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse email date '{}': {}",
+                                email_date_str,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    if let Some(since) = since_datetime {
+                        if email_datetime < since {
+                            continue;
+                        }
+                    }
+                    if let Some(until) = until_datetime {
+                        if email_datetime > until {
+                            continue;
+                        }
+                    }
+                }
+
                 emails.push(email);
             }
         }
