@@ -10,25 +10,71 @@ use crate::types::{FieldInfo, FunctionInfo, GlobalTypeRegistry, ParameterInfo, T
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
 
-pub struct TreeSitterAnalyzer {
-    parser: Parser,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    C,
+    Rust,
+}
+
+impl Language {
+    /// Detect language from file extension
+    pub fn from_path(path: &Path) -> Option<Self> {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(|ext| match ext {
+                "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" => Some(Language::C),
+                "rs" => Some(Language::Rust),
+                _ => None,
+            })
+    }
+}
+
+struct LanguageQueries {
     function_query: Query,
     comment_query: Query,
     type_query: Query,
-    typedef_query: Query,
+    typedef_query: Option<Query>, // Not needed for Rust
     macro_query: Query,
     call_query: Query,
 }
 
+pub struct TreeSitterAnalyzer {
+    c_parser: Parser,
+    rust_parser: Parser,
+    c_queries: LanguageQueries,
+    rust_queries: LanguageQueries,
+}
+
 impl TreeSitterAnalyzer {
     pub fn new() -> Result<Self> {
-        let language = tree_sitter_c::LANGUAGE.into();
-        let mut parser = Parser::new();
-        parser.set_language(&language)?;
+        // Initialize C parser and queries
+        let c_language = tree_sitter_c::LANGUAGE.into();
+        let mut c_parser = Parser::new();
+        c_parser.set_language(&c_language)?;
 
+        // Initialize Rust parser and queries
+        let rust_language = tree_sitter_rust::LANGUAGE.into();
+        let mut rust_parser = Parser::new();
+        rust_parser.set_language(&rust_language)?;
+
+        // Create C queries
+        let c_queries = Self::create_c_queries(&c_language)?;
+
+        // Create Rust queries
+        let rust_queries = Self::create_rust_queries(&rust_language)?;
+
+        Ok(TreeSitterAnalyzer {
+            c_parser,
+            rust_parser,
+            c_queries,
+            rust_queries,
+        })
+    }
+
+    fn create_c_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
         // Query for function definitions - handles both regular and inline functions
         let function_query = Query::new(
-            &language,
+            language,
             r#"
             ; Standard function definitions with bodies
             (function_definition
@@ -136,7 +182,7 @@ impl TreeSitterAnalyzer {
 
         // Query for function calls
         let call_query = Query::new(
-            &language,
+            language,
             r#"
             (call_expression
                 function: (identifier) @function_name
@@ -150,12 +196,86 @@ impl TreeSitterAnalyzer {
         "#,
         )?;
 
-        Ok(TreeSitterAnalyzer {
-            parser,
+        Ok(LanguageQueries {
             function_query,
             comment_query,
             type_query,
-            typedef_query,
+            typedef_query: Some(typedef_query),
+            macro_query,
+            call_query,
+        })
+    }
+
+    fn create_rust_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // Query for function definitions
+        let function_query = Query::new(
+            language,
+            r#"
+            (function_item
+                name: (identifier) @function_name
+                parameters: (parameters) @parameters
+                return_type: (_)? @return_type
+                body: (block)? @body
+            ) @function
+        "#,
+        )?;
+
+        // Query for comments
+        let comment_query = Query::new(
+            language,
+            r#"
+            (line_comment) @comment
+            (block_comment) @comment
+        "#,
+        )?;
+
+        // Query for struct/enum definitions
+        let type_query = Query::new(
+            language,
+            r#"
+            (struct_item
+                name: (type_identifier) @type_name
+                body: (field_declaration_list)? @body
+            ) @struct
+
+            (enum_item
+                name: (type_identifier) @type_name
+                body: (enum_variant_list)? @body
+            ) @enum
+        "#,
+        )?;
+
+        // Query for macro definitions (Rust macros)
+        let macro_query = Query::new(
+            language,
+            r#"
+            (macro_definition
+                name: (identifier) @macro_name
+            ) @macro
+        "#,
+        )?;
+
+        // Query for function calls
+        let call_query = Query::new(
+            language,
+            r#"
+            (call_expression
+                function: (identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (field_expression
+                    field: (field_identifier) @function_name
+                )
+            ) @method_call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None, // Rust doesn't have typedefs like C
             macro_query,
             call_query,
         })
@@ -173,6 +293,22 @@ impl TreeSitterAnalyzer {
         }
     }
 
+    /// Get the appropriate parser for a language
+    fn get_parser(&mut self, language: Language) -> &mut Parser {
+        match language {
+            Language::C => &mut self.c_parser,
+            Language::Rust => &mut self.rust_parser,
+        }
+    }
+
+    /// Get the appropriate queries for a language
+    fn get_queries(&self, language: Language) -> &LanguageQueries {
+        match language {
+            Language::C => &self.c_queries,
+            Language::Rust => &self.rust_queries,
+        }
+    }
+
     pub fn analyze_file(
         &mut self,
         file_path: &Path,
@@ -185,9 +321,13 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         source_root: Option<&Path>,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+        // Detect language from file extension
+        let language = Language::from_path(file_path)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
+
         let source_code = std::fs::read_to_string(file_path)?;
-        let tree = self
-            .parser
+        let parser = self.get_parser(language);
+        let tree = parser
             .parse(&source_code, None)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse file: {}", file_path.display()))?;
 
@@ -205,6 +345,7 @@ impl TreeSitterAnalyzer {
             file_path,
             &git_hash,
             source_root,
+            language,
         )?);
 
         // Extract types
@@ -214,16 +355,19 @@ impl TreeSitterAnalyzer {
             file_path,
             &git_hash,
             source_root,
+            language,
         )?);
 
-        // Extract typedefs as TypeInfo with kind="typedef" and add to types
-        raw_types.extend(self.extract_typedefs_as_typeinfo(
-            &tree,
-            &source_code,
-            file_path,
-            &git_hash,
-            source_root,
-        )?);
+        // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
+        if language == Language::C {
+            raw_types.extend(self.extract_typedefs_as_typeinfo(
+                &tree,
+                &source_code,
+                file_path,
+                &git_hash,
+                source_root,
+            )?);
+        }
 
         // Extract macros
         raw_macros.extend(self.extract_macros(
@@ -232,6 +376,7 @@ impl TreeSitterAnalyzer {
             file_path,
             &git_hash,
             source_root,
+            language,
         )?);
 
         // Call relationships are now embedded in function/macro JSON columns during parsing
@@ -246,8 +391,10 @@ impl TreeSitterAnalyzer {
 
     /// Parse a code snippet and extract function definitions
     pub fn analyze_code_snippet(&mut self, code: &str) -> Result<Vec<FunctionInfo>> {
-        let tree = self
-            .parser
+        // Default to C language for code snippets (can be enhanced to accept language parameter)
+        let language = Language::C;
+        let parser = self.get_parser(language);
+        let tree = parser
             .parse(code, None)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse code snippet"))?;
 
@@ -255,7 +402,7 @@ impl TreeSitterAnalyzer {
         let dummy_path = Path::new("snippet.c");
         let git_hash = crate::hash::compute_content_hash(code);
         // No git SHA for code snippets
-        self.extract_functions(&tree, code, dummy_path, &git_hash, None)
+        self.extract_functions(&tree, code, dummy_path, &git_hash, None, language)
     }
 
     /// Analyze source code directly with specified file path and git hash
@@ -267,7 +414,12 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
-        let tree = self.parser.parse(source_code, None).ok_or_else(|| {
+        // Detect language from file extension
+        let language = Language::from_path(file_path)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
+
+        let parser = self.get_parser(language);
+        let tree = parser.parse(source_code, None).ok_or_else(|| {
             anyhow::anyhow!("Failed to parse source code for: {}", file_path.display())
         })?;
 
@@ -278,16 +430,19 @@ impl TreeSitterAnalyzer {
             file_path,
             git_hash,
             source_root,
+            language,
         )?;
 
-        // Extract typedefs as TypeInfo with kind="typedef" and add to types
-        raw_types.extend(self.extract_typedefs_as_typeinfo(
-            &tree,
-            source_code,
-            file_path,
-            git_hash,
-            source_root,
-        )?);
+        // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
+        if language == Language::C {
+            raw_types.extend(self.extract_typedefs_as_typeinfo(
+                &tree,
+                source_code,
+                file_path,
+                git_hash,
+                source_root,
+            )?);
+        }
 
         // Perform intra-file deduplication (no thread contention since this is per-file)
         let functions = self.deduplicate_functions_within_file(raw_functions);
@@ -308,9 +463,10 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
+        language: Language,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         // Single pass: extract all calls once and map them to functions by byte ranges
-        let all_calls = self.extract_all_calls_optimized(tree, source_code)?;
+        let all_calls = self.extract_all_calls_optimized(tree, source_code, language)?;
 
         // Extract functions with embedded call data
         let functions = self.extract_functions_with_calls(
@@ -320,10 +476,18 @@ impl TreeSitterAnalyzer {
             git_hash,
             source_root,
             &all_calls,
+            language,
         )?;
 
         // Extract types (single traversal as before)
-        let types = self.extract_types(tree, source_code, file_path, git_hash, source_root)?;
+        let types = self.extract_types(
+            tree,
+            source_code,
+            file_path,
+            git_hash,
+            source_root,
+            language,
+        )?;
 
         // Extract macros with embedded data (single traversal)
         let macros = self.extract_macros_with_embedded_data(
@@ -332,6 +496,7 @@ impl TreeSitterAnalyzer {
             file_path,
             git_hash,
             source_root,
+            language,
         )?;
 
         Ok((functions, types, macros))
@@ -342,15 +507,20 @@ impl TreeSitterAnalyzer {
         &self,
         tree: &Tree,
         source_code: &str,
+        language: Language,
     ) -> Result<Vec<(String, usize, usize)>> {
+        let queries = self.get_queries(language);
         let mut calls = Vec::new();
         let mut cursor = QueryCursor::new();
-        let mut captures =
-            cursor.captures(&self.call_query, tree.root_node(), source_code.as_bytes());
+        let mut captures = cursor.captures(
+            &queries.call_query,
+            tree.root_node(),
+            source_code.as_bytes(),
+        );
 
         while let Some((call_match, _)) = captures.next() {
             for capture in call_match.captures {
-                let capture_name = &self.call_query.capture_names()[capture.index as usize];
+                let capture_name = &queries.call_query.capture_names()[capture.index as usize];
 
                 if *capture_name == "function_name" {
                     let node = capture.node;
@@ -379,14 +549,16 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         all_calls: &[(String, usize, usize)],
+        language: Language,
     ) -> Result<Vec<FunctionInfo>> {
+        let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         let mut captures =
-            cursor.captures(&self.function_query, tree.root_node(), source.as_bytes());
+            cursor.captures(&queries.function_query, tree.root_node(), source.as_bytes());
         let mut functions = Vec::new();
 
         // Extract all comments once (used by extract_function_with_comments)
-        let comments = self.extract_comments(tree, source)?;
+        let comments = self.extract_comments(tree, source, language)?;
 
         while let Some((m, _)) = captures.next() {
             let mut function_name = None;
@@ -400,7 +572,7 @@ impl TreeSitterAnalyzer {
             for capture in m.captures {
                 let node = capture.node;
                 let text = &source[node.byte_range()];
-                let capture_name = self.function_query.capture_names()[capture.index as usize];
+                let capture_name = queries.function_query.capture_names()[capture.index as usize];
 
                 match capture_name {
                     "function_name" => {
@@ -467,7 +639,8 @@ impl TreeSitterAnalyzer {
                 // Track which capture patterns were matched to determine if function has body
                 let mut matched_patterns = std::collections::HashSet::new();
                 for capture in m.captures {
-                    let capture_name = self.function_query.capture_names()[capture.index as usize];
+                    let capture_name =
+                        queries.function_query.capture_names()[capture.index as usize];
                     matched_patterns.insert(capture_name);
                 }
 
@@ -575,10 +748,11 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
+        language: Language,
     ) -> Result<Vec<FunctionInfo>> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
-        self.extract_macros(tree, source, file_path, git_hash, source_root)
+        self.extract_macros(tree, source, file_path, git_hash, source_root, language)
     }
 
     /// Legacy extract_functions method for backward compatibility with older analyze methods
@@ -589,9 +763,10 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
+        language: Language,
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
-        let all_calls = self.extract_all_calls_optimized(tree, source)?;
+        let all_calls = self.extract_all_calls_optimized(tree, source, language)?;
         self.extract_functions_with_calls(
             tree,
             source,
@@ -599,13 +774,20 @@ impl TreeSitterAnalyzer {
             git_hash,
             source_root,
             &all_calls,
+            language,
         )
     }
 
-    fn extract_comments(&self, tree: &Tree, source: &str) -> Result<Vec<(u32, u32, String)>> {
+    fn extract_comments(
+        &self,
+        tree: &Tree,
+        source: &str,
+        language: Language,
+    ) -> Result<Vec<(u32, u32, String)>> {
+        let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         let mut captures =
-            cursor.captures(&self.comment_query, tree.root_node(), source.as_bytes());
+            cursor.captures(&queries.comment_query, tree.root_node(), source.as_bytes());
         let mut comments = Vec::new();
 
         while let Some((m, _)) = captures.next() {
@@ -694,13 +876,16 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
+        language: Language,
     ) -> Result<Vec<TypeInfo>> {
+        let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
-        let mut captures = cursor.captures(&self.type_query, tree.root_node(), source.as_bytes());
+        let mut captures =
+            cursor.captures(&queries.type_query, tree.root_node(), source.as_bytes());
         let mut types = Vec::new();
 
         // Extract all comments with their positions
-        let comments = self.extract_comments(tree, source)?;
+        let comments = self.extract_comments(tree, source, language)?;
 
         while let Some((m, _)) = captures.next() {
             let mut type_name = None;
@@ -713,7 +898,7 @@ impl TreeSitterAnalyzer {
             for capture in m.captures {
                 let node = capture.node;
                 let text = &source[node.byte_range()];
-                let capture_name = self.type_query.capture_names()[capture.index as usize];
+                let capture_name = queries.type_query.capture_names()[capture.index as usize];
 
                 match capture_name {
                     "type_name" => {
@@ -794,9 +979,15 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
     ) -> Result<Vec<TypeInfo>> {
+        // This is C-specific, so always use C queries
+        let queries = &self.c_queries;
+        let typedef_query = queries
+            .typedef_query
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No typedef query available for this language"))?;
+
         let mut cursor = QueryCursor::new();
-        let mut captures =
-            cursor.captures(&self.typedef_query, tree.root_node(), source.as_bytes());
+        let mut captures = cursor.captures(typedef_query, tree.root_node(), source.as_bytes());
         let mut typedef_types = Vec::new();
 
         while let Some((m, _)) = captures.next() {
@@ -809,7 +1000,7 @@ impl TreeSitterAnalyzer {
             for capture in m.captures {
                 let node = capture.node;
                 let text = &source[node.byte_range()];
-                let capture_name = self.typedef_query.capture_names()[capture.index as usize];
+                let capture_name = typedef_query.capture_names()[capture.index as usize];
 
                 match capture_name {
                     "typedef_name" => {
@@ -951,9 +1142,12 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
+        language: Language,
     ) -> Result<Vec<FunctionInfo>> {
+        let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
-        let mut captures = cursor.captures(&self.macro_query, tree.root_node(), source.as_bytes());
+        let mut captures =
+            cursor.captures(&queries.macro_query, tree.root_node(), source.as_bytes());
         let mut macros = Vec::new();
 
         while let Some((m, _)) = captures.next() {
@@ -966,7 +1160,7 @@ impl TreeSitterAnalyzer {
             for capture in m.captures {
                 let node = capture.node;
                 let text = &source[node.byte_range()];
-                let capture_name = self.macro_query.capture_names()[capture.index as usize];
+                let capture_name = queries.macro_query.capture_names()[capture.index as usize];
 
                 match capture_name {
                     "macro_name" => {

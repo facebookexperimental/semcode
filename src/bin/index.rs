@@ -28,7 +28,7 @@ struct Args {
     database: Option<String>,
 
     /// File extensions to process (can be specified multiple times)
-    #[arg(short, long, value_delimiter = ',', default_value = "c,h")]
+    #[arg(short, long, value_delimiter = ',', default_value = "c,h,rs")]
     extensions: Vec<String>,
 
     /// Include directories (can be specified multiple times)
