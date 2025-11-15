@@ -12,6 +12,18 @@ We actively welcome your pull requests.
 5. Make sure your code lints.
 6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
+## Kernel Style DCO contributions
+This project is aimed at the kernel community, and they use the developer 
+certificate of origin instead of CLAs like the one described below.
+
+The DCO is defined here:
+https://developercertificate.org/
+
+If you'd like to use a DCO instead of completing the CLA, please
+send your pull request through:
+
+https://github.com/masoncl/semcode-devel
+
 ## Contributor License Agreement ("CLA")
 In order to accept your pull request, we need you to submit a CLA. You only need
 to do this once to work on any of Facebook's open source projects.

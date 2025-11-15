@@ -306,3 +306,15 @@ Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
 
+## Kernel Style DCO contributions
+This project is aimed at the kernel community, and they use the developer
+certificate of origin instead of CLAs.
+
+The DCO is defined here:
+https://developercertificate.org/
+
+If you'd like to use a DCO instead of completing the CLA on this repository, please
+send your pull request through:
+
+https://github.com/masoncl/semcode-devel
+
