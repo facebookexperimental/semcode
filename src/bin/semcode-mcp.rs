@@ -1942,6 +1942,18 @@ struct LoreSearchParams<'a> {
     until_date: Option<&'a str>,
 }
 
+/// Parameters for dig lore by commit operations
+struct DigLoreParams<'a> {
+    commit_ish: &'a str,
+    git_repo_path: &'a str,
+    verbose: usize,
+    show_all: bool,
+    show_thread: bool,
+    show_replies: bool,
+    since_date: Option<&'a str>,
+    until_date: Option<&'a str>,
+}
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
@@ -3304,19 +3316,17 @@ impl McpServer {
 
         let git_repo_path = "."; // MCP server typically runs in the repo directory
 
-        match mcp_dig_lore_by_commit(
-            &self.db,
-            commit,
+        let params = DigLoreParams {
+            commit_ish: commit,
             git_repo_path,
             verbose,
             show_all,
             show_thread,
             show_replies,
-            since_date.as_deref(),
-            until_date.as_deref(),
-        )
-        .await
-        {
+            since_date: since_date.as_deref(),
+            until_date: until_date.as_deref(),
+        };
+        match mcp_dig_lore_by_commit(&self.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -4001,33 +4011,25 @@ async fn mcp_lore_search_multi_field(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 /// Search for lore emails related to a git commit (dig command)
-#[allow(clippy::too_many_arguments)]
 async fn mcp_dig_lore_by_commit(
     db: &DatabaseManager,
-    commit_ish: &str,
-    git_repo_path: &str,
-    verbose: usize,
-    show_all: bool,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    params: &DigLoreParams<'_>,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
     // Use shared writer function for consistent behavior with CLI
     let options = LoreSearchOptions {
-        verbose,
-        show_thread,
-        show_replies,
-        since_date,
-        until_date,
+        verbose: params.verbose,
+        show_thread: params.show_thread,
+        show_replies: params.show_replies,
+        since_date: params.since_date,
+        until_date: params.until_date,
     };
     semcode::lore_writers::dig_lore_by_commit_to_writer(
         db,
-        commit_ish,
-        git_repo_path,
-        show_all,
+        params.commit_ish,
+        params.git_repo_path,
+        params.show_all,
         &options,
         &mut buffer,
     )
