@@ -786,7 +786,6 @@ async fn run_commits_only(args: Args) -> Result<()> {
 }
 
 /// Process commits using a streaming pipeline
-
 async fn run_pipeline(args: Args) -> Result<()> {
     info!("Starting Tree-sitter pipeline processing");
 

@@ -247,6 +247,7 @@ fn process_git_file_tuple_with_repo(
 }
 
 /// Worker function that processes tuples from a shared channel and sends batches to inserters
+#[allow(clippy::too_many_arguments)]
 fn tuple_worker_shared(
     worker_id: usize,
     shared_tuple_rx: Arc<std::sync::Mutex<mpsc::Receiver<GitFileTuple>>>,
@@ -260,9 +261,7 @@ fn tuple_worker_shared(
 ) {
     // Open repository ONCE per worker and convert to thread-safe version for sharing across rayon threads
     let thread_safe_repo = match gix::discover(&repo_path) {
-        Ok(repo) => match repo.into_sync() {
-            repo_sync => repo_sync,
-        },
+        Ok(repo) => repo.into_sync(),
         Err(e) => {
             tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
             return;
@@ -394,6 +393,7 @@ fn tuple_worker_shared(
 }
 
 /// Process git file tuples using streaming pipeline with database inserters
+#[allow(clippy::too_many_arguments)]
 async fn process_git_tuples_streaming(
     repo_path: PathBuf,
     git_range: String,
@@ -706,7 +706,6 @@ async fn process_git_tuples_streaming(
 }
 
 /// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
-
 /// Process git range using streaming file tuple pipeline
 /// This is the shared implementation used by semcode-index, query, and MCP tools
 pub async fn process_git_range(

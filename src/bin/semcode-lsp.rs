@@ -11,17 +11,9 @@ use url::Url;
 
 use semcode::{database_utils, DatabaseManager};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct SemcodeLspConfig {
     database_path: Option<String>,
-}
-
-impl Default for SemcodeLspConfig {
-    fn default() -> Self {
-        Self {
-            database_path: None,
-        }
-    }
 }
 
 pub struct SemcodeLspBackend {
@@ -420,7 +412,7 @@ async fn main() -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| SemcodeLspBackend::new(client));
+    let (service, socket) = LspService::new(SemcodeLspBackend::new);
 
     Server::new(stdin, stdout, socket).serve(service).await;
 

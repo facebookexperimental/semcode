@@ -6,6 +6,7 @@ use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 
+use crate::search::LoreSearchOptions;
 use crate::DatabaseManager;
 
 /// Sort emails by date (oldest first) using RFC 2822 date parsing
@@ -148,6 +149,7 @@ pub async fn lore_show_replies_to_writer(
     verbose: usize,
     writer: &mut dyn Write,
 ) -> Result<()> {
+    #[allow(unused)] // verbose is used in conditional compilation
     use std::collections::{HashSet, VecDeque};
 
     writeln!(writer, "Finding all replies to message: {}", message_id)?;
@@ -239,9 +241,7 @@ pub async fn lore_show_replies_to_writer(
 pub async fn lore_get_by_message_id_to_writer(
     db: &DatabaseManager,
     message_id: &str,
-    verbose: usize,
-    show_thread: bool,
-    show_replies: bool,
+    options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(writer, "Looking up email with message_id: {}\n", message_id)?;
@@ -250,12 +250,12 @@ pub async fn lore_get_by_message_id_to_writer(
 
     match email_opt {
         Some(email) => {
-            if show_thread {
+            if options.show_thread {
                 // Show the full thread for this message
-                lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
-            } else if show_replies {
+                lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
+            } else if options.show_replies {
                 // Show only replies/descendants
-                lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
+                lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
             } else {
                 // Show just this single message
                 writeln!(writer, "Email found:\n")?;
@@ -275,12 +275,12 @@ pub async fn lore_get_by_message_id_to_writer(
                     writeln!(writer, "   Recipients: {}", email.recipients)?;
                 }
 
-                if verbose >= 1 {
-                    writeln!(writer, "\n{}", "   --- Message Body ---")?;
+                if options.verbose >= 1 {
+                    writeln!(writer, "\n   --- Message Body ---")?;
                     for line in email.body.lines() {
                         writeln!(writer, "   {}", line)?;
                     }
-                    writeln!(writer, "{}", "   --- End Message ---")?;
+                    writeln!(writer, "   --- End Message ---")?;
                 }
             }
         }
@@ -302,11 +302,7 @@ pub async fn lore_search_with_thread_to_writer(
     field: &str,
     pattern: &str,
     limit: usize,
-    verbose: usize,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(
@@ -316,7 +312,13 @@ pub async fn lore_search_with_thread_to_writer(
     )?;
 
     let mut emails = db
-        .search_lore_emails(field, pattern, limit, since_date, until_date)
+        .search_lore_emails(
+            field,
+            pattern,
+            limit,
+            options.since_date,
+            options.until_date,
+        )
         .await?;
 
     if emails.is_empty() {
@@ -327,7 +329,7 @@ pub async fn lore_search_with_thread_to_writer(
     // Sort by date (oldest first)
     sort_emails_by_date(&mut emails);
 
-    if show_thread {
+    if options.show_thread {
         // Show full threads for all matching emails
         writeln!(
             writer,
@@ -340,12 +342,12 @@ pub async fn lore_search_with_thread_to_writer(
                 writeln!(writer, "\n{}\n", "=".repeat(80))?;
             }
             writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
-            lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
+            lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
         }
         return Ok(());
     }
 
-    if show_replies {
+    if options.show_replies {
         // Show replies for all matching emails
         writeln!(
             writer,
@@ -358,7 +360,7 @@ pub async fn lore_search_with_thread_to_writer(
                 writeln!(writer, "\n{}\n", "=".repeat(80))?;
             }
             writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
-            lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
+            lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
         }
         return Ok(());
     }
@@ -385,7 +387,7 @@ pub async fn lore_search_with_thread_to_writer(
         }
 
         // Show full message body only when verbose
-        if verbose >= 1 {
+        if options.verbose >= 1 {
             writeln!(writer, "\n   --- Message Body ---")?;
             // Body is already separated from headers
             for line in email.body.lines() {
@@ -413,11 +415,7 @@ pub async fn lore_search_multi_field_to_writer(
     db: &DatabaseManager,
     field_patterns: Vec<(&str, &str)>,
     limit: usize,
-    verbose: usize,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     writeln!(writer, "Searching lore emails with multiple filters:")?;
@@ -426,7 +424,12 @@ pub async fn lore_search_multi_field_to_writer(
     }
 
     let mut emails = db
-        .search_lore_emails_multi_field(field_patterns, limit, since_date, until_date)
+        .search_lore_emails_multi_field(
+            field_patterns,
+            limit,
+            options.since_date,
+            options.until_date,
+        )
         .await?;
 
     if emails.is_empty() {
@@ -437,7 +440,7 @@ pub async fn lore_search_multi_field_to_writer(
     // Sort by date (oldest first)
     sort_emails_by_date(&mut emails);
 
-    if show_thread {
+    if options.show_thread {
         // Show full threads for all matching emails
         writeln!(
             writer,
@@ -450,12 +453,12 @@ pub async fn lore_search_multi_field_to_writer(
                 writeln!(writer, "\n{}\n", "=".repeat(80))?;
             }
             writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
-            lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
+            lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
         }
         return Ok(());
     }
 
-    if show_replies {
+    if options.show_replies {
         // Show replies for all matching emails
         writeln!(
             writer,
@@ -468,7 +471,7 @@ pub async fn lore_search_multi_field_to_writer(
                 writeln!(writer, "\n{}\n", "=".repeat(80))?;
             }
             writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
-            lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
+            lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
         }
         return Ok(());
     }
@@ -495,7 +498,7 @@ pub async fn lore_search_multi_field_to_writer(
         }
 
         // Show full message body only when verbose
-        if verbose >= 1 {
+        if options.verbose >= 1 {
             writeln!(writer, "\n   --- Message Body ---")?;
             // Body is already separated from headers
             for line in email.body.lines() {
@@ -524,12 +527,8 @@ pub async fn dig_lore_by_commit_to_writer(
     db: &DatabaseManager,
     commit_ish: &str,
     git_repo_path: &str,
-    verbose: usize,
     show_all: bool,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     use crate::git;
@@ -544,10 +543,10 @@ pub async fn dig_lore_by_commit_to_writer(
     } else {
         writeln!(writer, "  (showing most recent match only)")?;
     }
-    if show_thread {
+    if options.show_thread {
         writeln!(writer, "  (with full threads)")?;
     }
-    if show_replies {
+    if options.show_replies {
         writeln!(writer, "  (with all replies)")?;
     }
 
@@ -602,7 +601,7 @@ pub async fn dig_lore_by_commit_to_writer(
 
     // Search lore emails by exact subject match (reuse database function)
     let emails = db
-        .search_lore_emails_by_subject(&subject, 100, since_date, until_date)
+        .search_lore_emails_by_subject(&subject, 100, options.since_date, options.until_date)
         .await?;
 
     if emails.is_empty() {
@@ -628,7 +627,7 @@ pub async fn dig_lore_by_commit_to_writer(
             sorted_emails.len()
         )?;
 
-        if show_thread {
+        if options.show_thread {
             // Show full threads
             for (idx, email) in sorted_emails.iter().enumerate() {
                 if idx > 0 {
@@ -641,9 +640,9 @@ pub async fn dig_lore_by_commit_to_writer(
                     sorted_emails.len(),
                     email.date
                 )?;
-                lore_show_thread_to_writer(db, &email.message_id, verbose, writer).await?;
+                lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
             }
-        } else if show_replies {
+        } else if options.show_replies {
             // Show all replies
             for (idx, email) in sorted_emails.iter().enumerate() {
                 if idx > 0 {
@@ -656,7 +655,7 @@ pub async fn dig_lore_by_commit_to_writer(
                     sorted_emails.len(),
                     email.date
                 )?;
-                lore_show_replies_to_writer(db, &email.message_id, verbose, writer).await?;
+                lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
             }
         } else {
             // Show summary of all matching emails
@@ -665,7 +664,7 @@ pub async fn dig_lore_by_commit_to_writer(
                 writeln!(writer, "   From: {}", email.from)?;
                 writeln!(writer, "   Message-ID: {}", email.message_id)?;
 
-                if verbose >= 1 {
+                if options.verbose >= 1 {
                     writeln!(writer, "\n   --- Message Body ---")?;
                     for line in email.body.lines() {
                         writeln!(writer, "   {}", line)?;
@@ -684,18 +683,20 @@ pub async fn dig_lore_by_commit_to_writer(
                 sorted_emails.len()
             )?;
 
-            if show_thread {
+            if options.show_thread {
                 writeln!(writer, "===> Most Recent Thread:")?;
-                lore_show_thread_to_writer(db, &most_recent.message_id, verbose, writer).await?;
-            } else if show_replies {
+                lore_show_thread_to_writer(db, &most_recent.message_id, options.verbose, writer)
+                    .await?;
+            } else if options.show_replies {
                 writeln!(writer, "===> Replies to Most Recent:")?;
-                lore_show_replies_to_writer(db, &most_recent.message_id, verbose, writer).await?;
+                lore_show_replies_to_writer(db, &most_recent.message_id, options.verbose, writer)
+                    .await?;
             } else {
                 writeln!(writer, "1. {} - {}", most_recent.date, most_recent.subject)?;
                 writeln!(writer, "   From: {}", most_recent.from)?;
                 writeln!(writer, "   Message-ID: {}", most_recent.message_id)?;
 
-                if verbose >= 1 {
+                if options.verbose >= 1 {
                     writeln!(writer, "\n   --- Message Body ---")?;
                     for line in most_recent.body.lines() {
                         writeln!(writer, "   {}", line)?;

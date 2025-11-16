@@ -14,10 +14,10 @@ pub struct DiffParseResult {
 }
 
 fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
+    if let Some(stripped) = path.strip_prefix("~/") {
         if let Some(home_dir) = std::env::var_os("HOME") {
             let home_path = Path::new(&home_dir);
-            return home_path.join(&path[2..]).to_string_lossy().to_string();
+            return home_path.join(stripped).to_string_lossy().to_string();
         }
     } else if path == "~" {
         if let Some(home_dir) = std::env::var_os("HOME") {
@@ -203,21 +203,21 @@ fn parse_hunk_with_walkback(
             break;
         }
 
-        if line.starts_with("+") {
+        if let Some(stripped) = line.strip_prefix("+") {
             // Added line - track as modified
-            hunk_lines.push(&line[1..]); // Remove + prefix
+            hunk_lines.push(stripped); // Remove + prefix
             modified_line_numbers.insert(current_line);
             current_line += 1;
 
             // Also extract function calls from added lines
-            let line_called_functions = extract_function_calls(&line[1..]);
+            let line_called_functions = extract_function_calls(stripped);
             called_functions.extend(line_called_functions);
-        } else if line.starts_with("-") {
+        } else if let Some(stripped) = line.strip_prefix("-") {
             // Removed line - track as modified but don't include in reconstructed code
             modified_line_numbers.insert(current_line);
 
             // Extract function calls from removed lines
-            let line_called_functions = extract_function_calls(&line[1..]);
+            let line_called_functions = extract_function_calls(stripped);
             called_functions.extend(line_called_functions);
             // Don't increment current_line for removed lines
         } else if !line.starts_with("@@") && !line.starts_with("---") && !line.starts_with("+++") {
@@ -241,9 +241,9 @@ fn parse_hunk_with_walkback(
 
         // Parse symbols and categorize them
         for symbol in symbols {
-            if symbol.starts_with('#') {
+            if let Some(stripped) = symbol.strip_prefix('#') {
                 // Macro: "#MACRO_NAME"
-                modified_macros.insert(symbol[1..].to_string());
+                modified_macros.insert(stripped.to_string());
             } else if symbol.contains("()") {
                 // Function: "function_name()"
                 modified_functions.insert(symbol.trim_end_matches("()").to_string());

@@ -738,7 +738,7 @@ pub fn get_commit_info_from_git<P: AsRef<Path>>(
 
             // Get commit message
             let message_bytes = commit.message_raw()?;
-            let message = String::from_utf8_lossy(&message_bytes).to_string();
+            let message = String::from_utf8_lossy(message_bytes).to_string();
 
             // Extract subject (first line of message)
             let subject = message.lines().next().unwrap_or("").to_string();

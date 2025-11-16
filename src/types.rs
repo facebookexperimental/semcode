@@ -18,19 +18,33 @@ pub struct FunctionInfo {
     pub types: Option<Vec<String>>, // Type names used by this function
 }
 
+/// Parameters for creating FunctionInfo from a macro
+#[derive(Debug, Clone)]
+pub struct MacroParams {
+    pub name: String,
+    pub file_path: String,
+    pub git_file_hash: String,
+    pub line_start: u32,
+    pub parameters: Vec<String>,
+    pub definition: String,
+    pub calls: Option<Vec<String>>,
+    pub types: Option<Vec<String>>,
+}
+
 impl FunctionInfo {
     /// Create a FunctionInfo for a function-like macro
     /// Macros are treated as functions with empty return types and untyped parameters
-    pub fn from_macro(
-        name: String,
-        file_path: String,
-        git_file_hash: String,
-        line_start: u32,
-        parameters: Vec<String>,
-        definition: String,
-        calls: Option<Vec<String>>,
-        types: Option<Vec<String>>,
-    ) -> Self {
+    pub fn from_macro(params: MacroParams) -> Self {
+        let MacroParams {
+            name,
+            file_path,
+            git_file_hash,
+            line_start,
+            parameters,
+            definition,
+            calls,
+            types,
+        } = params;
         // Convert simple parameter names to ParameterInfo structs
         let params = parameters
             .into_iter()

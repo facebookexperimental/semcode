@@ -38,7 +38,7 @@ pub use vectorizer::CodeVectorizer;
 
 // Re-export database types
 pub use database::calls::CallRelationship;
-pub use database::search::FunctionMatch;
+pub use database::search::{FunctionMatch, LoreEmailFilters};
 
 // Logging utilities
 pub mod logging {

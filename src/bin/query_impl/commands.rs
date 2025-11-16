@@ -3,7 +3,7 @@ use anstream::stdout;
 use anyhow::Result;
 use colored::*;
 use regex;
-use semcode::{git, DatabaseManager};
+use semcode::{git, DatabaseManager, LoreEmailFilters};
 
 use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
@@ -16,7 +16,7 @@ use semcode::search::{
     dump_calls, dump_content, dump_functions, dump_git_commits, dump_lore, dump_macros,
     dump_processed_files, dump_symbol_filename, dump_typedefs, dump_types, lore_get_by_message_id,
     lore_search_by_commit, lore_search_multi_field, lore_search_with_thread,
-    query_function_or_macro_verbose, query_type_or_typedef, show_tables,
+    query_function_or_macro_verbose, query_type_or_typedef, show_tables, LoreSearchOptions,
 };
 
 /// Parse a potential git SHA from command arguments or default to current HEAD
@@ -1305,15 +1305,19 @@ pub async fn handle_command(
                         None
                     };
 
+                    let options = LoreSearchOptions {
+                        verbose: verbose_level,
+                        show_thread,
+                        show_replies: false,
+                        since_date: since_date.as_deref(),
+                        until_date: until_date.as_deref(),
+                    };
                     lore_search_by_commit(
                         db,
                         commit_ish.unwrap(),
                         git_repo_path,
-                        verbose_level,
                         show_all,
-                        show_thread,
-                        since_date.as_deref(),
-                        until_date.as_deref(),
+                        &options,
                     )
                     .await?;
                 }
@@ -1530,15 +1534,14 @@ pub async fn handle_command(
                 // Handle -m flag for exact message_id lookup
                 if let Some(msg_id) = message_id {
                     if let Some(ref mut writer) = file_writer {
-                        lore_get_by_message_id_to_writer(
-                            db,
-                            &msg_id,
+                        let options = LoreSearchOptions {
                             verbose,
                             show_thread,
                             show_replies,
-                            writer,
-                        )
-                        .await?;
+                            since_date: None,
+                            until_date: None,
+                        };
+                        lore_get_by_message_id_to_writer(db, &msg_id, &options, writer).await?;
                     } else {
                         lore_get_by_message_id(db, &msg_id, verbose, show_thread, show_replies)
                             .await?;
@@ -1570,19 +1573,17 @@ pub async fn handle_command(
 
                     // Use multi-field search if multiple patterns, otherwise use single-field
                     if let Some(ref mut writer) = file_writer {
+                        let options = LoreSearchOptions {
+                            verbose,
+                            show_thread,
+                            show_replies,
+                            since_date: since_date.as_deref(),
+                            until_date: until_date.as_deref(),
+                        };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];
                             lore_search_with_thread_to_writer(
-                                db,
-                                field,
-                                pattern,
-                                limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
-                                writer,
+                                db, field, pattern, limit, &options, writer,
                             )
                             .await?;
                         } else {
@@ -1590,42 +1591,24 @@ pub async fn handle_command(
                                 db,
                                 field_patterns,
                                 limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
+                                &options,
                                 writer,
                             )
                             .await?;
                         }
                     } else {
+                        let options = LoreSearchOptions {
+                            verbose,
+                            show_thread,
+                            show_replies,
+                            since_date: since_date.as_deref(),
+                            until_date: until_date.as_deref(),
+                        };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];
-                            lore_search_with_thread(
-                                db,
-                                field,
-                                pattern,
-                                limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
-                            )
-                            .await?;
+                            lore_search_with_thread(db, field, pattern, limit, &options).await?;
                         } else {
-                            lore_search_multi_field(
-                                db,
-                                field_patterns,
-                                limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
-                            )
-                            .await?;
+                            lore_search_multi_field(db, field_patterns, limit, &options).await?;
                         }
                     }
                 }
@@ -2192,6 +2175,7 @@ async fn vgrep_similar_functions(
 }
 
 /// Search for commits similar to given query text using vector embeddings
+#[allow(clippy::too_many_arguments)]
 async fn vcommit_similar_commits(
     db: &DatabaseManager,
     query_text: &str,
@@ -2788,11 +2772,10 @@ async fn vcommit_similar_commits(
 
             for (i, (commit, similarity)) in final_results.iter().enumerate() {
                 println!(
-                    "\n{}. {} {} {}%",
+                    "\n{}. {} {} %",
                     (i + 1).to_string().yellow(),
                     "Similarity:".bold(),
-                    format!("{:.1}", similarity * 100.0).bright_green(),
-                    ""
+                    format!("{:.1}", similarity * 100.0).bright_green()
                 );
                 println!(
                     "   {} {}",
@@ -2861,6 +2844,7 @@ async fn vcommit_similar_commits(
 }
 
 /// Helper function for vlore that writes output to a generic writer
+#[allow(clippy::too_many_arguments)]
 async fn vlore_similar_emails(
     db: &DatabaseManager,
     query_text: &str,
@@ -2963,48 +2947,47 @@ async fn vlore_similar_emails(
 
     // Prepare filter patterns for database-level filtering
     let from_filter = if !from_patterns.is_empty() {
-        Some(&from_patterns[..])
+        Some(from_patterns)
     } else {
         None
     };
 
     let subject_filter = if !subject_patterns.is_empty() {
-        Some(&subject_patterns[..])
+        Some(subject_patterns)
     } else {
         None
     };
 
     let body_filter = if !body_patterns.is_empty() {
-        Some(&body_patterns[..])
+        Some(body_patterns)
     } else {
         None
     };
 
     let symbols_filter = if !symbols_patterns.is_empty() {
-        Some(&symbols_patterns[..])
+        Some(symbols_patterns)
     } else {
         None
     };
 
     let recipients_filter = if !recipients_patterns.is_empty() {
-        Some(&recipients_patterns[..])
+        Some(recipients_patterns)
     } else {
         None
     };
 
     // Search for similar lore emails with database-level filtering
+    let filters = LoreEmailFilters {
+        from_patterns: from_filter,
+        subject_patterns: subject_filter,
+        body_patterns: body_filter,
+        symbols_patterns: symbols_filter,
+        recipients_patterns: recipients_filter,
+        since_date,
+        until_date,
+    };
     match db
-        .search_similar_lore_emails(
-            &query_vector,
-            limit,
-            from_filter,
-            subject_filter,
-            body_filter,
-            symbols_filter,
-            recipients_filter,
-            since_date,
-            until_date,
-        )
+        .search_similar_lore_emails(&query_vector, limit, &filters)
         .await
     {
         Ok(results) if results.is_empty() => {
@@ -3303,6 +3286,7 @@ fn display_commit(commit: &semcode::GitCommitInfo, index: usize, verbose: bool) 
 }
 
 /// Show summary statistics for commit display
+#[allow(clippy::too_many_arguments)]
 fn show_commit_summary(
     total_commits: usize,
     matched_count: usize,
@@ -3420,6 +3404,7 @@ fn show_commit_summary(
 }
 
 /// Show all commits from database with optional filters
+#[allow(clippy::too_many_arguments)]
 async fn show_all_commits(
     db: &DatabaseManager,
     verbose: bool,
@@ -3573,6 +3558,7 @@ async fn show_all_commits(
 }
 
 /// Show metadata for a git commit
+#[allow(clippy::too_many_arguments)]
 async fn show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
@@ -3957,6 +3943,7 @@ async fn show_commit_metadata(
 }
 
 /// Show metadata for commits in a git range
+#[allow(clippy::too_many_arguments)]
 async fn show_commit_range(
     db: &DatabaseManager,
     range: &str,

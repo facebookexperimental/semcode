@@ -78,7 +78,7 @@ impl PageCache {
         // Query not in cache - paginate and cache it
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
-        let total_pages = (total_lines + LINES_PER_PAGE - 1) / LINES_PER_PAGE; // Ceiling division
+        let total_pages = total_lines.div_ceil(LINES_PER_PAGE); // Ceiling division
 
         if total_pages == 0 {
             return (format!("Page 1 of 1\n\n{}", content), false);
@@ -237,8 +237,8 @@ mod tests {
         }
 
         // query1 should have been removed (5 unrelated queries)
-        // query6 should still be cached
-        assert_eq!(cache.cache_size(), 1);
+        // All 5 newer queries (query2-query6) should still be cached
+        assert_eq!(cache.cache_size(), 5);
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub async fn check_and_optimize_if_needed(
 
     // Periodic optimization check (only inserter 0, every 300 batches total, at most once per 15 minutes)
     // Don't check until we've done at least 300 batches (skip the very first check)
-    if inserter_id != 0 || total_batches <= 300 || total_batches % 300 != 0 {
+    if inserter_id != 0 || total_batches <= 300 || !total_batches.is_multiple_of(300) {
         return false;
     }
 
@@ -168,7 +168,7 @@ fn parse_commit_message_tags(message: &str) -> std::collections::HashMap<String,
                 && !tag_value.is_empty()
             {
                 tags.entry(tag_name.to_string())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(tag_value.to_string());
             }
         }
@@ -194,7 +194,7 @@ pub fn extract_commit_metadata(repo: &gix::Repository, commit_sha: &str) -> Resu
 
     // Get commit message
     let message_bytes = commit.message_raw()?;
-    let message = String::from_utf8_lossy(&message_bytes).to_string();
+    let message = String::from_utf8_lossy(message_bytes).to_string();
 
     // Extract subject (first line of message)
     let subject = message.lines().next().unwrap_or("").to_string();
@@ -517,6 +517,7 @@ pub fn parse_email_from_commit(
 }
 
 /// Helper function to process a single email header
+#[allow(clippy::too_many_arguments)]
 fn process_header(
     name: &str,
     value: &str,

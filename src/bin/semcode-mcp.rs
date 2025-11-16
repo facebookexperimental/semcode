@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use clap::Parser;
-use semcode::{git, pages::PageCache, process_database_path, DatabaseManager};
+use semcode::{
+    git, pages::PageCache, process_database_path, search::LoreSearchOptions, DatabaseManager,
+    LoreEmailFilters,
+};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
@@ -485,6 +488,7 @@ async fn mcp_show_calls(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mcp_show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
@@ -859,6 +863,7 @@ async fn mcp_show_commit_metadata(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mcp_show_commit_range(
     db: &DatabaseManager,
     range: &str,
@@ -1307,6 +1312,7 @@ async fn mcp_show_commit_range(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mcp_show_all_commits(
     db: &DatabaseManager,
     verbose: bool,
@@ -1997,7 +2003,7 @@ impl McpServer {
 
         // Check if we have any functions in the database at all
         match self.db.count_functions().await {
-            Ok(count) if count == 0 => {
+            Ok(0) => {
                 // Completely empty database
                 match &state.status {
                     IndexingStatus::NotStarted => {
@@ -3485,7 +3491,7 @@ impl McpServer {
             "N/A".to_string()
         };
 
-        let mut result = format!("=== Indexing Status ===\n\n");
+        let mut result = "=== Indexing Status ===\n\n".to_string();
         result.push_str(&format!("Status: {}\n", status_text));
         if let Some(sha) = &state.git_sha {
             result.push_str(&format!("Git SHA: {}\n", &sha[..8.min(sha.len())]));
@@ -3920,20 +3926,21 @@ async fn mcp_lore_get_by_message_id(
     let mut buffer = Vec::new();
 
     // Use shared writer function
-    semcode::lore_writers::lore_get_by_message_id_to_writer(
-        db,
-        message_id,
+    let options = LoreSearchOptions {
         verbose,
         show_thread,
         show_replies,
-        &mut buffer,
-    )
-    .await?;
+        since_date: None,
+        until_date: None,
+    };
+    semcode::lore_writers::lore_get_by_message_id_to_writer(db, message_id, &options, &mut buffer)
+        .await?;
 
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
 /// Multi-field lore search supporting combinations of field filters
+#[allow(clippy::too_many_arguments)]
 async fn mcp_lore_search_multi_field(
     db: &DatabaseManager,
     from_patterns: &[String],
@@ -3979,15 +3986,18 @@ async fn mcp_lore_search_multi_field(
     }
 
     // Use shared writer function
-    semcode::lore_writers::lore_search_multi_field_to_writer(
-        db,
-        field_patterns,
-        limit,
+    let options = LoreSearchOptions {
         verbose,
         show_thread,
         show_replies,
         since_date,
         until_date,
+    };
+    semcode::lore_writers::lore_search_multi_field_to_writer(
+        db,
+        field_patterns,
+        limit,
+        &options,
         &mut buffer,
     )
     .await?;
@@ -3995,6 +4005,7 @@ async fn mcp_lore_search_multi_field(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 /// Search for lore emails related to a git commit (dig command)
+#[allow(clippy::too_many_arguments)]
 async fn mcp_dig_lore_by_commit(
     db: &DatabaseManager,
     commit_ish: &str,
@@ -4009,16 +4020,19 @@ async fn mcp_dig_lore_by_commit(
     let mut buffer = Vec::new();
 
     // Use shared writer function for consistent behavior with CLI
-    semcode::lore_writers::dig_lore_by_commit_to_writer(
-        db,
-        commit_ish,
-        git_repo_path,
+    let options = LoreSearchOptions {
         verbose,
-        show_all,
         show_thread,
         show_replies,
         since_date,
         until_date,
+    };
+    semcode::lore_writers::dig_lore_by_commit_to_writer(
+        db,
+        commit_ish,
+        git_repo_path,
+        show_all,
+        &options,
         &mut buffer,
     )
     .await?;
@@ -4026,6 +4040,7 @@ async fn mcp_dig_lore_by_commit(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mcp_vlore_similar_emails(
     db: &DatabaseManager,
     query_text: &str,
@@ -4110,48 +4125,47 @@ async fn mcp_vlore_similar_emails(
 
     // Prepare filter patterns for database-level filtering
     let from_filter = if !from_patterns.is_empty() {
-        Some(&from_patterns[..])
+        Some(from_patterns)
     } else {
         None
     };
 
     let subject_filter = if !subject_patterns.is_empty() {
-        Some(&subject_patterns[..])
+        Some(subject_patterns)
     } else {
         None
     };
 
     let body_filter = if !body_patterns.is_empty() {
-        Some(&body_patterns[..])
+        Some(body_patterns)
     } else {
         None
     };
 
     let symbols_filter = if !symbols_patterns.is_empty() {
-        Some(&symbols_patterns[..])
+        Some(symbols_patterns)
     } else {
         None
     };
 
     let recipients_filter = if !recipients_patterns.is_empty() {
-        Some(&recipients_patterns[..])
+        Some(recipients_patterns)
     } else {
         None
     };
 
     // Search for similar lore emails with database-level filtering
+    let filters = LoreEmailFilters {
+        from_patterns: from_filter,
+        subject_patterns: subject_filter,
+        body_patterns: body_filter,
+        symbols_patterns: symbols_filter,
+        recipients_patterns: recipients_filter,
+        since_date,
+        until_date,
+    };
     match db
-        .search_similar_lore_emails(
-            &query_vector,
-            limit,
-            from_filter,
-            subject_filter,
-            body_filter,
-            symbols_filter,
-            recipients_filter,
-            since_date,
-            until_date,
-        )
+        .search_similar_lore_emails(&query_vector, limit, &filters)
         .await
     {
         Ok(results) if results.is_empty() => {
@@ -4203,12 +4217,8 @@ async fn mcp_vlore_similar_emails(
 
                 // Show first 10 lines of message body
                 writeln!(buffer, "   Message:")?;
-                for (idx, line) in email.body.lines().take(10).enumerate() {
-                    if idx == 0 {
-                        writeln!(buffer, "     {}", line)?;
-                    } else {
-                        writeln!(buffer, "     {}", line)?;
-                    }
+                for line in email.body.lines().take(10) {
+                    writeln!(buffer, "     {}", line)?;
                 }
                 if email.body.lines().count() > 10 {
                     writeln!(buffer, "     ...")?;
@@ -4230,6 +4240,7 @@ async fn mcp_vlore_similar_emails(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mcp_vcommit_similar_commits(
     db: &DatabaseManager,
     query_text: &str,
@@ -4870,22 +4881,25 @@ async fn index_current_commit_background(
                                 if processed_pairs
                                     .contains(&(changed_file.path.clone(), new_hash.clone()))
                                 {
-                                    eprintln!("[Background] {}", format!(
-                                        "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
+                                    eprintln!(
+                                        "[Background] Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
                                         changed_file.path,
                                         &new_hash[..8]
-                                    ));
+                                    );
                                     return;
                                 } else {
-                                    eprintln!("[Background] {}", format!(
-                                        "Changed file '{}' (SHA: {}) needs indexing",
+                                    eprintln!(
+                                        "[Background] Changed file '{}' (SHA: {}) needs indexing",
                                         changed_file.path,
                                         &new_hash[..8]
-                                    ));
+                                    );
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[Background] {}", format!("Warning: Failed to get processed files: {}", e));
+                                eprintln!(
+                                    "[Background] Warning: Failed to get processed files: {}",
+                                    e
+                                );
                                 return;
                             }
                         }
@@ -4893,15 +4907,17 @@ async fn index_current_commit_background(
                 }
             } else {
                 // No changes in this commit (might be initial commit or root commit)
-                eprintln!("[Background] No changed files found in current commit, will check all files");
+                eprintln!(
+                    "[Background] No changed files found in current commit, will check all files"
+                );
             }
         }
         Err(e) => {
             // Failed to get changed files (might be initial commit, root commit, etc.)
-            eprintln!("[Background] {}", format!(
-                "Could not get changed files ({}), will check all files",
+            eprintln!(
+                "[Background] Could not get changed files ({}), will check all files",
                 e
-            ));
+            );
         }
     }
 
@@ -4922,10 +4938,12 @@ async fn index_current_commit_background(
 
     // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", _git_sha, _git_sha);
-    let extensions_vec: Vec<String> = vec!["c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "rs"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let extensions_vec: Vec<String> = [
+        "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "rs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
 
     match semcode::git_range::process_git_range(
         &repo_path,
@@ -4965,7 +4983,10 @@ async fn index_current_commit_background(
                                 );
                             }
                             Err(e) => {
-                                eprintln!("[Background] {}", format!("Warning: Database optimization failed: {}", e));
+                                eprintln!(
+                                    "[Background] Warning: Database optimization failed: {}",
+                                    e
+                                );
                             }
                         }
                     } else {
@@ -4974,15 +4995,15 @@ async fn index_current_commit_background(
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Background] {}", format!(
-                        "Warning: Failed to check optimization health: {}",
+                    eprintln!(
+                        "[Background] Warning: Failed to check optimization health: {}",
                         e
-                    ));
+                    );
                 }
             }
         }
         Err(e) => {
-            eprintln!("[Background] {}", format!("Warning: Auto-indexing failed: {}", e));
+            eprintln!("[Background] Warning: Auto-indexing failed: {}", e);
             let mut state = indexing_state.lock().await;
             state.status = IndexingStatus::Failed {
                 error: format!("Indexing failed: {}", e),
@@ -5179,7 +5200,12 @@ mod tests {
         };
         state.started_at = Some(std::time::SystemTime::now());
 
-        if let IndexingStatus::InProgress { phase, current, total } = &state.status {
+        if let IndexingStatus::InProgress {
+            phase,
+            current,
+            total,
+        } = &state.status
+        {
             assert_eq!(phase, "Analyzing files");
             assert_eq!(*current, 10);
             assert_eq!(*total, Some(100));

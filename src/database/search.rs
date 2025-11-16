@@ -13,6 +13,18 @@ use crate::types::{FieldInfo, FunctionInfo, ParameterInfo, TypeInfo, TypedefInfo
 use crate::vectorizer::CodeVectorizer;
 use std::collections::HashMap;
 
+/// Filter patterns for lore email vector searches
+#[derive(Debug, Clone, Default)]
+pub struct LoreEmailFilters<'a> {
+    pub from_patterns: Option<&'a [String]>,
+    pub subject_patterns: Option<&'a [String]>,
+    pub body_patterns: Option<&'a [String]>,
+    pub symbols_patterns: Option<&'a [String]>,
+    pub recipients_patterns: Option<&'a [String]>,
+    pub since_date: Option<&'a str>,
+    pub until_date: Option<&'a str>,
+}
+
 #[derive(Debug)]
 pub struct FunctionMatch {
     pub function: FunctionInfo,
@@ -903,7 +915,6 @@ impl SearchManager {
     }
 
     /// Git-aware macro search: two-phase resolution with exact match priority
-
     /// Helper function to search typedefs by git_file_hashes with optional name filter
     async fn search_typedefs_by_git_hashes(
         &self,
@@ -2015,7 +2026,7 @@ impl VectorSearchManager {
                 .max(2)
                 .min(vector_count)
         } else {
-            ((vector_count as f64).sqrt() as usize).max(256).min(1024)
+            ((vector_count as f64).sqrt() as usize).clamp(256, 1024)
         };
 
         tracing::info!(
@@ -3010,7 +3021,7 @@ impl VectorSearchManager {
         // Inserter will finish when result_rx is closed and all results are inserted
 
         // Just wait for workers to complete (reader runs in parallel)
-        tokio::spawn(async move { reader_task.await });
+        tokio::spawn(reader_task);
 
         // Wait for all workers to finish processing
         for handle in worker_handles {
@@ -3257,33 +3268,27 @@ impl VectorSearchManager {
         &self,
         query_vector: &[f32],
         limit: usize,
-        from_patterns: Option<&[String]>,
-        subject_patterns: Option<&[String]>,
-        body_patterns: Option<&[String]>,
-        symbols_patterns: Option<&[String]>,
-        recipients_patterns: Option<&[String]>,
-        since_date: Option<&str>,
-        until_date: Option<&str>,
+        filters: &LoreEmailFilters<'_>,
     ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
         tracing::info!(
             "vlore: search_similar_lore_emails called with since_date={:?}, until_date={:?}",
-            since_date,
-            until_date
+            filters.since_date,
+            filters.until_date
         );
 
         // Separate field filters from date filters
         // Field filters affect which emails to search (FTS/regex), date filters affect final results
-        let has_field_filters = from_patterns.is_some()
-            || subject_patterns.is_some()
-            || body_patterns.is_some()
-            || symbols_patterns.is_some()
-            || recipients_patterns.is_some();
+        let has_field_filters = filters.from_patterns.is_some()
+            || filters.subject_patterns.is_some()
+            || filters.body_patterns.is_some()
+            || filters.symbols_patterns.is_some()
+            || filters.recipients_patterns.is_some();
 
         let lore_vectors_table = self.connection.open_table("lore_vectors").execute().await?;
         let lore_table = self.connection.open_table("lore").execute().await?;
 
         // Build date filter clause if needed
-        let date_filter = match (since_date, until_date) {
+        let date_filter = match (filters.since_date, filters.until_date) {
             (Some(since), Some(until)) => {
                 let escaped_since = since.replace("'", "''");
                 let escaped_until = until.replace("'", "''");
@@ -3360,8 +3365,8 @@ impl VectorSearchManager {
                     &score_map,
                     lore_table,
                     limit,
-                    since_date,
-                    until_date,
+                    filters.since_date,
+                    filters.until_date,
                 )
                 .await;
         }
@@ -3386,11 +3391,11 @@ impl VectorSearchManager {
             let regex_start = std::time::Instant::now();
             let regex_message_ids = self
                 .query_lore_fields_intersection(
-                    from_patterns,
-                    subject_patterns,
-                    body_patterns,
-                    symbols_patterns,
-                    recipients_patterns,
+                    filters.from_patterns,
+                    filters.subject_patterns,
+                    filters.body_patterns,
+                    filters.symbols_patterns,
+                    filters.recipients_patterns,
                     search_limit,
                 )
                 .await?;
@@ -3484,8 +3489,8 @@ impl VectorSearchManager {
                     &score_map,
                     lore_table.clone(),
                     limit,
-                    since_date,
-                    until_date,
+                    filters.since_date,
+                    filters.until_date,
                 )
                 .await?;
 
