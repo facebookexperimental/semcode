@@ -19,6 +19,21 @@ use semcode::search::{
     query_function_or_macro_verbose, query_type_or_typedef, show_tables, LoreSearchOptions,
 };
 
+/// Parameters for vector-based commit similarity search
+struct VCommitParams<'a> {
+    query_text: &'a str,
+    limit: usize,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    git_range: Option<&'a str>,
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+    model_path: &'a Option<String>,
+}
+
 /// Parse a potential git SHA from command arguments or default to current HEAD
 /// Returns (remaining_args, git_sha)
 /// Now always returns a git SHA - either from --git flag, current HEAD, or a default
@@ -737,21 +752,20 @@ pub async fn handle_command(
                     );
                 } else {
                     let query_text = query_parts.join(" ");
-                    vcommit_similar_commits(
-                        db,
-                        &query_text,
+                    let params = VCommitParams {
+                        query_text: &query_text,
                         limit,
-                        &author_patterns,
-                        &subject_patterns,
-                        &regex_patterns,
-                        &symbol_patterns,
-                        &path_patterns,
-                        git_range.as_deref(),
-                        reachable_sha.as_deref(),
+                        author_patterns: &author_patterns,
+                        subject_patterns: &subject_patterns,
+                        regex_patterns: &regex_patterns,
+                        symbol_patterns: &symbol_patterns,
+                        path_patterns: &path_patterns,
+                        git_range: git_range.as_deref(),
+                        reachable_sha: reachable_sha.as_deref(),
                         git_repo_path,
                         model_path,
-                    )
-                    .await?;
+                    };
+                    vcommit_similar_commits(db, &params).await?;
                 }
             }
         }
@@ -2175,96 +2189,100 @@ async fn vgrep_similar_functions(
 }
 
 /// Search for commits similar to given query text using vector embeddings
-#[allow(clippy::too_many_arguments)]
-async fn vcommit_similar_commits(
-    db: &DatabaseManager,
-    query_text: &str,
-    limit: usize,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    git_range: Option<&str>,
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
-    model_path: &Option<String>,
-) -> Result<()> {
+async fn vcommit_similar_commits(db: &DatabaseManager, params: &VCommitParams<'_>) -> Result<()> {
     use semcode::CodeVectorizer;
 
-    let has_filters = !author_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty();
-    match (git_range, has_filters) {
+    let has_filters = !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty();
+    match (params.git_range, has_filters) {
         (Some(range), true) => {
             let mut filter_parts = Vec::new();
-            if !author_patterns.is_empty() {
-                filter_parts.push(format!("{} author pattern(s)", author_patterns.len()));
+            if !params.author_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} author pattern(s)",
+                    params.author_patterns.len()
+                ));
             }
-            if !subject_patterns.is_empty() {
-                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !regex_patterns.is_empty() {
-                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             println!(
-                "Searching for commits similar to: {} (git range: {}, {}, limit: {})",
-                query_text.yellow(),
+                "Searching for commits similar to: {} (git range: {}, {}, params.limit: {})",
+                params.query_text.yellow(),
                 range.cyan(),
                 filter_desc,
-                limit
+                params.limit
             );
         }
         (Some(range), false) => println!(
-            "Searching for commits similar to: {} (git range: {}, limit: {})",
-            query_text.yellow(),
+            "Searching for commits similar to: {} (git range: {}, params.limit: {})",
+            params.query_text.yellow(),
             range.cyan(),
-            limit
+            params.limit
         ),
         (None, true) => {
             let mut filter_parts = Vec::new();
-            if !author_patterns.is_empty() {
-                filter_parts.push(format!("{} author pattern(s)", author_patterns.len()));
+            if !params.author_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} author pattern(s)",
+                    params.author_patterns.len()
+                ));
             }
-            if !subject_patterns.is_empty() {
-                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !regex_patterns.is_empty() {
-                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             println!(
-                "Searching for commits similar to: {} ({}, limit: {})",
-                query_text.yellow(),
+                "Searching for commits similar to: {} ({}, params.limit: {})",
+                params.query_text.yellow(),
                 filter_desc,
-                limit
+                params.limit
             );
         }
         (None, false) => println!(
-            "Searching for commits similar to: {} (limit: {})",
-            query_text.yellow(),
-            limit
+            "Searching for commits similar to: {} (params.limit: {})",
+            params.query_text.yellow(),
+            params.limit
         ),
     }
 
     // Initialize vectorizer
     println!("Initializing vectorizer...");
-    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+    let vectorizer = match CodeVectorizer::new_with_config(false, params.model_path.clone()).await {
         Ok(v) => v,
         Err(e) => {
             println!("{} Failed to initialize vectorizer: {}", "Error:".red(), e);
@@ -2277,7 +2295,7 @@ async fn vcommit_similar_commits(
 
     // Generate vector for query text
     println!("Generating query vector...");
-    let query_vector = match vectorizer.vectorize_code(query_text) {
+    let query_vector = match vectorizer.vectorize_code(params.query_text) {
         Ok(v) => v,
         Err(e) => {
             println!(
@@ -2290,8 +2308,8 @@ async fn vcommit_similar_commits(
     };
 
     // Resolve git range to a set of commit SHAs if provided
-    let git_range_shas = if let Some(range) = git_range {
-        match gix::discover(git_repo_path) {
+    let git_range_shas = if let Some(range) = params.git_range {
+        match gix::discover(params.git_repo_path) {
             Ok(repo) => {
                 // Resolve the git range using gitoxide
                 let range_parts: Vec<&str> = range.split("..").collect();
@@ -2351,7 +2369,7 @@ async fn vcommit_similar_commits(
                 {
                     Ok(walk) => {
                         let mut commit_count = 0;
-                        const MAX_COMMITS: usize = 1000000; // Safety limit
+                        const MAX_COMMITS: usize = 1000000; // Safety params.limit
 
                         for commit_result in walk {
                             match commit_result {
@@ -2398,21 +2416,21 @@ async fn vcommit_similar_commits(
         None
     };
 
-    // Search for similar commits with higher limit if filtering
-    let search_limit = if !author_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty()
-        || git_range.is_some()
-        || reachable_sha.is_some()
+    // Search for similar commits with higher params.limit if filtering
+    let search_limit = if !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+        || params.git_range.is_some()
+        || params.reachable_sha.is_some()
     {
         // When filtering (author, subject, regex, symbols, paths, git range, or reachability), always fetch many results since we'll filter them down
-        // Use a large limit to ensure we find enough matches after filtering
+        // Use a large params.limit to ensure we find enough matches after filtering
         // Increased to 2M to handle very large repositories like Linux kernel (~1.2M commits)
         2_000_000
     } else {
-        limit
+        params.limit
     };
 
     // Search for similar commits
@@ -2442,10 +2460,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply author filtering if provided (ANY must match - OR logic)
-            let filtered_by_author = if !author_patterns.is_empty() {
+            let filtered_by_author = if !params.author_patterns.is_empty() {
                 // Compile all author regex patterns (case-insensitive)
                 let mut author_regexes = Vec::new();
-                for pattern in author_patterns {
+                for pattern in params.author_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2474,7 +2492,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Author filters ({} pattern(s)) reduced results from {} to {} commits",
-                    author_patterns.len(),
+                    params.author_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2485,10 +2503,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply subject filtering if provided (ANY must match - OR logic)
-            let filtered_by_subject = if !subject_patterns.is_empty() {
+            let filtered_by_subject = if !params.subject_patterns.is_empty() {
                 // Compile all subject regex patterns (case-insensitive)
                 let mut subject_regexes = Vec::new();
-                for pattern in subject_patterns {
+                for pattern in params.subject_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2519,7 +2537,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Subject filters ({} pattern(s)) reduced results from {} to {} commits",
-                    subject_patterns.len(),
+                    params.subject_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2530,10 +2548,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply regex filtering if provided (ALL patterns must match)
-            let filtered_by_regex = if !regex_patterns.is_empty() {
+            let filtered_by_regex = if !params.regex_patterns.is_empty() {
                 // Compile all regex patterns (case-insensitive)
                 let mut regexes = Vec::new();
-                for pattern in regex_patterns {
+                for pattern in params.regex_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2564,7 +2582,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Regex filters ({} pattern(s)) reduced results from {} to {} commits",
-                    regex_patterns.len(),
+                    params.regex_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2575,10 +2593,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply symbol filtering if provided (ALL patterns must match)
-            let filtered_by_symbol = if !symbol_patterns.is_empty() {
+            let filtered_by_symbol = if !params.symbol_patterns.is_empty() {
                 // Compile all symbol regex patterns (case-insensitive)
                 let mut symbol_regexes = Vec::new();
-                for pattern in symbol_patterns {
+                for pattern in params.symbol_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2609,7 +2627,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Symbol filters ({} pattern(s)) reduced results from {} to {} commits",
-                    symbol_patterns.len(),
+                    params.symbol_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2620,10 +2638,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply path filtering if provided (ANY pattern must match - OR logic)
-            let filtered_by_path = if !path_patterns.is_empty() {
+            let filtered_by_path = if !params.path_patterns.is_empty() {
                 // Compile all path regex patterns (case-insensitive)
                 let mut path_regexes = Vec::new();
-                for pattern in path_patterns {
+                for pattern in params.path_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2654,7 +2672,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Path filters ({} pattern(s)) reduced results from {} to {} commits",
-                    path_patterns.len(),
+                    params.path_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2665,16 +2683,16 @@ async fn vcommit_similar_commits(
             };
 
             // Apply reachability filtering if provided
-            let final_results = if let Some(reachable_from) = reachable_sha {
+            let final_results = if let Some(reachable_from) = params.reachable_sha {
                 let original_count = filtered_by_path.len();
 
                 // For > 10 commits, use hashset approach for better performance
                 let filtered: Vec<_> = if original_count > 10 {
-                    match git::get_reachable_commits(git_repo_path, reachable_from) {
+                    match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                         Ok(reachable_set) => filtered_by_path
                             .into_iter()
                             .filter(|(commit, _)| reachable_set.contains(&commit.git_sha))
-                            .take(limit)
+                            .take(params.limit)
                             .collect(),
                         Err(e) => {
                             tracing::warn!(
@@ -2686,7 +2704,7 @@ async fn vcommit_similar_commits(
                                 .into_iter()
                                 .filter(|(commit, _)| {
                                     match git::is_commit_reachable(
-                                        git_repo_path,
+                                        params.git_repo_path,
                                         reachable_from,
                                         &commit.git_sha,
                                     ) {
@@ -2702,7 +2720,7 @@ async fn vcommit_similar_commits(
                                         }
                                     }
                                 })
-                                .take(limit)
+                                .take(params.limit)
                                 .collect()
                         }
                     }
@@ -2712,7 +2730,7 @@ async fn vcommit_similar_commits(
                         .into_iter()
                         .filter(|(commit, _)| {
                             match git::is_commit_reachable(
-                                git_repo_path,
+                                params.git_repo_path,
                                 reachable_from,
                                 &commit.git_sha,
                             ) {
@@ -2728,7 +2746,7 @@ async fn vcommit_similar_commits(
                                 }
                             }
                         })
-                        .take(limit)
+                        .take(params.limit)
                         .collect()
                 };
 
@@ -2740,17 +2758,17 @@ async fn vcommit_similar_commits(
 
                 filtered
             } else {
-                filtered_by_path.into_iter().take(limit).collect()
+                filtered_by_path.into_iter().take(params.limit).collect()
             };
 
             if final_results.is_empty() {
                 println!("{} No similar commits found", "Info:".yellow());
-                if !author_patterns.is_empty()
-                    || !subject_patterns.is_empty()
-                    || !regex_patterns.is_empty()
-                    || !symbol_patterns.is_empty()
-                    || !path_patterns.is_empty()
-                    || git_range.is_some()
+                if !params.author_patterns.is_empty()
+                    || !params.subject_patterns.is_empty()
+                    || !params.regex_patterns.is_empty()
+                    || !params.symbol_patterns.is_empty()
+                    || !params.path_patterns.is_empty()
+                    || params.git_range.is_some()
                 {
                     println!(
                         "Try adjusting the filters or removing the -f/-s/-r/-g/-p/--git options"
