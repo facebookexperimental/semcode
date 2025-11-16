@@ -67,21 +67,25 @@ git config core.hooksPath hooks
 
 **Active Hooks**
 
-- **pre-commit**: Runs `cargo fmt --check` before each commit. Fast feedback on formatting issues.
-- **pre-push**: Runs comprehensive checks before each push:
+- **pre-commit**: Runs comprehensive checks before each commit:
+  - `cargo fmt --check` - Verifies code formatting
+  - `cargo check --all-targets` - Verifies code compiles
+  - `cargo test` - Runs all tests
+- **pre-push**: Runs additional quality checks before each push:
   - `cargo fmt --check` - Verifies code formatting
   - `cargo clippy --all-targets -- -D warnings` - Checks for code quality issues
   - `cargo test` - Runs all tests
 
-These hooks ensure that improperly formatted, non-compliant, or failing code cannot be committed or pushed to the repository.
+These hooks ensure that improperly formatted, non-compiling, or failing code cannot be committed or pushed to the repository.
 
 **If a hook fails:**
 
 1. For formatting issues: Run `cargo fmt` to format your code
-2. For clippy issues: Fix the warnings/errors reported by clippy
-3. For test failures: Fix the failing tests
-4. Stage your changes with `git add` (if needed)
-5. Try your commit or push again
+2. For compilation errors: Run `cargo check --all-targets` to see the errors and fix them
+3. For clippy issues: Fix the warnings/errors reported by clippy
+4. For test failures: Fix the failing tests
+5. Stage your changes with `git add` (if needed)
+6. Try your commit or push again
 
 **Hook Location**
 
