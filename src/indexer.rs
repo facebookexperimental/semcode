@@ -406,13 +406,7 @@ pub fn parse_email_from_commit(
     let email_content = String::from_utf8_lossy(blob.data.as_slice()).to_string();
 
     // Parse email headers
-    let mut from = String::new();
-    let mut date = String::new();
-    let mut message_id = String::new();
-    let mut in_reply_to: Option<String> = None;
-    let mut subject = String::new();
-    let mut references: Option<String> = None;
-    let mut recipients_list = Vec::new();
+    let mut headers = EmailHeaders::new();
 
     // Split headers and body
     let mut lines = email_content.lines();
@@ -426,17 +420,7 @@ pub fn parse_email_from_commit(
             if line.is_empty() {
                 // Empty line marks end of headers
                 if let Some((name, value)) = current_header.take() {
-                    process_header(
-                        &name,
-                        &value,
-                        &mut from,
-                        &mut date,
-                        &mut message_id,
-                        &mut in_reply_to,
-                        &mut subject,
-                        &mut references,
-                        &mut recipients_list,
-                    );
+                    headers.process_header(&name, &value);
                 }
                 in_headers = false;
                 continue;
@@ -454,17 +438,7 @@ pub fn parse_email_from_commit(
             } else {
                 // New header
                 if let Some((name, value)) = current_header.take() {
-                    process_header(
-                        &name,
-                        &value,
-                        &mut from,
-                        &mut date,
-                        &mut message_id,
-                        &mut in_reply_to,
-                        &mut subject,
-                        &mut references,
-                        &mut recipients_list,
-                    );
+                    headers.process_header(&name, &value);
                 }
 
                 if let Some(colon_pos) = line.find(':') {
@@ -481,21 +455,11 @@ pub fn parse_email_from_commit(
 
     // Process any remaining header
     if let Some((name, value)) = current_header {
-        process_header(
-            &name,
-            &value,
-            &mut from,
-            &mut date,
-            &mut message_id,
-            &mut in_reply_to,
-            &mut subject,
-            &mut references,
-            &mut recipients_list,
-        );
+        headers.process_header(&name, &value);
     }
 
-    let recipients = recipients_list.join(", ");
-    let headers = header_lines.join("\n");
+    let recipients = headers.recipients_list.join(", ");
+    let header_text = header_lines.join("\n");
     let body = body_lines.join("\n");
 
     // Extract symbols from any diffs found in the email body
@@ -503,41 +467,54 @@ pub fn parse_email_from_commit(
 
     Ok(crate::LoreEmailInfo {
         git_commit_sha: commit_sha.to_string(),
-        from,
-        date,
-        message_id,
-        in_reply_to,
-        subject,
-        references,
+        from: headers.from,
+        date: headers.date,
+        message_id: headers.message_id,
+        in_reply_to: headers.in_reply_to,
+        subject: headers.subject,
+        references: headers.references,
         recipients,
-        headers,
+        headers: header_text,
         body,
         symbols,
     })
 }
 
-/// Helper function to process a single email header
-#[allow(clippy::too_many_arguments)]
-fn process_header(
-    name: &str,
-    value: &str,
-    from: &mut String,
-    date: &mut String,
-    message_id: &mut String,
-    in_reply_to: &mut Option<String>,
-    subject: &mut String,
-    references: &mut Option<String>,
-    recipients_list: &mut Vec<String>,
-) {
-    match name {
-        "from" => *from = value.to_string(),
-        "date" => *date = value.to_string(),
-        "message-id" => *message_id = value.to_string(),
-        "in-reply-to" => *in_reply_to = Some(value.to_string()),
-        "subject" => *subject = value.to_string(),
-        "references" => *references = Some(value.to_string()),
-        "to" | "cc" => recipients_list.push(value.to_string()),
-        _ => {}
+/// Email header fields
+struct EmailHeaders {
+    from: String,
+    date: String,
+    message_id: String,
+    in_reply_to: Option<String>,
+    subject: String,
+    references: Option<String>,
+    recipients_list: Vec<String>,
+}
+
+impl EmailHeaders {
+    fn new() -> Self {
+        Self {
+            from: String::new(),
+            date: String::new(),
+            message_id: String::new(),
+            in_reply_to: None,
+            subject: String::new(),
+            references: None,
+            recipients_list: Vec::new(),
+        }
+    }
+
+    fn process_header(&mut self, name: &str, value: &str) {
+        match name {
+            "from" => self.from = value.to_string(),
+            "date" => self.date = value.to_string(),
+            "message-id" => self.message_id = value.to_string(),
+            "in-reply-to" => self.in_reply_to = Some(value.to_string()),
+            "subject" => self.subject = value.to_string(),
+            "references" => self.references = Some(value.to_string()),
+            "to" | "cc" => self.recipients_list.push(value.to_string()),
+            _ => {}
+        }
     }
 }
 
