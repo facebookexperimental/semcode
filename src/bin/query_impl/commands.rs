@@ -48,6 +48,19 @@ struct VLoreParams<'a> {
     model_path: &'a Option<String>,
 }
 
+/// Parameters for commit summary display
+struct CommitSummaryParams<'a> {
+    total_commits: usize,
+    matched_count: usize,
+    displayed_count: usize,
+    limit: usize,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+}
+
 /// Parse a potential git SHA from command arguments or default to current HEAD
 /// Returns (remaining_args, git_sha)
 /// Now always returns a git SHA - either from --git flag, current HEAD, or a default
@@ -3297,118 +3310,116 @@ fn display_commit(commit: &semcode::GitCommitInfo, index: usize, verbose: bool) 
 }
 
 /// Show summary statistics for commit display
-#[allow(clippy::too_many_arguments)]
-fn show_commit_summary(
-    total_commits: usize,
-    matched_count: usize,
-    displayed_count: usize,
-    limit: usize,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-) {
+fn show_commit_summary(params: &CommitSummaryParams) {
     println!("\n{}", "=".repeat(80));
 
     // Show summary with filtering/limiting info
-    if !author_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty()
-        || limit > 0
+    if !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+        || params.limit > 0
     {
         println!("{} ", "Summary:".bold().green());
-        println!("  Total commits: {}", total_commits);
-        if !author_patterns.is_empty()
-            || !subject_patterns.is_empty()
-            || !regex_patterns.is_empty()
-            || !symbol_patterns.is_empty()
-            || !path_patterns.is_empty()
+        println!("  Total commits: {}", params.total_commits);
+        if !params.author_patterns.is_empty()
+            || !params.subject_patterns.is_empty()
+            || !params.regex_patterns.is_empty()
+            || !params.symbol_patterns.is_empty()
+            || !params.path_patterns.is_empty()
         {
-            println!("  Matched by filters: {}", matched_count);
+            println!("  Matched by filters: {}", params.matched_count);
         }
-        println!("  Displayed: {}", displayed_count);
-        if limit > 0 && matched_count > limit {
+        println!("  Displayed: {}", params.displayed_count);
+        if params.limit > 0 && params.matched_count > params.limit {
             println!(
                 "  {} {} additional matching commits not shown (limited to {})",
                 "Note:".yellow(),
-                matched_count - displayed_count,
-                limit
+                params.matched_count - params.displayed_count,
+                params.limit
             );
         }
     } else {
         println!(
             "{} Total: {} commits",
             "Summary:".bold().green(),
-            displayed_count
+            params.displayed_count
         );
     }
 
-    if displayed_count == 0 {
-        let filter_count = (!author_patterns.is_empty() as usize)
-            + (!subject_patterns.is_empty() as usize)
-            + (!regex_patterns.is_empty() as usize)
-            + (!symbol_patterns.is_empty() as usize)
-            + (!path_patterns.is_empty() as usize);
+    if params.displayed_count == 0 {
+        let filter_count = (!params.author_patterns.is_empty() as usize)
+            + (!params.subject_patterns.is_empty() as usize)
+            + (!params.regex_patterns.is_empty() as usize)
+            + (!params.symbol_patterns.is_empty() as usize)
+            + (!params.path_patterns.is_empty() as usize);
 
         if filter_count >= 2 {
             let mut filter_types = Vec::new();
-            if !author_patterns.is_empty() {
-                filter_types.push(format!("{} author pattern(s)", author_patterns.len()));
+            if !params.author_patterns.is_empty() {
+                filter_types.push(format!(
+                    "{} author pattern(s)",
+                    params.author_patterns.len()
+                ));
             }
-            if !subject_patterns.is_empty() {
-                filter_types.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_types.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !regex_patterns.is_empty() {
-                filter_types.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_types.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_types.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_types.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_types.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_types.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             println!(
                 "\n{} No commits matched ALL {}",
                 "Info:".yellow(),
                 filter_types.join(" and ")
             );
-        } else if !author_patterns.is_empty() {
+        } else if !params.author_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ANY {} author pattern(s): {}",
                 "Info:".yellow(),
-                author_patterns.len(),
-                author_patterns.join(", ")
+                params.author_patterns.len(),
+                params.author_patterns.join(", ")
             );
-        } else if !subject_patterns.is_empty() {
+        } else if !params.subject_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ANY {} subject pattern(s): {}",
                 "Info:".yellow(),
-                subject_patterns.len(),
-                subject_patterns.join(", ")
+                params.subject_patterns.len(),
+                params.subject_patterns.join(", ")
             );
-        } else if !regex_patterns.is_empty() {
+        } else if !params.regex_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ALL {} regex pattern(s): {}",
                 "Info:".yellow(),
-                regex_patterns.len(),
-                regex_patterns.join(", ")
+                params.regex_patterns.len(),
+                params.regex_patterns.join(", ")
             );
-        } else if !symbol_patterns.is_empty() {
+        } else if !params.symbol_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ALL {} symbol pattern(s): {}",
                 "Info:".yellow(),
-                symbol_patterns.len(),
-                symbol_patterns.join(", ")
+                params.symbol_patterns.len(),
+                params.symbol_patterns.join(", ")
             );
-        } else if !path_patterns.is_empty() {
+        } else if !params.path_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ALL {} path pattern(s): {}",
                 "Info:".yellow(),
-                path_patterns.len(),
-                path_patterns.join(", ")
+                params.path_patterns.len(),
+                params.path_patterns.join(", ")
             );
         }
     }
@@ -3553,8 +3564,8 @@ async fn show_all_commits(
     }
 
     // Step 5: Show summary
-    show_commit_summary(
-        all_commits.len(),
+    let summary_params = CommitSummaryParams {
+        total_commits: all_commits.len(),
         matched_count,
         displayed_count,
         limit,
@@ -3563,7 +3574,8 @@ async fn show_all_commits(
         regex_patterns,
         symbol_patterns,
         path_patterns,
-    );
+    };
+    show_commit_summary(&summary_params);
 
     Ok(())
 }
@@ -4272,8 +4284,8 @@ async fn show_commit_range(
     }
 
     // Step 6: Show summary
-    show_commit_summary(
-        range_commits.len(),
+    let summary_params = CommitSummaryParams {
+        total_commits: range_commits.len(),
         matched_count,
         displayed_count,
         limit,
@@ -4282,7 +4294,8 @@ async fn show_commit_range(
         regex_patterns,
         symbol_patterns,
         path_patterns,
-    );
+    };
+    show_commit_summary(&summary_params);
 
     Ok(())
 }
