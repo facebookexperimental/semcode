@@ -74,6 +74,18 @@ struct ShowAllCommitsParams<'a> {
     git_repo_path: &'a str,
 }
 
+/// Parameters for show commit metadata operations
+struct ShowCommitMetadataParams<'a> {
+    verbose: bool,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+}
+
 /// Parse a potential git SHA from command arguments or default to current HEAD
 /// Returns (remaining_args, git_sha)
 /// Now always returns a git SHA - either from --git flag, current HEAD, or a default
@@ -485,19 +497,17 @@ pub async fn handle_command(
             .await?;
         } else {
             let git_ref = git_ref_parts.join(" ");
-            show_commit_metadata(
-                db,
-                &git_ref,
+            let metadata_params = ShowCommitMetadataParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
-                reachable_sha.as_deref(),
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
+                reachable_sha: reachable_sha.as_deref(),
                 git_repo_path,
-            )
-            .await?;
+            };
+            show_commit_metadata(db, &git_ref, &metadata_params).await?;
         }
 
         return Ok(false); // Continue the loop
@@ -3585,21 +3595,13 @@ async fn show_all_commits(db: &DatabaseManager, params: &ShowAllCommitsParams<'_
 }
 
 /// Show metadata for a git commit
-#[allow(clippy::too_many_arguments)]
 async fn show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &ShowCommitMetadataParams<'_>,
 ) -> Result<()> {
     // Step 1: Resolve git reference to full SHA using gitoxide
-    let resolved_sha = match gix::discover(git_repo_path) {
+    let resolved_sha = match gix::discover(params.git_repo_path) {
         Ok(repo) => match git::resolve_to_commit(&repo, git_ref) {
             Ok(commit) => commit.id().to_string(),
             Err(e) => {
@@ -3674,7 +3676,7 @@ async fn show_commit_metadata(
                 resolved_sha.bright_black()
             );
 
-            match git::get_commit_info_from_git(git_repo_path, &resolved_sha) {
+            match git::get_commit_info_from_git(params.git_repo_path, &resolved_sha) {
                 Ok(git_commit) => {
                     (
                         git_commit.git_sha,
@@ -3698,8 +3700,8 @@ async fn show_commit_metadata(
     };
 
     // Step 2b: Apply reachability filter if provided
-    if let Some(reachable_from) = reachable_sha {
-        match git::is_commit_reachable(git_repo_path, reachable_from, &resolved_sha) {
+    if let Some(reachable_from) = params.reachable_sha {
+        match git::is_commit_reachable(params.git_repo_path, reachable_from, &resolved_sha) {
             Ok(true) => {
                 // Commit is reachable, continue processing
             }
@@ -3720,9 +3722,9 @@ async fn show_commit_metadata(
     }
 
     // Step 2c: Apply author filters if provided (ANY must match - OR logic)
-    if !author_patterns.is_empty() {
+    if !params.author_patterns.is_empty() {
         let mut author_regexes = Vec::new();
-        for pattern in author_patterns {
+        for pattern in params.author_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => author_regexes.push(re),
                 Err(e) => {
@@ -3744,17 +3746,17 @@ async fn show_commit_metadata(
                 "{} Commit {} does not match any of {} author pattern(s): {}",
                 "Info:".yellow(),
                 resolved_sha.bright_black(),
-                author_patterns.len(),
-                author_patterns.join(", ")
+                params.author_patterns.len(),
+                params.author_patterns.join(", ")
             );
             return Ok(());
         }
     }
 
     // Step 2d: Apply subject filters if provided (ANY must match - OR logic)
-    if !subject_patterns.is_empty() {
+    if !params.subject_patterns.is_empty() {
         let mut subject_regexes = Vec::new();
-        for pattern in subject_patterns {
+        for pattern in params.subject_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => subject_regexes.push(re),
                 Err(e) => {
@@ -3778,18 +3780,18 @@ async fn show_commit_metadata(
                 "{} Commit {} does not match any of {} subject pattern(s): {}",
                 "Info:".yellow(),
                 resolved_sha.bright_black(),
-                subject_patterns.len(),
-                subject_patterns.join(", ")
+                params.subject_patterns.len(),
+                params.subject_patterns.join(", ")
             );
             return Ok(());
         }
     }
 
     // Step 3: Apply regex filters if provided (ALL must match)
-    if !regex_patterns.is_empty() {
+    if !params.regex_patterns.is_empty() {
         // Compile all regex patterns
         let mut regexes = Vec::new();
-        for pattern in regex_patterns {
+        for pattern in params.regex_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => regexes.push(re),
                 Err(e) => {
@@ -3809,7 +3811,7 @@ async fn show_commit_metadata(
         let mut failed_patterns = Vec::new();
         for (i, re) in regexes.iter().enumerate() {
             if !re.is_match(&combined) {
-                failed_patterns.push(regex_patterns[i].as_str());
+                failed_patterns.push(params.regex_patterns[i].as_str());
             }
         }
 
@@ -3826,10 +3828,10 @@ async fn show_commit_metadata(
     }
 
     // Step 3b: Apply symbol filters if provided (ALL must match)
-    if !symbol_patterns.is_empty() {
+    if !params.symbol_patterns.is_empty() {
         // Compile all symbol regex patterns
         let mut symbol_regexes = Vec::new();
-        for pattern in symbol_patterns {
+        for pattern in params.symbol_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => symbol_regexes.push(re),
                 Err(e) => {
@@ -3850,7 +3852,7 @@ async fn show_commit_metadata(
             // Check if ANY symbol matches this pattern
             let matches_any = commit_symbols.iter().any(|symbol| re.is_match(symbol));
             if !matches_any {
-                failed_symbol_patterns.push(symbol_patterns[i].as_str());
+                failed_symbol_patterns.push(params.symbol_patterns[i].as_str());
             }
         }
 
@@ -3867,10 +3869,10 @@ async fn show_commit_metadata(
     }
 
     // Step 3c: Apply path filters if provided (ANY must match - OR logic)
-    if !path_patterns.is_empty() {
+    if !params.path_patterns.is_empty() {
         // Compile all path regex patterns
         let mut path_regexes = Vec::new();
-        for pattern in path_patterns {
+        for pattern in params.path_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => path_regexes.push(re),
                 Err(e) => {
@@ -3895,8 +3897,8 @@ async fn show_commit_metadata(
                 "{} Commit {} does not match any of {} path pattern(s): {}",
                 "Info:".yellow(),
                 resolved_sha.bright_black(),
-                path_patterns.len(),
-                path_patterns.join(", ")
+                params.path_patterns.len(),
+                params.path_patterns.join(", ")
             );
             return Ok(());
         }
@@ -3954,8 +3956,8 @@ async fn show_commit_metadata(
         println!("{}", "─".repeat(60).bright_black());
     }
 
-    // Show diff if verbose flag is set
-    if verbose {
+    // Show diff if params.verbose flag is set
+    if params.verbose {
         if !commit_diff.is_empty() {
             println!("\n{}", "Diff:".bold().blue());
             println!("{}", "─".repeat(80).bright_black());
