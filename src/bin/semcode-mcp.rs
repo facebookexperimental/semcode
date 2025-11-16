@@ -1927,6 +1927,21 @@ struct CommitFilterParams<'a> {
     git_repo_path: &'a str,
 }
 
+/// Parameters for lore email search operations
+struct LoreSearchParams<'a> {
+    from_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    body_patterns: &'a [String],
+    symbols_patterns: &'a [String],
+    recipients_patterns: &'a [String],
+    limit: usize,
+    verbose: usize,
+    show_thread: bool,
+    show_replies: bool,
+    since_date: Option<&'a str>,
+    until_date: Option<&'a str>,
+}
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
@@ -3207,22 +3222,20 @@ impl McpServer {
             }
         } else {
             // Multi-field search (same as query tool's lore command with multiple -f/-s/-b/-g/-t flags)
-            match mcp_lore_search_multi_field(
-                &self.db,
-                &from_patterns,
-                &subject_patterns,
-                &body_patterns,
-                &symbols_patterns,
-                &recipients_patterns,
+            let search_params = LoreSearchParams {
+                from_patterns: &from_patterns,
+                subject_patterns: &subject_patterns,
+                body_patterns: &body_patterns,
+                symbols_patterns: &symbols_patterns,
+                recipients_patterns: &recipients_patterns,
                 limit,
                 verbose,
                 show_thread,
                 show_replies,
-                since_date.as_deref(),
-                until_date.as_deref(),
-            )
-            .await
-            {
+                since_date: since_date.as_deref(),
+                until_date: until_date.as_deref(),
+            };
+            match mcp_lore_search_multi_field(&self.db, &search_params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -3934,38 +3947,27 @@ async fn mcp_lore_get_by_message_id(
 }
 
 /// Multi-field lore search supporting combinations of field filters
-#[allow(clippy::too_many_arguments)]
 async fn mcp_lore_search_multi_field(
     db: &DatabaseManager,
-    from_patterns: &[String],
-    subject_patterns: &[String],
-    body_patterns: &[String],
-    symbols_patterns: &[String],
-    recipients_patterns: &[String],
-    limit: usize,
-    verbose: usize,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    params: &LoreSearchParams<'_>,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
     // Build field_patterns from the collected patterns (same logic as query tool)
     let mut field_patterns = Vec::new();
-    for pattern in from_patterns {
+    for pattern in params.from_patterns {
         field_patterns.push(("from", pattern.as_str()));
     }
-    for pattern in subject_patterns {
+    for pattern in params.subject_patterns {
         field_patterns.push(("subject", pattern.as_str()));
     }
-    for pattern in body_patterns {
+    for pattern in params.body_patterns {
         field_patterns.push(("body", pattern.as_str()));
     }
-    for pattern in symbols_patterns {
+    for pattern in params.symbols_patterns {
         field_patterns.push(("symbols", pattern.as_str()));
     }
-    for pattern in recipients_patterns {
+    for pattern in params.recipients_patterns {
         field_patterns.push(("recipients", pattern.as_str()));
     }
 
@@ -3981,16 +3983,16 @@ async fn mcp_lore_search_multi_field(
 
     // Use shared writer function
     let options = LoreSearchOptions {
-        verbose,
-        show_thread,
-        show_replies,
-        since_date,
-        until_date,
+        verbose: params.verbose,
+        show_thread: params.show_thread,
+        show_replies: params.show_replies,
+        since_date: params.since_date,
+        until_date: params.until_date,
     };
     semcode::lore_writers::lore_search_multi_field_to_writer(
         db,
         field_patterns,
-        limit,
+        params.limit,
         &options,
         &mut buffer,
     )
