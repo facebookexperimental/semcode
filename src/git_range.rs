@@ -55,6 +55,19 @@ struct TupleWorkerContext {
     accumulate_lock: Arc<std::sync::Mutex<()>>,
 }
 
+/// Configuration for streaming git tuples processing
+struct StreamingConfig {
+    repo_path: PathBuf,
+    git_range: String,
+    extensions: Vec<String>,
+    source_root: PathBuf,
+    no_macros: bool,
+    processed_files: Arc<HashSet<String>>,
+    num_workers: usize,
+    db_manager: Arc<DatabaseManager>,
+    num_inserters: usize,
+}
+
 /// Statistics from processing git file tuples (lightweight, no accumulated data)
 #[derive(Debug, Default, Clone)]
 struct GitTupleStats {
@@ -398,24 +411,13 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
 }
 
 /// Process git file tuples using streaming pipeline with database inserters
-#[allow(clippy::too_many_arguments)]
-async fn process_git_tuples_streaming(
-    repo_path: PathBuf,
-    git_range: String,
-    extensions: Vec<String>,
-    source_root: PathBuf,
-    no_macros: bool,
-    processed_files: Arc<HashSet<String>>,
-    num_workers: usize,
-    db_manager: Arc<DatabaseManager>,
-    num_inserters: usize,
-) -> Result<GitTupleStats> {
+async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupleStats> {
     use std::sync::Mutex;
 
     // First, get all commits in the range
-    let repo =
-        gix::discover(&repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
-    let commit_shas = list_shas_in_range(&repo, &git_range)?;
+    let repo = gix::discover(&config.repo_path)
+        .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+    let commit_shas = list_shas_in_range(&repo, &config.git_range)?;
 
     // Handle empty commit range early - return empty stats
     if commit_shas.is_empty() {
@@ -449,7 +451,7 @@ async fn process_git_tuples_streaming(
         "{} commits, {} generators, {} workers",
         commit_shas.len(),
         num_generators,
-        num_workers
+        config.num_workers
     ));
 
     // Create channels with backpressure
@@ -457,12 +459,12 @@ async fn process_git_tuples_streaming(
     // Scale result channel size with number of workers to prevent blocking
     // Allow 2 batches per worker in flight, with minimum of 4 and maximum of 64
     // Each batch ~= 2048 files, so this provides buffering without excessive memory use
-    let result_channel_size = (num_workers * 2).clamp(4, 64);
+    let result_channel_size = (config.num_workers * 2).clamp(4, 64);
     let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(result_channel_size);
     tracing::info!(
         "Result channel size: {} (scaled with {} workers)",
         result_channel_size,
-        num_workers
+        config.num_workers
     );
 
     // Wrap receivers for shared access
@@ -512,10 +514,10 @@ async fn process_git_tuples_streaming(
     // Spawn generator threads
     let mut generator_handles = Vec::new();
     for (generator_id, commit_chunk) in commit_chunks.into_iter().enumerate() {
-        let generator_repo_path = repo_path.clone();
-        let generator_extensions = extensions.clone();
+        let generator_repo_path = config.repo_path.clone();
+        let generator_extensions = config.extensions.clone();
         let generator_tuple_tx = tuple_tx.clone();
-        let generator_processed_files = processed_files.clone();
+        let generator_processed_files = config.processed_files.clone();
         let generator_sent_in_run = sent_in_this_run.clone();
 
         let handle = thread::spawn(move || {
@@ -543,14 +545,14 @@ async fn process_git_tuples_streaming(
 
     // Spawn worker threads
     let mut worker_handles = Vec::new();
-    for worker_id in 0..num_workers {
+    for worker_id in 0..config.num_workers {
         let ctx = TupleWorkerContext {
             worker_id,
             shared_tuple_rx: shared_tuple_rx.clone(),
             result_tx: result_tx.clone(),
-            repo_path: repo_path.clone(),
-            source_root: source_root.clone(),
-            no_macros,
+            repo_path: config.repo_path.clone(),
+            source_root: config.source_root.clone(),
+            no_macros: config.no_macros,
             processed_count: processed_count.clone(),
             batches_sent: batches_sent.clone(),
             accumulate_lock: accumulate_lock.clone(),
@@ -572,8 +574,8 @@ async fn process_git_tuples_streaming(
     // Only one inserter should check at a time to avoid redundant checks
     let last_optimization_check = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
 
-    for inserter_id in 0..num_inserters {
-        let db_manager_clone = Arc::clone(&db_manager);
+    for inserter_id in 0..config.num_inserters {
+        let db_manager_clone = Arc::clone(&config.db_manager);
         let result_rx_clone = shared_result_rx.clone();
         let functions_counter = inserted_functions.clone();
         let types_counter = inserted_types.clone();
@@ -813,18 +815,18 @@ pub async fn process_git_range(
 
     // Step 3: Process tuples using streaming pipeline with database inserters
     let processing_start = std::time::Instant::now();
-    let stats = process_git_tuples_streaming(
-        repo_path.clone(),
-        git_range.to_string(),
-        extensions.to_vec(),
-        repo_path.clone(),
+    let config = StreamingConfig {
+        repo_path: repo_path.clone(),
+        git_range: git_range.to_string(),
+        extensions: extensions.to_vec(),
+        source_root: repo_path.clone(),
         no_macros,
         processed_files,
         num_workers,
-        db_manager.clone(),
-        db_threads,
-    )
-    .await?;
+        db_manager: db_manager.clone(),
+        num_inserters: db_threads,
+    };
+    let stats = process_git_tuples_streaming(config).await?;
 
     let processing_time = processing_start.elapsed();
 
