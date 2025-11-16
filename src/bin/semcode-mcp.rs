@@ -488,25 +488,17 @@ async fn mcp_show_calls(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn mcp_show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &CommitFilterParams<'_>,
 ) -> Result<String> {
     use std::io::Write;
 
     let mut buffer = Vec::new();
 
     // Step 1: Resolve git reference to full SHA using gitoxide
-    let resolved_sha = match gix::discover(git_repo_path) {
+    let resolved_sha = match gix::discover(params.git_repo_path) {
         Ok(repo) => match git::resolve_to_commit(&repo, git_ref) {
             Ok(commit) => commit.id().to_string(),
             Err(e) => {
@@ -566,7 +558,7 @@ async fn mcp_show_commit_metadata(
                 resolved_sha
             )?;
 
-            match git::get_commit_info_from_git(git_repo_path, &resolved_sha) {
+            match git::get_commit_info_from_git(params.git_repo_path, &resolved_sha) {
                 Ok(git_commit) => {
                     (
                         git_commit.git_sha,
@@ -590,8 +582,8 @@ async fn mcp_show_commit_metadata(
     };
 
     // Step 2b: Apply reachability filter if provided
-    if let Some(reachable_from) = reachable_sha {
-        match git::is_commit_reachable(git_repo_path, reachable_from, &resolved_sha) {
+    if let Some(reachable_from) = params.reachable_sha {
+        match git::is_commit_reachable(params.git_repo_path, reachable_from, &resolved_sha) {
             Ok(true) => {
                 // Commit is reachable, continue processing
             }
@@ -611,9 +603,9 @@ async fn mcp_show_commit_metadata(
     }
 
     // Step 2c: Apply author filters if provided (ANY must match - OR logic)
-    if !author_patterns.is_empty() {
+    if !params.author_patterns.is_empty() {
         let mut author_regexes = Vec::new();
-        for pattern in author_patterns {
+        for pattern in params.author_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -637,17 +629,17 @@ async fn mcp_show_commit_metadata(
                 buffer,
                 "Info: Commit {} does not match any of {} author pattern(s): {}",
                 resolved_sha,
-                author_patterns.len(),
-                author_patterns.join(", ")
+                params.author_patterns.len(),
+                params.author_patterns.join(", ")
             )?;
             return Ok(String::from_utf8_lossy(&buffer).to_string());
         }
     }
 
     // Step 2d: Apply subject filters if provided (ANY must match - OR logic)
-    if !subject_patterns.is_empty() {
+    if !params.subject_patterns.is_empty() {
         let mut subject_regexes = Vec::new();
-        for pattern in subject_patterns {
+        for pattern in params.subject_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -673,18 +665,18 @@ async fn mcp_show_commit_metadata(
                 buffer,
                 "Info: Commit {} does not match any of {} subject pattern(s): {}",
                 resolved_sha,
-                subject_patterns.len(),
-                subject_patterns.join(", ")
+                params.subject_patterns.len(),
+                params.subject_patterns.join(", ")
             )?;
             return Ok(String::from_utf8_lossy(&buffer).to_string());
         }
     }
 
     // Step 3: Apply regex filters if provided (ALL must match)
-    if !regex_patterns.is_empty() {
+    if !params.regex_patterns.is_empty() {
         // Compile all regex patterns (case-insensitive)
         let mut regexes = Vec::new();
-        for pattern in regex_patterns {
+        for pattern in params.regex_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -702,7 +694,7 @@ async fn mcp_show_commit_metadata(
         let mut failed_patterns = Vec::new();
         for (i, re) in regexes.iter().enumerate() {
             if !re.is_match(&combined) {
-                failed_patterns.push(regex_patterns[i].as_str());
+                failed_patterns.push(params.regex_patterns[i].as_str());
             }
         }
 
@@ -719,10 +711,10 @@ async fn mcp_show_commit_metadata(
     }
 
     // Step 3b: Apply symbol filters if provided (ALL must match)
-    if !symbol_patterns.is_empty() {
+    if !params.symbol_patterns.is_empty() {
         // Compile all symbol regex patterns (case-insensitive)
         let mut symbol_regexes = Vec::new();
-        for pattern in symbol_patterns {
+        for pattern in params.symbol_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -745,7 +737,7 @@ async fn mcp_show_commit_metadata(
             // Check if ANY symbol matches this pattern
             let matches_any = commit_symbols.iter().any(|symbol| re.is_match(symbol));
             if !matches_any {
-                failed_symbol_patterns.push(symbol_patterns[i].as_str());
+                failed_symbol_patterns.push(params.symbol_patterns[i].as_str());
             }
         }
 
@@ -762,10 +754,10 @@ async fn mcp_show_commit_metadata(
     }
 
     // Step 3c: Apply path filters if provided (ANY must match - OR logic)
-    if !path_patterns.is_empty() {
+    if !params.path_patterns.is_empty() {
         // Compile all path regex patterns (case-insensitive)
         let mut path_regexes = Vec::new();
-        for pattern in path_patterns {
+        for pattern in params.path_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -792,8 +784,8 @@ async fn mcp_show_commit_metadata(
                 buffer,
                 "Info: Commit {} does not match any of {} path pattern(s): {}",
                 resolved_sha,
-                path_patterns.len(),
-                path_patterns.join(", ")
+                params.path_patterns.len(),
+                params.path_patterns.join(", ")
             )?;
             return Ok(String::from_utf8_lossy(&buffer).to_string());
         }
@@ -849,7 +841,7 @@ async fn mcp_show_commit_metadata(
     }
 
     // Show diff if verbose flag is set
-    if verbose {
+    if params.verbose {
         if !commit_diff.is_empty() {
             writeln!(buffer, "\nDiff:")?;
             writeln!(buffer, "{}", "─".repeat(80))?;
@@ -1925,6 +1917,18 @@ impl IndexingState {
     }
 }
 
+/// Common parameters for commit filtering operations
+struct CommitFilterParams<'a> {
+    verbose: bool,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+}
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
@@ -2935,20 +2939,17 @@ impl McpServer {
             }
         } else if let Some(git_ref_str) = git_ref {
             // Show single commit
-            match mcp_show_commit_metadata(
-                &self.db,
-                git_ref_str,
+            let params = CommitFilterParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 reachable_sha,
                 git_repo_path,
-            )
-            .await
-            {
+            };
+            match mcp_show_commit_metadata(&self.db, git_ref_str, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
