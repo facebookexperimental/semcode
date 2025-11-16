@@ -61,6 +61,19 @@ struct CommitSummaryParams<'a> {
     path_patterns: &'a [String],
 }
 
+/// Parameters for show all commits operations
+struct ShowAllCommitsParams<'a> {
+    verbose: bool,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    limit: usize,
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+}
+
 /// Parse a potential git SHA from command arguments or default to current HEAD
 /// Returns (remaining_args, git_sha)
 /// Now always returns a git SHA - either from --git flag, current HEAD, or a default
@@ -443,19 +456,18 @@ pub async fn handle_command(
 
         if git_ref_parts.is_empty() && git_range.is_none() {
             // No arguments provided - show all commits from database
-            show_all_commits(
-                db,
+            let params = ShowAllCommitsParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 limit,
-                reachable_sha.as_deref(),
+                reachable_sha: reachable_sha.as_deref(),
                 git_repo_path,
-            )
-            .await?;
+            };
+            show_all_commits(db, &params).await?;
         } else if let Some(range) = git_range {
             show_commit_range(
                 db,
@@ -3426,19 +3438,7 @@ fn show_commit_summary(params: &CommitSummaryParams) {
 }
 
 /// Show all commits from database with optional filters
-#[allow(clippy::too_many_arguments)]
-async fn show_all_commits(
-    db: &DatabaseManager,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    limit: usize,
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
-) -> Result<()> {
+async fn show_all_commits(db: &DatabaseManager, params: &ShowAllCommitsParams<'_>) -> Result<()> {
     // Step 1: Get all commits from database
     let all_commits = db.get_all_git_commits().await?;
 
@@ -3448,32 +3448,32 @@ async fn show_all_commits(
     }
 
     // Step 2: Compile filters
-    let author_filters = if !author_patterns.is_empty() {
-        compile_regex_filters(author_patterns)?
+    let author_filters = if !params.author_patterns.is_empty() {
+        compile_regex_filters(params.author_patterns)?
     } else {
         Vec::new()
     };
 
-    let subject_filters = if !subject_patterns.is_empty() {
-        compile_regex_filters(subject_patterns)?
+    let subject_filters = if !params.subject_patterns.is_empty() {
+        compile_regex_filters(params.subject_patterns)?
     } else {
         Vec::new()
     };
 
-    let regex_filters = if !regex_patterns.is_empty() {
-        compile_regex_filters(regex_patterns)?
+    let regex_filters = if !params.regex_patterns.is_empty() {
+        compile_regex_filters(params.regex_patterns)?
     } else {
         Vec::new()
     };
 
-    let symbol_filters = if !symbol_patterns.is_empty() {
-        compile_symbol_filters(symbol_patterns)?
+    let symbol_filters = if !params.symbol_patterns.is_empty() {
+        compile_symbol_filters(params.symbol_patterns)?
     } else {
         Vec::new()
     };
 
-    let path_filters = if !path_patterns.is_empty() {
-        compile_path_filters(path_patterns)?
+    let path_filters = if !params.path_patterns.is_empty() {
+        compile_path_filters(params.path_patterns)?
     } else {
         Vec::new()
     };
@@ -3501,9 +3501,9 @@ async fn show_all_commits(
         .collect();
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
-    let reachable_set = if let Some(reachable_from) = reachable_sha {
+    let reachable_set = if let Some(reachable_from) = params.reachable_sha {
         if filtered_commits.len() > 10 {
-            match git::get_reachable_commits(git_repo_path, reachable_from) {
+            match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                 Ok(set) => Some(set),
                 Err(e) => {
                     println!(
@@ -3527,12 +3527,16 @@ async fn show_all_commits(
 
     for commit in &filtered_commits {
         // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
+        if let Some(reachable_from) = params.reachable_sha {
             // Use hashset if available, otherwise do individual check
             let is_reachable = if let Some(ref set) = reachable_set {
                 set.contains(&commit.git_sha)
             } else {
-                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                match git::is_commit_reachable(
+                    params.git_repo_path,
+                    reachable_from,
+                    &commit.git_sha,
+                ) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -3554,13 +3558,13 @@ async fn show_all_commits(
 
         matched_count += 1;
 
-        // Apply limit
-        if limit > 0 && displayed_count >= limit {
+        // Apply params.limit
+        if params.limit > 0 && displayed_count >= params.limit {
             continue;
         }
 
         displayed_count += 1;
-        display_commit(commit, displayed_count, verbose);
+        display_commit(commit, displayed_count, params.verbose);
     }
 
     // Step 5: Show summary
@@ -3568,12 +3572,12 @@ async fn show_all_commits(
         total_commits: all_commits.len(),
         matched_count,
         displayed_count,
-        limit,
-        author_patterns,
-        subject_patterns,
-        regex_patterns,
-        symbol_patterns,
-        path_patterns,
+        limit: params.limit,
+        author_patterns: params.author_patterns,
+        subject_patterns: params.subject_patterns,
+        regex_patterns: params.regex_patterns,
+        symbol_patterns: params.symbol_patterns,
+        path_patterns: params.path_patterns,
     };
     show_commit_summary(&summary_params);
 
