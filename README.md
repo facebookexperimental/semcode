@@ -43,8 +43,15 @@ The MCP server can also be used by
 
 ### Dependencies
 
+```bash
+# Ubuntu/Debian
+sudo apt-get install build-essential libclang-dev protobuf-compiler libprotobuf-dev
+
+# Fedora
+sudo dnf install gcc-c++ clang-devel protobuf-compiler protobuf-devel
 ```
-Install protobuf-devel from your distro
+
+**Note:** The C++ compiler (`g++`/`gcc-c++`) is required for building dependencies.
 
 **Rust:**
 Install from [rustup.rs](https://rustup.rs/)
