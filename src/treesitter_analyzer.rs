@@ -31,6 +31,16 @@ impl Language {
     }
 }
 
+/// Context for extracting code elements from a parsed tree
+pub struct ExtractionContext<'a> {
+    pub tree: &'a Tree,
+    pub source: &'a str,
+    pub file_path: &'a Path,
+    pub git_hash: &'a str,
+    pub source_root: Option<&'a Path>,
+    pub language: Language,
+}
+
 struct LanguageQueries {
     function_query: Query,
     comment_query: Query,
@@ -470,16 +480,18 @@ impl TreeSitterAnalyzer {
         // Single pass: extract all calls once and map them to functions by byte ranges
         let all_calls = self.extract_all_calls_optimized(tree, source_code, language)?;
 
-        // Extract functions with embedded call data
-        let functions = self.extract_functions_with_calls(
+        // Create extraction context
+        let ctx = ExtractionContext {
             tree,
-            source_code,
+            source: source_code,
             file_path,
             git_hash,
             source_root,
-            &all_calls,
             language,
-        )?;
+        };
+
+        // Extract functions with embedded call data
+        let functions = self.extract_functions_with_calls(&ctx, &all_calls)?;
 
         // Extract types (single traversal as before)
         let types = self.extract_types(
@@ -543,25 +555,22 @@ impl TreeSitterAnalyzer {
     }
 
     /// Extract functions with pre-computed call data (avoids per-function tree traversals)
-    #[allow(clippy::too_many_arguments)]
     fn extract_functions_with_calls(
         &self,
-        tree: &Tree,
-        source: &str,
-        file_path: &Path,
-        git_hash: &str,
-        source_root: Option<&Path>,
+        ctx: &ExtractionContext,
         all_calls: &[(String, usize, usize)],
-        language: Language,
     ) -> Result<Vec<FunctionInfo>> {
-        let queries = self.get_queries(language);
+        let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
-        let mut captures =
-            cursor.captures(&queries.function_query, tree.root_node(), source.as_bytes());
+        let mut captures = cursor.captures(
+            &queries.function_query,
+            ctx.tree.root_node(),
+            ctx.source.as_bytes(),
+        );
         let mut functions = Vec::new();
 
         // Extract all comments once (used by extract_function_with_comments)
-        let comments = self.extract_comments(tree, source, language)?;
+        let comments = self.extract_comments(ctx.tree, ctx.source, ctx.language)?;
 
         while let Some((m, _)) = captures.next() {
             let mut function_name = None;
@@ -574,7 +583,7 @@ impl TreeSitterAnalyzer {
 
             for capture in m.captures {
                 let node = capture.node;
-                let text = &source[node.byte_range()];
+                let text = &ctx.source[node.byte_range()];
                 let capture_name = queries.function_query.capture_names()[capture.index as usize];
 
                 match capture_name {
@@ -586,7 +595,7 @@ impl TreeSitterAnalyzer {
                         return_type = Some(text.to_string());
                     }
                     "parameters" => {
-                        parameters = self.parse_parameters_from_node(node, source);
+                        parameters = self.parse_parameters_from_node(node, ctx.source);
                         if let Some(ref name) = function_name {
                             if name == "btrfs_lookup_inode" {
                                 tracing::debug!(
@@ -615,7 +624,7 @@ impl TreeSitterAnalyzer {
                         if return_type.is_none() {
                             return_type = Some(self.extract_return_type_from_function(
                                 node,
-                                source,
+                                ctx.source,
                                 &function_name,
                             ));
                         }
@@ -652,7 +661,8 @@ impl TreeSitterAnalyzer {
                     // Try to manually find parameter_list nodes in the function AST
                     for capture in m.captures {
                         let node = capture.node;
-                        if self.try_extract_parameters_from_node(node, source, &mut parameters) {
+                        if self.try_extract_parameters_from_node(node, ctx.source, &mut parameters)
+                        {
                             if name == "btrfs_lookup_inode" {
                                 tracing::debug!(
                                     "{}: Fallback parameter extraction found {} params",
@@ -673,7 +683,7 @@ impl TreeSitterAnalyzer {
 
                 // Extract complete function text including top comments
                 let complete_body = self.extract_function_with_comments(
-                    source,
+                    ctx.source,
                     function_start_byte,
                     function_end_byte,
                     line_start,
@@ -709,8 +719,8 @@ impl TreeSitterAnalyzer {
 
                 let func = FunctionInfo {
                     name: name.clone(),
-                    file_path: self.make_relative_path(file_path, source_root),
-                    git_file_hash: git_hash.to_string(),
+                    file_path: self.make_relative_path(ctx.file_path, ctx.source_root),
+                    git_file_hash: ctx.git_hash.to_string(),
                     line_start,
                     line_end,
                     return_type: return_type.unwrap_or_else(|| "void".to_string()),
@@ -770,15 +780,15 @@ impl TreeSitterAnalyzer {
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
         let all_calls = self.extract_all_calls_optimized(tree, source, language)?;
-        self.extract_functions_with_calls(
+        let ctx = ExtractionContext {
             tree,
             source,
             file_path,
             git_hash,
             source_root,
-            &all_calls,
             language,
-        )
+        };
+        self.extract_functions_with_calls(&ctx, &all_calls)
     }
 
     fn extract_comments(
