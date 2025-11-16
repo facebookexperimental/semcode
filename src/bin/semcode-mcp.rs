@@ -1303,17 +1303,9 @@ async fn mcp_show_commit_range(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn mcp_show_all_commits(
     db: &DatabaseManager,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &CommitFilterParams<'_>,
 ) -> Result<String> {
     use std::io::Write;
 
@@ -1329,8 +1321,8 @@ async fn mcp_show_all_commits(
 
     // Step 2a: Compile author filters if provided (ANY must match - OR logic)
     let mut author_filters = Vec::new();
-    if !author_patterns.is_empty() {
-        for pattern in author_patterns {
+    if !params.author_patterns.is_empty() {
+        for pattern in params.author_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1350,8 +1342,8 @@ async fn mcp_show_all_commits(
 
     // Step 2b: Compile subject filters if provided (ANY must match - OR logic)
     let mut subject_filters = Vec::new();
-    if !subject_patterns.is_empty() {
-        for pattern in subject_patterns {
+    if !params.subject_patterns.is_empty() {
+        for pattern in params.subject_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1371,8 +1363,8 @@ async fn mcp_show_all_commits(
 
     // Step 2: Compile regex filters if provided (ALL must match)
     let mut regex_filters = Vec::new();
-    if !regex_patterns.is_empty() {
-        for pattern in regex_patterns {
+    if !params.regex_patterns.is_empty() {
+        for pattern in params.regex_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1388,8 +1380,8 @@ async fn mcp_show_all_commits(
 
     // Step 2b: Compile symbol filters if provided (ALL must match)
     let mut symbol_filters = Vec::new();
-    if !symbol_patterns.is_empty() {
-        for pattern in symbol_patterns {
+    if !params.symbol_patterns.is_empty() {
+        for pattern in params.symbol_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1409,8 +1401,8 @@ async fn mcp_show_all_commits(
 
     // Step 2c: Compile path filters if provided (ALL must match)
     let mut path_filters = Vec::new();
-    if !path_patterns.is_empty() {
-        for pattern in path_patterns {
+    if !params.path_patterns.is_empty() {
+        for pattern in params.path_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1503,9 +1495,9 @@ async fn mcp_show_all_commits(
         .collect();
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
-    let reachable_set = if let Some(reachable_from) = reachable_sha {
+    let reachable_set = if let Some(reachable_from) = params.reachable_sha {
         if filtered_commits.len() > 10 {
-            match git::get_reachable_commits(git_repo_path, reachable_from) {
+            match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                 Ok(set) => Some(set),
                 Err(e) => {
                     writeln!(
@@ -1529,12 +1521,16 @@ async fn mcp_show_all_commits(
 
     for commit in &filtered_commits {
         // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
+        if let Some(reachable_from) = params.reachable_sha {
             // Use hashset if available, otherwise do individual check
             let is_reachable = if let Some(ref set) = reachable_set {
                 set.contains(&commit.git_sha)
             } else {
-                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                match git::is_commit_reachable(
+                    params.git_repo_path,
+                    reachable_from,
+                    &commit.git_sha,
+                ) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -1556,7 +1552,7 @@ async fn mcp_show_all_commits(
         matched_count += 1;
         displayed_count += 1;
 
-        if verbose {
+        if params.verbose {
             // Verbose mode: show full details for each commit
             writeln!(buffer, "\n{}", "─".repeat(80))?;
             writeln!(buffer, "{}. Commit: {}", displayed_count, commit.git_sha)?;
@@ -1584,7 +1580,7 @@ async fn mcp_show_all_commits(
                 }
             }
 
-            // Show diff if verbose
+            // Show diff if params.verbose
             if !commit.diff.is_empty() {
                 writeln!(buffer, "\n   Diff:")?;
                 writeln!(buffer, "   {}", "─".repeat(76))?;
@@ -1609,40 +1605,43 @@ async fn mcp_show_all_commits(
     writeln!(buffer, "\n{}", "=".repeat(80))?;
 
     // Step 4: Show summary with filtering info
-    if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty() {
+    if !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+    {
         writeln!(buffer, "Summary:")?;
         writeln!(buffer, "  Total commits in database: {}", all_commits.len())?;
         writeln!(buffer, "  Matched by filters: {}", matched_count)?;
         writeln!(buffer, "  Displayed: {}", displayed_count)?;
 
         if displayed_count == 0 {
-            if !regex_patterns.is_empty() && !symbol_patterns.is_empty() {
+            if !params.regex_patterns.is_empty() && !params.symbol_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} regex pattern(s) and {} symbol pattern(s)",
-                    regex_patterns.len(),
-                    symbol_patterns.len()
+                    params.regex_patterns.len(),
+                    params.symbol_patterns.len()
                 )?;
-            } else if !regex_patterns.is_empty() {
+            } else if !params.regex_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} regex pattern(s): {}",
-                    regex_patterns.len(),
-                    regex_patterns.join(", ")
+                    params.regex_patterns.len(),
+                    params.regex_patterns.join(", ")
                 )?;
-            } else if !symbol_patterns.is_empty() {
+            } else if !params.symbol_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} symbol pattern(s): {}",
-                    symbol_patterns.len(),
-                    symbol_patterns.join(", ")
+                    params.symbol_patterns.len(),
+                    params.symbol_patterns.join(", ")
                 )?;
-            } else if !path_patterns.is_empty() {
+            } else if !params.path_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} path pattern(s): {}",
-                    path_patterns.len(),
-                    path_patterns.join(", ")
+                    params.path_patterns.len(),
+                    params.path_patterns.join(", ")
                 )?;
             }
         }
@@ -2959,19 +2958,17 @@ impl McpServer {
             }
         } else {
             // Neither git_ref nor git_range provided - show all commits from database
-            match mcp_show_all_commits(
-                &self.db,
+            let params = CommitFilterParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 reachable_sha,
                 git_repo_path,
-            )
-            .await
-            {
+            };
+            match mcp_show_all_commits(&self.db, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
