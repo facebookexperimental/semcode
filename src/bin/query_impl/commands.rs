@@ -481,20 +481,18 @@ pub async fn handle_command(
             };
             show_all_commits(db, &params).await?;
         } else if let Some(range) = git_range {
-            show_commit_range(
-                db,
-                &range,
+            let range_params = ShowAllCommitsParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 limit,
-                reachable_sha.as_deref(),
+                reachable_sha: reachable_sha.as_deref(),
                 git_repo_path,
-            )
-            .await?;
+            };
+            show_commit_range(db, &range, &range_params).await?;
         } else {
             let git_ref = git_ref_parts.join(" ");
             let metadata_params = ShowCommitMetadataParams {
@@ -3972,22 +3970,13 @@ async fn show_commit_metadata(
 }
 
 /// Show metadata for commits in a git range
-#[allow(clippy::too_many_arguments)]
 async fn show_commit_range(
     db: &DatabaseManager,
     range: &str,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    limit: usize,
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &ShowAllCommitsParams<'_>,
 ) -> Result<()> {
     // Step 1: Resolve git range using gitoxide
-    let range_commits = match gix::discover(git_repo_path) {
+    let range_commits = match gix::discover(params.git_repo_path) {
         Ok(repo) => {
             // Parse the range (FROM..TO)
             let range_parts: Vec<&str> = range.split("..").collect();
@@ -4062,15 +4051,15 @@ async fn show_commit_range(
             {
                 Ok(walk) => {
                     let mut commits = Vec::new();
-                    // Higher limit when any filtering is active, since results will be filtered down
-                    let max_commits = if !author_patterns.is_empty()
-                        || !subject_patterns.is_empty()
-                        || !regex_patterns.is_empty()
-                        || !symbol_patterns.is_empty()
+                    // Higher params.limit when any filtering is active, since results will be filtered down
+                    let max_commits = if !params.author_patterns.is_empty()
+                        || !params.subject_patterns.is_empty()
+                        || !params.regex_patterns.is_empty()
+                        || !params.symbol_patterns.is_empty()
                     {
                         1_000_000 // Allow larger ranges when filtering
                     } else {
-                        10_000 // Standard safety limit
+                        10_000 // Standard safety params.limit
                     };
 
                     for commit_result in walk {
@@ -4083,10 +4072,10 @@ async fn show_commit_range(
                                         range,
                                         max_commits
                                     );
-                                    if author_patterns.is_empty()
-                                        && subject_patterns.is_empty()
-                                        && regex_patterns.is_empty()
-                                        && symbol_patterns.is_empty()
+                                    if params.author_patterns.is_empty()
+                                        && params.subject_patterns.is_empty()
+                                        && params.regex_patterns.is_empty()
+                                        && params.symbol_patterns.is_empty()
                                     {
                                         println!(
                                             "{} Try using -f, -s, -r, or -g <regex> to filter results, or use a smaller range",
@@ -4131,32 +4120,32 @@ async fn show_commit_range(
     }
 
     // Step 2: Compile filters
-    let author_filters = if !author_patterns.is_empty() {
-        compile_regex_filters(author_patterns)?
+    let author_filters = if !params.author_patterns.is_empty() {
+        compile_regex_filters(params.author_patterns)?
     } else {
         Vec::new()
     };
 
-    let subject_filters = if !subject_patterns.is_empty() {
-        compile_regex_filters(subject_patterns)?
+    let subject_filters = if !params.subject_patterns.is_empty() {
+        compile_regex_filters(params.subject_patterns)?
     } else {
         Vec::new()
     };
 
-    let regex_filters = if !regex_patterns.is_empty() {
-        compile_regex_filters(regex_patterns)?
+    let regex_filters = if !params.regex_patterns.is_empty() {
+        compile_regex_filters(params.regex_patterns)?
     } else {
         Vec::new()
     };
 
-    let symbol_filters = if !symbol_patterns.is_empty() {
-        compile_symbol_filters(symbol_patterns)?
+    let symbol_filters = if !params.symbol_patterns.is_empty() {
+        compile_symbol_filters(params.symbol_patterns)?
     } else {
         Vec::new()
     };
 
-    let path_filters = if !path_patterns.is_empty() {
-        compile_path_filters(path_patterns)?
+    let path_filters = if !params.path_patterns.is_empty() {
+        compile_path_filters(params.path_patterns)?
     } else {
         Vec::new()
     };
@@ -4227,9 +4216,9 @@ async fn show_commit_range(
     }
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
-    let reachable_set = if let Some(reachable_from) = reachable_sha {
+    let reachable_set = if let Some(reachable_from) = params.reachable_sha {
         if all_filtered_commits.len() > 10 {
-            match git::get_reachable_commits(git_repo_path, reachable_from) {
+            match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                 Ok(set) => Some(set),
                 Err(e) => {
                     println!(
@@ -4253,12 +4242,16 @@ async fn show_commit_range(
 
     for commit in &all_filtered_commits {
         // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
+        if let Some(reachable_from) = params.reachable_sha {
             // Use hashset if available, otherwise do individual check
             let is_reachable = if let Some(ref set) = reachable_set {
                 set.contains(&commit.git_sha)
             } else {
-                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                match git::is_commit_reachable(
+                    params.git_repo_path,
+                    reachable_from,
+                    &commit.git_sha,
+                ) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -4280,13 +4273,13 @@ async fn show_commit_range(
 
         matched_count += 1;
 
-        // Apply limit
-        if limit > 0 && displayed_count >= limit {
+        // Apply params.limit
+        if params.limit > 0 && displayed_count >= params.limit {
             continue;
         }
 
         displayed_count += 1;
-        display_commit(commit, displayed_count, verbose);
+        display_commit(commit, displayed_count, params.verbose);
     }
 
     // Step 6: Show summary
@@ -4294,12 +4287,12 @@ async fn show_commit_range(
         total_commits: range_commits.len(),
         matched_count,
         displayed_count,
-        limit,
-        author_patterns,
-        subject_patterns,
-        regex_patterns,
-        symbol_patterns,
-        path_patterns,
+        limit: params.limit,
+        author_patterns: params.author_patterns,
+        subject_patterns: params.subject_patterns,
+        regex_patterns: params.regex_patterns,
+        symbol_patterns: params.symbol_patterns,
+        path_patterns: params.path_patterns,
     };
     show_commit_summary(&summary_params);
 
