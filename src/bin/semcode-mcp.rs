@@ -1884,11 +1884,48 @@ struct Args {
     model_path: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum IndexingStatus {
+    NotStarted,
+    InProgress {
+        phase: String,
+        current: usize,
+        total: Option<usize>,
+    },
+    Completed {
+        files_processed: usize,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct IndexingState {
+    status: IndexingStatus,
+    git_sha: Option<String>,
+    started_at: Option<std::time::SystemTime>,
+    completed_at: Option<std::time::SystemTime>,
+}
+
+impl IndexingState {
+    fn new() -> Self {
+        Self {
+            status: IndexingStatus::NotStarted,
+            git_sha: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+}
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
     model_path: Option<String>,
     page_cache: PageCache,
+    indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
+    notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl McpServer {
@@ -1922,6 +1959,8 @@ impl McpServer {
             default_git_sha,
             model_path,
             page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -1932,6 +1971,50 @@ impl McpServer {
             .map(|s| s.to_string())
             .or_else(|| self.default_git_sha.clone())
             .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string())
+    }
+
+    /// Check if the database appears to be empty and return a helpful message if so
+    async fn check_database_status(&self) -> Option<String> {
+        let state = self.indexing_state.lock().await;
+
+        // Check if indexing is currently in progress
+        if matches!(state.status, IndexingStatus::InProgress { .. }) {
+            if let IndexingStatus::InProgress { ref phase, .. } = state.status {
+                return Some(format!(
+                    "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
+                    phase
+                ));
+            }
+        }
+
+        // Check if indexing failed
+        if let IndexingStatus::Failed { ref error } = state.status {
+            return Some(format!(
+                "Database indexing failed: {}. The database may be incomplete or empty.",
+                error
+            ));
+        }
+
+        // Check if we have any functions in the database at all
+        match self.db.count_functions().await {
+            Ok(count) if count == 0 => {
+                // Completely empty database
+                match &state.status {
+                    IndexingStatus::NotStarted => {
+                        Some("Database is empty. Background indexing hasn't started yet. Please wait a moment and try again.".to_string())
+                    }
+                    IndexingStatus::Completed { .. } => {
+                        Some("Database is empty. This repository may not contain any C/C++ source files, or indexing didn't find any functions.".to_string())
+                    }
+                    _ => None,
+                }
+            }
+            Ok(_count) => {
+                // Database has data, allow queries to proceed
+                None
+            }
+            _ => None, // Couldn't check or other error
+        }
     }
 
     async fn handle_request(&self, request: Value) -> Value {
@@ -2490,6 +2573,14 @@ impl McpServer {
                         },
                         "required": ["query_text"]
                     }
+                },
+                {
+                    "name": "indexing_status",
+                    "description": "Check the status of the background indexing operation. Returns current state, progress, and any errors.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
                 }
             ]
         })
@@ -2513,6 +2604,7 @@ impl McpServer {
             "lore_search" => self.handle_lore_search(arguments).await,
             "dig" => self.handle_dig(arguments).await,
             "vlore_similar_emails" => self.handle_vlore_similar_emails(arguments).await,
+            "indexing_status" => self.handle_indexing_status().await,
             _ => json!({
                 "error": format!("Unknown tool: {}", name),
                 "isError": true
@@ -2522,6 +2614,13 @@ impl McpServer {
 
     // Tool implementation methods
     async fn handle_find_function(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2538,6 +2637,13 @@ impl McpServer {
     }
 
     async fn handle_find_type(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2554,6 +2660,13 @@ impl McpServer {
     }
 
     async fn handle_find_callers(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2570,6 +2683,13 @@ impl McpServer {
     }
 
     async fn handle_find_calls(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2586,6 +2706,13 @@ impl McpServer {
     }
 
     async fn handle_find_callchain(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2634,6 +2761,13 @@ impl McpServer {
     }
 
     async fn handle_grep_functions(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let pattern = args["pattern"].as_str().unwrap_or("");
         let verbose = args["verbose"].as_bool().unwrap_or(false);
         let git_sha_arg = args["git_sha"].as_str();
@@ -2656,6 +2790,13 @@ impl McpServer {
     }
 
     async fn handle_vgrep_functions(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let query_text = args["query_text"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let path_pattern = args["path_pattern"].as_str();
@@ -3302,6 +3443,58 @@ impl McpServer {
                 "isError": true
             }),
         }
+    }
+
+    async fn handle_indexing_status(&self) -> Value {
+        let state = self.indexing_state.lock().await;
+
+        let status_text = match &state.status {
+            IndexingStatus::NotStarted => "Not started".to_string(),
+            IndexingStatus::InProgress {
+                phase,
+                current,
+                total,
+            } => {
+                if let Some(total_count) = total {
+                    format!("{} ({}/{})", phase, current, total_count)
+                } else {
+                    format!("{} ({})", phase, current)
+                }
+            }
+            IndexingStatus::Completed { files_processed } => {
+                format!("Completed ({} files processed)", files_processed)
+            }
+            IndexingStatus::Failed { error } => {
+                format!("Failed: {}", error)
+            }
+        };
+
+        let elapsed = if let Some(started) = state.started_at {
+            if let Some(completed) = state.completed_at {
+                completed
+                    .duration_since(started)
+                    .map(|d| format!("{:.2}s", d.as_secs_f64()))
+                    .unwrap_or_else(|_| "N/A".to_string())
+            } else {
+                std::time::SystemTime::now()
+                    .duration_since(started)
+                    .map(|d| format!("{:.2}s (ongoing)", d.as_secs_f64()))
+                    .unwrap_or_else(|_| "N/A".to_string())
+            }
+        } else {
+            "N/A".to_string()
+        };
+
+        let mut result = format!("=== Indexing Status ===\n\n");
+        result.push_str(&format!("Status: {}\n", status_text));
+        if let Some(sha) = &state.git_sha {
+            result.push_str(&format!("Git SHA: {}\n", &sha[..8.min(sha.len())]));
+        }
+        result.push_str(&format!("Elapsed time: {}\n", elapsed));
+
+        json!({
+            "content": [{"type": "text", "text": result}]
+        })
     }
 }
 
@@ -4587,52 +4780,67 @@ async fn mcp_vcommit_similar_commits(
 }
 
 /// Background task to index the current commit if needed (non-blocking)
-async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_repo: String) {
-    use std::fs::OpenOptions;
-    use std::io::Write as _;
+async fn index_current_commit_background(
+    db_manager: Arc<DatabaseManager>,
+    git_repo: String,
+    indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
+    notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+) {
+    eprintln!("[Background] Indexing task started");
 
-    eprintln!("[DEBUG] Background task actually started!");
-
-    // Open log file in append mode
-    let mut log_file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/wtgdf")
-    {
-        Ok(f) => {
-            eprintln!("[DEBUG] Successfully opened /tmp/wtgdf");
-            f
-        }
-        Err(e) => {
-            eprintln!("[Background] Failed to open log file /tmp/wtgdf: {}", e);
-            return;
-        }
+    // Helper to send MCP notifications
+    let send_notification = |message: String| {
+        let tx = notification_tx.clone();
+        tokio::spawn(async move {
+            let guard = tx.lock().await;
+            if let Some(sender) = guard.as_ref() {
+                let notification = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "level": "info",
+                        "message": message
+                    }
+                });
+                let _ = sender.send(serde_json::to_string(&notification).unwrap_or_default());
+            }
+        });
     };
 
-    let mut log = |msg: &str| {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let _ = writeln!(log_file, "[{}] {}", timestamp, msg);
-        let _ = log_file.flush();
-    };
-
-    log("Background indexing task started");
-    eprintln!("[DEBUG] Wrote first log message");
+    eprintln!("[Background] Background indexing task started");
+    send_notification("Semcode: Checking if indexing is needed...".to_string());
 
     // Get current git SHA
     let _git_sha = match semcode::git::get_git_sha(&git_repo) {
         Ok(Some(sha)) => {
-            log(&format!("Current commit: {}", sha));
+            eprintln!("[Background] Current commit: {}", sha);
+            // Update state with git SHA
+            {
+                let mut state = indexing_state.lock().await;
+                state.git_sha = Some(sha.clone());
+                state.started_at = Some(std::time::SystemTime::now());
+            }
             sha
         }
         Ok(None) => {
-            log("Not in a git repository, skipping auto-indexing");
+            eprintln!("[Background] Not in a git repository, skipping auto-indexing");
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: "Not in a git repository".to_string(),
+            };
+            send_notification(
+                "Semcode: Not in a git repository, skipping auto-indexing".to_string(),
+            );
             return;
         }
         Err(e) => {
-            log(&format!("Warning: Failed to get git SHA: {}", e));
+            let error_msg = format!("Failed to get git SHA: {}", e);
+            eprintln!("[Background] Warning: {}", error_msg);
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: error_msg.clone(),
+            };
+            send_notification(format!("Semcode: {}", error_msg));
             return;
         }
     };
@@ -4662,14 +4870,14 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
                                 if processed_pairs
                                     .contains(&(changed_file.path.clone(), new_hash.clone()))
                                 {
-                                    log(&format!(
+                                    eprintln!("[Background] {}", format!(
                                         "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
                                         changed_file.path,
                                         &new_hash[..8]
                                     ));
                                     return;
                                 } else {
-                                    log(&format!(
+                                    eprintln!("[Background] {}", format!(
                                         "Changed file '{}' (SHA: {}) needs indexing",
                                         changed_file.path,
                                         &new_hash[..8]
@@ -4677,7 +4885,7 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
                                 }
                             }
                             Err(e) => {
-                                log(&format!("Warning: Failed to get processed files: {}", e));
+                                eprintln!("[Background] {}", format!("Warning: Failed to get processed files: {}", e));
                                 return;
                             }
                         }
@@ -4685,12 +4893,12 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
                 }
             } else {
                 // No changes in this commit (might be initial commit or root commit)
-                log("No changed files found in current commit, will check all files");
+                eprintln!("[Background] No changed files found in current commit, will check all files");
             }
         }
         Err(e) => {
             // Failed to get changed files (might be initial commit, root commit, etc.)
-            log(&format!(
+            eprintln!("[Background] {}", format!(
                 "Could not get changed files ({}), will check all files",
                 e
             ));
@@ -4699,21 +4907,25 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
 
     // Run git range indexing using the shared library function
     // This uses the same code path as semcode-index -s .
-    log("Checking for files to index...");
+    eprintln!("[Background] Checking for files to index...");
+
+    // Update state to in-progress
+    {
+        let mut state = indexing_state.lock().await;
+        state.status = IndexingStatus::InProgress {
+            phase: "Analyzing files".to_string(),
+            current: 0,
+            total: None,
+        };
+    }
+    send_notification("Semcode: Indexing current commit...".to_string());
 
     // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", _git_sha, _git_sha);
-    let extensions_vec = vec![
-        "c".to_string(),
-        "h".to_string(),
-        "cc".to_string(),
-        "cpp".to_string(),
-        "cxx".to_string(),
-        "c++".to_string(),
-        "hh".to_string(),
-        "hpp".to_string(),
-        "hxx".to_string(),
-    ];
+    let extensions_vec: Vec<String> = vec!["c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "rs"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     match semcode::git_range::process_git_range(
         &repo_path,
@@ -4726,28 +4938,43 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
     .await
     {
         Ok(()) => {
-            log("Indexing complete");
+            eprintln!("[Background] Indexing complete");
+            send_notification("Semcode: Indexing complete".to_string());
+
+            // Update state to completed
+            {
+                let mut state = indexing_state.lock().await;
+                state.status = IndexingStatus::Completed {
+                    files_processed: 0, // We don't have exact count from process_git_range
+                };
+                state.completed_at = Some(std::time::SystemTime::now());
+            }
 
             // Check if database needs optimization
             match db_manager.check_optimization_health().await {
                 Ok((needs_optimization, _diagnostic_msg)) => {
                     if needs_optimization {
-                        log("Database needs optimization");
-                        log("Running optimization...");
+                        eprintln!("[Background] Database needs optimization");
+                        send_notification("Semcode: Optimizing database...".to_string());
                         match db_manager.optimize_database().await {
                             Ok(()) => {
-                                log("Database optimization complete");
+                                eprintln!("[Background] Database optimization complete");
+                                send_notification(
+                                    "Semcode: Database optimization complete, ready for queries"
+                                        .to_string(),
+                                );
                             }
                             Err(e) => {
-                                log(&format!("Warning: Database optimization failed: {}", e));
+                                eprintln!("[Background] {}", format!("Warning: Database optimization failed: {}", e));
                             }
                         }
                     } else {
-                        log("Database is healthy, skipping optimization");
+                        eprintln!("[Background] Database is healthy, skipping optimization");
+                        send_notification("Semcode: Database ready for queries".to_string());
                     }
                 }
                 Err(e) => {
-                    log(&format!(
+                    eprintln!("[Background] {}", format!(
                         "Warning: Failed to check optimization health: {}",
                         e
                     ));
@@ -4755,7 +4982,13 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
             }
         }
         Err(e) => {
-            log(&format!("Warning: Auto-indexing skipped: {}", e));
+            eprintln!("[Background] {}", format!("Warning: Auto-indexing failed: {}", e));
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: format!("Indexing failed: {}", e),
+            };
+            state.completed_at = Some(std::time::SystemTime::now());
+            send_notification(format!("Semcode: Indexing failed: {}", e));
         }
     }
 }
@@ -4768,7 +5001,39 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
 
     let stdin = tokio::io::stdin();
     let mut stdin = BufReader::new(stdin);
-    let mut stdout = tokio::io::stdout();
+    let stdout = tokio::io::stdout();
+
+    // Create notification channel
+    let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Set up notification sender in server
+    {
+        let mut tx_guard = server.notification_tx.lock().await;
+        *tx_guard = Some(notification_tx);
+    }
+
+    // Spawn task to forward notifications to stdout
+    let stdout_clone = Arc::new(tokio::sync::Mutex::new(stdout));
+    let stdout_for_notifications = stdout_clone.clone();
+    tokio::spawn(async move {
+        while let Some(notification) = notification_rx.recv().await {
+            let mut stdout = stdout_for_notifications.lock().await;
+            if let Err(e) = stdout.write_all(notification.as_bytes()).await {
+                eprintln!("[Notification] Failed to write: {}", e);
+                break;
+            }
+            if let Err(e) = stdout.write_all(b"\n").await {
+                eprintln!("[Notification] Failed to write newline: {}", e);
+                break;
+            }
+            if let Err(e) = stdout.flush().await {
+                eprintln!("[Notification] Failed to flush: {}", e);
+                break;
+            }
+        }
+    });
+
+    let stdout = stdout_clone;
 
     let mut line = String::new();
 
@@ -4790,15 +5055,16 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                     Ok(request) => {
                         let response = server.handle_request(request).await;
                         if let Ok(response_str) = serde_json::to_string(&response) {
-                            if let Err(e) = stdout.write_all(response_str.as_bytes()).await {
+                            let mut stdout_guard = stdout.lock().await;
+                            if let Err(e) = stdout_guard.write_all(response_str.as_bytes()).await {
                                 eprintln!("Failed to write response: {e}");
                                 break;
                             }
-                            if let Err(e) = stdout.write_all(b"\n").await {
+                            if let Err(e) = stdout_guard.write_all(b"\n").await {
                                 eprintln!("Failed to write newline: {e}");
                                 break;
                             }
-                            if let Err(e) = stdout.flush().await {
+                            if let Err(e) = stdout_guard.flush().await {
                                 eprintln!("Failed to flush stdout: {e}");
                                 break;
                             }
@@ -4815,9 +5081,10 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                             }
                         });
                         if let Ok(response_str) = serde_json::to_string(&error_response) {
-                            let _ = stdout.write_all(response_str.as_bytes()).await;
-                            let _ = stdout.write_all(b"\n").await;
-                            let _ = stdout.flush().await;
+                            let mut stdout_guard = stdout.lock().await;
+                            let _ = stdout_guard.write_all(response_str.as_bytes()).await;
+                            let _ = stdout_guard.write_all(b"\n").await;
+                            let _ = stdout_guard.flush().await;
                         }
                     }
                 }
@@ -4863,22 +5130,213 @@ async fn main() -> Result<()> {
     server.db.create_tables().await?;
 
     // Spawn background task to index current commit if needed
-    eprintln!("[DEBUG] About to spawn background indexing task");
+    eprintln!("[Background] Spawning background indexing task");
     let db_for_indexing = server.db.clone();
     let git_repo_for_indexing = args.git_repo.clone();
+    let indexing_state_for_bg = server.indexing_state.clone();
+    let notification_tx_for_bg = server.notification_tx.clone();
     let _indexing_handle = tokio::spawn(async move {
-        eprintln!("[DEBUG] Inside spawned task closure");
-        index_current_commit_background(db_for_indexing, git_repo_for_indexing).await;
-        eprintln!("[DEBUG] Background indexing function returned");
+        index_current_commit_background(
+            db_for_indexing,
+            git_repo_for_indexing,
+            indexing_state_for_bg,
+            notification_tx_for_bg,
+        )
+        .await;
     });
-    eprintln!("[DEBUG] Task spawned, handle created");
 
     // Give the background task a chance to start before entering the blocking loop
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    eprintln!("[DEBUG] Yielded to background task");
 
     // Run MCP server on stdio
     run_stdio_server(server).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_indexing_state_new() {
+        let state = IndexingState::new();
+        assert!(matches!(state.status, IndexingStatus::NotStarted));
+        assert!(state.git_sha.is_none());
+        assert!(state.started_at.is_none());
+        assert!(state.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_indexing_status_transitions() {
+        let mut state = IndexingState::new();
+
+        // Transition to in progress
+        state.status = IndexingStatus::InProgress {
+            phase: "Analyzing files".to_string(),
+            current: 10,
+            total: Some(100),
+        };
+        state.started_at = Some(std::time::SystemTime::now());
+
+        if let IndexingStatus::InProgress { phase, current, total } = &state.status {
+            assert_eq!(phase, "Analyzing files");
+            assert_eq!(*current, 10);
+            assert_eq!(*total, Some(100));
+        } else {
+            panic!("Expected InProgress status");
+        }
+
+        // Transition to completed
+        state.status = IndexingStatus::Completed {
+            files_processed: 42,
+        };
+        state.completed_at = Some(std::time::SystemTime::now());
+
+        if let IndexingStatus::Completed { files_processed } = state.status {
+            assert_eq!(files_processed, 42);
+        } else {
+            panic!("Expected Completed status");
+        }
+    }
+
+    #[test]
+    fn test_indexing_status_failed() {
+        let state = IndexingState {
+            status: IndexingStatus::Failed {
+                error: "Test error".to_string(),
+            },
+            git_sha: Some("abc123".to_string()),
+            started_at: Some(std::time::SystemTime::now()),
+            completed_at: Some(std::time::SystemTime::now()),
+        };
+
+        if let IndexingStatus::Failed { error } = &state.status {
+            assert_eq!(error, "Test error");
+        } else {
+            panic!("Expected Failed status");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_not_started() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Not started"));
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_in_progress() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let state = IndexingState {
+            status: IndexingStatus::InProgress {
+                phase: "Testing".to_string(),
+                current: 5,
+                total: Some(10),
+            },
+            git_sha: Some("abc123def456".to_string()),
+            started_at: Some(std::time::SystemTime::now()),
+            completed_at: None,
+        };
+
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Testing (5/10)"));
+        assert!(content.contains("abc123de"));
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_completed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let started = std::time::SystemTime::now();
+        let completed = started + std::time::Duration::from_secs(5);
+
+        let state = IndexingState {
+            status: IndexingStatus::Completed {
+                files_processed: 100,
+            },
+            git_sha: Some("def789".to_string()),
+            started_at: Some(started),
+            completed_at: Some(completed),
+        };
+
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Completed (100 files processed)"));
+        assert!(content.contains("5.00s"));
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_failed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let state = IndexingState {
+            status: IndexingStatus::Failed {
+                error: "Connection timeout".to_string(),
+            },
+            git_sha: Some("xyz123".to_string()),
+            started_at: Some(std::time::SystemTime::now()),
+            completed_at: Some(std::time::SystemTime::now()),
+        };
+
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Failed: Connection timeout"));
+    }
 }
