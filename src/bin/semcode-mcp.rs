@@ -1954,6 +1954,20 @@ struct DigLoreParams<'a> {
     until_date: Option<&'a str>,
 }
 
+/// Parameters for vector-based lore email similarity search
+struct VLoreParams<'a> {
+    query_text: &'a str,
+    limit: usize,
+    from_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    body_patterns: &'a [String],
+    symbols_patterns: &'a [String],
+    recipients_patterns: &'a [String],
+    since_date: Option<&'a str>,
+    until_date: Option<&'a str>,
+    model_path: &'a Option<String>,
+}
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
@@ -3440,21 +3454,19 @@ impl McpServer {
             limit
         );
 
-        match mcp_vlore_similar_emails(
-            &self.db,
+        let params = VLoreParams {
             query_text,
             limit,
-            &from_patterns,
-            &subject_patterns,
-            &body_patterns,
-            &symbols_patterns,
-            &recipients_patterns,
-            since_date.as_deref(),
-            until_date.as_deref(),
-            &self.model_path,
-        )
-        .await
-        {
+            from_patterns: &from_patterns,
+            subject_patterns: &subject_patterns,
+            body_patterns: &body_patterns,
+            symbols_patterns: &symbols_patterns,
+            recipients_patterns: &recipients_patterns,
+            since_date: since_date.as_deref(),
+            until_date: until_date.as_deref(),
+            model_path: &self.model_path,
+        };
+        match mcp_vlore_similar_emails(&self.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -4038,68 +4050,64 @@ async fn mcp_dig_lore_by_commit(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn mcp_vlore_similar_emails(
     db: &DatabaseManager,
-    query_text: &str,
-    limit: usize,
-    from_patterns: &[String],
-    subject_patterns: &[String],
-    body_patterns: &[String],
-    symbols_patterns: &[String],
-    recipients_patterns: &[String],
-    since_date: Option<&str>,
-    until_date: Option<&str>,
-    model_path: &Option<String>,
+    params: &VLoreParams<'_>,
 ) -> Result<String> {
     use semcode::CodeVectorizer;
     use std::io::Write;
 
     let mut buffer = Vec::new();
 
-    let has_filters = !from_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !body_patterns.is_empty()
-        || !symbols_patterns.is_empty()
-        || !recipients_patterns.is_empty();
+    let has_filters = !params.from_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.body_patterns.is_empty()
+        || !params.symbols_patterns.is_empty()
+        || !params.recipients_patterns.is_empty();
     match has_filters {
         true => {
             let mut filter_parts = Vec::new();
-            if !from_patterns.is_empty() {
-                filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
+            if !params.from_patterns.is_empty() {
+                filter_parts.push(format!("{} from pattern(s)", params.from_patterns.len()));
             }
-            if !subject_patterns.is_empty() {
-                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !body_patterns.is_empty() {
-                filter_parts.push(format!("{} body pattern(s)", body_patterns.len()));
+            if !params.body_patterns.is_empty() {
+                filter_parts.push(format!("{} body pattern(s)", params.body_patterns.len()));
             }
-            if !symbols_patterns.is_empty() {
-                filter_parts.push(format!("{} symbols pattern(s)", symbols_patterns.len()));
+            if !params.symbols_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbols pattern(s)",
+                    params.symbols_patterns.len()
+                ));
             }
-            if !recipients_patterns.is_empty() {
+            if !params.recipients_patterns.is_empty() {
                 filter_parts.push(format!(
                     "{} recipients pattern(s)",
-                    recipients_patterns.len()
+                    params.recipients_patterns.len()
                 ));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             writeln!(
                 buffer,
-                "Searching for lore emails similar to: {} ({}, limit: {})",
-                query_text, filter_desc, limit
+                "Searching for lore emails similar to: {} ({}, params.limit: {})",
+                params.query_text, filter_desc, params.limit
             )?;
         }
         false => writeln!(
             buffer,
-            "Searching for lore emails similar to: {} (limit: {})",
-            query_text, limit
+            "Searching for lore emails similar to: {} (params.limit: {})",
+            params.query_text, params.limit
         )?,
     }
 
     // Initialize vectorizer
     writeln!(buffer, "Initializing vectorizer...")?;
-    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+    let vectorizer = match CodeVectorizer::new_with_config(false, params.model_path.clone()).await {
         Ok(v) => v,
         Err(e) => {
             writeln!(buffer, "Error: Failed to initialize vectorizer: {}", e)?;
@@ -4113,7 +4121,7 @@ async fn mcp_vlore_similar_emails(
 
     // Generate vector for query text
     writeln!(buffer, "Generating query vector...")?;
-    let query_vector = match vectorizer.vectorize_code(query_text) {
+    let query_vector = match vectorizer.vectorize_code(params.query_text) {
         Ok(v) => v,
         Err(e) => {
             writeln!(buffer, "Error: Failed to generate vector for query: {}", e)?;
@@ -4122,32 +4130,32 @@ async fn mcp_vlore_similar_emails(
     };
 
     // Prepare filter patterns for database-level filtering
-    let from_filter = if !from_patterns.is_empty() {
-        Some(from_patterns)
+    let from_filter = if !params.from_patterns.is_empty() {
+        Some(params.from_patterns)
     } else {
         None
     };
 
-    let subject_filter = if !subject_patterns.is_empty() {
-        Some(subject_patterns)
+    let subject_filter = if !params.subject_patterns.is_empty() {
+        Some(params.subject_patterns)
     } else {
         None
     };
 
-    let body_filter = if !body_patterns.is_empty() {
-        Some(body_patterns)
+    let body_filter = if !params.body_patterns.is_empty() {
+        Some(params.body_patterns)
     } else {
         None
     };
 
-    let symbols_filter = if !symbols_patterns.is_empty() {
-        Some(symbols_patterns)
+    let symbols_filter = if !params.symbols_patterns.is_empty() {
+        Some(params.symbols_patterns)
     } else {
         None
     };
 
-    let recipients_filter = if !recipients_patterns.is_empty() {
-        Some(recipients_patterns)
+    let recipients_filter = if !params.recipients_patterns.is_empty() {
+        Some(params.recipients_patterns)
     } else {
         None
     };
@@ -4159,11 +4167,11 @@ async fn mcp_vlore_similar_emails(
         body_patterns: body_filter,
         symbols_patterns: symbols_filter,
         recipients_patterns: recipients_filter,
-        since_date,
-        until_date,
+        since_date: params.since_date,
+        until_date: params.until_date,
     };
     match db
-        .search_similar_lore_emails(&query_vector, limit, &filters)
+        .search_similar_lore_emails(&query_vector, params.limit, &filters)
         .await
     {
         Ok(results) if results.is_empty() => {
