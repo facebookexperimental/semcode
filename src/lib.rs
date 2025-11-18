@@ -3,6 +3,7 @@
 mod database;
 pub mod database_utils;
 pub mod date_utils;
+pub mod file_extensions;
 pub mod git;
 pub mod git_range;
 pub mod hash;

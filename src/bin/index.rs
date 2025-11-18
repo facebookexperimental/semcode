@@ -28,8 +28,8 @@ struct Args {
     database: Option<String>,
 
     /// File extensions to process (can be specified multiple times)
-    #[arg(short, long, value_delimiter = ',', default_value = "c,h,rs")]
-    extensions: Vec<String>,
+    #[arg(short, long, value_delimiter = ',', default_value_t = semcode::file_extensions::default_extensions_string())]
+    extensions: String,
 
     /// Include directories (can be specified multiple times)
     #[arg(short, long)]
@@ -810,8 +810,8 @@ async fn run_pipeline(args: Args) -> Result<()> {
     if !args.vectors {
         let extensions: Vec<String> = args
             .extensions
-            .iter()
-            .map(|ext| ext.trim_start_matches('.').to_string())
+            .split(',')
+            .map(|ext| ext.trim().trim_start_matches('.').to_string())
             .collect();
 
         // Determine git range to process

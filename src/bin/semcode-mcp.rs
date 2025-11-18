@@ -4882,14 +4882,13 @@ async fn index_current_commit_background(
     match semcode::git::get_changed_files(&repo_path, "HEAD~1", "HEAD") {
         Ok(changed_files) => {
             if !changed_files.is_empty() {
-                // Find first C/C++ file that was changed (added or modified)
-                let extensions = vec!["c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx"];
+                // Find first C/C++/Rust file that was changed (added or modified)
                 if let Some(changed_file) = changed_files.iter().find(|cf| {
                     matches!(
                         cf.change_type,
                         semcode::git::ChangeType::Added | semcode::git::ChangeType::Modified
                     ) && cf.new_file_hash.is_some()
-                        && extensions.iter().any(|ext| cf.path.ends_with(ext))
+                        && semcode::file_extensions::is_supported_for_analysis(&cf.path)
                 }) {
                     if let Some(new_hash) = &changed_file.new_file_hash {
                         // Get already processed files from database
@@ -4956,12 +4955,7 @@ async fn index_current_commit_background(
 
     // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", _git_sha, _git_sha);
-    let extensions_vec: Vec<String> = [
-        "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "rs",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let extensions_vec = semcode::file_extensions::supported_extensions();
 
     match semcode::git_range::process_git_range(
         &repo_path,

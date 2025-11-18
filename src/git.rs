@@ -962,12 +962,7 @@ pub fn write_diff_and_extract_symbols(
             .saturating_sub(1); // Convert to 0-indexed
 
         // Find the symbol at the start of this hunk using walk-back
-        let symbol_context = if file_path.ends_with(".c")
-            || file_path.ends_with(".h")
-            || file_path.ends_with(".cpp")
-            || file_path.ends_with(".cc")
-            || file_path.ends_with(".cxx")
-        {
+        let symbol_context = if crate::file_extensions::is_c_cpp_file(file_path) {
             crate::symbol_walkback::find_symbol_for_line(&new_lines, start_line).or_else(|| {
                 // If walk-back fails, try to find the first non-empty line in the hunk
                 hunk.iter_changes()
@@ -1011,12 +1006,7 @@ pub fn write_diff_and_extract_symbols(
     }
 
     // Extract symbols for C/C++ files only using walk-back algorithm
-    let symbols = if file_path.ends_with(".c")
-        || file_path.ends_with(".h")
-        || file_path.ends_with(".cpp")
-        || file_path.ends_with(".cc")
-        || file_path.ends_with(".cxx")
-    {
+    let symbols = if crate::file_extensions::is_c_cpp_file(file_path) {
         // Collect modified line numbers from both old and new files
         let mut new_modified_lines = HashSet::new();
         let mut old_modified_lines = HashSet::new();
