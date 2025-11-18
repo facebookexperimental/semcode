@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use clap::Parser;
-use semcode::{git, pages::PageCache, process_database_path, DatabaseManager};
+use semcode::{
+    git, pages::PageCache, process_database_path, search::LoreSearchOptions, DatabaseManager,
+    LoreEmailFilters,
+};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
@@ -488,21 +491,14 @@ async fn mcp_show_calls(
 async fn mcp_show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &CommitFilterParams<'_>,
 ) -> Result<String> {
     use std::io::Write;
 
     let mut buffer = Vec::new();
 
     // Step 1: Resolve git reference to full SHA using gitoxide
-    let resolved_sha = match gix::discover(git_repo_path) {
+    let resolved_sha = match gix::discover(params.git_repo_path) {
         Ok(repo) => match git::resolve_to_commit(&repo, git_ref) {
             Ok(commit) => commit.id().to_string(),
             Err(e) => {
@@ -562,7 +558,7 @@ async fn mcp_show_commit_metadata(
                 resolved_sha
             )?;
 
-            match git::get_commit_info_from_git(git_repo_path, &resolved_sha) {
+            match git::get_commit_info_from_git(params.git_repo_path, &resolved_sha) {
                 Ok(git_commit) => {
                     (
                         git_commit.git_sha,
@@ -586,8 +582,8 @@ async fn mcp_show_commit_metadata(
     };
 
     // Step 2b: Apply reachability filter if provided
-    if let Some(reachable_from) = reachable_sha {
-        match git::is_commit_reachable(git_repo_path, reachable_from, &resolved_sha) {
+    if let Some(reachable_from) = params.reachable_sha {
+        match git::is_commit_reachable(params.git_repo_path, reachable_from, &resolved_sha) {
             Ok(true) => {
                 // Commit is reachable, continue processing
             }
@@ -607,9 +603,9 @@ async fn mcp_show_commit_metadata(
     }
 
     // Step 2c: Apply author filters if provided (ANY must match - OR logic)
-    if !author_patterns.is_empty() {
+    if !params.author_patterns.is_empty() {
         let mut author_regexes = Vec::new();
-        for pattern in author_patterns {
+        for pattern in params.author_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -633,17 +629,17 @@ async fn mcp_show_commit_metadata(
                 buffer,
                 "Info: Commit {} does not match any of {} author pattern(s): {}",
                 resolved_sha,
-                author_patterns.len(),
-                author_patterns.join(", ")
+                params.author_patterns.len(),
+                params.author_patterns.join(", ")
             )?;
             return Ok(String::from_utf8_lossy(&buffer).to_string());
         }
     }
 
     // Step 2d: Apply subject filters if provided (ANY must match - OR logic)
-    if !subject_patterns.is_empty() {
+    if !params.subject_patterns.is_empty() {
         let mut subject_regexes = Vec::new();
-        for pattern in subject_patterns {
+        for pattern in params.subject_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -669,18 +665,18 @@ async fn mcp_show_commit_metadata(
                 buffer,
                 "Info: Commit {} does not match any of {} subject pattern(s): {}",
                 resolved_sha,
-                subject_patterns.len(),
-                subject_patterns.join(", ")
+                params.subject_patterns.len(),
+                params.subject_patterns.join(", ")
             )?;
             return Ok(String::from_utf8_lossy(&buffer).to_string());
         }
     }
 
     // Step 3: Apply regex filters if provided (ALL must match)
-    if !regex_patterns.is_empty() {
+    if !params.regex_patterns.is_empty() {
         // Compile all regex patterns (case-insensitive)
         let mut regexes = Vec::new();
-        for pattern in regex_patterns {
+        for pattern in params.regex_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -698,7 +694,7 @@ async fn mcp_show_commit_metadata(
         let mut failed_patterns = Vec::new();
         for (i, re) in regexes.iter().enumerate() {
             if !re.is_match(&combined) {
-                failed_patterns.push(regex_patterns[i].as_str());
+                failed_patterns.push(params.regex_patterns[i].as_str());
             }
         }
 
@@ -715,10 +711,10 @@ async fn mcp_show_commit_metadata(
     }
 
     // Step 3b: Apply symbol filters if provided (ALL must match)
-    if !symbol_patterns.is_empty() {
+    if !params.symbol_patterns.is_empty() {
         // Compile all symbol regex patterns (case-insensitive)
         let mut symbol_regexes = Vec::new();
-        for pattern in symbol_patterns {
+        for pattern in params.symbol_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -741,7 +737,7 @@ async fn mcp_show_commit_metadata(
             // Check if ANY symbol matches this pattern
             let matches_any = commit_symbols.iter().any(|symbol| re.is_match(symbol));
             if !matches_any {
-                failed_symbol_patterns.push(symbol_patterns[i].as_str());
+                failed_symbol_patterns.push(params.symbol_patterns[i].as_str());
             }
         }
 
@@ -758,10 +754,10 @@ async fn mcp_show_commit_metadata(
     }
 
     // Step 3c: Apply path filters if provided (ANY must match - OR logic)
-    if !path_patterns.is_empty() {
+    if !params.path_patterns.is_empty() {
         // Compile all path regex patterns (case-insensitive)
         let mut path_regexes = Vec::new();
-        for pattern in path_patterns {
+        for pattern in params.path_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -788,8 +784,8 @@ async fn mcp_show_commit_metadata(
                 buffer,
                 "Info: Commit {} does not match any of {} path pattern(s): {}",
                 resolved_sha,
-                path_patterns.len(),
-                path_patterns.join(", ")
+                params.path_patterns.len(),
+                params.path_patterns.join(", ")
             )?;
             return Ok(String::from_utf8_lossy(&buffer).to_string());
         }
@@ -845,7 +841,7 @@ async fn mcp_show_commit_metadata(
     }
 
     // Show diff if verbose flag is set
-    if verbose {
+    if params.verbose {
         if !commit_diff.is_empty() {
             writeln!(buffer, "\nDiff:")?;
             writeln!(buffer, "{}", "─".repeat(80))?;
@@ -862,21 +858,14 @@ async fn mcp_show_commit_metadata(
 async fn mcp_show_commit_range(
     db: &DatabaseManager,
     range: &str,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &CommitFilterParams<'_>,
 ) -> Result<String> {
     use std::io::Write;
 
     let mut buffer = Vec::new();
 
     // Step 1: Resolve git range using gitoxide
-    let range_commits = match gix::discover(git_repo_path) {
+    let range_commits = match gix::discover(params.git_repo_path) {
         Ok(repo) => {
             // Parse the range (FROM..TO)
             let range_parts: Vec<&str> = range.split("..").collect();
@@ -932,7 +921,7 @@ async fn mcp_show_commit_range(
                 Ok(walk) => {
                     let mut commits = Vec::new();
                     // Higher limit when regex filtering is active, since results will be filtered down
-                    let max_commits = if !regex_patterns.is_empty() {
+                    let max_commits = if !params.regex_patterns.is_empty() {
                         100_000 // Allow larger ranges when filtering
                     } else {
                         10_000 // Standard safety limit
@@ -947,10 +936,10 @@ async fn mcp_show_commit_range(
                                         "Error: Git range {} is too large (>{} commits)",
                                         range, max_commits
                                     )?;
-                                    if regex_patterns.is_empty() {
+                                    if params.regex_patterns.is_empty() {
                                         writeln!(
                                             buffer,
-                                            "Hint: Try using regex_patterns to filter results, or use a smaller range"
+                                            "Hint: Try using params.regex_patterns to filter results, or use a smaller range"
                                         )?;
                                     } else {
                                         writeln!(
@@ -992,8 +981,8 @@ async fn mcp_show_commit_range(
 
     // Step 2a: Compile author filters if provided (ANY must match - OR logic)
     let mut author_filters = Vec::new();
-    if !author_patterns.is_empty() {
-        for pattern in author_patterns {
+    if !params.author_patterns.is_empty() {
+        for pattern in params.author_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1013,8 +1002,8 @@ async fn mcp_show_commit_range(
 
     // Step 2b: Compile subject filters if provided (ANY must match - OR logic)
     let mut subject_filters = Vec::new();
-    if !subject_patterns.is_empty() {
-        for pattern in subject_patterns {
+    if !params.subject_patterns.is_empty() {
+        for pattern in params.subject_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1034,8 +1023,8 @@ async fn mcp_show_commit_range(
 
     // Step 2: Compile regex filters if provided (ALL must match)
     let mut regex_filters = Vec::new();
-    if !regex_patterns.is_empty() {
-        for pattern in regex_patterns {
+    if !params.regex_patterns.is_empty() {
+        for pattern in params.regex_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1051,8 +1040,8 @@ async fn mcp_show_commit_range(
 
     // Step 2b: Compile symbol filters if provided (ALL must match)
     let mut symbol_filters = Vec::new();
-    if !symbol_patterns.is_empty() {
-        for pattern in symbol_patterns {
+    if !params.symbol_patterns.is_empty() {
+        for pattern in params.symbol_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1072,8 +1061,8 @@ async fn mcp_show_commit_range(
 
     // Step 2c: Compile path filters if provided (ALL must match)
     let mut path_filters = Vec::new();
-    if !path_patterns.is_empty() {
-        for pattern in path_patterns {
+    if !params.path_patterns.is_empty() {
+        for pattern in params.path_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1157,9 +1146,9 @@ async fn mcp_show_commit_range(
     }
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
-    let reachable_set = if let Some(reachable_from) = reachable_sha {
+    let reachable_set = if let Some(reachable_from) = params.reachable_sha {
         if all_filtered_commits.len() > 10 {
-            match git::get_reachable_commits(git_repo_path, reachable_from) {
+            match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                 Ok(set) => Some(set),
                 Err(e) => {
                     writeln!(
@@ -1183,12 +1172,16 @@ async fn mcp_show_commit_range(
 
     for commit in &all_filtered_commits {
         // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
+        if let Some(reachable_from) = params.reachable_sha {
             // Use hashset if available, otherwise do individual check
             let is_reachable = if let Some(ref set) = reachable_set {
                 set.contains(&commit.git_sha)
             } else {
-                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                match git::is_commit_reachable(
+                    params.git_repo_path,
+                    reachable_from,
+                    &commit.git_sha,
+                ) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -1210,7 +1203,7 @@ async fn mcp_show_commit_range(
         matched_count += 1;
         displayed_count += 1;
 
-        if verbose {
+        if params.verbose {
             // Verbose mode: show full details for each commit
             writeln!(buffer, "\n{}", "─".repeat(80))?;
             writeln!(buffer, "{}. Commit: {}", displayed_count, commit.git_sha)?;
@@ -1238,7 +1231,7 @@ async fn mcp_show_commit_range(
                 }
             }
 
-            // Show diff if verbose
+            // Show diff if params.verbose
             if !commit.diff.is_empty() {
                 writeln!(buffer, "\n   Diff:")?;
                 writeln!(buffer, "   {}", "─".repeat(76))?;
@@ -1263,40 +1256,43 @@ async fn mcp_show_commit_range(
     writeln!(buffer, "\n{}", "=".repeat(80))?;
 
     // Show summary with filtering info
-    if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty() {
+    if !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+    {
         writeln!(buffer, "Summary:")?;
         writeln!(buffer, "  Total commits in range: {}", range_commits.len())?;
         writeln!(buffer, "  Matched by filters: {}", matched_count)?;
         writeln!(buffer, "  Displayed: {}", displayed_count)?;
 
         if displayed_count == 0 {
-            if !regex_patterns.is_empty() && !symbol_patterns.is_empty() {
+            if !params.regex_patterns.is_empty() && !params.symbol_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} regex pattern(s) and {} symbol pattern(s)",
-                    regex_patterns.len(),
-                    symbol_patterns.len()
+                    params.regex_patterns.len(),
+                    params.symbol_patterns.len()
                 )?;
-            } else if !regex_patterns.is_empty() {
+            } else if !params.regex_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} regex pattern(s): {}",
-                    regex_patterns.len(),
-                    regex_patterns.join(", ")
+                    params.regex_patterns.len(),
+                    params.regex_patterns.join(", ")
                 )?;
-            } else if !symbol_patterns.is_empty() {
+            } else if !params.symbol_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} symbol pattern(s): {}",
-                    symbol_patterns.len(),
-                    symbol_patterns.join(", ")
+                    params.symbol_patterns.len(),
+                    params.symbol_patterns.join(", ")
                 )?;
-            } else if !path_patterns.is_empty() {
+            } else if !params.path_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} path pattern(s): {}",
-                    path_patterns.len(),
-                    path_patterns.join(", ")
+                    params.path_patterns.len(),
+                    params.path_patterns.join(", ")
                 )?;
             }
         }
@@ -1309,14 +1305,7 @@ async fn mcp_show_commit_range(
 
 async fn mcp_show_all_commits(
     db: &DatabaseManager,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &CommitFilterParams<'_>,
 ) -> Result<String> {
     use std::io::Write;
 
@@ -1332,8 +1321,8 @@ async fn mcp_show_all_commits(
 
     // Step 2a: Compile author filters if provided (ANY must match - OR logic)
     let mut author_filters = Vec::new();
-    if !author_patterns.is_empty() {
-        for pattern in author_patterns {
+    if !params.author_patterns.is_empty() {
+        for pattern in params.author_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1353,8 +1342,8 @@ async fn mcp_show_all_commits(
 
     // Step 2b: Compile subject filters if provided (ANY must match - OR logic)
     let mut subject_filters = Vec::new();
-    if !subject_patterns.is_empty() {
-        for pattern in subject_patterns {
+    if !params.subject_patterns.is_empty() {
+        for pattern in params.subject_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1374,8 +1363,8 @@ async fn mcp_show_all_commits(
 
     // Step 2: Compile regex filters if provided (ALL must match)
     let mut regex_filters = Vec::new();
-    if !regex_patterns.is_empty() {
-        for pattern in regex_patterns {
+    if !params.regex_patterns.is_empty() {
+        for pattern in params.regex_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1391,8 +1380,8 @@ async fn mcp_show_all_commits(
 
     // Step 2b: Compile symbol filters if provided (ALL must match)
     let mut symbol_filters = Vec::new();
-    if !symbol_patterns.is_empty() {
-        for pattern in symbol_patterns {
+    if !params.symbol_patterns.is_empty() {
+        for pattern in params.symbol_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1412,8 +1401,8 @@ async fn mcp_show_all_commits(
 
     // Step 2c: Compile path filters if provided (ALL must match)
     let mut path_filters = Vec::new();
-    if !path_patterns.is_empty() {
-        for pattern in path_patterns {
+    if !params.path_patterns.is_empty() {
+        for pattern in params.path_patterns {
             match regex::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
@@ -1506,9 +1495,9 @@ async fn mcp_show_all_commits(
         .collect();
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
-    let reachable_set = if let Some(reachable_from) = reachable_sha {
+    let reachable_set = if let Some(reachable_from) = params.reachable_sha {
         if filtered_commits.len() > 10 {
-            match git::get_reachable_commits(git_repo_path, reachable_from) {
+            match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                 Ok(set) => Some(set),
                 Err(e) => {
                     writeln!(
@@ -1532,12 +1521,16 @@ async fn mcp_show_all_commits(
 
     for commit in &filtered_commits {
         // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
+        if let Some(reachable_from) = params.reachable_sha {
             // Use hashset if available, otherwise do individual check
             let is_reachable = if let Some(ref set) = reachable_set {
                 set.contains(&commit.git_sha)
             } else {
-                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                match git::is_commit_reachable(
+                    params.git_repo_path,
+                    reachable_from,
+                    &commit.git_sha,
+                ) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -1559,7 +1552,7 @@ async fn mcp_show_all_commits(
         matched_count += 1;
         displayed_count += 1;
 
-        if verbose {
+        if params.verbose {
             // Verbose mode: show full details for each commit
             writeln!(buffer, "\n{}", "─".repeat(80))?;
             writeln!(buffer, "{}. Commit: {}", displayed_count, commit.git_sha)?;
@@ -1587,7 +1580,7 @@ async fn mcp_show_all_commits(
                 }
             }
 
-            // Show diff if verbose
+            // Show diff if params.verbose
             if !commit.diff.is_empty() {
                 writeln!(buffer, "\n   Diff:")?;
                 writeln!(buffer, "   {}", "─".repeat(76))?;
@@ -1612,40 +1605,43 @@ async fn mcp_show_all_commits(
     writeln!(buffer, "\n{}", "=".repeat(80))?;
 
     // Step 4: Show summary with filtering info
-    if !regex_patterns.is_empty() || !symbol_patterns.is_empty() || !path_patterns.is_empty() {
+    if !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+    {
         writeln!(buffer, "Summary:")?;
         writeln!(buffer, "  Total commits in database: {}", all_commits.len())?;
         writeln!(buffer, "  Matched by filters: {}", matched_count)?;
         writeln!(buffer, "  Displayed: {}", displayed_count)?;
 
         if displayed_count == 0 {
-            if !regex_patterns.is_empty() && !symbol_patterns.is_empty() {
+            if !params.regex_patterns.is_empty() && !params.symbol_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} regex pattern(s) and {} symbol pattern(s)",
-                    regex_patterns.len(),
-                    symbol_patterns.len()
+                    params.regex_patterns.len(),
+                    params.symbol_patterns.len()
                 )?;
-            } else if !regex_patterns.is_empty() {
+            } else if !params.regex_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} regex pattern(s): {}",
-                    regex_patterns.len(),
-                    regex_patterns.join(", ")
+                    params.regex_patterns.len(),
+                    params.regex_patterns.join(", ")
                 )?;
-            } else if !symbol_patterns.is_empty() {
+            } else if !params.symbol_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} symbol pattern(s): {}",
-                    symbol_patterns.len(),
-                    symbol_patterns.join(", ")
+                    params.symbol_patterns.len(),
+                    params.symbol_patterns.join(", ")
                 )?;
-            } else if !path_patterns.is_empty() {
+            } else if !params.path_patterns.is_empty() {
                 writeln!(
                     buffer,
                     "\nInfo: No commits matched ALL {} path pattern(s): {}",
-                    path_patterns.len(),
-                    path_patterns.join(", ")
+                    params.path_patterns.len(),
+                    params.path_patterns.join(", ")
                 )?;
             }
         }
@@ -1884,11 +1880,116 @@ struct Args {
     model_path: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum IndexingStatus {
+    NotStarted,
+    InProgress {
+        phase: String,
+        current: usize,
+        total: Option<usize>,
+    },
+    Completed {
+        files_processed: usize,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct IndexingState {
+    status: IndexingStatus,
+    git_sha: Option<String>,
+    started_at: Option<std::time::SystemTime>,
+    completed_at: Option<std::time::SystemTime>,
+}
+
+impl IndexingState {
+    fn new() -> Self {
+        Self {
+            status: IndexingStatus::NotStarted,
+            git_sha: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+}
+
+/// Common parameters for commit filtering operations
+struct CommitFilterParams<'a> {
+    verbose: bool,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+}
+
+/// Parameters for lore email search operations
+struct LoreSearchParams<'a> {
+    from_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    body_patterns: &'a [String],
+    symbols_patterns: &'a [String],
+    recipients_patterns: &'a [String],
+    limit: usize,
+    verbose: usize,
+    show_thread: bool,
+    show_replies: bool,
+    since_date: Option<&'a str>,
+    until_date: Option<&'a str>,
+}
+
+/// Parameters for dig lore by commit operations
+struct DigLoreParams<'a> {
+    commit_ish: &'a str,
+    git_repo_path: &'a str,
+    verbose: usize,
+    show_all: bool,
+    show_thread: bool,
+    show_replies: bool,
+    since_date: Option<&'a str>,
+    until_date: Option<&'a str>,
+}
+
+/// Parameters for vector-based lore email similarity search
+struct VLoreParams<'a> {
+    query_text: &'a str,
+    limit: usize,
+    from_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    body_patterns: &'a [String],
+    symbols_patterns: &'a [String],
+    recipients_patterns: &'a [String],
+    since_date: Option<&'a str>,
+    until_date: Option<&'a str>,
+    model_path: &'a Option<String>,
+}
+
+/// Parameters for vector-based commit similarity search
+struct VCommitParams<'a> {
+    query_text: &'a str,
+    limit: usize,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    git_range: Option<&'a str>,
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+    model_path: &'a Option<String>,
+}
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
     model_path: Option<String>,
     page_cache: PageCache,
+    indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
+    notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl McpServer {
@@ -1922,6 +2023,8 @@ impl McpServer {
             default_git_sha,
             model_path,
             page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -1932,6 +2035,50 @@ impl McpServer {
             .map(|s| s.to_string())
             .or_else(|| self.default_git_sha.clone())
             .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string())
+    }
+
+    /// Check if the database appears to be empty and return a helpful message if so
+    async fn check_database_status(&self) -> Option<String> {
+        let state = self.indexing_state.lock().await;
+
+        // Check if indexing is currently in progress
+        if matches!(state.status, IndexingStatus::InProgress { .. }) {
+            if let IndexingStatus::InProgress { ref phase, .. } = state.status {
+                return Some(format!(
+                    "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
+                    phase
+                ));
+            }
+        }
+
+        // Check if indexing failed
+        if let IndexingStatus::Failed { ref error } = state.status {
+            return Some(format!(
+                "Database indexing failed: {}. The database may be incomplete or empty.",
+                error
+            ));
+        }
+
+        // Check if we have any functions in the database at all
+        match self.db.count_functions().await {
+            Ok(0) => {
+                // Completely empty database
+                match &state.status {
+                    IndexingStatus::NotStarted => {
+                        Some("Database is empty. Background indexing hasn't started yet. Please wait a moment and try again.".to_string())
+                    }
+                    IndexingStatus::Completed { .. } => {
+                        Some("Database is empty. This repository may not contain any C/C++ source files, or indexing didn't find any functions.".to_string())
+                    }
+                    _ => None,
+                }
+            }
+            Ok(_count) => {
+                // Database has data, allow queries to proceed
+                None
+            }
+            _ => None, // Couldn't check or other error
+        }
     }
 
     async fn handle_request(&self, request: Value) -> Value {
@@ -2490,6 +2637,14 @@ impl McpServer {
                         },
                         "required": ["query_text"]
                     }
+                },
+                {
+                    "name": "indexing_status",
+                    "description": "Check the status of the background indexing operation. Returns current state, progress, and any errors.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
                 }
             ]
         })
@@ -2513,6 +2668,7 @@ impl McpServer {
             "lore_search" => self.handle_lore_search(arguments).await,
             "dig" => self.handle_dig(arguments).await,
             "vlore_similar_emails" => self.handle_vlore_similar_emails(arguments).await,
+            "indexing_status" => self.handle_indexing_status().await,
             _ => json!({
                 "error": format!("Unknown tool: {}", name),
                 "isError": true
@@ -2522,6 +2678,13 @@ impl McpServer {
 
     // Tool implementation methods
     async fn handle_find_function(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2538,6 +2701,13 @@ impl McpServer {
     }
 
     async fn handle_find_type(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2554,6 +2724,13 @@ impl McpServer {
     }
 
     async fn handle_find_callers(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2570,6 +2747,13 @@ impl McpServer {
     }
 
     async fn handle_find_calls(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2586,6 +2770,13 @@ impl McpServer {
     }
 
     async fn handle_find_callchain(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let git_sha = self.resolve_git_sha(git_sha_arg);
@@ -2634,6 +2825,13 @@ impl McpServer {
     }
 
     async fn handle_grep_functions(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let pattern = args["pattern"].as_str().unwrap_or("");
         let verbose = args["verbose"].as_bool().unwrap_or(false);
         let git_sha_arg = args["git_sha"].as_str();
@@ -2656,6 +2854,13 @@ impl McpServer {
     }
 
     async fn handle_vgrep_functions(&self, args: &Value) -> Value {
+        // Check if database is empty and return helpful message
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
         let query_text = args["query_text"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let path_pattern = args["path_pattern"].as_str();
@@ -2761,20 +2966,17 @@ impl McpServer {
         // Check if git_range is provided
         if let Some(range) = git_range {
             // Show commit range
-            match mcp_show_commit_range(
-                &self.db,
-                range,
+            let params = CommitFilterParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 reachable_sha,
                 git_repo_path,
-            )
-            .await
-            {
+            };
+            match mcp_show_commit_range(&self.db, range, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -2788,20 +2990,17 @@ impl McpServer {
             }
         } else if let Some(git_ref_str) = git_ref {
             // Show single commit
-            match mcp_show_commit_metadata(
-                &self.db,
-                git_ref_str,
+            let params = CommitFilterParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 reachable_sha,
                 git_repo_path,
-            )
-            .await
-            {
+            };
+            match mcp_show_commit_metadata(&self.db, git_ref_str, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -2815,19 +3014,17 @@ impl McpServer {
             }
         } else {
             // Neither git_ref nor git_range provided - show all commits from database
-            match mcp_show_all_commits(
-                &self.db,
+            let params = CommitFilterParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 reachable_sha,
                 git_repo_path,
-            )
-            .await
-            {
+            };
+            match mcp_show_all_commits(&self.db, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -2918,22 +3115,20 @@ impl McpServer {
         // Get it from the database manager or discover from current directory
         let git_repo_path = "."; // MCP server typically runs in the repo directory
 
-        match mcp_vcommit_similar_commits(
-            &self.db,
+        let params = VCommitParams {
             query_text,
             limit,
-            &author_patterns,
-            &subject_patterns,
-            &regex_patterns,
-            &symbol_patterns,
-            &path_patterns,
+            author_patterns: &author_patterns,
+            subject_patterns: &subject_patterns,
+            regex_patterns: &regex_patterns,
+            symbol_patterns: &symbol_patterns,
+            path_patterns: &path_patterns,
             git_range,
             reachable_sha,
             git_repo_path,
-            &self.model_path,
-        )
-        .await
-        {
+            model_path: &self.model_path,
+        };
+        match mcp_vcommit_similar_commits(&self.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -3066,22 +3261,20 @@ impl McpServer {
             }
         } else {
             // Multi-field search (same as query tool's lore command with multiple -f/-s/-b/-g/-t flags)
-            match mcp_lore_search_multi_field(
-                &self.db,
-                &from_patterns,
-                &subject_patterns,
-                &body_patterns,
-                &symbols_patterns,
-                &recipients_patterns,
+            let search_params = LoreSearchParams {
+                from_patterns: &from_patterns,
+                subject_patterns: &subject_patterns,
+                body_patterns: &body_patterns,
+                symbols_patterns: &symbols_patterns,
+                recipients_patterns: &recipients_patterns,
                 limit,
                 verbose,
                 show_thread,
                 show_replies,
-                since_date.as_deref(),
-                until_date.as_deref(),
-            )
-            .await
-            {
+                since_date: since_date.as_deref(),
+                until_date: until_date.as_deref(),
+            };
+            match mcp_lore_search_multi_field(&self.db, &search_params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -3150,19 +3343,17 @@ impl McpServer {
 
         let git_repo_path = "."; // MCP server typically runs in the repo directory
 
-        match mcp_dig_lore_by_commit(
-            &self.db,
-            commit,
+        let params = DigLoreParams {
+            commit_ish: commit,
             git_repo_path,
             verbose,
             show_all,
             show_thread,
             show_replies,
-            since_date.as_deref(),
-            until_date.as_deref(),
-        )
-        .await
-        {
+            since_date: since_date.as_deref(),
+            until_date: until_date.as_deref(),
+        };
+        match mcp_dig_lore_by_commit(&self.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -3276,21 +3467,19 @@ impl McpServer {
             limit
         );
 
-        match mcp_vlore_similar_emails(
-            &self.db,
+        let params = VLoreParams {
             query_text,
             limit,
-            &from_patterns,
-            &subject_patterns,
-            &body_patterns,
-            &symbols_patterns,
-            &recipients_patterns,
-            since_date.as_deref(),
-            until_date.as_deref(),
-            &self.model_path,
-        )
-        .await
-        {
+            from_patterns: &from_patterns,
+            subject_patterns: &subject_patterns,
+            body_patterns: &body_patterns,
+            symbols_patterns: &symbols_patterns,
+            recipients_patterns: &recipients_patterns,
+            since_date: since_date.as_deref(),
+            until_date: until_date.as_deref(),
+            model_path: &self.model_path,
+        };
+        match mcp_vlore_similar_emails(&self.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -3302,6 +3491,58 @@ impl McpServer {
                 "isError": true
             }),
         }
+    }
+
+    async fn handle_indexing_status(&self) -> Value {
+        let state = self.indexing_state.lock().await;
+
+        let status_text = match &state.status {
+            IndexingStatus::NotStarted => "Not started".to_string(),
+            IndexingStatus::InProgress {
+                phase,
+                current,
+                total,
+            } => {
+                if let Some(total_count) = total {
+                    format!("{} ({}/{})", phase, current, total_count)
+                } else {
+                    format!("{} ({})", phase, current)
+                }
+            }
+            IndexingStatus::Completed { files_processed } => {
+                format!("Completed ({} files processed)", files_processed)
+            }
+            IndexingStatus::Failed { error } => {
+                format!("Failed: {}", error)
+            }
+        };
+
+        let elapsed = if let Some(started) = state.started_at {
+            if let Some(completed) = state.completed_at {
+                completed
+                    .duration_since(started)
+                    .map(|d| format!("{:.2}s", d.as_secs_f64()))
+                    .unwrap_or_else(|_| "N/A".to_string())
+            } else {
+                std::time::SystemTime::now()
+                    .duration_since(started)
+                    .map(|d| format!("{:.2}s (ongoing)", d.as_secs_f64()))
+                    .unwrap_or_else(|_| "N/A".to_string())
+            }
+        } else {
+            "N/A".to_string()
+        };
+
+        let mut result = "=== Indexing Status ===\n\n".to_string();
+        result.push_str(&format!("Status: {}\n", status_text));
+        if let Some(sha) = &state.git_sha {
+            result.push_str(&format!("Git SHA: {}\n", &sha[..8.min(sha.len())]));
+        }
+        result.push_str(&format!("Elapsed time: {}\n", elapsed));
+
+        json!({
+            "content": [{"type": "text", "text": result}]
+        })
     }
 }
 
@@ -3727,15 +3968,15 @@ async fn mcp_lore_get_by_message_id(
     let mut buffer = Vec::new();
 
     // Use shared writer function
-    semcode::lore_writers::lore_get_by_message_id_to_writer(
-        db,
-        message_id,
+    let options = LoreSearchOptions {
         verbose,
         show_thread,
         show_replies,
-        &mut buffer,
-    )
-    .await?;
+        since_date: None,
+        until_date: None,
+    };
+    semcode::lore_writers::lore_get_by_message_id_to_writer(db, message_id, &options, &mut buffer)
+        .await?;
 
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
@@ -3743,35 +3984,25 @@ async fn mcp_lore_get_by_message_id(
 /// Multi-field lore search supporting combinations of field filters
 async fn mcp_lore_search_multi_field(
     db: &DatabaseManager,
-    from_patterns: &[String],
-    subject_patterns: &[String],
-    body_patterns: &[String],
-    symbols_patterns: &[String],
-    recipients_patterns: &[String],
-    limit: usize,
-    verbose: usize,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    params: &LoreSearchParams<'_>,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
     // Build field_patterns from the collected patterns (same logic as query tool)
     let mut field_patterns = Vec::new();
-    for pattern in from_patterns {
+    for pattern in params.from_patterns {
         field_patterns.push(("from", pattern.as_str()));
     }
-    for pattern in subject_patterns {
+    for pattern in params.subject_patterns {
         field_patterns.push(("subject", pattern.as_str()));
     }
-    for pattern in body_patterns {
+    for pattern in params.body_patterns {
         field_patterns.push(("body", pattern.as_str()));
     }
-    for pattern in symbols_patterns {
+    for pattern in params.symbols_patterns {
         field_patterns.push(("symbols", pattern.as_str()));
     }
-    for pattern in recipients_patterns {
+    for pattern in params.recipients_patterns {
         field_patterns.push(("recipients", pattern.as_str()));
     }
 
@@ -3786,15 +4017,18 @@ async fn mcp_lore_search_multi_field(
     }
 
     // Use shared writer function
+    let options = LoreSearchOptions {
+        verbose: params.verbose,
+        show_thread: params.show_thread,
+        show_replies: params.show_replies,
+        since_date: params.since_date,
+        until_date: params.until_date,
+    };
     semcode::lore_writers::lore_search_multi_field_to_writer(
         db,
         field_patterns,
-        limit,
-        verbose,
-        show_thread,
-        show_replies,
-        since_date,
-        until_date,
+        params.limit,
+        &options,
         &mut buffer,
     )
     .await?;
@@ -3804,28 +4038,24 @@ async fn mcp_lore_search_multi_field(
 /// Search for lore emails related to a git commit (dig command)
 async fn mcp_dig_lore_by_commit(
     db: &DatabaseManager,
-    commit_ish: &str,
-    git_repo_path: &str,
-    verbose: usize,
-    show_all: bool,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    params: &DigLoreParams<'_>,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
     // Use shared writer function for consistent behavior with CLI
+    let options = LoreSearchOptions {
+        verbose: params.verbose,
+        show_thread: params.show_thread,
+        show_replies: params.show_replies,
+        since_date: params.since_date,
+        until_date: params.until_date,
+    };
     semcode::lore_writers::dig_lore_by_commit_to_writer(
         db,
-        commit_ish,
-        git_repo_path,
-        verbose,
-        show_all,
-        show_thread,
-        show_replies,
-        since_date,
-        until_date,
+        params.commit_ish,
+        params.git_repo_path,
+        params.show_all,
+        &options,
         &mut buffer,
     )
     .await?;
@@ -3835,65 +4065,62 @@ async fn mcp_dig_lore_by_commit(
 
 async fn mcp_vlore_similar_emails(
     db: &DatabaseManager,
-    query_text: &str,
-    limit: usize,
-    from_patterns: &[String],
-    subject_patterns: &[String],
-    body_patterns: &[String],
-    symbols_patterns: &[String],
-    recipients_patterns: &[String],
-    since_date: Option<&str>,
-    until_date: Option<&str>,
-    model_path: &Option<String>,
+    params: &VLoreParams<'_>,
 ) -> Result<String> {
     use semcode::CodeVectorizer;
     use std::io::Write;
 
     let mut buffer = Vec::new();
 
-    let has_filters = !from_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !body_patterns.is_empty()
-        || !symbols_patterns.is_empty()
-        || !recipients_patterns.is_empty();
+    let has_filters = !params.from_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.body_patterns.is_empty()
+        || !params.symbols_patterns.is_empty()
+        || !params.recipients_patterns.is_empty();
     match has_filters {
         true => {
             let mut filter_parts = Vec::new();
-            if !from_patterns.is_empty() {
-                filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
+            if !params.from_patterns.is_empty() {
+                filter_parts.push(format!("{} from pattern(s)", params.from_patterns.len()));
             }
-            if !subject_patterns.is_empty() {
-                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !body_patterns.is_empty() {
-                filter_parts.push(format!("{} body pattern(s)", body_patterns.len()));
+            if !params.body_patterns.is_empty() {
+                filter_parts.push(format!("{} body pattern(s)", params.body_patterns.len()));
             }
-            if !symbols_patterns.is_empty() {
-                filter_parts.push(format!("{} symbols pattern(s)", symbols_patterns.len()));
+            if !params.symbols_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbols pattern(s)",
+                    params.symbols_patterns.len()
+                ));
             }
-            if !recipients_patterns.is_empty() {
+            if !params.recipients_patterns.is_empty() {
                 filter_parts.push(format!(
                     "{} recipients pattern(s)",
-                    recipients_patterns.len()
+                    params.recipients_patterns.len()
                 ));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             writeln!(
                 buffer,
-                "Searching for lore emails similar to: {} ({}, limit: {})",
-                query_text, filter_desc, limit
+                "Searching for lore emails similar to: {} ({}, params.limit: {})",
+                params.query_text, filter_desc, params.limit
             )?;
         }
         false => writeln!(
             buffer,
-            "Searching for lore emails similar to: {} (limit: {})",
-            query_text, limit
+            "Searching for lore emails similar to: {} (params.limit: {})",
+            params.query_text, params.limit
         )?,
     }
 
     // Initialize vectorizer
     writeln!(buffer, "Initializing vectorizer...")?;
-    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+    let vectorizer = match CodeVectorizer::new_with_config(false, params.model_path.clone()).await {
         Ok(v) => v,
         Err(e) => {
             writeln!(buffer, "Error: Failed to initialize vectorizer: {}", e)?;
@@ -3907,7 +4134,7 @@ async fn mcp_vlore_similar_emails(
 
     // Generate vector for query text
     writeln!(buffer, "Generating query vector...")?;
-    let query_vector = match vectorizer.vectorize_code(query_text) {
+    let query_vector = match vectorizer.vectorize_code(params.query_text) {
         Ok(v) => v,
         Err(e) => {
             writeln!(buffer, "Error: Failed to generate vector for query: {}", e)?;
@@ -3916,49 +4143,48 @@ async fn mcp_vlore_similar_emails(
     };
 
     // Prepare filter patterns for database-level filtering
-    let from_filter = if !from_patterns.is_empty() {
-        Some(&from_patterns[..])
+    let from_filter = if !params.from_patterns.is_empty() {
+        Some(params.from_patterns)
     } else {
         None
     };
 
-    let subject_filter = if !subject_patterns.is_empty() {
-        Some(&subject_patterns[..])
+    let subject_filter = if !params.subject_patterns.is_empty() {
+        Some(params.subject_patterns)
     } else {
         None
     };
 
-    let body_filter = if !body_patterns.is_empty() {
-        Some(&body_patterns[..])
+    let body_filter = if !params.body_patterns.is_empty() {
+        Some(params.body_patterns)
     } else {
         None
     };
 
-    let symbols_filter = if !symbols_patterns.is_empty() {
-        Some(&symbols_patterns[..])
+    let symbols_filter = if !params.symbols_patterns.is_empty() {
+        Some(params.symbols_patterns)
     } else {
         None
     };
 
-    let recipients_filter = if !recipients_patterns.is_empty() {
-        Some(&recipients_patterns[..])
+    let recipients_filter = if !params.recipients_patterns.is_empty() {
+        Some(params.recipients_patterns)
     } else {
         None
     };
 
     // Search for similar lore emails with database-level filtering
+    let filters = LoreEmailFilters {
+        from_patterns: from_filter,
+        subject_patterns: subject_filter,
+        body_patterns: body_filter,
+        symbols_patterns: symbols_filter,
+        recipients_patterns: recipients_filter,
+        since_date: params.since_date,
+        until_date: params.until_date,
+    };
     match db
-        .search_similar_lore_emails(
-            &query_vector,
-            limit,
-            from_filter,
-            subject_filter,
-            body_filter,
-            symbols_filter,
-            recipients_filter,
-            since_date,
-            until_date,
-        )
+        .search_similar_lore_emails(&query_vector, params.limit, &filters)
         .await
     {
         Ok(results) if results.is_empty() => {
@@ -4010,12 +4236,8 @@ async fn mcp_vlore_similar_emails(
 
                 // Show first 10 lines of message body
                 writeln!(buffer, "   Message:")?;
-                for (idx, line) in email.body.lines().take(10).enumerate() {
-                    if idx == 0 {
-                        writeln!(buffer, "     {}", line)?;
-                    } else {
-                        writeln!(buffer, "     {}", line)?;
-                    }
+                for line in email.body.lines().take(10) {
+                    writeln!(buffer, "     {}", line)?;
                 }
                 if email.body.lines().count() > 10 {
                     writeln!(buffer, "     ...")?;
@@ -4039,17 +4261,7 @@ async fn mcp_vlore_similar_emails(
 
 async fn mcp_vcommit_similar_commits(
     db: &DatabaseManager,
-    query_text: &str,
-    limit: usize,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    git_range: Option<&str>,
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
-    model_path: &Option<String>,
+    params: &VCommitParams<'_>,
 ) -> Result<String> {
     use semcode::CodeVectorizer;
     use std::io::Write;
@@ -4057,59 +4269,69 @@ async fn mcp_vcommit_similar_commits(
     let mut buffer = Vec::new();
 
     // Show search parameters
-    let has_filters = !author_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty();
-    match (git_range, has_filters) {
+    let has_filters = !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty();
+    match (params.git_range, has_filters) {
         (Some(range), true) => {
             let mut filter_parts = Vec::new();
-            if !regex_patterns.is_empty() {
-                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             writeln!(
                 buffer,
-                "Searching for commits similar to: {query_text} (git range: {range}, {filter_desc}, limit: {limit})"
+                "Searching for commits similar to: {} (git range: {}, {}, limit: {})",
+                params.query_text, range, filter_desc, params.limit
             )?;
         }
         (Some(range), false) => writeln!(
             buffer,
-            "Searching for commits similar to: {query_text} (git range: {range}, limit: {limit})"
+            "Searching for commits similar to: {} (git range: {}, limit: {})",
+            params.query_text, range, params.limit
         )?,
         (None, true) => {
             let mut filter_parts = Vec::new();
-            if !regex_patterns.is_empty() {
-                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             writeln!(
                 buffer,
-                "Searching for commits similar to: {query_text} ({filter_desc}, limit: {limit})"
+                "Searching for commits similar to: {} ({}, limit: {})",
+                params.query_text, filter_desc, params.limit
             )?;
         }
         (None, false) => writeln!(
             buffer,
-            "Searching for commits similar to: {query_text} (limit: {limit})"
+            "Searching for commits similar to: {} (limit: {})",
+            params.query_text, params.limit
         )?,
     }
 
     // Initialize vectorizer
     writeln!(buffer, "Initializing vectorizer...")?;
-    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+    let vectorizer = match CodeVectorizer::new_with_config(false, params.model_path.clone()).await {
         Ok(v) => v,
         Err(e) => {
             writeln!(buffer, "Error: Failed to initialize vectorizer: {e}")?;
@@ -4123,7 +4345,7 @@ async fn mcp_vcommit_similar_commits(
 
     // Generate vector for query text
     writeln!(buffer, "Generating query vector...")?;
-    let query_vector = match vectorizer.vectorize_code(query_text) {
+    let query_vector = match vectorizer.vectorize_code(params.query_text) {
         Ok(v) => v,
         Err(e) => {
             writeln!(buffer, "Error: Failed to generate vector for query: {e}")?;
@@ -4132,8 +4354,8 @@ async fn mcp_vcommit_similar_commits(
     };
 
     // Resolve git range to a set of commit SHAs if provided
-    let git_range_shas = if let Some(range) = git_range {
-        match gix::discover(git_repo_path) {
+    let git_range_shas = if let Some(range) = params.git_range {
+        match gix::discover(params.git_repo_path) {
             Ok(repo) => {
                 // Resolve the git range using gitoxide
                 let range_parts: Vec<&str> = range.split("..").collect();
@@ -4191,7 +4413,7 @@ async fn mcp_vcommit_similar_commits(
                 {
                     Ok(walk) => {
                         let mut commit_count = 0;
-                        const MAX_COMMITS: usize = 100000; // Safety limit
+                        const MAX_COMMITS: usize = 100000; // Safety params.limit
 
                         for commit_result in walk {
                             match commit_result {
@@ -4238,17 +4460,17 @@ async fn mcp_vcommit_similar_commits(
         None
     };
 
-    // Search for similar commits with higher limit if filtering
-    let search_limit = if !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty()
-        || git_range.is_some()
+    // Search for similar commits with higher params.limit if filtering
+    let search_limit = if !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+        || params.git_range.is_some()
     {
         // When filtering (regex, symbols, paths, or git range), always fetch many results since we'll filter them down
-        // Use a large limit to ensure we find enough matches after filtering
+        // Use a large params.limit to ensure we find enough matches after filtering
         500_000
     } else {
-        limit
+        params.limit
     };
 
     // Search for similar commits
@@ -4282,10 +4504,10 @@ async fn mcp_vcommit_similar_commits(
             };
 
             // Apply regex filtering if provided (ALL patterns must match)
-            let filtered_by_regex = if !regex_patterns.is_empty() {
+            let filtered_by_regex = if !params.regex_patterns.is_empty() {
                 // Compile all regex patterns (case-insensitive)
                 let mut regexes = Vec::new();
-                for pattern in regex_patterns {
+                for pattern in params.regex_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -4312,7 +4534,7 @@ async fn mcp_vcommit_similar_commits(
                 writeln!(
                     buffer,
                     "Regex filters ({} pattern(s)) reduced results from {} to {} commits",
-                    regex_patterns.len(),
+                    params.regex_patterns.len(),
                     original_count,
                     filtered.len()
                 )?;
@@ -4323,10 +4545,10 @@ async fn mcp_vcommit_similar_commits(
             };
 
             // Apply symbol filtering if provided (ALL patterns must match)
-            let filtered_by_symbol = if !symbol_patterns.is_empty() {
+            let filtered_by_symbol = if !params.symbol_patterns.is_empty() {
                 // Compile all symbol regex patterns (case-insensitive)
                 let mut symbol_regexes = Vec::new();
-                for pattern in symbol_patterns {
+                for pattern in params.symbol_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -4357,7 +4579,7 @@ async fn mcp_vcommit_similar_commits(
                 writeln!(
                     buffer,
                     "Symbol filters ({} pattern(s)) reduced results from {} to {} commits",
-                    symbol_patterns.len(),
+                    params.symbol_patterns.len(),
                     original_count,
                     filtered.len()
                 )?;
@@ -4368,10 +4590,10 @@ async fn mcp_vcommit_similar_commits(
             };
 
             // Apply path filtering if provided (ANY must match - OR logic)
-            let filtered_by_path = if !path_patterns.is_empty() {
+            let filtered_by_path = if !params.path_patterns.is_empty() {
                 // Compile all path regex patterns (case-insensitive)
                 let mut path_regexes = Vec::new();
-                for pattern in path_patterns {
+                for pattern in params.path_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -4402,7 +4624,7 @@ async fn mcp_vcommit_similar_commits(
                 writeln!(
                     buffer,
                     "Path filters ({} pattern(s)) reduced results from {} to {} commits",
-                    path_patterns.len(),
+                    params.path_patterns.len(),
                     original_count,
                     filtered.len()
                 )?;
@@ -4413,16 +4635,16 @@ async fn mcp_vcommit_similar_commits(
             };
 
             // Apply reachability filtering if provided
-            let final_results = if let Some(reachable_from) = reachable_sha {
+            let final_results = if let Some(reachable_from) = params.reachable_sha {
                 let original_count = filtered_by_path.len();
 
                 // For > 10 commits, use hashset approach for better performance
                 let filtered: Vec<_> = if original_count > 10 {
-                    match git::get_reachable_commits(git_repo_path, reachable_from) {
+                    match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                         Ok(reachable_set) => filtered_by_path
                             .into_iter()
                             .filter(|(commit, _)| reachable_set.contains(&commit.git_sha))
-                            .take(limit)
+                            .take(params.limit)
                             .collect(),
                         Err(e) => {
                             writeln!(
@@ -4435,7 +4657,7 @@ async fn mcp_vcommit_similar_commits(
                                 .into_iter()
                                 .filter(|(commit, _)| {
                                     match git::is_commit_reachable(
-                                        git_repo_path,
+                                        params.git_repo_path,
                                         reachable_from,
                                         &commit.git_sha,
                                     ) {
@@ -4452,7 +4674,7 @@ async fn mcp_vcommit_similar_commits(
                                         }
                                     }
                                 })
-                                .take(limit)
+                                .take(params.limit)
                                 .collect()
                         }
                     }
@@ -4462,7 +4684,7 @@ async fn mcp_vcommit_similar_commits(
                         .into_iter()
                         .filter(|(commit, _)| {
                             match git::is_commit_reachable(
-                                git_repo_path,
+                                params.git_repo_path,
                                 reachable_from,
                                 &commit.git_sha,
                             ) {
@@ -4479,7 +4701,7 @@ async fn mcp_vcommit_similar_commits(
                                 }
                             }
                         })
-                        .take(limit)
+                        .take(params.limit)
                         .collect()
                 };
 
@@ -4492,15 +4714,15 @@ async fn mcp_vcommit_similar_commits(
 
                 filtered
             } else {
-                filtered_by_path.into_iter().take(limit).collect()
+                filtered_by_path.into_iter().take(params.limit).collect()
             };
 
             if final_results.is_empty() {
                 writeln!(buffer, "Info: No similar commits found")?;
-                if !regex_patterns.is_empty()
-                    || !symbol_patterns.is_empty()
-                    || !path_patterns.is_empty()
-                    || git_range.is_some()
+                if !params.regex_patterns.is_empty()
+                    || !params.symbol_patterns.is_empty()
+                    || !params.path_patterns.is_empty()
+                    || params.git_range.is_some()
                 {
                     writeln!(
                         buffer,
@@ -4587,52 +4809,67 @@ async fn mcp_vcommit_similar_commits(
 }
 
 /// Background task to index the current commit if needed (non-blocking)
-async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_repo: String) {
-    use std::fs::OpenOptions;
-    use std::io::Write as _;
+async fn index_current_commit_background(
+    db_manager: Arc<DatabaseManager>,
+    git_repo: String,
+    indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
+    notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+) {
+    eprintln!("[Background] Indexing task started");
 
-    eprintln!("[DEBUG] Background task actually started!");
-
-    // Open log file in append mode
-    let mut log_file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/wtgdf")
-    {
-        Ok(f) => {
-            eprintln!("[DEBUG] Successfully opened /tmp/wtgdf");
-            f
-        }
-        Err(e) => {
-            eprintln!("[Background] Failed to open log file /tmp/wtgdf: {}", e);
-            return;
-        }
+    // Helper to send MCP notifications
+    let send_notification = |message: String| {
+        let tx = notification_tx.clone();
+        tokio::spawn(async move {
+            let guard = tx.lock().await;
+            if let Some(sender) = guard.as_ref() {
+                let notification = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "level": "info",
+                        "message": message
+                    }
+                });
+                let _ = sender.send(serde_json::to_string(&notification).unwrap_or_default());
+            }
+        });
     };
 
-    let mut log = |msg: &str| {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let _ = writeln!(log_file, "[{}] {}", timestamp, msg);
-        let _ = log_file.flush();
-    };
-
-    log("Background indexing task started");
-    eprintln!("[DEBUG] Wrote first log message");
+    eprintln!("[Background] Background indexing task started");
+    send_notification("Semcode: Checking if indexing is needed...".to_string());
 
     // Get current git SHA
     let _git_sha = match semcode::git::get_git_sha(&git_repo) {
         Ok(Some(sha)) => {
-            log(&format!("Current commit: {}", sha));
+            eprintln!("[Background] Current commit: {}", sha);
+            // Update state with git SHA
+            {
+                let mut state = indexing_state.lock().await;
+                state.git_sha = Some(sha.clone());
+                state.started_at = Some(std::time::SystemTime::now());
+            }
             sha
         }
         Ok(None) => {
-            log("Not in a git repository, skipping auto-indexing");
+            eprintln!("[Background] Not in a git repository, skipping auto-indexing");
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: "Not in a git repository".to_string(),
+            };
+            send_notification(
+                "Semcode: Not in a git repository, skipping auto-indexing".to_string(),
+            );
             return;
         }
         Err(e) => {
-            log(&format!("Warning: Failed to get git SHA: {}", e));
+            let error_msg = format!("Failed to get git SHA: {}", e);
+            eprintln!("[Background] Warning: {}", error_msg);
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: error_msg.clone(),
+            };
+            send_notification(format!("Semcode: {}", error_msg));
             return;
         }
     };
@@ -4662,22 +4899,25 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
                                 if processed_pairs
                                     .contains(&(changed_file.path.clone(), new_hash.clone()))
                                 {
-                                    log(&format!(
-                                        "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
+                                    eprintln!(
+                                        "[Background] Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
                                         changed_file.path,
                                         &new_hash[..8]
-                                    ));
+                                    );
                                     return;
                                 } else {
-                                    log(&format!(
-                                        "Changed file '{}' (SHA: {}) needs indexing",
+                                    eprintln!(
+                                        "[Background] Changed file '{}' (SHA: {}) needs indexing",
                                         changed_file.path,
                                         &new_hash[..8]
-                                    ));
+                                    );
                                 }
                             }
                             Err(e) => {
-                                log(&format!("Warning: Failed to get processed files: {}", e));
+                                eprintln!(
+                                    "[Background] Warning: Failed to get processed files: {}",
+                                    e
+                                );
                                 return;
                             }
                         }
@@ -4685,35 +4925,43 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
                 }
             } else {
                 // No changes in this commit (might be initial commit or root commit)
-                log("No changed files found in current commit, will check all files");
+                eprintln!(
+                    "[Background] No changed files found in current commit, will check all files"
+                );
             }
         }
         Err(e) => {
             // Failed to get changed files (might be initial commit, root commit, etc.)
-            log(&format!(
-                "Could not get changed files ({}), will check all files",
+            eprintln!(
+                "[Background] Could not get changed files ({}), will check all files",
                 e
-            ));
+            );
         }
     }
 
     // Run git range indexing using the shared library function
     // This uses the same code path as semcode-index -s .
-    log("Checking for files to index...");
+    eprintln!("[Background] Checking for files to index...");
+
+    // Update state to in-progress
+    {
+        let mut state = indexing_state.lock().await;
+        state.status = IndexingStatus::InProgress {
+            phase: "Analyzing files".to_string(),
+            current: 0,
+            total: None,
+        };
+    }
+    send_notification("Semcode: Indexing current commit...".to_string());
 
     // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", _git_sha, _git_sha);
-    let extensions_vec = vec![
-        "c".to_string(),
-        "h".to_string(),
-        "cc".to_string(),
-        "cpp".to_string(),
-        "cxx".to_string(),
-        "c++".to_string(),
-        "hh".to_string(),
-        "hpp".to_string(),
-        "hxx".to_string(),
-    ];
+    let extensions_vec: Vec<String> = [
+        "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "rs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
 
     match semcode::git_range::process_git_range(
         &repo_path,
@@ -4726,36 +4974,60 @@ async fn index_current_commit_background(db_manager: Arc<DatabaseManager>, git_r
     .await
     {
         Ok(()) => {
-            log("Indexing complete");
+            eprintln!("[Background] Indexing complete");
+            send_notification("Semcode: Indexing complete".to_string());
+
+            // Update state to completed
+            {
+                let mut state = indexing_state.lock().await;
+                state.status = IndexingStatus::Completed {
+                    files_processed: 0, // We don't have exact count from process_git_range
+                };
+                state.completed_at = Some(std::time::SystemTime::now());
+            }
 
             // Check if database needs optimization
             match db_manager.check_optimization_health().await {
                 Ok((needs_optimization, _diagnostic_msg)) => {
                     if needs_optimization {
-                        log("Database needs optimization");
-                        log("Running optimization...");
+                        eprintln!("[Background] Database needs optimization");
+                        send_notification("Semcode: Optimizing database...".to_string());
                         match db_manager.optimize_database().await {
                             Ok(()) => {
-                                log("Database optimization complete");
+                                eprintln!("[Background] Database optimization complete");
+                                send_notification(
+                                    "Semcode: Database optimization complete, ready for queries"
+                                        .to_string(),
+                                );
                             }
                             Err(e) => {
-                                log(&format!("Warning: Database optimization failed: {}", e));
+                                eprintln!(
+                                    "[Background] Warning: Database optimization failed: {}",
+                                    e
+                                );
                             }
                         }
                     } else {
-                        log("Database is healthy, skipping optimization");
+                        eprintln!("[Background] Database is healthy, skipping optimization");
+                        send_notification("Semcode: Database ready for queries".to_string());
                     }
                 }
                 Err(e) => {
-                    log(&format!(
-                        "Warning: Failed to check optimization health: {}",
+                    eprintln!(
+                        "[Background] Warning: Failed to check optimization health: {}",
                         e
-                    ));
+                    );
                 }
             }
         }
         Err(e) => {
-            log(&format!("Warning: Auto-indexing skipped: {}", e));
+            eprintln!("[Background] Warning: Auto-indexing failed: {}", e);
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: format!("Indexing failed: {}", e),
+            };
+            state.completed_at = Some(std::time::SystemTime::now());
+            send_notification(format!("Semcode: Indexing failed: {}", e));
         }
     }
 }
@@ -4768,7 +5040,39 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
 
     let stdin = tokio::io::stdin();
     let mut stdin = BufReader::new(stdin);
-    let mut stdout = tokio::io::stdout();
+    let stdout = tokio::io::stdout();
+
+    // Create notification channel
+    let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Set up notification sender in server
+    {
+        let mut tx_guard = server.notification_tx.lock().await;
+        *tx_guard = Some(notification_tx);
+    }
+
+    // Spawn task to forward notifications to stdout
+    let stdout_clone = Arc::new(tokio::sync::Mutex::new(stdout));
+    let stdout_for_notifications = stdout_clone.clone();
+    tokio::spawn(async move {
+        while let Some(notification) = notification_rx.recv().await {
+            let mut stdout = stdout_for_notifications.lock().await;
+            if let Err(e) = stdout.write_all(notification.as_bytes()).await {
+                eprintln!("[Notification] Failed to write: {}", e);
+                break;
+            }
+            if let Err(e) = stdout.write_all(b"\n").await {
+                eprintln!("[Notification] Failed to write newline: {}", e);
+                break;
+            }
+            if let Err(e) = stdout.flush().await {
+                eprintln!("[Notification] Failed to flush: {}", e);
+                break;
+            }
+        }
+    });
+
+    let stdout = stdout_clone;
 
     let mut line = String::new();
 
@@ -4790,15 +5094,16 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                     Ok(request) => {
                         let response = server.handle_request(request).await;
                         if let Ok(response_str) = serde_json::to_string(&response) {
-                            if let Err(e) = stdout.write_all(response_str.as_bytes()).await {
+                            let mut stdout_guard = stdout.lock().await;
+                            if let Err(e) = stdout_guard.write_all(response_str.as_bytes()).await {
                                 eprintln!("Failed to write response: {e}");
                                 break;
                             }
-                            if let Err(e) = stdout.write_all(b"\n").await {
+                            if let Err(e) = stdout_guard.write_all(b"\n").await {
                                 eprintln!("Failed to write newline: {e}");
                                 break;
                             }
-                            if let Err(e) = stdout.flush().await {
+                            if let Err(e) = stdout_guard.flush().await {
                                 eprintln!("Failed to flush stdout: {e}");
                                 break;
                             }
@@ -4815,9 +5120,10 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                             }
                         });
                         if let Ok(response_str) = serde_json::to_string(&error_response) {
-                            let _ = stdout.write_all(response_str.as_bytes()).await;
-                            let _ = stdout.write_all(b"\n").await;
-                            let _ = stdout.flush().await;
+                            let mut stdout_guard = stdout.lock().await;
+                            let _ = stdout_guard.write_all(response_str.as_bytes()).await;
+                            let _ = stdout_guard.write_all(b"\n").await;
+                            let _ = stdout_guard.flush().await;
                         }
                     }
                 }
@@ -4863,22 +5169,218 @@ async fn main() -> Result<()> {
     server.db.create_tables().await?;
 
     // Spawn background task to index current commit if needed
-    eprintln!("[DEBUG] About to spawn background indexing task");
+    eprintln!("[Background] Spawning background indexing task");
     let db_for_indexing = server.db.clone();
     let git_repo_for_indexing = args.git_repo.clone();
+    let indexing_state_for_bg = server.indexing_state.clone();
+    let notification_tx_for_bg = server.notification_tx.clone();
     let _indexing_handle = tokio::spawn(async move {
-        eprintln!("[DEBUG] Inside spawned task closure");
-        index_current_commit_background(db_for_indexing, git_repo_for_indexing).await;
-        eprintln!("[DEBUG] Background indexing function returned");
+        index_current_commit_background(
+            db_for_indexing,
+            git_repo_for_indexing,
+            indexing_state_for_bg,
+            notification_tx_for_bg,
+        )
+        .await;
     });
-    eprintln!("[DEBUG] Task spawned, handle created");
 
     // Give the background task a chance to start before entering the blocking loop
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    eprintln!("[DEBUG] Yielded to background task");
 
     // Run MCP server on stdio
     run_stdio_server(server).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_indexing_state_new() {
+        let state = IndexingState::new();
+        assert!(matches!(state.status, IndexingStatus::NotStarted));
+        assert!(state.git_sha.is_none());
+        assert!(state.started_at.is_none());
+        assert!(state.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_indexing_status_transitions() {
+        let mut state = IndexingState::new();
+
+        // Transition to in progress
+        state.status = IndexingStatus::InProgress {
+            phase: "Analyzing files".to_string(),
+            current: 10,
+            total: Some(100),
+        };
+        state.started_at = Some(std::time::SystemTime::now());
+
+        if let IndexingStatus::InProgress {
+            phase,
+            current,
+            total,
+        } = &state.status
+        {
+            assert_eq!(phase, "Analyzing files");
+            assert_eq!(*current, 10);
+            assert_eq!(*total, Some(100));
+        } else {
+            panic!("Expected InProgress status");
+        }
+
+        // Transition to completed
+        state.status = IndexingStatus::Completed {
+            files_processed: 42,
+        };
+        state.completed_at = Some(std::time::SystemTime::now());
+
+        if let IndexingStatus::Completed { files_processed } = state.status {
+            assert_eq!(files_processed, 42);
+        } else {
+            panic!("Expected Completed status");
+        }
+    }
+
+    #[test]
+    fn test_indexing_status_failed() {
+        let state = IndexingState {
+            status: IndexingStatus::Failed {
+                error: "Test error".to_string(),
+            },
+            git_sha: Some("abc123".to_string()),
+            started_at: Some(std::time::SystemTime::now()),
+            completed_at: Some(std::time::SystemTime::now()),
+        };
+
+        if let IndexingStatus::Failed { error } = &state.status {
+            assert_eq!(error, "Test error");
+        } else {
+            panic!("Expected Failed status");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_not_started() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Not started"));
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_in_progress() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let state = IndexingState {
+            status: IndexingStatus::InProgress {
+                phase: "Testing".to_string(),
+                current: 5,
+                total: Some(10),
+            },
+            git_sha: Some("abc123def456".to_string()),
+            started_at: Some(std::time::SystemTime::now()),
+            completed_at: None,
+        };
+
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Testing (5/10)"));
+        assert!(content.contains("abc123de"));
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_completed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let started = std::time::SystemTime::now();
+        let completed = started + std::time::Duration::from_secs(5);
+
+        let state = IndexingState {
+            status: IndexingStatus::Completed {
+                files_processed: 100,
+            },
+            git_sha: Some("def789".to_string()),
+            started_at: Some(started),
+            completed_at: Some(completed),
+        };
+
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Completed (100 files processed)"));
+        assert!(content.contains("5.00s"));
+    }
+
+    #[tokio::test]
+    async fn test_indexing_status_handler_failed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let state = IndexingState {
+            status: IndexingStatus::Failed {
+                error: "Connection timeout".to_string(),
+            },
+            git_sha: Some("xyz123".to_string()),
+            started_at: Some(std::time::SystemTime::now()),
+            completed_at: Some(std::time::SystemTime::now()),
+        };
+
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let result = server.handle_indexing_status().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("Failed: Connection timeout"));
+    }
 }

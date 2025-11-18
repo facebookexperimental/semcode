@@ -10,6 +10,25 @@ use crate::display::{
     display_function_to_writer_with_options, display_type_to_writer, display_typedef_to_writer,
 };
 
+/// Options for displaying call relationships
+#[derive(Debug, Clone)]
+pub struct DisplayCallOptions {
+    pub truncate: bool,
+    pub verbose: bool,
+    pub show_calls: bool,
+    pub show_callers: bool,
+}
+
+/// Options for lore email search and display
+#[derive(Debug, Clone)]
+pub struct LoreSearchOptions<'a> {
+    pub verbose: usize,
+    pub show_thread: bool,
+    pub show_replies: bool,
+    pub since_date: Option<&'a str>,
+    pub until_date: Option<&'a str>,
+}
+
 /// Get functions called by the given function name - git-aware version
 async fn get_function_calls_git_aware(
     db: &DatabaseManager,
@@ -28,24 +47,20 @@ async fn get_function_callers(db: &DatabaseManager, function_name: &str) -> Resu
 }
 
 /// Display call relationships for a function with truncation control
-
 /// Display call relationships for a function with full control over what to show
 fn display_call_relationships_with_options(
     _function_name: &str,
     calls: &[String],
     called_by: &[String],
     writer: &mut dyn Write,
-    truncate: bool,
-    verbose: bool,
-    show_calls: bool,
-    show_callers: bool,
+    options: &DisplayCallOptions,
 ) -> Result<()> {
     const TRUNCATE_LIMIT: usize = 25;
 
-    if show_calls && !calls.is_empty() {
+    if options.show_calls && !calls.is_empty() {
         writeln!(writer, "\nCalls: {}", calls.len())?;
 
-        let should_truncate = truncate && !verbose && calls.len() > TRUNCATE_LIMIT;
+        let should_truncate = options.truncate && !options.verbose && calls.len() > TRUNCATE_LIMIT;
         let display_calls = if should_truncate {
             &calls[..TRUNCATE_LIMIT]
         } else {
@@ -66,10 +81,11 @@ fn display_call_relationships_with_options(
         }
     }
 
-    if show_callers && !called_by.is_empty() {
+    if options.show_callers && !called_by.is_empty() {
         writeln!(writer, "\nCalled By: {}", called_by.len())?;
 
-        let should_truncate = truncate && !verbose && called_by.len() > TRUNCATE_LIMIT;
+        let should_truncate =
+            options.truncate && !options.verbose && called_by.len() > TRUNCATE_LIMIT;
         let display_callers = if should_truncate {
             &called_by[..TRUNCATE_LIMIT]
         } else {
@@ -453,27 +469,27 @@ pub async fn lore_search(
     limit: usize,
     verbose: usize,
 ) -> Result<()> {
-    lore_search_with_thread(db, field, pattern, limit, verbose, false, false, None, None).await
+    let options = LoreSearchOptions {
+        verbose,
+        show_thread: false,
+        show_replies: false,
+        since_date: None,
+        until_date: None,
+    };
+    lore_search_with_thread(db, field, pattern, limit, &options).await
 }
 
 pub async fn lore_search_multi_field(
     db: &DatabaseManager,
     field_patterns: Vec<(&str, &str)>,
     limit: usize,
-    verbose: usize,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    options: &LoreSearchOptions<'_>,
 ) -> Result<()> {
     // Build description of the search
     use std::collections::HashMap;
     let mut field_map: HashMap<&str, Vec<&str>> = HashMap::new();
     for (field, pattern) in &field_patterns {
-        field_map
-            .entry(field)
-            .or_insert_with(Vec::new)
-            .push(pattern);
+        field_map.entry(field).or_default().push(pattern);
     }
 
     println!("Searching lore emails with conditions:");
@@ -490,7 +506,12 @@ pub async fn lore_search_multi_field(
     }
 
     let mut emails = db
-        .search_lore_emails_multi_field(field_patterns, limit, since_date, until_date)
+        .search_lore_emails_multi_field(
+            field_patterns,
+            limit,
+            options.since_date,
+            options.until_date,
+        )
         .await?;
 
     if emails.is_empty() {
@@ -501,7 +522,7 @@ pub async fn lore_search_multi_field(
     // Sort by date (oldest first)
     crate::lore_writers::sort_emails_by_date(&mut emails);
 
-    if show_thread {
+    if options.show_thread {
         // Show full threads for all matching emails
         println!(
             "\n{} matches found, showing threads:\n",
@@ -512,12 +533,12 @@ pub async fn lore_search_multi_field(
             if idx > 0 {
                 println!("\n{}\n", "=".repeat(80).bright_black());
             }
-            lore_show_thread(db, &email.message_id, verbose).await?;
+            lore_show_thread(db, &email.message_id, options.verbose).await?;
         }
         return Ok(());
     }
 
-    if show_replies {
+    if options.show_replies {
         // Show replies for all matching emails
         println!(
             "\n{} matches found, showing replies:\n",
@@ -534,7 +555,7 @@ pub async fn lore_search_multi_field(
                 idx + 1,
                 emails.len()
             );
-            lore_show_replies(db, &email.message_id, verbose).await?;
+            lore_show_replies(db, &email.message_id, options.verbose).await?;
         }
         return Ok(());
     }
@@ -556,7 +577,7 @@ pub async fn lore_search_multi_field(
         }
 
         // Show full message body only when verbose
-        if verbose >= 1 {
+        if options.verbose >= 1 {
             println!("\n{}", "   --- Message Body ---".bright_black());
             // Body is already separated from headers
             for line in email.body.lines() {
@@ -576,11 +597,7 @@ pub async fn lore_search_with_thread(
     field: &str,
     pattern: &str,
     limit: usize,
-    verbose: usize,
-    show_thread: bool,
-    show_replies: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    options: &LoreSearchOptions<'_>,
 ) -> Result<()> {
     println!(
         "Searching lore emails where {} matches pattern: {}",
@@ -589,7 +606,13 @@ pub async fn lore_search_with_thread(
     );
 
     let mut emails = db
-        .search_lore_emails(field, pattern, limit, since_date, until_date)
+        .search_lore_emails(
+            field,
+            pattern,
+            limit,
+            options.since_date,
+            options.until_date,
+        )
         .await?;
 
     if emails.is_empty() {
@@ -600,7 +623,7 @@ pub async fn lore_search_with_thread(
     // Sort by date (oldest first)
     crate::lore_writers::sort_emails_by_date(&mut emails);
 
-    if show_thread {
+    if options.show_thread {
         // Show full threads for all matching emails
         println!(
             "\n{} matches found, showing threads:\n",
@@ -617,12 +640,12 @@ pub async fn lore_search_with_thread(
                 idx + 1,
                 emails.len()
             );
-            lore_show_thread(db, &email.message_id, verbose).await?;
+            lore_show_thread(db, &email.message_id, options.verbose).await?;
         }
         return Ok(());
     }
 
-    if show_replies {
+    if options.show_replies {
         // Show replies for all matching emails
         println!(
             "\n{} matches found, showing replies:\n",
@@ -639,7 +662,7 @@ pub async fn lore_search_with_thread(
                 idx + 1,
                 emails.len()
             );
-            lore_show_replies(db, &email.message_id, verbose).await?;
+            lore_show_replies(db, &email.message_id, options.verbose).await?;
         }
         return Ok(());
     }
@@ -671,7 +694,7 @@ pub async fn lore_search_with_thread(
         }
 
         // Show full message body only when verbose
-        if verbose >= 1 {
+        if options.verbose >= 1 {
             println!("\n{}", "   --- Message Body ---".bright_black());
             // Body is already separated from headers
             for line in email.body.lines() {
@@ -781,10 +804,7 @@ pub fn sort_emails_by_thread_order(
 
     for email in emails {
         let parent_key = email.in_reply_to.clone();
-        children_map
-            .entry(parent_key)
-            .or_insert_with(Vec::new)
-            .push(email);
+        children_map.entry(parent_key).or_default().push(email);
     }
 
     // Sort children by date within each parent
@@ -1061,11 +1081,8 @@ pub async fn lore_search_by_commit(
     db: &DatabaseManager,
     git_commit_ish: &str,
     git_repo_path: &str,
-    verbose: usize,
     show_all: bool,
-    show_thread: bool,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
+    options: &LoreSearchOptions<'_>,
 ) -> Result<()> {
     use anstream::stdout;
 
@@ -1074,12 +1091,8 @@ pub async fn lore_search_by_commit(
         db,
         git_commit_ish,
         git_repo_path,
-        verbose,
         show_all,
-        show_thread,
-        false, // show_replies (not used in CLI version currently)
-        since_date,
-        until_date,
+        options,
         &mut stdout(),
     )
     .await
@@ -1196,10 +1209,12 @@ async fn query_function_or_macro_to_writer_with_options(
                     &calls,
                     &[],
                     writer,
-                    true,
-                    verbose,
-                    true,
-                    false,
+                    &DisplayCallOptions {
+                        truncate: true,
+                        verbose,
+                        show_calls: true,
+                        show_callers: false,
+                    },
                 )?;
             }
 
@@ -1218,10 +1233,12 @@ async fn query_function_or_macro_to_writer_with_options(
                         &[],
                         &called_by,
                         writer,
-                        true,
-                        verbose,
-                        false,
-                        true,
+                        &DisplayCallOptions {
+                            truncate: true,
+                            verbose,
+                            show_calls: false,
+                            show_callers: true,
+                        },
                     )?;
                 }
             } else if definitions.len() == 1 {
@@ -1232,10 +1249,12 @@ async fn query_function_or_macro_to_writer_with_options(
                     &[],
                     &called_by,
                     writer,
-                    true,
-                    verbose,
-                    false,
-                    true,
+                    &DisplayCallOptions {
+                        truncate: true,
+                        verbose,
+                        show_calls: false,
+                        show_callers: true,
+                    },
                 )?;
             } else {
                 // No definitions found, only declarations
@@ -1278,10 +1297,12 @@ async fn query_function_or_macro_to_writer_with_options(
                             &calls,
                             &[],
                             writer,
-                            true,
-                            verbose,
-                            true,
-                            false,
+                            &DisplayCallOptions {
+                                truncate: true,
+                                verbose,
+                                show_calls: true,
+                                show_callers: false,
+                            },
                         )?;
                     }
 
@@ -1303,10 +1324,12 @@ async fn query_function_or_macro_to_writer_with_options(
                             &[],
                             &callers,
                             writer,
-                            true,
-                            verbose,
-                            false,
-                            true,
+                            &DisplayCallOptions {
+                                truncate: true,
+                                verbose,
+                                show_calls: false,
+                                show_callers: true,
+                            },
                         )?;
                     }
                 }

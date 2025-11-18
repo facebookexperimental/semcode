@@ -963,26 +963,10 @@ impl DatabaseManager {
         &self,
         query_vector: &[f32],
         limit: usize,
-        from_patterns: Option<&[String]>,
-        subject_patterns: Option<&[String]>,
-        body_patterns: Option<&[String]>,
-        symbols_patterns: Option<&[String]>,
-        recipients_patterns: Option<&[String]>,
-        since_date: Option<&str>,
-        until_date: Option<&str>,
+        filters: &crate::database::search::LoreEmailFilters<'_>,
     ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
         self.vector_search_manager
-            .search_similar_lore_emails(
-                query_vector,
-                limit,
-                from_patterns,
-                subject_patterns,
-                body_patterns,
-                symbols_patterns,
-                recipients_patterns,
-                since_date,
-                until_date,
-            )
+            .search_similar_lore_emails(query_vector, limit, filters)
             .await
     }
 
@@ -3148,7 +3132,6 @@ impl DatabaseManager {
     }
 
     /// Get callers using pre-loaded git manifest for filtering
-
     /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
     /// Uses the shared git tree traversal utility for consistency
     async fn generate_git_manifest(
@@ -4180,7 +4163,7 @@ impl DatabaseManager {
         for (field, pattern) in field_patterns {
             field_map
                 .entry(field)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(pattern.to_string());
         }
 

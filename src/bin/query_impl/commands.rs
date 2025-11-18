@@ -3,7 +3,7 @@ use anstream::stdout;
 use anyhow::Result;
 use colored::*;
 use regex;
-use semcode::{git, DatabaseManager};
+use semcode::{git, DatabaseManager, LoreEmailFilters};
 
 use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
@@ -16,8 +16,75 @@ use semcode::search::{
     dump_calls, dump_content, dump_functions, dump_git_commits, dump_lore, dump_macros,
     dump_processed_files, dump_symbol_filename, dump_typedefs, dump_types, lore_get_by_message_id,
     lore_search_by_commit, lore_search_multi_field, lore_search_with_thread,
-    query_function_or_macro_verbose, query_type_or_typedef, show_tables,
+    query_function_or_macro_verbose, query_type_or_typedef, show_tables, LoreSearchOptions,
 };
+
+/// Parameters for vector-based commit similarity search
+struct VCommitParams<'a> {
+    query_text: &'a str,
+    limit: usize,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    git_range: Option<&'a str>,
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+    model_path: &'a Option<String>,
+}
+
+/// Parameters for vector-based lore email similarity search
+struct VLoreParams<'a> {
+    query_text: &'a str,
+    limit: usize,
+    from_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    body_patterns: &'a [String],
+    symbols_patterns: &'a [String],
+    recipients_patterns: &'a [String],
+    since_date: Option<&'a str>,
+    until_date: Option<&'a str>,
+    model_path: &'a Option<String>,
+}
+
+/// Parameters for commit summary display
+struct CommitSummaryParams<'a> {
+    total_commits: usize,
+    matched_count: usize,
+    displayed_count: usize,
+    limit: usize,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+}
+
+/// Parameters for show all commits operations
+struct ShowAllCommitsParams<'a> {
+    verbose: bool,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    limit: usize,
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+}
+
+/// Parameters for show commit metadata operations
+struct ShowCommitMetadataParams<'a> {
+    verbose: bool,
+    author_patterns: &'a [String],
+    subject_patterns: &'a [String],
+    regex_patterns: &'a [String],
+    symbol_patterns: &'a [String],
+    path_patterns: &'a [String],
+    reachable_sha: Option<&'a str>,
+    git_repo_path: &'a str,
+}
 
 /// Parse a potential git SHA from command arguments or default to current HEAD
 /// Returns (remaining_args, git_sha)
@@ -401,49 +468,44 @@ pub async fn handle_command(
 
         if git_ref_parts.is_empty() && git_range.is_none() {
             // No arguments provided - show all commits from database
-            show_all_commits(
-                db,
+            let params = ShowAllCommitsParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 limit,
-                reachable_sha.as_deref(),
+                reachable_sha: reachable_sha.as_deref(),
                 git_repo_path,
-            )
-            .await?;
+            };
+            show_all_commits(db, &params).await?;
         } else if let Some(range) = git_range {
-            show_commit_range(
-                db,
-                &range,
+            let range_params = ShowAllCommitsParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
                 limit,
-                reachable_sha.as_deref(),
+                reachable_sha: reachable_sha.as_deref(),
                 git_repo_path,
-            )
-            .await?;
+            };
+            show_commit_range(db, &range, &range_params).await?;
         } else {
             let git_ref = git_ref_parts.join(" ");
-            show_commit_metadata(
-                db,
-                &git_ref,
+            let metadata_params = ShowCommitMetadataParams {
                 verbose,
-                &author_patterns,
-                &subject_patterns,
-                &regex_patterns,
-                &symbol_patterns,
-                &path_patterns,
-                reachable_sha.as_deref(),
+                author_patterns: &author_patterns,
+                subject_patterns: &subject_patterns,
+                regex_patterns: &regex_patterns,
+                symbol_patterns: &symbol_patterns,
+                path_patterns: &path_patterns,
+                reachable_sha: reachable_sha.as_deref(),
                 git_repo_path,
-            )
-            .await?;
+            };
+            show_commit_metadata(db, &git_ref, &metadata_params).await?;
         }
 
         return Ok(false); // Continue the loop
@@ -737,21 +799,20 @@ pub async fn handle_command(
                     );
                 } else {
                     let query_text = query_parts.join(" ");
-                    vcommit_similar_commits(
-                        db,
-                        &query_text,
+                    let params = VCommitParams {
+                        query_text: &query_text,
                         limit,
-                        &author_patterns,
-                        &subject_patterns,
-                        &regex_patterns,
-                        &symbol_patterns,
-                        &path_patterns,
-                        git_range.as_deref(),
-                        reachable_sha.as_deref(),
+                        author_patterns: &author_patterns,
+                        subject_patterns: &subject_patterns,
+                        regex_patterns: &regex_patterns,
+                        symbol_patterns: &symbol_patterns,
+                        path_patterns: &path_patterns,
+                        git_range: git_range.as_deref(),
+                        reachable_sha: reachable_sha.as_deref(),
                         git_repo_path,
                         model_path,
-                    )
-                    .await?;
+                    };
+                    vcommit_similar_commits(db, &params).await?;
                 }
             }
         }
@@ -924,40 +985,23 @@ pub async fn handle_command(
                         }
                     }
 
+                    let params = VLoreParams {
+                        query_text: &query_text,
+                        limit,
+                        from_patterns: &from_patterns,
+                        subject_patterns: &subject_patterns,
+                        body_patterns: &body_patterns,
+                        symbols_patterns: &symbols_patterns,
+                        recipients_patterns: &recipients_patterns,
+                        since_date: since_date.as_deref(),
+                        until_date: until_date.as_deref(),
+                        model_path,
+                    };
+
                     if let Some(ref mut writer) = file_writer {
-                        vlore_similar_emails(
-                            db,
-                            &query_text,
-                            limit,
-                            &from_patterns,
-                            &subject_patterns,
-                            &body_patterns,
-                            &symbols_patterns,
-                            &recipients_patterns,
-                            model_path,
-                            verbose,
-                            writer,
-                            since_date.as_deref(),
-                            until_date.as_deref(),
-                        )
-                        .await?;
+                        vlore_similar_emails(db, &params, verbose, writer).await?;
                     } else {
-                        vlore_similar_emails(
-                            db,
-                            &query_text,
-                            limit,
-                            &from_patterns,
-                            &subject_patterns,
-                            &body_patterns,
-                            &symbols_patterns,
-                            &recipients_patterns,
-                            model_path,
-                            verbose,
-                            &mut anstream::stdout(),
-                            since_date.as_deref(),
-                            until_date.as_deref(),
-                        )
-                        .await?;
+                        vlore_similar_emails(db, &params, verbose, &mut anstream::stdout()).await?;
                     }
 
                     if file_writer.is_some() {
@@ -1305,15 +1349,19 @@ pub async fn handle_command(
                         None
                     };
 
+                    let options = LoreSearchOptions {
+                        verbose: verbose_level,
+                        show_thread,
+                        show_replies: false,
+                        since_date: since_date.as_deref(),
+                        until_date: until_date.as_deref(),
+                    };
                     lore_search_by_commit(
                         db,
                         commit_ish.unwrap(),
                         git_repo_path,
-                        verbose_level,
                         show_all,
-                        show_thread,
-                        since_date.as_deref(),
-                        until_date.as_deref(),
+                        &options,
                     )
                     .await?;
                 }
@@ -1530,15 +1578,14 @@ pub async fn handle_command(
                 // Handle -m flag for exact message_id lookup
                 if let Some(msg_id) = message_id {
                     if let Some(ref mut writer) = file_writer {
-                        lore_get_by_message_id_to_writer(
-                            db,
-                            &msg_id,
+                        let options = LoreSearchOptions {
                             verbose,
                             show_thread,
                             show_replies,
-                            writer,
-                        )
-                        .await?;
+                            since_date: None,
+                            until_date: None,
+                        };
+                        lore_get_by_message_id_to_writer(db, &msg_id, &options, writer).await?;
                     } else {
                         lore_get_by_message_id(db, &msg_id, verbose, show_thread, show_replies)
                             .await?;
@@ -1570,19 +1617,17 @@ pub async fn handle_command(
 
                     // Use multi-field search if multiple patterns, otherwise use single-field
                     if let Some(ref mut writer) = file_writer {
+                        let options = LoreSearchOptions {
+                            verbose,
+                            show_thread,
+                            show_replies,
+                            since_date: since_date.as_deref(),
+                            until_date: until_date.as_deref(),
+                        };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];
                             lore_search_with_thread_to_writer(
-                                db,
-                                field,
-                                pattern,
-                                limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
-                                writer,
+                                db, field, pattern, limit, &options, writer,
                             )
                             .await?;
                         } else {
@@ -1590,42 +1635,24 @@ pub async fn handle_command(
                                 db,
                                 field_patterns,
                                 limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
+                                &options,
                                 writer,
                             )
                             .await?;
                         }
                     } else {
+                        let options = LoreSearchOptions {
+                            verbose,
+                            show_thread,
+                            show_replies,
+                            since_date: since_date.as_deref(),
+                            until_date: until_date.as_deref(),
+                        };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];
-                            lore_search_with_thread(
-                                db,
-                                field,
-                                pattern,
-                                limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
-                            )
-                            .await?;
+                            lore_search_with_thread(db, field, pattern, limit, &options).await?;
                         } else {
-                            lore_search_multi_field(
-                                db,
-                                field_patterns,
-                                limit,
-                                verbose,
-                                show_thread,
-                                show_replies,
-                                since_date.as_deref(),
-                                until_date.as_deref(),
-                            )
-                            .await?;
+                            lore_search_multi_field(db, field_patterns, limit, &options).await?;
                         }
                     }
                 }
@@ -2192,95 +2219,100 @@ async fn vgrep_similar_functions(
 }
 
 /// Search for commits similar to given query text using vector embeddings
-async fn vcommit_similar_commits(
-    db: &DatabaseManager,
-    query_text: &str,
-    limit: usize,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    git_range: Option<&str>,
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
-    model_path: &Option<String>,
-) -> Result<()> {
+async fn vcommit_similar_commits(db: &DatabaseManager, params: &VCommitParams<'_>) -> Result<()> {
     use semcode::CodeVectorizer;
 
-    let has_filters = !author_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty();
-    match (git_range, has_filters) {
+    let has_filters = !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty();
+    match (params.git_range, has_filters) {
         (Some(range), true) => {
             let mut filter_parts = Vec::new();
-            if !author_patterns.is_empty() {
-                filter_parts.push(format!("{} author pattern(s)", author_patterns.len()));
+            if !params.author_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} author pattern(s)",
+                    params.author_patterns.len()
+                ));
             }
-            if !subject_patterns.is_empty() {
-                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !regex_patterns.is_empty() {
-                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             println!(
-                "Searching for commits similar to: {} (git range: {}, {}, limit: {})",
-                query_text.yellow(),
+                "Searching for commits similar to: {} (git range: {}, {}, params.limit: {})",
+                params.query_text.yellow(),
                 range.cyan(),
                 filter_desc,
-                limit
+                params.limit
             );
         }
         (Some(range), false) => println!(
-            "Searching for commits similar to: {} (git range: {}, limit: {})",
-            query_text.yellow(),
+            "Searching for commits similar to: {} (git range: {}, params.limit: {})",
+            params.query_text.yellow(),
             range.cyan(),
-            limit
+            params.limit
         ),
         (None, true) => {
             let mut filter_parts = Vec::new();
-            if !author_patterns.is_empty() {
-                filter_parts.push(format!("{} author pattern(s)", author_patterns.len()));
+            if !params.author_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} author pattern(s)",
+                    params.author_patterns.len()
+                ));
             }
-            if !subject_patterns.is_empty() {
-                filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !regex_patterns.is_empty() {
-                filter_parts.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_parts.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_parts.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_parts.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_parts.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_parts.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
             println!(
-                "Searching for commits similar to: {} ({}, limit: {})",
-                query_text.yellow(),
+                "Searching for commits similar to: {} ({}, params.limit: {})",
+                params.query_text.yellow(),
                 filter_desc,
-                limit
+                params.limit
             );
         }
         (None, false) => println!(
-            "Searching for commits similar to: {} (limit: {})",
-            query_text.yellow(),
-            limit
+            "Searching for commits similar to: {} (params.limit: {})",
+            params.query_text.yellow(),
+            params.limit
         ),
     }
 
     // Initialize vectorizer
     println!("Initializing vectorizer...");
-    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+    let vectorizer = match CodeVectorizer::new_with_config(false, params.model_path.clone()).await {
         Ok(v) => v,
         Err(e) => {
             println!("{} Failed to initialize vectorizer: {}", "Error:".red(), e);
@@ -2293,7 +2325,7 @@ async fn vcommit_similar_commits(
 
     // Generate vector for query text
     println!("Generating query vector...");
-    let query_vector = match vectorizer.vectorize_code(query_text) {
+    let query_vector = match vectorizer.vectorize_code(params.query_text) {
         Ok(v) => v,
         Err(e) => {
             println!(
@@ -2306,8 +2338,8 @@ async fn vcommit_similar_commits(
     };
 
     // Resolve git range to a set of commit SHAs if provided
-    let git_range_shas = if let Some(range) = git_range {
-        match gix::discover(git_repo_path) {
+    let git_range_shas = if let Some(range) = params.git_range {
+        match gix::discover(params.git_repo_path) {
             Ok(repo) => {
                 // Resolve the git range using gitoxide
                 let range_parts: Vec<&str> = range.split("..").collect();
@@ -2367,7 +2399,7 @@ async fn vcommit_similar_commits(
                 {
                     Ok(walk) => {
                         let mut commit_count = 0;
-                        const MAX_COMMITS: usize = 1000000; // Safety limit
+                        const MAX_COMMITS: usize = 1000000; // Safety params.limit
 
                         for commit_result in walk {
                             match commit_result {
@@ -2414,21 +2446,21 @@ async fn vcommit_similar_commits(
         None
     };
 
-    // Search for similar commits with higher limit if filtering
-    let search_limit = if !author_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty()
-        || git_range.is_some()
-        || reachable_sha.is_some()
+    // Search for similar commits with higher params.limit if filtering
+    let search_limit = if !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+        || params.git_range.is_some()
+        || params.reachable_sha.is_some()
     {
         // When filtering (author, subject, regex, symbols, paths, git range, or reachability), always fetch many results since we'll filter them down
-        // Use a large limit to ensure we find enough matches after filtering
+        // Use a large params.limit to ensure we find enough matches after filtering
         // Increased to 2M to handle very large repositories like Linux kernel (~1.2M commits)
         2_000_000
     } else {
-        limit
+        params.limit
     };
 
     // Search for similar commits
@@ -2458,10 +2490,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply author filtering if provided (ANY must match - OR logic)
-            let filtered_by_author = if !author_patterns.is_empty() {
+            let filtered_by_author = if !params.author_patterns.is_empty() {
                 // Compile all author regex patterns (case-insensitive)
                 let mut author_regexes = Vec::new();
-                for pattern in author_patterns {
+                for pattern in params.author_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2490,7 +2522,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Author filters ({} pattern(s)) reduced results from {} to {} commits",
-                    author_patterns.len(),
+                    params.author_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2501,10 +2533,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply subject filtering if provided (ANY must match - OR logic)
-            let filtered_by_subject = if !subject_patterns.is_empty() {
+            let filtered_by_subject = if !params.subject_patterns.is_empty() {
                 // Compile all subject regex patterns (case-insensitive)
                 let mut subject_regexes = Vec::new();
-                for pattern in subject_patterns {
+                for pattern in params.subject_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2535,7 +2567,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Subject filters ({} pattern(s)) reduced results from {} to {} commits",
-                    subject_patterns.len(),
+                    params.subject_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2546,10 +2578,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply regex filtering if provided (ALL patterns must match)
-            let filtered_by_regex = if !regex_patterns.is_empty() {
+            let filtered_by_regex = if !params.regex_patterns.is_empty() {
                 // Compile all regex patterns (case-insensitive)
                 let mut regexes = Vec::new();
-                for pattern in regex_patterns {
+                for pattern in params.regex_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2580,7 +2612,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Regex filters ({} pattern(s)) reduced results from {} to {} commits",
-                    regex_patterns.len(),
+                    params.regex_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2591,10 +2623,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply symbol filtering if provided (ALL patterns must match)
-            let filtered_by_symbol = if !symbol_patterns.is_empty() {
+            let filtered_by_symbol = if !params.symbol_patterns.is_empty() {
                 // Compile all symbol regex patterns (case-insensitive)
                 let mut symbol_regexes = Vec::new();
-                for pattern in symbol_patterns {
+                for pattern in params.symbol_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2625,7 +2657,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Symbol filters ({} pattern(s)) reduced results from {} to {} commits",
-                    symbol_patterns.len(),
+                    params.symbol_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2636,10 +2668,10 @@ async fn vcommit_similar_commits(
             };
 
             // Apply path filtering if provided (ANY pattern must match - OR logic)
-            let filtered_by_path = if !path_patterns.is_empty() {
+            let filtered_by_path = if !params.path_patterns.is_empty() {
                 // Compile all path regex patterns (case-insensitive)
                 let mut path_regexes = Vec::new();
-                for pattern in path_patterns {
+                for pattern in params.path_patterns {
                     match regex::RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
@@ -2670,7 +2702,7 @@ async fn vcommit_similar_commits(
 
                 tracing::info!(
                     "Path filters ({} pattern(s)) reduced results from {} to {} commits",
-                    path_patterns.len(),
+                    params.path_patterns.len(),
                     original_count,
                     filtered.len()
                 );
@@ -2681,16 +2713,16 @@ async fn vcommit_similar_commits(
             };
 
             // Apply reachability filtering if provided
-            let final_results = if let Some(reachable_from) = reachable_sha {
+            let final_results = if let Some(reachable_from) = params.reachable_sha {
                 let original_count = filtered_by_path.len();
 
                 // For > 10 commits, use hashset approach for better performance
                 let filtered: Vec<_> = if original_count > 10 {
-                    match git::get_reachable_commits(git_repo_path, reachable_from) {
+                    match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                         Ok(reachable_set) => filtered_by_path
                             .into_iter()
                             .filter(|(commit, _)| reachable_set.contains(&commit.git_sha))
-                            .take(limit)
+                            .take(params.limit)
                             .collect(),
                         Err(e) => {
                             tracing::warn!(
@@ -2702,7 +2734,7 @@ async fn vcommit_similar_commits(
                                 .into_iter()
                                 .filter(|(commit, _)| {
                                     match git::is_commit_reachable(
-                                        git_repo_path,
+                                        params.git_repo_path,
                                         reachable_from,
                                         &commit.git_sha,
                                     ) {
@@ -2718,7 +2750,7 @@ async fn vcommit_similar_commits(
                                         }
                                     }
                                 })
-                                .take(limit)
+                                .take(params.limit)
                                 .collect()
                         }
                     }
@@ -2728,7 +2760,7 @@ async fn vcommit_similar_commits(
                         .into_iter()
                         .filter(|(commit, _)| {
                             match git::is_commit_reachable(
-                                git_repo_path,
+                                params.git_repo_path,
                                 reachable_from,
                                 &commit.git_sha,
                             ) {
@@ -2744,7 +2776,7 @@ async fn vcommit_similar_commits(
                                 }
                             }
                         })
-                        .take(limit)
+                        .take(params.limit)
                         .collect()
                 };
 
@@ -2756,17 +2788,17 @@ async fn vcommit_similar_commits(
 
                 filtered
             } else {
-                filtered_by_path.into_iter().take(limit).collect()
+                filtered_by_path.into_iter().take(params.limit).collect()
             };
 
             if final_results.is_empty() {
                 println!("{} No similar commits found", "Info:".yellow());
-                if !author_patterns.is_empty()
-                    || !subject_patterns.is_empty()
-                    || !regex_patterns.is_empty()
-                    || !symbol_patterns.is_empty()
-                    || !path_patterns.is_empty()
-                    || git_range.is_some()
+                if !params.author_patterns.is_empty()
+                    || !params.subject_patterns.is_empty()
+                    || !params.regex_patterns.is_empty()
+                    || !params.symbol_patterns.is_empty()
+                    || !params.path_patterns.is_empty()
+                    || params.git_range.is_some()
                 {
                     println!(
                         "Try adjusting the filters or removing the -f/-s/-r/-g/-p/--git options"
@@ -2788,11 +2820,10 @@ async fn vcommit_similar_commits(
 
             for (i, (commit, similarity)) in final_results.iter().enumerate() {
                 println!(
-                    "\n{}. {} {} {}%",
+                    "\n{}. {} {} %",
                     (i + 1).to_string().yellow(),
                     "Similarity:".bold(),
-                    format!("{:.1}", similarity * 100.0).bright_green(),
-                    ""
+                    format!("{:.1}", similarity * 100.0).bright_green()
                 );
                 println!(
                     "   {} {}",
@@ -2863,46 +2894,43 @@ async fn vcommit_similar_commits(
 /// Helper function for vlore that writes output to a generic writer
 async fn vlore_similar_emails(
     db: &DatabaseManager,
-    query_text: &str,
-    limit: usize,
-    from_patterns: &[String],
-    subject_patterns: &[String],
-    body_patterns: &[String],
-    symbols_patterns: &[String],
-    recipients_patterns: &[String],
-    model_path: &Option<String>,
+    params: &VLoreParams<'_>,
     verbose: bool,
     writer: &mut dyn std::io::Write,
-    since_date: Option<&str>,
-    until_date: Option<&str>,
 ) -> Result<()> {
     use semcode::CodeVectorizer;
 
-    let has_filters = !from_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !body_patterns.is_empty()
-        || !symbols_patterns.is_empty()
-        || !recipients_patterns.is_empty();
+    let has_filters = !params.from_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.body_patterns.is_empty()
+        || !params.symbols_patterns.is_empty()
+        || !params.recipients_patterns.is_empty();
 
-    // Note: since_date and until_date are applied at SQL level, not as FTS filters
-    if has_filters || since_date.is_some() || until_date.is_some() {
+    // Note: params.since_date and params.until_date are applied at SQL level, not as FTS filters
+    if has_filters || params.since_date.is_some() || params.until_date.is_some() {
         let mut filter_parts = Vec::new();
-        if !from_patterns.is_empty() {
-            filter_parts.push(format!("{} from pattern(s)", from_patterns.len()));
+        if !params.from_patterns.is_empty() {
+            filter_parts.push(format!("{} from pattern(s)", params.from_patterns.len()));
         }
-        if !subject_patterns.is_empty() {
-            filter_parts.push(format!("{} subject pattern(s)", subject_patterns.len()));
+        if !params.subject_patterns.is_empty() {
+            filter_parts.push(format!(
+                "{} subject pattern(s)",
+                params.subject_patterns.len()
+            ));
         }
-        if !body_patterns.is_empty() {
-            filter_parts.push(format!("{} body pattern(s)", body_patterns.len()));
+        if !params.body_patterns.is_empty() {
+            filter_parts.push(format!("{} body pattern(s)", params.body_patterns.len()));
         }
-        if !symbols_patterns.is_empty() {
-            filter_parts.push(format!("{} symbols pattern(s)", symbols_patterns.len()));
+        if !params.symbols_patterns.is_empty() {
+            filter_parts.push(format!(
+                "{} symbols pattern(s)",
+                params.symbols_patterns.len()
+            ));
         }
-        if !recipients_patterns.is_empty() {
+        if !params.recipients_patterns.is_empty() {
             filter_parts.push(format!(
                 "{} recipients pattern(s)",
-                recipients_patterns.len()
+                params.recipients_patterns.len()
             ));
         }
         let filter_desc = format!("filtering with {}", filter_parts.join(" and "));
@@ -2910,8 +2938,8 @@ async fn vlore_similar_emails(
             writer,
             "{}",
             format!(
-                "Searching for lore emails similar to: {} ({}, limit: {})",
-                query_text, filter_desc, limit
+                "Searching for lore emails similar to: {} ({}, params.limit: {})",
+                params.query_text, filter_desc, params.limit
             )
             .yellow()
         )?;
@@ -2920,8 +2948,8 @@ async fn vlore_similar_emails(
             writer,
             "{}",
             format!(
-                "Searching for lore emails similar to: {} (limit: {})",
-                query_text, limit
+                "Searching for lore emails similar to: {} (params.limit: {})",
+                params.query_text, params.limit
             )
             .yellow()
         )?;
@@ -2929,7 +2957,7 @@ async fn vlore_similar_emails(
 
     // Initialize vectorizer
     writeln!(writer, "Initializing vectorizer...")?;
-    let vectorizer = match CodeVectorizer::new_with_config(false, model_path.clone()).await {
+    let vectorizer = match CodeVectorizer::new_with_config(false, params.model_path.clone()).await {
         Ok(v) => v,
         Err(e) => {
             writeln!(
@@ -2948,7 +2976,7 @@ async fn vlore_similar_emails(
 
     // Generate vector for query text
     writeln!(writer, "Generating query vector...")?;
-    let query_vector = match vectorizer.vectorize_code(query_text) {
+    let query_vector = match vectorizer.vectorize_code(params.query_text) {
         Ok(v) => v,
         Err(e) => {
             writeln!(
@@ -2962,49 +2990,48 @@ async fn vlore_similar_emails(
     };
 
     // Prepare filter patterns for database-level filtering
-    let from_filter = if !from_patterns.is_empty() {
-        Some(&from_patterns[..])
+    let from_filter = if !params.from_patterns.is_empty() {
+        Some(params.from_patterns)
     } else {
         None
     };
 
-    let subject_filter = if !subject_patterns.is_empty() {
-        Some(&subject_patterns[..])
+    let subject_filter = if !params.subject_patterns.is_empty() {
+        Some(params.subject_patterns)
     } else {
         None
     };
 
-    let body_filter = if !body_patterns.is_empty() {
-        Some(&body_patterns[..])
+    let body_filter = if !params.body_patterns.is_empty() {
+        Some(params.body_patterns)
     } else {
         None
     };
 
-    let symbols_filter = if !symbols_patterns.is_empty() {
-        Some(&symbols_patterns[..])
+    let symbols_filter = if !params.symbols_patterns.is_empty() {
+        Some(params.symbols_patterns)
     } else {
         None
     };
 
-    let recipients_filter = if !recipients_patterns.is_empty() {
-        Some(&recipients_patterns[..])
+    let recipients_filter = if !params.recipients_patterns.is_empty() {
+        Some(params.recipients_patterns)
     } else {
         None
     };
 
     // Search for similar lore emails with database-level filtering
+    let filters = LoreEmailFilters {
+        from_patterns: from_filter,
+        subject_patterns: subject_filter,
+        body_patterns: body_filter,
+        symbols_patterns: symbols_filter,
+        recipients_patterns: recipients_filter,
+        since_date: params.since_date,
+        until_date: params.until_date,
+    };
     match db
-        .search_similar_lore_emails(
-            &query_vector,
-            limit,
-            from_filter,
-            subject_filter,
-            body_filter,
-            symbols_filter,
-            recipients_filter,
-            since_date,
-            until_date,
-        )
+        .search_similar_lore_emails(&query_vector, params.limit, &filters)
         .await
     {
         Ok(results) if results.is_empty() => {
@@ -3303,135 +3330,123 @@ fn display_commit(commit: &semcode::GitCommitInfo, index: usize, verbose: bool) 
 }
 
 /// Show summary statistics for commit display
-fn show_commit_summary(
-    total_commits: usize,
-    matched_count: usize,
-    displayed_count: usize,
-    limit: usize,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-) {
+fn show_commit_summary(params: &CommitSummaryParams) {
     println!("\n{}", "=".repeat(80));
 
     // Show summary with filtering/limiting info
-    if !author_patterns.is_empty()
-        || !subject_patterns.is_empty()
-        || !regex_patterns.is_empty()
-        || !symbol_patterns.is_empty()
-        || !path_patterns.is_empty()
-        || limit > 0
+    if !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
+        || !params.regex_patterns.is_empty()
+        || !params.symbol_patterns.is_empty()
+        || !params.path_patterns.is_empty()
+        || params.limit > 0
     {
         println!("{} ", "Summary:".bold().green());
-        println!("  Total commits: {}", total_commits);
-        if !author_patterns.is_empty()
-            || !subject_patterns.is_empty()
-            || !regex_patterns.is_empty()
-            || !symbol_patterns.is_empty()
-            || !path_patterns.is_empty()
+        println!("  Total commits: {}", params.total_commits);
+        if !params.author_patterns.is_empty()
+            || !params.subject_patterns.is_empty()
+            || !params.regex_patterns.is_empty()
+            || !params.symbol_patterns.is_empty()
+            || !params.path_patterns.is_empty()
         {
-            println!("  Matched by filters: {}", matched_count);
+            println!("  Matched by filters: {}", params.matched_count);
         }
-        println!("  Displayed: {}", displayed_count);
-        if limit > 0 && matched_count > limit {
+        println!("  Displayed: {}", params.displayed_count);
+        if params.limit > 0 && params.matched_count > params.limit {
             println!(
                 "  {} {} additional matching commits not shown (limited to {})",
                 "Note:".yellow(),
-                matched_count - displayed_count,
-                limit
+                params.matched_count - params.displayed_count,
+                params.limit
             );
         }
     } else {
         println!(
             "{} Total: {} commits",
             "Summary:".bold().green(),
-            displayed_count
+            params.displayed_count
         );
     }
 
-    if displayed_count == 0 {
-        let filter_count = (!author_patterns.is_empty() as usize)
-            + (!subject_patterns.is_empty() as usize)
-            + (!regex_patterns.is_empty() as usize)
-            + (!symbol_patterns.is_empty() as usize)
-            + (!path_patterns.is_empty() as usize);
+    if params.displayed_count == 0 {
+        let filter_count = (!params.author_patterns.is_empty() as usize)
+            + (!params.subject_patterns.is_empty() as usize)
+            + (!params.regex_patterns.is_empty() as usize)
+            + (!params.symbol_patterns.is_empty() as usize)
+            + (!params.path_patterns.is_empty() as usize);
 
         if filter_count >= 2 {
             let mut filter_types = Vec::new();
-            if !author_patterns.is_empty() {
-                filter_types.push(format!("{} author pattern(s)", author_patterns.len()));
+            if !params.author_patterns.is_empty() {
+                filter_types.push(format!(
+                    "{} author pattern(s)",
+                    params.author_patterns.len()
+                ));
             }
-            if !subject_patterns.is_empty() {
-                filter_types.push(format!("{} subject pattern(s)", subject_patterns.len()));
+            if !params.subject_patterns.is_empty() {
+                filter_types.push(format!(
+                    "{} subject pattern(s)",
+                    params.subject_patterns.len()
+                ));
             }
-            if !regex_patterns.is_empty() {
-                filter_types.push(format!("{} regex pattern(s)", regex_patterns.len()));
+            if !params.regex_patterns.is_empty() {
+                filter_types.push(format!("{} regex pattern(s)", params.regex_patterns.len()));
             }
-            if !symbol_patterns.is_empty() {
-                filter_types.push(format!("{} symbol pattern(s)", symbol_patterns.len()));
+            if !params.symbol_patterns.is_empty() {
+                filter_types.push(format!(
+                    "{} symbol pattern(s)",
+                    params.symbol_patterns.len()
+                ));
             }
-            if !path_patterns.is_empty() {
-                filter_types.push(format!("{} path pattern(s)", path_patterns.len()));
+            if !params.path_patterns.is_empty() {
+                filter_types.push(format!("{} path pattern(s)", params.path_patterns.len()));
             }
             println!(
                 "\n{} No commits matched ALL {}",
                 "Info:".yellow(),
                 filter_types.join(" and ")
             );
-        } else if !author_patterns.is_empty() {
+        } else if !params.author_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ANY {} author pattern(s): {}",
                 "Info:".yellow(),
-                author_patterns.len(),
-                author_patterns.join(", ")
+                params.author_patterns.len(),
+                params.author_patterns.join(", ")
             );
-        } else if !subject_patterns.is_empty() {
+        } else if !params.subject_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ANY {} subject pattern(s): {}",
                 "Info:".yellow(),
-                subject_patterns.len(),
-                subject_patterns.join(", ")
+                params.subject_patterns.len(),
+                params.subject_patterns.join(", ")
             );
-        } else if !regex_patterns.is_empty() {
+        } else if !params.regex_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ALL {} regex pattern(s): {}",
                 "Info:".yellow(),
-                regex_patterns.len(),
-                regex_patterns.join(", ")
+                params.regex_patterns.len(),
+                params.regex_patterns.join(", ")
             );
-        } else if !symbol_patterns.is_empty() {
+        } else if !params.symbol_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ALL {} symbol pattern(s): {}",
                 "Info:".yellow(),
-                symbol_patterns.len(),
-                symbol_patterns.join(", ")
+                params.symbol_patterns.len(),
+                params.symbol_patterns.join(", ")
             );
-        } else if !path_patterns.is_empty() {
+        } else if !params.path_patterns.is_empty() {
             println!(
                 "\n{} No commits matched ALL {} path pattern(s): {}",
                 "Info:".yellow(),
-                path_patterns.len(),
-                path_patterns.join(", ")
+                params.path_patterns.len(),
+                params.path_patterns.join(", ")
             );
         }
     }
 }
 
 /// Show all commits from database with optional filters
-async fn show_all_commits(
-    db: &DatabaseManager,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    limit: usize,
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
-) -> Result<()> {
+async fn show_all_commits(db: &DatabaseManager, params: &ShowAllCommitsParams<'_>) -> Result<()> {
     // Step 1: Get all commits from database
     let all_commits = db.get_all_git_commits().await?;
 
@@ -3441,32 +3456,32 @@ async fn show_all_commits(
     }
 
     // Step 2: Compile filters
-    let author_filters = if !author_patterns.is_empty() {
-        compile_regex_filters(author_patterns)?
+    let author_filters = if !params.author_patterns.is_empty() {
+        compile_regex_filters(params.author_patterns)?
     } else {
         Vec::new()
     };
 
-    let subject_filters = if !subject_patterns.is_empty() {
-        compile_regex_filters(subject_patterns)?
+    let subject_filters = if !params.subject_patterns.is_empty() {
+        compile_regex_filters(params.subject_patterns)?
     } else {
         Vec::new()
     };
 
-    let regex_filters = if !regex_patterns.is_empty() {
-        compile_regex_filters(regex_patterns)?
+    let regex_filters = if !params.regex_patterns.is_empty() {
+        compile_regex_filters(params.regex_patterns)?
     } else {
         Vec::new()
     };
 
-    let symbol_filters = if !symbol_patterns.is_empty() {
-        compile_symbol_filters(symbol_patterns)?
+    let symbol_filters = if !params.symbol_patterns.is_empty() {
+        compile_symbol_filters(params.symbol_patterns)?
     } else {
         Vec::new()
     };
 
-    let path_filters = if !path_patterns.is_empty() {
-        compile_path_filters(path_patterns)?
+    let path_filters = if !params.path_patterns.is_empty() {
+        compile_path_filters(params.path_patterns)?
     } else {
         Vec::new()
     };
@@ -3494,9 +3509,9 @@ async fn show_all_commits(
         .collect();
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
-    let reachable_set = if let Some(reachable_from) = reachable_sha {
+    let reachable_set = if let Some(reachable_from) = params.reachable_sha {
         if filtered_commits.len() > 10 {
-            match git::get_reachable_commits(git_repo_path, reachable_from) {
+            match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                 Ok(set) => Some(set),
                 Err(e) => {
                     println!(
@@ -3520,12 +3535,16 @@ async fn show_all_commits(
 
     for commit in &filtered_commits {
         // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
+        if let Some(reachable_from) = params.reachable_sha {
             // Use hashset if available, otherwise do individual check
             let is_reachable = if let Some(ref set) = reachable_set {
                 set.contains(&commit.git_sha)
             } else {
-                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                match git::is_commit_reachable(
+                    params.git_repo_path,
+                    reachable_from,
+                    &commit.git_sha,
+                ) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -3547,27 +3566,28 @@ async fn show_all_commits(
 
         matched_count += 1;
 
-        // Apply limit
-        if limit > 0 && displayed_count >= limit {
+        // Apply params.limit
+        if params.limit > 0 && displayed_count >= params.limit {
             continue;
         }
 
         displayed_count += 1;
-        display_commit(commit, displayed_count, verbose);
+        display_commit(commit, displayed_count, params.verbose);
     }
 
     // Step 5: Show summary
-    show_commit_summary(
-        all_commits.len(),
+    let summary_params = CommitSummaryParams {
+        total_commits: all_commits.len(),
         matched_count,
         displayed_count,
-        limit,
-        author_patterns,
-        subject_patterns,
-        regex_patterns,
-        symbol_patterns,
-        path_patterns,
-    );
+        limit: params.limit,
+        author_patterns: params.author_patterns,
+        subject_patterns: params.subject_patterns,
+        regex_patterns: params.regex_patterns,
+        symbol_patterns: params.symbol_patterns,
+        path_patterns: params.path_patterns,
+    };
+    show_commit_summary(&summary_params);
 
     Ok(())
 }
@@ -3576,17 +3596,10 @@ async fn show_all_commits(
 async fn show_commit_metadata(
     db: &DatabaseManager,
     git_ref: &str,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &ShowCommitMetadataParams<'_>,
 ) -> Result<()> {
     // Step 1: Resolve git reference to full SHA using gitoxide
-    let resolved_sha = match gix::discover(git_repo_path) {
+    let resolved_sha = match gix::discover(params.git_repo_path) {
         Ok(repo) => match git::resolve_to_commit(&repo, git_ref) {
             Ok(commit) => commit.id().to_string(),
             Err(e) => {
@@ -3661,7 +3674,7 @@ async fn show_commit_metadata(
                 resolved_sha.bright_black()
             );
 
-            match git::get_commit_info_from_git(git_repo_path, &resolved_sha) {
+            match git::get_commit_info_from_git(params.git_repo_path, &resolved_sha) {
                 Ok(git_commit) => {
                     (
                         git_commit.git_sha,
@@ -3685,8 +3698,8 @@ async fn show_commit_metadata(
     };
 
     // Step 2b: Apply reachability filter if provided
-    if let Some(reachable_from) = reachable_sha {
-        match git::is_commit_reachable(git_repo_path, reachable_from, &resolved_sha) {
+    if let Some(reachable_from) = params.reachable_sha {
+        match git::is_commit_reachable(params.git_repo_path, reachable_from, &resolved_sha) {
             Ok(true) => {
                 // Commit is reachable, continue processing
             }
@@ -3707,9 +3720,9 @@ async fn show_commit_metadata(
     }
 
     // Step 2c: Apply author filters if provided (ANY must match - OR logic)
-    if !author_patterns.is_empty() {
+    if !params.author_patterns.is_empty() {
         let mut author_regexes = Vec::new();
-        for pattern in author_patterns {
+        for pattern in params.author_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => author_regexes.push(re),
                 Err(e) => {
@@ -3731,17 +3744,17 @@ async fn show_commit_metadata(
                 "{} Commit {} does not match any of {} author pattern(s): {}",
                 "Info:".yellow(),
                 resolved_sha.bright_black(),
-                author_patterns.len(),
-                author_patterns.join(", ")
+                params.author_patterns.len(),
+                params.author_patterns.join(", ")
             );
             return Ok(());
         }
     }
 
     // Step 2d: Apply subject filters if provided (ANY must match - OR logic)
-    if !subject_patterns.is_empty() {
+    if !params.subject_patterns.is_empty() {
         let mut subject_regexes = Vec::new();
-        for pattern in subject_patterns {
+        for pattern in params.subject_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => subject_regexes.push(re),
                 Err(e) => {
@@ -3765,18 +3778,18 @@ async fn show_commit_metadata(
                 "{} Commit {} does not match any of {} subject pattern(s): {}",
                 "Info:".yellow(),
                 resolved_sha.bright_black(),
-                subject_patterns.len(),
-                subject_patterns.join(", ")
+                params.subject_patterns.len(),
+                params.subject_patterns.join(", ")
             );
             return Ok(());
         }
     }
 
     // Step 3: Apply regex filters if provided (ALL must match)
-    if !regex_patterns.is_empty() {
+    if !params.regex_patterns.is_empty() {
         // Compile all regex patterns
         let mut regexes = Vec::new();
-        for pattern in regex_patterns {
+        for pattern in params.regex_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => regexes.push(re),
                 Err(e) => {
@@ -3796,7 +3809,7 @@ async fn show_commit_metadata(
         let mut failed_patterns = Vec::new();
         for (i, re) in regexes.iter().enumerate() {
             if !re.is_match(&combined) {
-                failed_patterns.push(regex_patterns[i].as_str());
+                failed_patterns.push(params.regex_patterns[i].as_str());
             }
         }
 
@@ -3813,10 +3826,10 @@ async fn show_commit_metadata(
     }
 
     // Step 3b: Apply symbol filters if provided (ALL must match)
-    if !symbol_patterns.is_empty() {
+    if !params.symbol_patterns.is_empty() {
         // Compile all symbol regex patterns
         let mut symbol_regexes = Vec::new();
-        for pattern in symbol_patterns {
+        for pattern in params.symbol_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => symbol_regexes.push(re),
                 Err(e) => {
@@ -3837,7 +3850,7 @@ async fn show_commit_metadata(
             // Check if ANY symbol matches this pattern
             let matches_any = commit_symbols.iter().any(|symbol| re.is_match(symbol));
             if !matches_any {
-                failed_symbol_patterns.push(symbol_patterns[i].as_str());
+                failed_symbol_patterns.push(params.symbol_patterns[i].as_str());
             }
         }
 
@@ -3854,10 +3867,10 @@ async fn show_commit_metadata(
     }
 
     // Step 3c: Apply path filters if provided (ANY must match - OR logic)
-    if !path_patterns.is_empty() {
+    if !params.path_patterns.is_empty() {
         // Compile all path regex patterns
         let mut path_regexes = Vec::new();
-        for pattern in path_patterns {
+        for pattern in params.path_patterns {
             match regex::Regex::new(pattern) {
                 Ok(re) => path_regexes.push(re),
                 Err(e) => {
@@ -3882,8 +3895,8 @@ async fn show_commit_metadata(
                 "{} Commit {} does not match any of {} path pattern(s): {}",
                 "Info:".yellow(),
                 resolved_sha.bright_black(),
-                path_patterns.len(),
-                path_patterns.join(", ")
+                params.path_patterns.len(),
+                params.path_patterns.join(", ")
             );
             return Ok(());
         }
@@ -3941,8 +3954,8 @@ async fn show_commit_metadata(
         println!("{}", "─".repeat(60).bright_black());
     }
 
-    // Show diff if verbose flag is set
-    if verbose {
+    // Show diff if params.verbose flag is set
+    if params.verbose {
         if !commit_diff.is_empty() {
             println!("\n{}", "Diff:".bold().blue());
             println!("{}", "─".repeat(80).bright_black());
@@ -3960,18 +3973,10 @@ async fn show_commit_metadata(
 async fn show_commit_range(
     db: &DatabaseManager,
     range: &str,
-    verbose: bool,
-    author_patterns: &[String],
-    subject_patterns: &[String],
-    regex_patterns: &[String],
-    symbol_patterns: &[String],
-    path_patterns: &[String],
-    limit: usize,
-    reachable_sha: Option<&str>,
-    git_repo_path: &str,
+    params: &ShowAllCommitsParams<'_>,
 ) -> Result<()> {
     // Step 1: Resolve git range using gitoxide
-    let range_commits = match gix::discover(git_repo_path) {
+    let range_commits = match gix::discover(params.git_repo_path) {
         Ok(repo) => {
             // Parse the range (FROM..TO)
             let range_parts: Vec<&str> = range.split("..").collect();
@@ -4046,15 +4051,15 @@ async fn show_commit_range(
             {
                 Ok(walk) => {
                     let mut commits = Vec::new();
-                    // Higher limit when any filtering is active, since results will be filtered down
-                    let max_commits = if !author_patterns.is_empty()
-                        || !subject_patterns.is_empty()
-                        || !regex_patterns.is_empty()
-                        || !symbol_patterns.is_empty()
+                    // Higher params.limit when any filtering is active, since results will be filtered down
+                    let max_commits = if !params.author_patterns.is_empty()
+                        || !params.subject_patterns.is_empty()
+                        || !params.regex_patterns.is_empty()
+                        || !params.symbol_patterns.is_empty()
                     {
                         1_000_000 // Allow larger ranges when filtering
                     } else {
-                        10_000 // Standard safety limit
+                        10_000 // Standard safety params.limit
                     };
 
                     for commit_result in walk {
@@ -4067,10 +4072,10 @@ async fn show_commit_range(
                                         range,
                                         max_commits
                                     );
-                                    if author_patterns.is_empty()
-                                        && subject_patterns.is_empty()
-                                        && regex_patterns.is_empty()
-                                        && symbol_patterns.is_empty()
+                                    if params.author_patterns.is_empty()
+                                        && params.subject_patterns.is_empty()
+                                        && params.regex_patterns.is_empty()
+                                        && params.symbol_patterns.is_empty()
                                     {
                                         println!(
                                             "{} Try using -f, -s, -r, or -g <regex> to filter results, or use a smaller range",
@@ -4115,32 +4120,32 @@ async fn show_commit_range(
     }
 
     // Step 2: Compile filters
-    let author_filters = if !author_patterns.is_empty() {
-        compile_regex_filters(author_patterns)?
+    let author_filters = if !params.author_patterns.is_empty() {
+        compile_regex_filters(params.author_patterns)?
     } else {
         Vec::new()
     };
 
-    let subject_filters = if !subject_patterns.is_empty() {
-        compile_regex_filters(subject_patterns)?
+    let subject_filters = if !params.subject_patterns.is_empty() {
+        compile_regex_filters(params.subject_patterns)?
     } else {
         Vec::new()
     };
 
-    let regex_filters = if !regex_patterns.is_empty() {
-        compile_regex_filters(regex_patterns)?
+    let regex_filters = if !params.regex_patterns.is_empty() {
+        compile_regex_filters(params.regex_patterns)?
     } else {
         Vec::new()
     };
 
-    let symbol_filters = if !symbol_patterns.is_empty() {
-        compile_symbol_filters(symbol_patterns)?
+    let symbol_filters = if !params.symbol_patterns.is_empty() {
+        compile_symbol_filters(params.symbol_patterns)?
     } else {
         Vec::new()
     };
 
-    let path_filters = if !path_patterns.is_empty() {
-        compile_path_filters(path_patterns)?
+    let path_filters = if !params.path_patterns.is_empty() {
+        compile_path_filters(params.path_patterns)?
     } else {
         Vec::new()
     };
@@ -4211,9 +4216,9 @@ async fn show_commit_range(
     }
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
-    let reachable_set = if let Some(reachable_from) = reachable_sha {
+    let reachable_set = if let Some(reachable_from) = params.reachable_sha {
         if all_filtered_commits.len() > 10 {
-            match git::get_reachable_commits(git_repo_path, reachable_from) {
+            match git::get_reachable_commits(params.git_repo_path, reachable_from) {
                 Ok(set) => Some(set),
                 Err(e) => {
                     println!(
@@ -4237,12 +4242,16 @@ async fn show_commit_range(
 
     for commit in &all_filtered_commits {
         // Apply reachability filter if provided
-        if let Some(reachable_from) = reachable_sha {
+        if let Some(reachable_from) = params.reachable_sha {
             // Use hashset if available, otherwise do individual check
             let is_reachable = if let Some(ref set) = reachable_set {
                 set.contains(&commit.git_sha)
             } else {
-                match git::is_commit_reachable(git_repo_path, reachable_from, &commit.git_sha) {
+                match git::is_commit_reachable(
+                    params.git_repo_path,
+                    reachable_from,
+                    &commit.git_sha,
+                ) {
                     Ok(true) => true,
                     Ok(false) => false,
                     Err(e) => {
@@ -4264,27 +4273,28 @@ async fn show_commit_range(
 
         matched_count += 1;
 
-        // Apply limit
-        if limit > 0 && displayed_count >= limit {
+        // Apply params.limit
+        if params.limit > 0 && displayed_count >= params.limit {
             continue;
         }
 
         displayed_count += 1;
-        display_commit(commit, displayed_count, verbose);
+        display_commit(commit, displayed_count, params.verbose);
     }
 
     // Step 6: Show summary
-    show_commit_summary(
-        range_commits.len(),
+    let summary_params = CommitSummaryParams {
+        total_commits: range_commits.len(),
         matched_count,
         displayed_count,
-        limit,
-        author_patterns,
-        subject_patterns,
-        regex_patterns,
-        symbol_patterns,
-        path_patterns,
-    );
+        limit: params.limit,
+        author_patterns: params.author_patterns,
+        subject_patterns: params.subject_patterns,
+        regex_patterns: params.regex_patterns,
+        symbol_patterns: params.symbol_patterns,
+        path_patterns: params.path_patterns,
+    };
+    show_commit_summary(&summary_params);
 
     Ok(())
 }

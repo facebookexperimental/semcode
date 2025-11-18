@@ -1,0 +1,40 @@
+#!/bin/bash
+#
+# Pre-commit hook to enforce cargo fmt, compilation, and tests
+#
+# This hook checks if the code is properly formatted, compiles, and all tests pass
+# before allowing a commit. If any check fails, it will fail with a helpful message.
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Check if code is formatted
+if cargo fmt --check &> /dev/null; then
+    echo -e "${GREEN}✓ cargo fmt check passed${NC}"
+else
+    echo -e "${RED}✗ cargo fmt check failed - run 'cargo fmt' to fix${NC}"
+    exit 1
+fi
+
+# Check if code compiles
+echo "Checking compilation..."
+if cargo check --all-targets 2>&1 | grep -E "(error|warning:)" > /dev/null; then
+    echo -e "${RED}✗ compilation check failed${NC}"
+    echo "Run 'cargo check --all-targets' to see errors"
+    exit 1
+else
+    echo -e "${GREEN}✓ compilation check passed${NC}"
+fi
+
+# Run tests
+echo "Running tests..."
+if cargo test 2>&1 | grep -E "test result:.*FAILED" > /dev/null; then
+    echo -e "${RED}✗ tests failed${NC}"
+    echo "Run 'cargo test' to see failures"
+    exit 1
+else
+    echo -e "${GREEN}✓ tests passed${NC}"
+    exit 0
+fi

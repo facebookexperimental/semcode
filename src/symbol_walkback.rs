@@ -67,17 +67,16 @@ pub fn find_symbol_for_line(lines: &[&str], line_idx: usize) -> Option<String> {
     let current_line = lines[line_idx].trim();
 
     // Check for single-line typedef
-    if current_line.starts_with("typedef ") && current_line.ends_with(';') {
-        if extract_typedef_name(current_line).is_some() {
-            return Some(current_line.to_string());
-        }
+    if current_line.starts_with("typedef ")
+        && current_line.ends_with(';')
+        && extract_typedef_name(current_line).is_some()
+    {
+        return Some(current_line.to_string());
     }
 
     // Check for single-line function-like macro
-    if current_line.starts_with("#define ") {
-        if extract_macro_name(current_line).is_some() {
-            return Some(current_line.to_string());
-        }
+    if current_line.starts_with("#define ") && extract_macro_name(current_line).is_some() {
+        return Some(current_line.to_string());
     }
 
     // Walk backwards looking for a definition

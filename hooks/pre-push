@@ -1,0 +1,51 @@
+#!/bin/bash
+#
+# Pre-push hook to enforce cargo fmt, clippy, and tests
+#
+# This hook checks if the code is properly formatted, passes clippy,
+# and all tests pass before allowing a push.
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+# Track if any check fails
+FAILED=0
+
+# Check if code is formatted
+echo -ne "Checking formatting... "
+if cargo fmt --check &> /dev/null; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗ (run 'cargo fmt')${NC}"
+    FAILED=1
+fi
+
+# Check clippy
+echo -ne "Checking clippy... "
+if cargo clippy --all-targets -- -D warnings &> /dev/null; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗${NC}"
+    FAILED=1
+fi
+
+# Run tests
+echo -ne "Running tests... "
+if cargo test &> /dev/null; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗${NC}"
+    FAILED=1
+fi
+
+# Exit with failure if any check failed
+if [ $FAILED -eq 1 ]; then
+    echo -e "\n${RED}Pre-push checks failed. Please fix the issues above.${NC}"
+    exit 1
+else
+    echo -e "\n${GREEN}All pre-push checks passed!${NC}"
+    exit 0
+fi

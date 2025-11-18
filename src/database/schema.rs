@@ -724,10 +724,8 @@ impl SchemaManager {
         let table = self.connection.open_table("lore").execute().await?;
 
         // Check if FTS indices already exist by trying to list them
-        let indices = match table.list_indices().await {
-            Ok(indices) => indices,
-            Err(_) => Vec::new(),
-        };
+        let indices: Vec<lancedb::index::IndexConfig> =
+            (table.list_indices().await).unwrap_or_default();
 
         // Check if FTS indices already exist (index_type must be FTS)
         use lancedb::index::IndexType;
