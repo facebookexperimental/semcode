@@ -16,11 +16,13 @@ Semcode is a semantic code search tool written in Rust that indexes C/C++ codeba
 Install required system dependencies:
 ```bash
 # Ubuntu/Debian
-sudo apt-get install libclang-dev protobuf-compiler libprotobuf-dev
+sudo apt-get install build-essential libclang-dev protobuf-compiler libprotobuf-dev
 
 # Fedora
-sudo dnf install clang-devel protobuf-compiler protobuf-devel
+sudo dnf install gcc-c++ clang-devel protobuf-compiler protobuf-devel
 ```
+
+**Note:** The C++ compiler (`g++`/`gcc-c++`) is required for building dependencies like `esaxx-rs`.
 
 ### Build Commands
 ```bash
