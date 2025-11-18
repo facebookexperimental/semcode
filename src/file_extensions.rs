@@ -17,6 +17,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "hxx", // C++ header files
     "h++", // C++ header files
     "rs",  // Rust source files
+    "py",  // Python source files
 ];
 
 /// Default extensions for indexing (subset of SUPPORTED_EXTENSIONS)
@@ -63,6 +64,11 @@ pub fn is_c_cpp_file(file_path: &str) -> bool {
         || file_path.ends_with(".h++")
 }
 
+/// Check if a file path is a Python file
+pub fn is_python_file(file_path: &str) -> bool {
+    file_path.ends_with(".py")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,7 +98,7 @@ mod tests {
         assert!(is_supported_for_analysis("test.rs"));
         assert!(is_supported_for_analysis("test.cpp"));
         assert!(is_supported_for_analysis("test.hpp"));
-        assert!(!is_supported_for_analysis("test.py"));
+        assert!(is_supported_for_analysis("test.py"));
         assert!(!is_supported_for_analysis("test.txt"));
     }
 
@@ -106,5 +112,13 @@ mod tests {
         assert!(is_c_cpp_file("test.hxx"));
         assert!(!is_c_cpp_file("test.rs"));
         assert!(!is_c_cpp_file("test.py"));
+    }
+
+    #[test]
+    fn test_is_python_file() {
+        assert!(is_python_file("test.py"));
+        assert!(!is_python_file("test.c"));
+        assert!(!is_python_file("test.rs"));
+        assert!(!is_python_file("test.txt"));
     }
 }

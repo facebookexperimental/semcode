@@ -16,6 +16,7 @@ use crate::hash::compute_file_hash;
 pub enum Language {
     C,
     Rust,
+    Python,
 }
 
 impl Language {
@@ -26,6 +27,7 @@ impl Language {
             .and_then(|ext| match ext {
                 "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" => Some(Language::C),
                 "rs" => Some(Language::Rust),
+                "py" => Some(Language::Python),
                 _ => None,
             })
     }
@@ -53,8 +55,10 @@ struct LanguageQueries {
 pub struct TreeSitterAnalyzer {
     c_parser: Parser,
     rust_parser: Parser,
+    python_parser: Parser,
     c_queries: LanguageQueries,
     rust_queries: LanguageQueries,
+    python_queries: LanguageQueries,
 }
 
 impl TreeSitterAnalyzer {
@@ -69,17 +73,27 @@ impl TreeSitterAnalyzer {
         let mut rust_parser = Parser::new();
         rust_parser.set_language(&rust_language)?;
 
+        // Initialize Python parser and queries
+        let python_language = tree_sitter_python::LANGUAGE.into();
+        let mut python_parser = Parser::new();
+        python_parser.set_language(&python_language)?;
+
         // Create C queries
         let c_queries = Self::create_c_queries(&c_language)?;
 
         // Create Rust queries
         let rust_queries = Self::create_rust_queries(&rust_language)?;
 
+        // Create Python queries
+        let python_queries = Self::create_python_queries(&python_language)?;
+
         Ok(TreeSitterAnalyzer {
             c_parser,
             rust_parser,
+            python_parser,
             c_queries,
             rust_queries,
+            python_queries,
         })
     }
 
@@ -293,6 +307,75 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    fn create_python_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // Query for function definitions (including methods)
+        let function_query = Query::new(
+            language,
+            r#"
+            (function_definition
+                name: (identifier) @function_name
+                parameters: (parameters) @parameters
+                return_type: (_)? @return_type
+                body: (block) @body
+            ) @function
+        "#,
+        )?;
+
+        // Query for comments
+        let comment_query = Query::new(
+            language,
+            r#"
+            (comment) @comment
+        "#,
+        )?;
+
+        // Query for class definitions
+        let type_query = Query::new(
+            language,
+            r#"
+            (class_definition
+                name: (identifier) @type_name
+                body: (block) @body
+            ) @class
+        "#,
+        )?;
+
+        // Python doesn't have traditional macros, but we can track decorators
+        let macro_query = Query::new(
+            language,
+            r#"
+            (decorator
+                (identifier) @macro_name
+            ) @decorator
+        "#,
+        )?;
+
+        // Query for function calls
+        let call_query = Query::new(
+            language,
+            r#"
+            (call
+                function: (identifier) @function_name
+            ) @call
+
+            (call
+                function: (attribute
+                    attribute: (identifier) @function_name
+                )
+            ) @method_call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None, // Python doesn't have typedefs
+            macro_query,
+            call_query,
+        })
+    }
+
     /// Helper method to convert absolute path to relative path based on source root
     fn make_relative_path(&self, file_path: &Path, source_root: Option<&Path>) -> String {
         if let Some(root) = source_root {
@@ -310,6 +393,7 @@ impl TreeSitterAnalyzer {
         match language {
             Language::C => &mut self.c_parser,
             Language::Rust => &mut self.rust_parser,
+            Language::Python => &mut self.python_parser,
         }
     }
 
@@ -318,6 +402,7 @@ impl TreeSitterAnalyzer {
         match language {
             Language::C => &self.c_queries,
             Language::Rust => &self.rust_queries,
+            Language::Python => &self.python_queries,
         }
     }
 
@@ -939,6 +1024,14 @@ impl TreeSitterAnalyzer {
                     }
                     "enum" => {
                         kind = "enum".to_string();
+                        type_start_byte = node.start_byte();
+                        type_end_byte = node.end_byte();
+                        if line_start == 0 {
+                            line_start = node.start_position().row as u32 + 1;
+                        }
+                    }
+                    "class" => {
+                        kind = "class".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
                         if line_start == 0 {
