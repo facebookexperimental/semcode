@@ -1222,7 +1222,10 @@ impl SearchManager {
                     }
 
                     // Apply regex matching in code since LanceDB has issues with combined conditions
-                    let regex = match regex::Regex::new(pattern) {
+                    let regex = match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(r) => r,
                         Err(_) => continue, // Skip invalid regex patterns
                     };
@@ -1457,7 +1460,10 @@ impl SearchManager {
                     }
 
                     // Apply regex matching in code since LanceDB has issues with combined conditions
-                    let regex = match regex::Regex::new(pattern) {
+                    let regex = match regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                    {
                         Ok(r) => r,
                         Err(_) => continue, // Skip invalid regex patterns
                     };
@@ -1502,7 +1508,10 @@ impl SearchManager {
             .await?;
 
         // Apply regex matching in code since LanceDB has issues with combined conditions
-        let regex = match regex::Regex::new(pattern) {
+        let regex = match regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()), // Return empty for invalid regex patterns
         };
@@ -1648,7 +1657,10 @@ impl SearchManager {
         let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
 
         // Apply regex matching in code
-        let regex = match regex::Regex::new(pattern) {
+        let regex = match regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+        {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()), // Return empty for invalid regex patterns
         };
@@ -1833,7 +1845,9 @@ impl VectorSearchManager {
             let results = query.execute().await?.try_collect::<Vec<_>>().await?;
 
             // Step 2: Post-filter results with regex in memory (small result set)
-            let regex = regex::Regex::new(&pattern)?;
+            let regex = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()?;
             let mut message_ids = HashSet::new();
 
             for batch in &results {

@@ -2844,7 +2844,10 @@ impl DatabaseManager {
 
         // Filter by path pattern if provided
         let (final_functions, final_limit_hit) = if let Some(path_regex) = path_pattern {
-            match regex::Regex::new(path_regex) {
+            match regex::RegexBuilder::new(path_regex)
+                .case_insensitive(true)
+                .build()
+            {
                 Ok(path_re) => {
                     let original_count = matching_functions.len();
                     let mut filtered = Vec::new();
@@ -3719,7 +3722,9 @@ impl DatabaseManager {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let regex = regex::Regex::new(pattern)?;
+        let regex = regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()?;
         let mut emails = Vec::new();
         let target_limit = if limit > 0 { limit } else { 10000 };
 
@@ -5051,7 +5056,10 @@ impl DatabaseManager {
             // Compile regex patterns
             let mut regexes = Vec::new();
             for pattern in regex_patterns {
-                match regex::Regex::new(pattern) {
+                match regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                {
                     Ok(re) => regexes.push(re),
                     Err(e) => {
                         tracing::warn!("Invalid regex pattern '{}': {}", pattern, e);
@@ -5073,7 +5081,10 @@ impl DatabaseManager {
             // Compile symbol regex patterns
             let mut symbol_regexes = Vec::new();
             for pattern in symbol_patterns {
-                match regex::Regex::new(pattern) {
+                match regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                {
                     Ok(re) => symbol_regexes.push(re),
                     Err(e) => {
                         tracing::warn!("Invalid symbol regex pattern '{}': {}", pattern, e);
