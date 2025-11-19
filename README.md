@@ -274,9 +274,11 @@ Note: this is mostly untested, and not required for general usage.  I've been
 trying nomic v2 and running it through model2vec to make things faster without
 a GPU.  There are scripts:
 
+```
 pip3 install -r scripts/requirements.txt
 scripts/direct_download.py
 scripts/nomic2vec.py
+```
 
 Take the resulting model directory and move it to ~/.cache/semcode/models/model2vec.
 
