@@ -25,7 +25,9 @@ impl Language {
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(|ext| match ext {
-                "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" => Some(Language::C),
+                "c" | "h" | "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => {
+                    Some(Language::C)
+                }
                 "rs" => Some(Language::Rust),
                 "py" => Some(Language::Python),
                 _ => None,

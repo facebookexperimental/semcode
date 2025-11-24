@@ -27,8 +27,8 @@ struct Args {
     #[arg(short, long)]
     database: Option<String>,
 
-    /// File extensions to process (can be specified multiple times)
-    #[arg(short, long, value_delimiter = ',', default_value_t = semcode::file_extensions::default_extensions_string())]
+    /// File extensions to process (comma-separated)
+    #[arg(short, long, default_value_t = semcode::file_extensions::default_extensions_string())]
     extensions: String,
 
     /// Include directories (can be specified multiple times)
