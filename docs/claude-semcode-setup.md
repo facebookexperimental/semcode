@@ -31,9 +31,42 @@ semcode-index -s . --git v6.16..v6.17
 
 Bigger ranges take longer, so it's better to just index what you need.
 
-## Configuring Claude to use your MCP server
+## Configuring MCP for Claude
 
-Refer to Claude docs on how to do this permanently, but:
+claude plugins are the preferred way to configure things, but you can also
+setup a json file with details about the MCP server.  The documentation below
+describes both.
+
+### Configuring Claude Plugins
+
+For instructions on installing and configuring the semcode Claude plugin, see [../plugin/README.md](../plugin/README.md).
+
+The plugin provides a streamlined way to use semcode with Claude Code.
+
+### Pre-approving Semcode Tools
+
+Claude Code requires explicit approval before MCP tools can be used. To avoid being prompted once per tool, you can pre-approve all semcode tools for a specific directory:
+
+```bash
+cd /path/to/semcode
+./plugin/semcode/approve-tools.sh /path/to/your/kernel
+```
+
+Example:
+```bash
+./plugin/semcode/approve-tools.sh /src/linux
+```
+
+This creates or updates `.claude/settings.local.json` in the specified directory with all semcode tool approvals. Restart Claude if it's currently running for changes to take effect.
+
+**Note**: Tool approvals are per-directory. If you work with multiple codebases, run the script for each one.
+
+For detailed information about tool approval methods and troubleshooting, see [../plugin/semcode/TOOL_APPROVAL.md](../plugin/semcode/TOOL_APPROVAL.md).
+
+### Configuring Claude via the --mcp-config command line option
+
+If claude plugins aren't right for your configuration, passing the mcp config
+on the command line is also possible.
 
 ```
 cat > mcp-config.json << EOF
@@ -41,6 +74,8 @@ cat > mcp-config.json << EOF
 EOF
 claude --mcp-config mcp-config.json
 ```
+
+## Trying it out
 
 Now you can make sure Claude is able to use semcode:
 
