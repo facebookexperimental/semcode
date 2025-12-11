@@ -27,6 +27,11 @@ struct Args {
     /// Path to local model directory (for semantic search)
     #[arg(long, value_name = "PATH")]
     model_path: Option<String>,
+
+    /// Query code at a specific branch instead of current HEAD
+    /// Example: --branch main
+    #[arg(long, value_name = "BRANCH")]
+    branch: Option<String>,
 }
 
 /// Check if the current commit needs indexing and perform incremental indexing if needed
@@ -192,7 +197,15 @@ async fn main() -> Result<()> {
                 let parts: Vec<&str> = parts_owned.iter().map(|s| s.as_str()).collect();
 
                 // Handle command and check if we should exit
-                if handle_command(&parts, &db_manager, &args.git_repo, &args.model_path).await? {
+                if handle_command(
+                    &parts,
+                    &db_manager,
+                    &args.git_repo,
+                    &args.model_path,
+                    &args.branch,
+                )
+                .await?
+                {
                     break;
                 }
             }

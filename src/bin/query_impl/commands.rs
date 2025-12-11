@@ -88,14 +88,45 @@ struct ShowCommitMetadataParams<'a> {
 
 /// Parse a potential git SHA from command arguments or default to current HEAD
 /// Returns (remaining_args, git_sha)
-/// Now always returns a git SHA - either from --git flag, current HEAD, or a default
-fn parse_git_sha<'a>(parts: &'a [&'a str], git_repo_path: &str) -> Result<(Vec<&'a str>, String)> {
+/// Now always returns a git SHA - either from --git flag, target branch, current HEAD, or a default
+fn parse_git_sha<'a>(
+    parts: &'a [&'a str],
+    git_repo_path: &str,
+    target_branch: &Option<String>,
+) -> Result<(Vec<&'a str>, String)> {
     if parts.len() >= 3 && parts[1] == "--git" {
         let git_sha = parts[2].to_string();
         let remaining: Vec<&str> = [&parts[0..1], &parts[3..]].concat();
         Ok((remaining, git_sha))
+    } else if let Some(branch) = target_branch {
+        // Use the target branch to resolve to a specific commit
+        match git::resolve_branch(git_repo_path, branch) {
+            Ok(sha) => {
+                tracing::debug!(
+                    "Using branch '{}' as git SHA: {}",
+                    branch,
+                    &sha[..8.min(sha.len())]
+                );
+                Ok((parts.to_vec(), sha))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to resolve branch '{}': {}, falling back to HEAD",
+                    branch,
+                    e
+                );
+                // Fall back to HEAD
+                match git::get_git_sha(git_repo_path) {
+                    Ok(Some(head_sha)) => Ok((parts.to_vec(), head_sha)),
+                    _ => Ok((
+                        parts.to_vec(),
+                        "0000000000000000000000000000000000000000".to_string(),
+                    )),
+                }
+            }
+        }
     } else {
-        // No --git flag provided, try to get current HEAD
+        // No --git flag or target branch provided, try to get current HEAD
         match git::get_git_sha(git_repo_path) {
             Ok(Some(head_sha)) => {
                 tracing::debug!("Using current HEAD as default git SHA: {}", head_sha);
@@ -344,6 +375,7 @@ pub async fn handle_command(
     db: &DatabaseManager,
     git_repo_path: &str,
     model_path: &Option<String>,
+    target_branch: &Option<String>,
 ) -> Result<bool> {
     // Handle commit command first (before parse_git_sha) since it uses --git differently
     if parts[0] == "commit" {
@@ -512,7 +544,7 @@ pub async fn handle_command(
     }
 
     // Parse potential git SHA first (for all other commands)
-    let (parts, git_sha) = parse_git_sha(parts, git_repo_path)?;
+    let (parts, git_sha) = parse_git_sha(parts, git_repo_path, target_branch)?;
 
     match parts[0] {
         "quit" | "exit" | "q" => {
