@@ -2696,6 +2696,32 @@ impl McpServer {
                         "type": "object",
                         "properties": {}
                     }
+                },
+                {
+                    "name": "list_branches",
+                    "description": "List all indexed branches with their status (up-to-date or outdated)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "compare_branches",
+                    "description": "Compare two branches showing their relationship (merge base, which is ahead/behind)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "branch1": {
+                                "type": "string",
+                                "description": "First branch name (e.g., 'main', 'develop')"
+                            },
+                            "branch2": {
+                                "type": "string",
+                                "description": "Second branch name (e.g., 'feature-branch', 'origin/main')"
+                            }
+                        },
+                        "required": ["branch1", "branch2"]
+                    }
                 }
             ]
         })
@@ -2720,6 +2746,8 @@ impl McpServer {
             "dig" => self.handle_dig(arguments).await,
             "vlore_similar_emails" => self.handle_vlore_similar_emails(arguments).await,
             "indexing_status" => self.handle_indexing_status().await,
+            "list_branches" => self.handle_list_branches().await,
+            "compare_branches" => self.handle_compare_branches(arguments).await,
             _ => json!({
                 "error": format!("Unknown tool: {}", name),
                 "isError": true
@@ -3600,6 +3628,172 @@ impl McpServer {
 
         json!({
             "content": [{"type": "text", "text": result}]
+        })
+    }
+
+    async fn handle_list_branches(&self) -> Value {
+        match self.db.list_indexed_branches().await {
+            Ok(branches) => {
+                let mut output = "=== Indexed Branches ===\n\n".to_string();
+
+                if branches.is_empty() {
+                    output.push_str("No branches have been indexed yet.\n");
+                    output.push_str("Use 'semcode-index --branch <name>' to index a branch.\n");
+                } else {
+                    for branch in &branches {
+                        // Check if branch is up-to-date
+                        let status =
+                            match git::resolve_branch(&self.git_repo_path, &branch.branch_name) {
+                                Ok(current_tip) => {
+                                    if current_tip == branch.tip_commit {
+                                        "up-to-date"
+                                    } else {
+                                        "outdated"
+                                    }
+                                }
+                                Err(_) => "unknown",
+                            };
+
+                        let remote_info = branch
+                            .remote
+                            .as_ref()
+                            .map(|r| format!(" [{}]", r))
+                            .unwrap_or_default();
+
+                        output.push_str(&format!(
+                            "  {} ({}){}\n",
+                            branch.branch_name,
+                            &branch.tip_commit[..8.min(branch.tip_commit.len())],
+                            remote_info
+                        ));
+                        output.push_str(&format!("    Status: {}\n\n", status));
+                    }
+
+                    output.push_str(&format!("Total: {} branch(es) indexed\n", branches.len()));
+                }
+
+                json!({
+                    "content": [{"type": "text", "text": output}]
+                })
+            }
+            Err(e) => json!({
+                "error": format!("Failed to list branches: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
+    async fn handle_compare_branches(&self, args: &Value) -> Value {
+        let branch1 = args["branch1"].as_str().unwrap_or("");
+        let branch2 = args["branch2"].as_str().unwrap_or("");
+
+        if branch1.is_empty() || branch2.is_empty() {
+            return json!({
+                "error": "Both branch1 and branch2 are required",
+                "isError": true
+            });
+        }
+
+        // Resolve both branches to SHAs
+        let sha1 = match git::resolve_branch(&self.git_repo_path, branch1) {
+            Ok(sha) => sha,
+            Err(e) => {
+                return json!({
+                    "error": format!("Cannot resolve branch '{}': {}", branch1, e),
+                    "isError": true
+                });
+            }
+        };
+        let sha2 = match git::resolve_branch(&self.git_repo_path, branch2) {
+            Ok(sha) => sha,
+            Err(e) => {
+                return json!({
+                    "error": format!("Cannot resolve branch '{}': {}", branch2, e),
+                    "isError": true
+                });
+            }
+        };
+
+        let mut output = format!("=== Branch Comparison: {} vs {} ===\n\n", branch1, branch2);
+
+        // Show branch tips
+        output.push_str("Branch Tips:\n");
+        output.push_str(&format!("  {}: {}\n", branch1, &sha1[..12.min(sha1.len())]));
+        output.push_str(&format!(
+            "  {}: {}\n\n",
+            branch2,
+            &sha2[..12.min(sha2.len())]
+        ));
+
+        // Try to find merge base
+        match git::find_merge_base(&self.git_repo_path, &sha1, &sha2) {
+            Ok(merge_base) => {
+                output.push_str(&format!(
+                    "Merge Base: {}\n",
+                    &merge_base[..12.min(merge_base.len())]
+                ));
+
+                // Show which branch is ahead
+                if merge_base == sha1 {
+                    output.push_str(&format!("\n{} is behind {}\n", branch1, branch2));
+                } else if merge_base == sha2 {
+                    output.push_str(&format!("\n{} is behind {}\n", branch2, branch1));
+                } else {
+                    output.push_str("\nBranches have diverged from merge base\n");
+                }
+            }
+            Err(e) => {
+                output.push_str(&format!("Could not find merge base: {}\n", e));
+            }
+        }
+
+        // Check indexing status for both branches
+        output.push_str("\nIndexing Status:\n");
+        match self.db.get_indexed_branch_info(branch1).await {
+            Ok(Some(info)) => {
+                let status = if info.tip_commit == sha1 {
+                    "up-to-date"
+                } else {
+                    "outdated"
+                };
+                output.push_str(&format!(
+                    "  {}: {} (indexed at {})\n",
+                    branch1,
+                    status,
+                    &info.tip_commit[..8.min(info.tip_commit.len())]
+                ));
+            }
+            Ok(None) => {
+                output.push_str(&format!("  {}: not indexed\n", branch1));
+            }
+            Err(_) => {
+                output.push_str(&format!("  {}: unknown\n", branch1));
+            }
+        }
+        match self.db.get_indexed_branch_info(branch2).await {
+            Ok(Some(info)) => {
+                let status = if info.tip_commit == sha2 {
+                    "up-to-date"
+                } else {
+                    "outdated"
+                };
+                output.push_str(&format!(
+                    "  {}: {} (indexed at {})\n",
+                    branch2,
+                    status,
+                    &info.tip_commit[..8.min(info.tip_commit.len())]
+                ));
+            }
+            Ok(None) => {
+                output.push_str(&format!("  {}: not indexed\n", branch2));
+            }
+            Err(_) => {
+                output.push_str(&format!("  {}: unknown\n", branch2));
+            }
+        }
+
+        json!({
+            "content": [{"type": "text", "text": output}]
         })
     }
 }
