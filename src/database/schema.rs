@@ -58,6 +58,10 @@ impl SchemaManager {
             self.create_lore_vectors_table().await?;
         }
 
+        if !table_names.iter().any(|n| n == "indexed_branches") {
+            self.create_indexed_branches_table().await?;
+        }
+
         // Check and create content shard tables (content_0 through content_15)
         self.create_content_shard_tables().await?;
 
@@ -274,6 +278,23 @@ impl SchemaManager {
             .await?;
 
         tracing::info!("Created lore table for email archive indexing");
+        Ok(())
+    }
+
+    async fn create_indexed_branches_table(&self) -> Result<()> {
+        use crate::database::branches::IndexedBranchStore;
+
+        let schema = IndexedBranchStore::get_schema();
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("indexed_branches", batch_iterator)
+            .execute()
+            .await?;
+
+        tracing::info!("Created indexed_branches table for multi-branch support");
         Ok(())
     }
 
@@ -656,6 +677,39 @@ impl SchemaManager {
             // Note: BTree indices on body, recipients, and symbols removed - FTS used instead
         }
 
+        // Create indices for indexed_branches table
+        if table_names.iter().any(|n| n == "indexed_branches") {
+            let table = self
+                .connection
+                .open_table("indexed_branches")
+                .execute()
+                .await?;
+
+            // Primary index on branch_name for fast branch lookups
+            self.try_create_index(
+                &table,
+                &["branch_name"],
+                "BTree index on indexed_branches.branch_name",
+            )
+            .await;
+
+            // Index on tip_commit for finding branches at specific commits
+            self.try_create_index(
+                &table,
+                &["tip_commit"],
+                "BTree index on indexed_branches.tip_commit",
+            )
+            .await;
+
+            // Index on remote for remote-based queries
+            self.try_create_index(
+                &table,
+                &["remote"],
+                "BTree index on indexed_branches.remote",
+            )
+            .await;
+        }
+
         // Create indices for all content shard tables
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
@@ -820,6 +874,7 @@ impl SchemaManager {
             "symbol_filename",
             "git_commits",
             "lore",
+            "indexed_branches",
         ];
 
         // Add all content shard tables
@@ -999,6 +1054,7 @@ impl SchemaManager {
             "symbol_filename",
             "git_commits",
             "lore",
+            "indexed_branches",
         ];
 
         // Add all content shard tables
@@ -1170,6 +1226,7 @@ impl SchemaManager {
             "symbol_filename" => self.create_symbol_filename_table().await,
             "git_commits" => self.create_git_commits_table().await,
             "lore" => self.create_lore_table().await,
+            "indexed_branches" => self.create_indexed_branches_table().await,
             "content" => self.create_content_table().await,
             name if name.starts_with("content_") => {
                 // Handle content shard tables

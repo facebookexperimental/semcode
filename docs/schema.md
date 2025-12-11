@@ -36,7 +36,8 @@ The database consists of the following tables:
 7. **git_commits** - Git commit metadata with unified diffs and changed symbols
 8. **lore** - Lore.kernel.org email archive with FTS indices for fast searching
 9. **lore_vectors** - Vector embeddings for semantic search of lore emails
-10. **content_0 through content_15** - Deduplicated content storage (16 shards)
+10. **indexed_branches** - Tracks which git branches have been indexed with their tip commits
+11. **content_0 through content_15** - Deduplicated content storage (16 shards)
 
 ## Table Schemas
 
@@ -354,7 +355,38 @@ Embeddings combine from, subject, recipients, and body into a single representat
 - IVF-PQ vector index for fast approximate nearest neighbor search
 
 
-### 10. content_0 through content_15 (Content Shards)
+### 10. indexed_branches
+
+Tracks which git branches have been indexed, enabling multi-branch support and efficient incremental indexing across branches.
+
+**Schema:**
+```
+branch_name         (Utf8, NOT NULL)     - Branch name (e.g., "main", "origin/develop")
+tip_commit          (Utf8, NOT NULL)     - Commit SHA at the tip when indexed (40-char hex)
+indexed_at          (Int64, NOT NULL)    - Unix timestamp of when branch was last indexed
+remote              (Utf8, nullable)     - Remote name if tracking branch (e.g., "origin")
+```
+
+**Purpose:**
+- Tracks which branches have been indexed and at which commit
+- Enables efficient multi-branch indexing by skipping already-current branches
+- Supports both local branches (e.g., "main") and remote-tracking branches (e.g., "origin/develop")
+- Stores indexing timestamp for freshness tracking
+
+**Use Cases:**
+- Multi-branch indexing: `semcode-index --branches main,develop,feature-x`
+- Branch update detection: Skip branches already indexed at current tip
+- Query scoping: Limit queries to specific branch context
+- Branch cleanup: Remove data for deleted branches
+
+**Indices:**
+- BTree on `branch_name` (primary lookup by branch name)
+- BTree on `tip_commit` (find branches at specific commits)
+- BTree on `remote` (filter by remote)
+
+---
+
+### 11. content_0 through content_15 (Content Shards)
 
 Stores deduplicated content referenced by other tables, distributed across 16 shard tables for optimal performance.
 
