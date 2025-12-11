@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anstream::stdout;
 use anyhow::Result;
+use chrono::{TimeZone, Utc};
 use colored::*;
 use regex;
 use semcode::{git, DatabaseManager, LoreEmailFilters};
@@ -1896,6 +1897,270 @@ pub async fn handle_command(
                         println!("Operation cancelled.");
                     }
                 }
+            }
+        }
+        "branches" | "br" => {
+            // List indexed branches
+            match db.list_indexed_branches().await {
+                Ok(branches) => {
+                    if branches.is_empty() {
+                        println!("{}", "No branches have been indexed yet.".yellow());
+                        println!("Use 'semcode-index --branch <name>' to index a branch.");
+                    } else {
+                        println!("{}", "Indexed Branches:".bold().cyan());
+                        println!("{:─<70}", "".bright_black());
+
+                        // Get current git branch for comparison
+                        let current_branch = git::get_current_branch(git_repo_path).ok().flatten();
+
+                        for branch in &branches {
+                            let is_current = current_branch.as_ref() == Some(&branch.branch_name);
+                            let current_marker = if is_current { " (current)" } else { "" };
+                            let remote_info = branch
+                                .remote
+                                .as_ref()
+                                .map(|r| format!(" [{}]", r))
+                                .unwrap_or_default();
+
+                            // Check if branch is up-to-date with repo
+                            let status =
+                                match git::resolve_branch(git_repo_path, &branch.branch_name) {
+                                    Ok(current_tip) => {
+                                        if current_tip == branch.tip_commit {
+                                            "up-to-date".green().to_string()
+                                        } else {
+                                            "outdated".yellow().to_string()
+                                        }
+                                    }
+                                    Err(_) => "unknown".bright_black().to_string(),
+                                };
+
+                            println!(
+                                "  {} {}{}{}",
+                                branch.branch_name.yellow(),
+                                format!(
+                                    "({})",
+                                    &branch.tip_commit[..8.min(branch.tip_commit.len())]
+                                )
+                                .bright_black(),
+                                remote_info.cyan(),
+                                current_marker.green()
+                            );
+                            let indexed_time = Utc
+                                .timestamp_opt(branch.indexed_at, 0)
+                                .single()
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            println!(
+                                "    Status: {} | Indexed: {}",
+                                status,
+                                indexed_time.bright_black()
+                            );
+                        }
+
+                        println!("{:─<70}", "".bright_black());
+                        println!("Total: {} branch(es) indexed", branches.len());
+                    }
+                }
+                Err(e) => {
+                    println!("{} Failed to list branches: {}", "Error:".red(), e);
+                }
+            }
+        }
+        "branch" => {
+            // Show current branch info
+            println!("{}", "Branch Information:".bold().cyan());
+            println!("{:─<70}", "".bright_black());
+
+            // Show current git branch
+            match git::get_current_branch(git_repo_path) {
+                Ok(Some(branch)) => {
+                    println!("  Current git branch: {}", branch.yellow());
+                }
+                Ok(None) => {
+                    println!(
+                        "  Current git branch: {} (detached HEAD)",
+                        "none".bright_black()
+                    );
+                }
+                Err(e) => {
+                    println!("  Current git branch: {} ({})", "unknown".red(), e);
+                }
+            }
+
+            // Show current HEAD SHA
+            match git::get_git_sha(git_repo_path) {
+                Ok(Some(sha)) => {
+                    println!(
+                        "  Current HEAD: {}",
+                        sha[..12.min(sha.len())].bright_black()
+                    );
+                }
+                Ok(None) => {
+                    println!("  Current HEAD: {}", "not in a git repo".bright_black());
+                }
+                Err(e) => {
+                    println!("  Current HEAD: {} ({})", "unknown".red(), e);
+                }
+            }
+
+            // Show query target branch if set
+            if let Some(target) = target_branch {
+                println!("  Query target branch: {}", target.green());
+                match git::resolve_branch(git_repo_path, target) {
+                    Ok(sha) => {
+                        println!("  Target SHA: {}", sha[..12.min(sha.len())].bright_black());
+                    }
+                    Err(e) => {
+                        println!("  Target SHA: {} ({})", "unknown".red(), e);
+                    }
+                }
+            } else {
+                println!(
+                    "  Query target branch: {} (using HEAD)",
+                    "none".bright_black()
+                );
+            }
+
+            println!("{:─<70}", "".bright_black());
+        }
+        "compare" => {
+            // Compare branches
+            if parts.len() < 3 {
+                println!("{}", "Usage: compare <branch1> <branch2>".red());
+                println!("  Compare two branches and show their relationship");
+                println!("  Example: compare main feature-branch");
+                println!("  Example: compare origin/main develop");
+            } else {
+                let branch1 = parts[1];
+                let branch2 = parts[2];
+
+                // Resolve both branches to SHAs
+                let sha1 = match git::resolve_branch(git_repo_path, branch1) {
+                    Ok(sha) => sha,
+                    Err(e) => {
+                        println!(
+                            "{} Cannot resolve branch '{}': {}",
+                            "Error:".red(),
+                            branch1,
+                            e
+                        );
+                        return Ok(false);
+                    }
+                };
+                let sha2 = match git::resolve_branch(git_repo_path, branch2) {
+                    Ok(sha) => sha,
+                    Err(e) => {
+                        println!(
+                            "{} Cannot resolve branch '{}': {}",
+                            "Error:".red(),
+                            branch2,
+                            e
+                        );
+                        return Ok(false);
+                    }
+                };
+
+                println!(
+                    "{}",
+                    format!("Branch Comparison: {} vs {}", branch1, branch2)
+                        .bold()
+                        .cyan()
+                );
+                println!("{:─<70}", "".bright_black());
+
+                // Show branch tips
+                println!("\n{}", "Branch Tips:".bold());
+                println!(
+                    "  {}: {}",
+                    branch1.yellow(),
+                    &sha1[..12.min(sha1.len())].bright_black()
+                );
+                println!(
+                    "  {}: {}",
+                    branch2.yellow(),
+                    &sha2[..12.min(sha2.len())].bright_black()
+                );
+
+                // Try to find merge base
+                match git::find_merge_base(git_repo_path, &sha1, &sha2) {
+                    Ok(merge_base) => {
+                        println!("\n{}", "Merge Base:".bold());
+                        println!(
+                            "  {}",
+                            &merge_base[..12.min(merge_base.len())].bright_black()
+                        );
+
+                        // Show which branch is ahead
+                        if merge_base == sha1 {
+                            println!(
+                                "\n{}",
+                                format!("{} is behind {}", branch1, branch2).yellow()
+                            );
+                        } else if merge_base == sha2 {
+                            println!(
+                                "\n{}",
+                                format!("{} is behind {}", branch2, branch1).yellow()
+                            );
+                        } else {
+                            println!("\n{}", "Branches have diverged from merge base".yellow());
+                        }
+                    }
+                    Err(e) => {
+                        println!("\n{} Could not find merge base: {}", "Warning:".yellow(), e);
+                    }
+                }
+
+                // Check indexing status for both branches
+                println!("\n{}", "Indexing Status:".bold());
+                match db.get_indexed_branch_info(branch1).await {
+                    Ok(Some(info)) => {
+                        let status = if info.tip_commit == sha1 {
+                            "up-to-date".green().to_string()
+                        } else {
+                            "outdated".yellow().to_string()
+                        };
+                        println!(
+                            "  {}: {} (indexed at {})",
+                            branch1.yellow(),
+                            status,
+                            &info.tip_commit[..8.min(info.tip_commit.len())].bright_black()
+                        );
+                    }
+                    Ok(None) => {
+                        println!("  {}: {}", branch1.yellow(), "not indexed".red());
+                    }
+                    Err(_) => {
+                        println!("  {}: {}", branch1.yellow(), "unknown".bright_black());
+                    }
+                }
+                match db.get_indexed_branch_info(branch2).await {
+                    Ok(Some(info)) => {
+                        let status = if info.tip_commit == sha2 {
+                            "up-to-date".green().to_string()
+                        } else {
+                            "outdated".yellow().to_string()
+                        };
+                        println!(
+                            "  {}: {} (indexed at {})",
+                            branch2.yellow(),
+                            status,
+                            &info.tip_commit[..8.min(info.tip_commit.len())].bright_black()
+                        );
+                    }
+                    Ok(None) => {
+                        println!("  {}: {}", branch2.yellow(), "not indexed".red());
+                    }
+                    Err(_) => {
+                        println!("  {}: {}", branch2.yellow(), "unknown".bright_black());
+                    }
+                }
+
+                println!("\n{:─<70}", "".bright_black());
+                println!(
+                    "{}",
+                    "Hint: Use --branch <name> to query at a specific branch".bright_black()
+                );
             }
         }
         _ => {
