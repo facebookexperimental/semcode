@@ -103,6 +103,30 @@ struct Args {
     /// Clone and index a lore.kernel.org archive into <db_dir>/lore/<repo>
     #[arg(long, value_name = "URL")]
     lore: Option<String>,
+
+    // ==================== Multi-Branch Indexing ====================
+    /// Index a specific branch (can be specified multiple times)
+    /// Example: --branch main --branch develop
+    #[arg(long, value_name = "BRANCH")]
+    branch: Vec<String>,
+
+    /// Comma-separated list of branches to index
+    /// Example: --branches main,develop,feature-x
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    branches: Vec<String>,
+
+    /// Index all local branches
+    #[arg(long)]
+    all_branches: bool,
+
+    /// Include remote-tracking branches when using --all-branches
+    #[arg(long)]
+    remote_branches: bool,
+
+    /// Only index branches that have new commits since last indexed
+    /// (skip branches already indexed at current tip)
+    #[arg(long)]
+    update_branches: bool,
 }
 
 /// Fetch and parse the lore.kernel.org manifest
@@ -401,6 +425,209 @@ async fn clone_lore_repository(lore_url: &str, db_path: &str) -> Result<PathBuf>
     Ok(clone_path)
 }
 
+// ==================== Branch Indexing Support ====================
+
+/// Collect branches to index from the various branch-related CLI flags
+fn collect_branches_to_index(args: &Args) -> Result<Vec<String>> {
+    use semcode::git::{branch_exists, list_branches};
+
+    let mut branches = Vec::new();
+
+    // Collect from --branch flags (can be repeated)
+    branches.extend(args.branch.iter().cloned());
+
+    // Collect from --branches (comma-separated)
+    branches.extend(args.branches.iter().cloned());
+
+    // If --all-branches is set, get all branches from git
+    if args.all_branches {
+        let git_branches = list_branches(&args.source, args.remote_branches)?;
+        for branch in git_branches {
+            if !branches.contains(&branch.name) {
+                branches.push(branch.name);
+            }
+        }
+    }
+
+    // Remove duplicates while preserving order
+    let mut seen = HashSet::new();
+    branches.retain(|b| seen.insert(b.clone()));
+
+    // Validate that all branches exist
+    for branch in &branches {
+        if !branch_exists(&args.source, branch)? {
+            return Err(anyhow::anyhow!("Branch '{}' does not exist", branch));
+        }
+    }
+
+    Ok(branches)
+}
+
+/// Run branch indexing mode - index multiple branches
+async fn run_branch_indexing(args: Args, branches: Vec<String>) -> Result<()> {
+    use semcode::git::resolve_branch;
+
+    info!("Starting multi-branch indexing mode");
+    info!("Branches to index: {:?}", branches);
+
+    // Process database path
+    let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
+
+    // Create database manager and tables
+    let db_manager =
+        DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
+    db_manager.create_tables().await?;
+
+    if args.clear {
+        println!("Clearing existing data...");
+        db_manager.clear_all_data().await?;
+        println!("Existing data cleared.");
+    }
+
+    let start_time = std::time::Instant::now();
+    let mut branches_indexed = 0;
+    let mut branches_skipped = 0;
+
+    for branch_name in &branches {
+        println!(
+            "\n{}",
+            format!("=== Processing branch: {} ===", branch_name).cyan()
+        );
+
+        // Resolve branch to commit SHA
+        let tip_commit = resolve_branch(&args.source, branch_name)?;
+        info!("Branch {} at commit {}", branch_name, &tip_commit[..8]);
+
+        // Check if branch is already indexed at current tip (if --update-branches)
+        if args.update_branches
+            && db_manager
+                .is_branch_current(branch_name, &tip_commit)
+                .await?
+        {
+            println!(
+                "  {} Branch already indexed at current tip, skipping",
+                "→".yellow()
+            );
+            branches_skipped += 1;
+            continue;
+        }
+
+        // Get the indexed tip for this branch (if any) to compute the range
+        let range = if let Some(indexed_tip) = db_manager.get_branch_tip(branch_name).await? {
+            // Incremental: index from last indexed commit to current tip
+            info!(
+                "Incremental indexing: {}..{} for branch {}",
+                &indexed_tip[..8],
+                &tip_commit[..8],
+                branch_name
+            );
+            format!("{}..{}", indexed_tip, tip_commit)
+        } else {
+            // Full indexing: index entire branch history
+            // Use HEAD~100..HEAD as a reasonable default for first indexing
+            // (or user can specify --git range separately)
+            info!("Initial indexing for branch {}", branch_name);
+            format!("{}^..{}", tip_commit, tip_commit)
+        };
+
+        println!("  {} Processing range: {}", "→".blue(), range);
+
+        // Process this range using the existing git range pipeline
+        let repo = gix::discover(&args.source)
+            .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+
+        let commit_shas = match list_shas_in_range(&repo, &range) {
+            Ok(shas) => shas,
+            Err(e) => {
+                warn!("Failed to get commits for range {}: {}", range, e);
+                // For initial indexing, just use the tip commit
+                vec![tip_commit.clone()]
+            }
+        };
+
+        if commit_shas.is_empty() {
+            println!("  {} No new commits to index", "✓".green());
+        } else {
+            println!(
+                "  {} Found {} commits to process",
+                "→".blue(),
+                commit_shas.len()
+            );
+
+            // Use the existing git range pipeline for processing
+            let db_manager_arc = Arc::new(
+                DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string())
+                    .await?,
+            );
+
+            // Get extensions
+            let extensions: Vec<String> = args
+                .extensions
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+
+            semcode::git_range::process_git_range(
+                &args.source,
+                &range,
+                &extensions,
+                db_manager_arc,
+                args.no_macros,
+                args.db_threads,
+            )
+            .await?;
+        }
+
+        // Record that this branch has been indexed at the current tip
+        let remote = if branch_name.contains('/') {
+            branch_name.split('/').next()
+        } else {
+            None
+        };
+        db_manager
+            .record_branch_indexed(branch_name, &tip_commit, remote)
+            .await?;
+
+        println!("  {} Branch indexed successfully", "✓".green());
+        branches_indexed += 1;
+    }
+
+    let total_time = start_time.elapsed();
+
+    println!(
+        "\n{}",
+        "=== Multi-Branch Indexing Complete ===".green().bold()
+    );
+    println!("Total time: {:.1}s", total_time.as_secs_f64());
+    println!("Branches indexed: {}", branches_indexed);
+    if branches_skipped > 0 {
+        println!("Branches skipped (already current): {}", branches_skipped);
+    }
+
+    // List all indexed branches
+    let indexed = db_manager.list_indexed_branches().await?;
+    if !indexed.is_empty() {
+        println!("\nIndexed branches:");
+        for branch in indexed {
+            println!(
+                "  {} → {} (indexed {})",
+                branch.branch_name.cyan(),
+                &branch.tip_commit[..8],
+                chrono::DateTime::from_timestamp(branch.indexed_at, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+    }
+
+    println!("\nTo query this database, run:");
+    println!("  semcode --database {}", database_path);
+
+    Ok(())
+}
+
+// ==================== End Branch Indexing Support ====================
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Suppress ORT verbose logging
@@ -640,6 +867,13 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!(
             "--git and --commits are mutually exclusive. Use --git to index files in a commit range, or --commits to index only commit metadata."
         ));
+    }
+
+    // Check if branch indexing mode is requested
+    let branches_to_index = collect_branches_to_index(&args)?;
+    if !branches_to_index.is_empty() {
+        info!("Branch indexing mode: {} branches", branches_to_index.len());
+        return run_branch_indexing(args, branches_to_index).await;
     }
 
     info!("Starting semantic code indexing");
