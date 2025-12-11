@@ -89,36 +89,40 @@ pub async fn check_and_optimize_if_needed(
 /// Parse git range and get all commit SHAs in the range
 /// Uses gitoxide's built-in rev-spec parsing for proper A..B semantics
 pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>> {
-    // For simplicity, let's just handle the common A..B case manually for now
-    // and use gitoxide's rev_walk properly
-    if !range.contains("..") {
-        return Err(anyhow::anyhow!(
-            "Only range format (A..B) is supported, got: '{}'",
-            range
-        ));
-    }
+    // Support two formats:
+    // 1. "A..B" - commits reachable from B but not from A
+    // 2. "REF" (no ..) - all commits reachable from REF (for initial indexing)
 
-    // Parse A..B manually
-    let parts: Vec<&str> = range.split("..").collect();
-    if parts.len() != 2 {
-        return Err(anyhow::anyhow!("Invalid range format '{}'", range));
-    }
+    let (from_spec, to_spec) = if range.contains("..") {
+        let parts: Vec<&str> = range.split("..").collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid range format '{}'", range));
+        }
+        (parts[0], parts[1])
+    } else {
+        // No range separator - return all commits up to this ref
+        ("", range)
+    };
 
-    let from_spec = parts[0];
-    let to_spec = parts[1];
-
-    // Resolve the commit IDs
-    let from_commit = resolve_to_commit(repo, from_spec)?;
+    // Resolve the target commit
     let to_commit = resolve_to_commit(repo, to_spec)?;
-    let from_id = from_commit.id().detach();
     let to_id = to_commit.id().detach();
 
-    // Use rev_walk with proper include/exclude
-    let walk = repo
-        .rev_walk([to_id])
-        .with_hidden([from_id])
-        .sorting(Sorting::ByCommitTime(Default::default()))
-        .all()?;
+    // Build the rev_walk - optionally exclude ancestors of from_spec
+    let walk = if from_spec.is_empty() {
+        // No exclusion - include all ancestors
+        repo.rev_walk([to_id])
+            .sorting(Sorting::ByCommitTime(Default::default()))
+            .all()?
+    } else {
+        // Exclude commits reachable from from_spec
+        let from_commit = resolve_to_commit(repo, from_spec)?;
+        let from_id = from_commit.id().detach();
+        repo.rev_walk([to_id])
+            .with_hidden([from_id])
+            .sorting(Sorting::ByCommitTime(Default::default()))
+            .all()?
+    };
 
     let mut shas = Vec::new();
     let mut commit_count = 0;

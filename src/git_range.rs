@@ -706,6 +706,400 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     Ok(stats)
 }
 
+/// Configuration for streaming tree-based processing (single commit snapshot)
+struct TreeStreamingConfig {
+    repo_path: PathBuf,
+    commit_sha: String,
+    extensions: Vec<String>,
+    source_root: PathBuf,
+    no_macros: bool,
+    processed_files: Arc<HashSet<String>>,
+    num_workers: usize,
+    db_manager: Arc<DatabaseManager>,
+    num_inserters: usize,
+}
+
+/// Stream git file tuples from a tree at a specific commit (producer for tree-based indexing)
+fn stream_tree_file_tuples(
+    repo_path: PathBuf,
+    commit_sha: String,
+    extensions: Vec<String>,
+    tuple_tx: mpsc::Sender<GitFileTuple>,
+    processed_files: Arc<HashSet<String>>,
+) -> Result<usize> {
+    use crate::git::walk_tree_at_commit;
+
+    let mut sent_files = 0;
+    let mut filtered_already_processed = 0;
+
+    // Walk the tree at the commit and send tuples for matching files
+    walk_tree_at_commit(&repo_path, &commit_sha, |relative_path, object_id| {
+        // Check if file has one of the target extensions
+        let path = std::path::Path::new(relative_path);
+        let ext_matches = path
+            .extension()
+            .map(|ext| extensions.contains(&ext.to_string_lossy().to_string()))
+            .unwrap_or(false);
+
+        if !ext_matches {
+            return Ok(());
+        }
+
+        let file_sha = object_id.to_string();
+
+        // Filter out files already processed in database
+        if processed_files.contains(&file_sha) {
+            filtered_already_processed += 1;
+            return Ok(());
+        }
+
+        let tuple = GitFileTuple {
+            file_path: PathBuf::from(relative_path),
+            file_sha,
+            object_id: *object_id,
+        };
+
+        // Send tuple to channel - if channel is closed, workers are done
+        if tuple_tx.send(tuple).is_ok() {
+            sent_files += 1;
+        }
+
+        Ok(())
+    })?;
+
+    tracing::info!(
+        "Tree walk complete: {} files sent, {} filtered (already processed)",
+        sent_files,
+        filtered_already_processed
+    );
+
+    Ok(sent_files)
+}
+
+/// Process git tree at a specific commit using streaming pipeline
+/// Unlike process_git_range which walks commits, this walks the tree snapshot
+async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTupleStats> {
+    use std::sync::Mutex;
+
+    // Create progress bar for file processing
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] Processing tree: {pos} files processed - {msg}",
+        )
+        .unwrap()
+        .progress_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+    );
+    pb.set_message(format!("{} workers", config.num_workers));
+
+    // Create channels with backpressure
+    let (tuple_tx, tuple_rx) = mpsc::channel::<GitFileTuple>();
+    let result_channel_size = (config.num_workers * 2).clamp(4, 64);
+    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(result_channel_size);
+
+    // Wrap receivers for shared access
+    let shared_tuple_rx = Arc::new(Mutex::new(tuple_rx));
+    let shared_result_rx = Arc::new(Mutex::new(result_rx));
+
+    // Shared progress counters
+    let processed_count = Arc::new(AtomicUsize::new(0));
+    let inserted_functions = Arc::new(AtomicUsize::new(0));
+    let inserted_types = Arc::new(AtomicUsize::new(0));
+    let batches_sent = Arc::new(AtomicUsize::new(0));
+    let batches_inserted = Arc::new(AtomicUsize::new(0));
+
+    // Spawn progress updater thread
+    let pb_clone = pb.clone();
+    let processed_clone = processed_count.clone();
+    let functions_clone = inserted_functions.clone();
+    let types_clone = inserted_types.clone();
+    let batches_sent_clone = batches_sent.clone();
+    let batches_inserted_clone = batches_inserted.clone();
+    let progress_thread = std::thread::spawn(move || loop {
+        let files = processed_clone.load(Ordering::Relaxed);
+        let funcs = functions_clone.load(Ordering::Relaxed);
+        let types = types_clone.load(Ordering::Relaxed);
+        let sent = batches_sent_clone.load(Ordering::Relaxed);
+        let inserted = batches_inserted_clone.load(Ordering::Relaxed);
+        let pending = sent.saturating_sub(inserted);
+
+        pb_clone.set_position(files as u64);
+        pb_clone.set_message(format!(
+            "{} funcs, {} types | {} batches pending",
+            funcs, types, pending
+        ));
+
+        if pb_clone.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+
+    // Spawn single generator thread that walks the tree
+    let generator_repo_path = config.repo_path.clone();
+    let generator_commit_sha = config.commit_sha.clone();
+    let generator_extensions = config.extensions.clone();
+    let generator_processed_files = config.processed_files.clone();
+
+    let generator_handle = thread::spawn(move || {
+        if let Err(e) = stream_tree_file_tuples(
+            generator_repo_path,
+            generator_commit_sha,
+            generator_extensions,
+            tuple_tx,
+            generator_processed_files,
+        ) {
+            tracing::error!("Tree generator failed: {}", e);
+        }
+    });
+
+    // Use a mutex as a simple semaphore to control worker batch filling
+    let accumulate_lock = Arc::new(std::sync::Mutex::new(()));
+
+    // Spawn worker threads (reuse existing tuple_worker_shared)
+    let mut worker_handles = Vec::new();
+    for worker_id in 0..config.num_workers {
+        let ctx = TupleWorkerContext {
+            worker_id,
+            shared_tuple_rx: shared_tuple_rx.clone(),
+            result_tx: result_tx.clone(),
+            repo_path: config.repo_path.clone(),
+            source_root: config.source_root.clone(),
+            no_macros: config.no_macros,
+            processed_count: processed_count.clone(),
+            batches_sent: batches_sent.clone(),
+            accumulate_lock: accumulate_lock.clone(),
+        };
+
+        let handle = thread::spawn(move || {
+            tuple_worker_shared(ctx);
+        });
+        worker_handles.push(handle);
+    }
+
+    // Close the original result sender (workers have clones)
+    drop(result_tx);
+
+    // Spawn database inserter tasks
+    let mut inserter_handles = Vec::new();
+    let last_optimization_check = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+
+    for inserter_id in 0..config.num_inserters {
+        let db_manager_clone = Arc::clone(&config.db_manager);
+        let result_rx_clone = shared_result_rx.clone();
+        let functions_counter = inserted_functions.clone();
+        let types_counter = inserted_types.clone();
+        let batches_inserted_counter = batches_inserted.clone();
+        let optimization_check_timer = last_optimization_check.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let rx = result_rx_clone.lock().unwrap();
+                    rx.recv()
+                };
+
+                match batch {
+                    Ok(batch) => {
+                        let func_count = batch.functions.len();
+                        let type_count = batch.types.len();
+
+                        let (func_result, type_result, processed_files_result) = tokio::join!(
+                            async {
+                                if !batch.functions.is_empty() {
+                                    db_manager_clone.insert_functions(batch.functions).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.types.is_empty() {
+                                    db_manager_clone.insert_types(batch.types).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.processed_files.is_empty() {
+                                    db_manager_clone
+                                        .mark_files_processed(batch.processed_files)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        );
+
+                        let mut insertion_successful = true;
+                        if let Err(e) = func_result {
+                            error!("Inserter {} failed to insert functions: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            functions_counter.fetch_add(func_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = type_result {
+                            error!("Inserter {} failed to insert types: {}", inserter_id, e);
+                            insertion_successful = false;
+                        } else {
+                            types_counter.fetch_add(type_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = processed_files_result {
+                            error!(
+                                "Inserter {} failed to insert processed_files: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+
+                        if insertion_successful {
+                            let total_batches =
+                                batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                            crate::indexer::check_and_optimize_if_needed(
+                                &db_manager_clone,
+                                inserter_id,
+                                total_batches,
+                                &optimization_check_timer,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        inserter_handles.push(handle);
+    }
+
+    // Wait for generator to complete
+    if let Err(e) = generator_handle.join() {
+        tracing::error!("Tree generator thread panicked: {:?}", e);
+    }
+
+    // Wait for all workers to complete
+    for (worker_id, handle) in worker_handles.into_iter().enumerate() {
+        if let Err(e) = handle.join() {
+            tracing::error!("Worker {} thread panicked: {:?}", worker_id, e);
+        }
+    }
+
+    // Wait for all inserter tasks to finish
+    for (inserter_id, handle) in inserter_handles.into_iter().enumerate() {
+        if let Err(e) = handle.await {
+            tracing::error!("Inserter {} task failed: {:?}", inserter_id, e);
+        }
+    }
+
+    // Collect final statistics
+    let stats = GitTupleStats {
+        files_processed: processed_count.load(Ordering::Relaxed),
+        functions_count: inserted_functions.load(Ordering::Relaxed),
+        types_count: inserted_types.load(Ordering::Relaxed),
+    };
+
+    pb.finish_with_message(format!(
+        "Complete: {} files, {} functions, {} types",
+        stats.files_processed, stats.functions_count, stats.types_count
+    ));
+    progress_thread.join().unwrap();
+
+    Ok(stats)
+}
+
+/// Process git tree at a specific commit (snapshot-based indexing)
+/// This indexes all files at the commit without walking commit history.
+/// Use this for initial branch indexing instead of process_git_range.
+pub async fn process_git_tree(
+    repo_path: &std::path::Path,
+    commit_sha: &str,
+    extensions: &[String],
+    db_manager: Arc<DatabaseManager>,
+    no_macros: bool,
+    db_threads: usize,
+) -> Result<()> {
+    info!(
+        "Processing git tree at {} using streaming pipeline",
+        &commit_sha[..8.min(commit_sha.len())]
+    );
+
+    let start_time = std::time::Instant::now();
+
+    // Get already processed files from database for deduplication
+    info!("Loading processed files from database for deduplication");
+    let processed_files_records = db_manager.get_all_processed_files().await?;
+    let processed_files: HashSet<String> = processed_files_records
+        .into_iter()
+        .map(|record| record.git_file_sha)
+        .collect();
+
+    info!(
+        "Found {} already processed files in database",
+        processed_files.len()
+    );
+    let processed_files = Arc::new(processed_files);
+
+    // Determine number of workers
+    let num_workers = num_cpus::get().max(1);
+    info!(
+        "Starting tree streaming pipeline with {} worker threads",
+        num_workers
+    );
+
+    // Process tree using streaming pipeline
+    let processing_start = std::time::Instant::now();
+    let config = TreeStreamingConfig {
+        repo_path: repo_path.to_path_buf(),
+        commit_sha: commit_sha.to_string(),
+        extensions: extensions.to_vec(),
+        source_root: repo_path.to_path_buf(),
+        no_macros,
+        processed_files,
+        num_workers,
+        db_manager: db_manager.clone(),
+        num_inserters: db_threads,
+    };
+    let stats = process_git_tree_streaming(config).await?;
+
+    let processing_time = processing_start.elapsed();
+
+    info!(
+        "Tree pipeline completed in {:.1}s: {} files, {} functions, {} types",
+        processing_time.as_secs_f64(),
+        stats.files_processed,
+        stats.functions_count,
+        stats.types_count
+    );
+
+    let total_time = start_time.elapsed();
+
+    println!("\n=== Git Tree Indexing Complete ===");
+    println!("Total time: {:.1}s", total_time.as_secs_f64());
+    println!("Files processed: {}", stats.files_processed);
+    println!("Functions indexed: {}", stats.functions_count);
+    println!("Types indexed: {}", stats.types_count);
+
+    // Check if optimization is needed
+    match db_manager.check_optimization_health().await {
+        Ok((needs_optimization, message)) => {
+            if needs_optimization {
+                println!("\n{}", message);
+                match db_manager.optimize_database().await {
+                    Ok(_) => println!("Database optimization completed successfully"),
+                    Err(e) => error!("Failed to optimize database: {}", e),
+                }
+            } else {
+                println!("\n{}", message);
+            }
+        }
+        Err(e) => {
+            error!("Failed to check database health: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
 /// Process git range using streaming file tuple pipeline
 /// This is the shared implementation used by semcode-index, query, and MCP tools

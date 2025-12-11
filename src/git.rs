@@ -1175,6 +1175,53 @@ pub fn branch_exists<P: AsRef<Path>>(repo_path: P, branch_name: &str) -> Result<
     }
 }
 
+/// Get detailed branch information for a specific branch name
+/// This properly determines if a branch is local or remote-tracking
+pub fn get_branch_info<P: AsRef<Path>>(repo_path: P, branch_name: &str) -> Result<BranchRef> {
+    let repo = gix::discover(repo_path.as_ref())?;
+
+    // First, try to resolve as a local branch
+    let local_ref_name = format!("refs/heads/{}", branch_name);
+    if let Ok(reference) = repo.find_reference(&local_ref_name) {
+        if let Ok(commit) = reference.into_fully_peeled_id() {
+            return Ok(BranchRef {
+                name: branch_name.to_string(),
+                tip_commit: commit.to_string(),
+                is_remote: false,
+                remote: None,
+            });
+        }
+    }
+
+    // Try to resolve as a remote-tracking branch
+    let refs = repo.references()?;
+    for reference in refs.remote_branches()?.flatten() {
+        let full_name = reference.name().shorten().to_string();
+        if full_name == branch_name {
+            // Extract remote name from the branch name (e.g., "origin/main" -> "origin")
+            let remote = branch_name.split('/').next().map(String::from);
+
+            if let Ok(commit) = reference.into_fully_peeled_id() {
+                return Ok(BranchRef {
+                    name: branch_name.to_string(),
+                    tip_commit: commit.to_string(),
+                    is_remote: true,
+                    remote,
+                });
+            }
+        }
+    }
+
+    // Fall back to resolve_branch for the commit, assume local if we get here
+    let tip_commit = resolve_branch(repo_path.as_ref(), branch_name)?;
+    Ok(BranchRef {
+        name: branch_name.to_string(),
+        tip_commit,
+        is_remote: false,
+        remote: None,
+    })
+}
+
 // ==================== End Branch Operations ====================
 
 /// Write a unified diff and extract symbols from changed lines
