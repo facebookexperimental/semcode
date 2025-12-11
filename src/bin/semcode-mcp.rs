@@ -1987,6 +1987,7 @@ struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
     model_path: Option<String>,
+    git_repo_path: String,
     page_cache: PageCache,
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
     notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
@@ -2022,6 +2023,7 @@ impl McpServer {
             db,
             default_git_sha,
             model_path,
+            git_repo_path: git_repo_path.to_string(),
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2035,6 +2037,26 @@ impl McpServer {
             .map(|s| s.to_string())
             .or_else(|| self.default_git_sha.clone())
             .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string())
+    }
+
+    /// Resolve git SHA from either git_sha or branch argument
+    /// If branch is provided, resolve it to a SHA. Otherwise use git_sha or default.
+    fn resolve_git_sha_or_branch(
+        &self,
+        git_sha_arg: Option<&str>,
+        branch_arg: Option<&str>,
+    ) -> String {
+        // Branch takes precedence if provided
+        if let Some(branch) = branch_arg {
+            match git::resolve_branch(&self.git_repo_path, branch) {
+                Ok(sha) => return sha,
+                Err(e) => {
+                    eprintln!("Warning: Failed to resolve branch '{}': {}", branch, e);
+                    // Fall through to git_sha or default
+                }
+            }
+        }
+        self.resolve_git_sha(git_sha_arg)
     }
 
     /// Check if the database appears to be empty and return a helpful message if so
@@ -2123,7 +2145,7 @@ impl McpServer {
             "tools": [
                 {
                     "name": "find_function",
-                    "description": "Find a function or macro by exact name, optionally at a specific git commit",
+                    "description": "Find a function or macro by exact name, optionally at a specific git commit or branch",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2134,6 +2156,10 @@ impl McpServer {
                             "git_sha": {
                                 "type": "string",
                                 "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
                             }
                         },
                         "required": ["name"]
@@ -2141,7 +2167,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_type",
-                    "description": "Find a type, struct, union, or typedef by exact name, optionally at a specific git commit",
+                    "description": "Find a type, struct, union, or typedef by exact name, optionally at a specific git commit or branch",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2152,6 +2178,10 @@ impl McpServer {
                             "git_sha": {
                                 "type": "string",
                                 "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
                             }
                         },
                         "required": ["name"]
@@ -2159,7 +2189,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_callers",
-                    "description": "Find all functions that call a specific function, optionally at a specific git commit",
+                    "description": "Find all functions that call a specific function, optionally at a specific git commit or branch",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2170,6 +2200,10 @@ impl McpServer {
                             "git_sha": {
                                 "type": "string",
                                 "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
                             }
                         },
                         "required": ["name"]
@@ -2177,7 +2211,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_calls",
-                    "description": "Find all functions called by a specific function, optionally at a specific git commit",
+                    "description": "Find all functions called by a specific function, optionally at a specific git commit or branch",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2188,6 +2222,10 @@ impl McpServer {
                             "git_sha": {
                                 "type": "string",
                                 "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
                             }
                         },
                         "required": ["name"]
@@ -2195,7 +2233,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_callchain",
-                    "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit",
+                    "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit or branch",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2206,6 +2244,10 @@ impl McpServer {
                             "git_sha": {
                                 "type": "string",
                                 "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
                             },
                             "up_levels": {
                                 "type": "integer",
@@ -2262,6 +2304,10 @@ impl McpServer {
                                 "type": "string",
                                 "description": "Optional git commit SHA to search at (defaults to current HEAD)"
                             },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                            },
                             "path_pattern": {
                                 "type": "string",
                                 "description": "Optional regex pattern to filter results by file path"
@@ -2289,6 +2335,10 @@ impl McpServer {
                             "git_sha": {
                                 "type": "string",
                                 "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
                             },
                             "path_pattern": {
                                 "type": "string",
@@ -2687,7 +2737,8 @@ impl McpServer {
 
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
-        let git_sha = self.resolve_git_sha(git_sha_arg);
+        let branch_arg = args["branch"].as_str();
+        let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
 
         match mcp_query_function_or_macro(&self.db, name, &git_sha).await {
             Ok(output) => json!({
@@ -2710,7 +2761,8 @@ impl McpServer {
 
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
-        let git_sha = self.resolve_git_sha(git_sha_arg);
+        let branch_arg = args["branch"].as_str();
+        let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
 
         match mcp_query_type_or_typedef(&self.db, name, &git_sha).await {
             Ok(output) => json!({
@@ -2733,7 +2785,8 @@ impl McpServer {
 
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
-        let git_sha = self.resolve_git_sha(git_sha_arg);
+        let branch_arg = args["branch"].as_str();
+        let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
 
         match mcp_show_callers(&self.db, name, &git_sha).await {
             Ok(output) => json!({
@@ -2756,7 +2809,8 @@ impl McpServer {
 
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
-        let git_sha = self.resolve_git_sha(git_sha_arg);
+        let branch_arg = args["branch"].as_str();
+        let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
 
         match mcp_show_calls(&self.db, name, &git_sha).await {
             Ok(output) => json!({
@@ -2779,7 +2833,8 @@ impl McpServer {
 
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
-        let git_sha = self.resolve_git_sha(git_sha_arg);
+        let branch_arg = args["branch"].as_str();
+        let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
 
         // Parse the new parameters with same defaults as query tool
         let up_levels = args["up_levels"].as_u64().unwrap_or(2) as usize;
@@ -2835,10 +2890,11 @@ impl McpServer {
         let pattern = args["pattern"].as_str().unwrap_or("");
         let verbose = args["verbose"].as_bool().unwrap_or(false);
         let git_sha_arg = args["git_sha"].as_str();
+        let branch_arg = args["branch"].as_str();
         let path_pattern = args["path_pattern"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(100) as usize;
 
-        let git_sha = self.resolve_git_sha(git_sha_arg);
+        let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
 
         match mcp_grep_function_bodies(&self.db, pattern, verbose, path_pattern, limit, &git_sha)
             .await
@@ -2863,10 +2919,11 @@ impl McpServer {
 
         let query_text = args["query_text"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
+        let branch_arg = args["branch"].as_str();
         let path_pattern = args["path_pattern"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
 
-        let _git_sha = self.resolve_git_sha(git_sha_arg);
+        let _git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
 
         match mcp_vgrep_similar_functions(
             &self.db,
@@ -5268,6 +5325,7 @@ mod tests {
             db,
             default_git_sha: None,
             model_path: None,
+            git_repo_path: ".".to_string(),
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -5301,6 +5359,7 @@ mod tests {
             db,
             default_git_sha: None,
             model_path: None,
+            git_repo_path: ".".to_string(),
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -5336,6 +5395,7 @@ mod tests {
             db,
             default_git_sha: None,
             model_path: None,
+            git_repo_path: ".".to_string(),
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -5368,6 +5428,7 @@ mod tests {
             db,
             default_git_sha: None,
             model_path: None,
+            git_repo_path: ".".to_string(),
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
