@@ -157,6 +157,22 @@ fn print_command_help() {
     );
 
     println!();
+    println!("{}", "Branch Commands:".bold().cyan());
+    println!(
+        "  {} ({})                  - List indexed branches",
+        "branches".yellow(),
+        "br".yellow()
+    );
+    println!(
+        "  {}                        - Show current branch information",
+        "branch".yellow()
+    );
+    println!(
+        "  {} <b1> <b2>          - Compare two branches",
+        "compare".yellow()
+    );
+
+    println!();
     println!("{}", "General:".bold().cyan());
     println!(
         "  {} ({}, {}) - Check if database needs optimization",
