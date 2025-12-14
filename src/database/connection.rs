@@ -1966,7 +1966,7 @@ impl DatabaseManager {
     pub async fn optimize_database(&self) -> Result<()> {
         use colored::Colorize;
 
-        println!(
+        tracing::info!(
             "\n{}",
             "═══ DATABASE OPTIMIZATION STARTED ═══".yellow().bold()
         );
@@ -1974,22 +1974,22 @@ impl DatabaseManager {
         tracing::info!("Running database optimization...");
 
         // Rebuild all scalar indices to ensure they're optimal
-        println!("{}", "  → Rebuilding scalar indices...".cyan());
+        tracing::info!("{}", "  → Rebuilding scalar indices...".cyan());
         self.rebuild_indices().await?;
-        println!("{}", "  ✓ Scalar indices rebuilt".green());
+        tracing::info!("{}", "  ✓ Scalar indices rebuilt".green());
 
         // Run table optimization
-        println!("{}", "  → Optimizing tables...".cyan());
+        tracing::info!("{}", "  → Optimizing tables...".cyan());
         self.optimize_tables().await?;
-        println!("{}", "  ✓ Tables optimized".green());
+        tracing::info!("{}", "  ✓ Tables optimized".green());
 
         // Compact and cleanup (triggers compression)
-        println!("{}", "  → Compacting and pruning old versions...".cyan());
+        tracing::info!("{}", "  → Compacting and pruning old versions...".cyan());
         self.compact_and_cleanup().await?;
-        println!("{}", "  ✓ Compaction complete".green());
+        tracing::info!("{}", "  ✓ Compaction complete".green());
 
         let elapsed = start_time.elapsed();
-        println!(
+        tracing::info!(
             "{}",
             format!(
                 "═══ DATABASE OPTIMIZATION COMPLETE ({:.1}s) ═══\n",

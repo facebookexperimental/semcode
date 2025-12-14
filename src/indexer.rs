@@ -53,14 +53,14 @@ pub async fn check_and_optimize_if_needed(
     match db_manager.check_optimization_health().await {
         Ok((needs_optimization, message)) => {
             if needs_optimization {
-                println!("{}", message);
-                println!(
+                info!("{}", message);
+                info!(
                     "\n{} Fragment threshold exceeded during indexing, running optimization...",
                     "⚠️".yellow()
                 );
                 match db_manager.optimize_database().await {
                     Ok(_) => {
-                        println!("{} In-progress optimization completed", "✓".green());
+                        info!("{} In-progress optimization completed", "✓".green());
                     }
                     Err(e) => {
                         warn!("In-progress optimization failed: {}", e);
@@ -1027,11 +1027,11 @@ pub async fn index_git_commits(
     let commit_count = commit_shas.len();
 
     if commit_shas.is_empty() {
-        println!("No commits found in range: {}", git_range);
+        info!("No commits found in range: {}", git_range);
         return Ok(0);
     }
 
-    println!(
+    info!(
         "Checking for {} commits already in database...",
         commit_count
     );
@@ -1050,17 +1050,17 @@ pub async fn index_git_commits(
 
     let already_indexed = commit_count - new_commit_shas.len();
     if already_indexed > 0 {
-        println!(
+        info!(
             "{} commits already indexed, processing {} new commits",
             already_indexed,
             new_commit_shas.len()
         );
     } else {
-        println!("Processing all {} new commits", new_commit_shas.len());
+        info!("Processing all {} new commits", new_commit_shas.len());
     }
 
     if new_commit_shas.is_empty() {
-        println!("All commits in range are already indexed!");
+        info!("All commits in range are already indexed!");
         return Ok(commit_count);
     }
 
@@ -1083,9 +1083,9 @@ pub async fn index_git_commits(
 
     let total_time = start_time.elapsed();
 
-    println!("\n=== Commit Indexing Complete ===");
-    println!("Total time: {:.1}s", total_time.as_secs_f64());
-    println!("Commits indexed: {}", commit_count);
+    info!("\n=== Commit Indexing Complete ===");
+    info!("Total time: {:.1}s", total_time.as_secs_f64());
+    info!("Commits indexed: {}", commit_count);
 
     Ok(commit_count)
 }

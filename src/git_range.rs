@@ -749,7 +749,7 @@ pub async fn process_git_range(
     let commit_count = commit_shas.len();
 
     if !commit_shas.is_empty() {
-        println!(
+        info!(
             "Checking for {} commits already in database...",
             commit_count
         );
@@ -768,13 +768,13 @@ pub async fn process_git_range(
 
         let already_indexed = commit_count - new_commit_shas.len();
         if already_indexed > 0 {
-            println!(
+            info!(
                 "{} commits already indexed, processing {} new commits",
                 already_indexed,
                 new_commit_shas.len()
             );
         } else {
-            println!("Processing all {} new commits", new_commit_shas.len());
+            info!("Processing all {} new commits", new_commit_shas.len());
         }
 
         if !new_commit_shas.is_empty() {
@@ -799,7 +799,7 @@ pub async fn process_git_range(
                 commit_extraction_start.elapsed().as_secs_f64()
             );
         } else {
-            println!("All commits in range are already indexed!");
+            info!("All commits in range are already indexed!");
         }
     } else {
         info!("No commits found in range");
@@ -843,24 +843,24 @@ pub async fn process_git_range(
 
     let total_time = start_time.elapsed();
 
-    println!("\n=== Git Range Pipeline Complete ===");
-    println!("Total time: {:.1}s", total_time.as_secs_f64());
-    println!("Commits indexed: {commit_count}");
-    println!("Files processed: {}", stats.files_processed);
-    println!("Functions indexed: {}", stats.functions_count);
-    println!("Types indexed: {}", stats.types_count);
+    info!("\n=== Git Range Pipeline Complete ===");
+    info!("Total time: {:.1}s", total_time.as_secs_f64());
+    info!("Commits indexed: {commit_count}");
+    info!("Files processed: {}", stats.files_processed);
+    info!("Functions indexed: {}", stats.functions_count);
+    info!("Types indexed: {}", stats.types_count);
 
     // Check if optimization is needed after git range indexing
     match db_manager.check_optimization_health().await {
         Ok((needs_optimization, message)) => {
             if needs_optimization {
-                println!("\n{}", message);
+                info!("\n{}", message);
                 match db_manager.optimize_database().await {
-                    Ok(_) => println!("Database optimization completed successfully"),
+                    Ok(_) => info!("Database optimization completed successfully"),
                     Err(e) => error!("Failed to optimize database: {}", e),
                 }
             } else {
-                println!("\n{}", message);
+                info!("\n{}", message);
             }
         }
         Err(e) => {
