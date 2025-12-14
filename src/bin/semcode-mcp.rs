@@ -2090,6 +2090,7 @@ impl McpServer {
             "initialize" => self.handle_initialize(params).await,
             "tools/list" => self.handle_list_tools().await,
             "tools/call" => self.handle_tool_call(params).await,
+            "ping" => json!({}),
             _ => json!({
                 "error": {
                     "code": -32601,
@@ -5086,20 +5087,38 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
 
                 match serde_json::from_str::<Value>(&line) {
                     Ok(request) => {
-                        let response = server.handle_request(request).await;
-                        if let Ok(response_str) = serde_json::to_string(&response) {
-                            let mut stdout_guard = stdout.lock().await;
-                            if let Err(e) = stdout_guard.write_all(response_str.as_bytes()).await {
-                                eprintln!("Failed to write response: {e}");
-                                break;
+                        // Check if this is a notification (no id) or a request (has id)
+                        if request.get("id").is_some() {
+                            // It's a request, send a response
+                            let response = server.handle_request(request).await;
+                            if let Ok(response_str) = serde_json::to_string(&response) {
+                                let mut stdout_guard = stdout.lock().await;
+                                if let Err(e) = stdout_guard.write_all(response_str.as_bytes()).await {
+                                    eprintln!("Failed to write response: {e}");
+                                    break;
+                                }
+                                if let Err(e) = stdout_guard.write_all(b"\n").await {
+                                    eprintln!("Failed to write newline: {e}");
+                                    break;
+                                }
+                                if let Err(e) = stdout_guard.flush().await {
+                                    eprintln!("Failed to flush stdout: {e}");
+                                    break;
+                                }
                             }
-                            if let Err(e) = stdout_guard.write_all(b"\n").await {
-                                eprintln!("Failed to write newline: {e}");
-                                break;
-                            }
-                            if let Err(e) = stdout_guard.flush().await {
-                                eprintln!("Failed to flush stdout: {e}");
-                                break;
+                        } else {
+                            // It's a notification, handle without response
+                            let method = request["method"].as_str().unwrap_or("");
+                            match method {
+                                "notifications/initialized" => {
+                                    eprintln!("Client initialized");
+                                }
+                                "notifications/cancelled" => {
+                                    eprintln!("Request cancelled (notification received)");
+                                }
+                                _ => {
+                                    eprintln!("Received notification: {}", method);
+                                }
                             }
                         }
                     }
