@@ -1,12 +1,15 @@
 # semcode usage guide
 
 All semcode functions are git aware and default to lookups on the current
-commit.  You can also pass a specific commit you're interested in.
+commit.  You can also pass a specific commit you're interested in, or a branch name.
 
 **Note on Regex Patterns**: All regex patterns in semcode are **case-insensitive by default**. This applies to all pattern matching including function names, commit messages, symbols, and lore email searches. You don't need to use the `(?i)` flag.
 
+**Branch Support**: Most query tools support a `branch` parameter as an alternative to `git_sha`. When you specify a branch name (e.g., "main", "develop"), it will be resolved to the current tip commit of that branch. Branch takes precedence over git_sha if both are provided.
+
 **find_function**: search for functions and macros
   - git_sha: indicates which commit to search (default: current)
+  - branch: branch name to search (alternative to git_sha, e.g., "main", "develop")
   - name: function/macro name, or a regex
   - also displays details on callers and callees
 **find_type**: search for types and typedefs
@@ -74,6 +77,20 @@ commit.  You can also pass a specific commit you're interested in.
     sha provided.  Mutually exclusive with git_range
   - page: optional page number for pagination (1-based).  Each page contains
     50 lines, results indicate current page and total pages.  Default: full results
+**list_branches**: list all indexed branches with their status
+  - No parameters required
+  - Shows branch names, indexed commit SHAs, and freshness status
+  - **up-to-date**: indexed commit matches current branch tip
+  - **outdated**: branch has new commits since indexing (re-index to update)
+  - Useful for tracking multiple stable branches (e.g., linux-5.10.y, 6.1.y, 6.12.y)
+    and knowing when they need re-indexing after new releases
+**compare_branches**: compare two branches and show their relationship
+  - branch1: first branch name (e.g., "main")
+  - branch2: second branch name (e.g., "feature-branch")
+  - Shows merge base, ahead/behind status, and indexing status for both branches
+**indexing_status**: check the status of background indexing operation
+  - No parameters required
+  - Shows current indexing progress, errors, and timing
 
 ## Recipes
 
