@@ -5178,9 +5178,6 @@ async fn main() -> Result<()> {
     // Create MCP server
     let server = Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path).await?);
 
-    // Ensure tables exist
-    server.db.create_tables().await?;
-
     // Spawn background task to index current commit if needed
     eprintln!("[Background] Spawning background indexing task");
     let db_for_indexing = server.db.clone();
@@ -5188,6 +5185,11 @@ async fn main() -> Result<()> {
     let indexing_state_for_bg = server.indexing_state.clone();
     let notification_tx_for_bg = server.notification_tx.clone();
     let _indexing_handle = tokio::spawn(async move {
+        // Ensure tables exist before indexing
+        if let Err(e) = db_for_indexing.create_tables().await {
+            eprintln!("[Background] Error creating/verifying tables: {}", e);
+        }
+
         index_current_commit_background(
             db_for_indexing,
             git_repo_for_indexing,
