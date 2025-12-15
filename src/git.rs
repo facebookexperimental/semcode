@@ -243,6 +243,124 @@ mod tests {
         assert!(result.is_ok());
         // May or may not be in a git repo depending on system
     }
+
+    // ==================== Branch Operations Tests ====================
+
+    #[test]
+    fn test_get_current_branch() {
+        // This should work if running in a git repository
+        let result = get_current_branch(".");
+        assert!(result.is_ok());
+
+        // If we're on a branch (not detached HEAD), we should get a name
+        if let Ok(Some(branch)) = result {
+            assert!(!branch.is_empty());
+            // Branch name should not contain refs/heads/ prefix
+            assert!(!branch.starts_with("refs/"));
+        }
+    }
+
+    #[test]
+    fn test_list_branches_local() {
+        // List local branches only
+        let result = list_branches(".", false);
+        assert!(result.is_ok());
+
+        let branches = result.unwrap();
+        // Should have at least one local branch (main/master)
+        assert!(!branches.is_empty());
+
+        // All should be local branches
+        for branch in &branches {
+            assert!(!branch.is_remote);
+            assert!(branch.remote.is_none());
+            // Tip commit should be a valid SHA
+            assert_eq!(branch.tip_commit.len(), 40);
+            assert!(branch.tip_commit.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn test_list_branches_with_remote() {
+        // List all branches including remote
+        let result = list_branches(".", true);
+        assert!(result.is_ok());
+
+        let branches = result.unwrap();
+        // Should have at least one branch
+        assert!(!branches.is_empty());
+
+        // Check that remote branches have proper attributes
+        for branch in &branches {
+            if branch.is_remote {
+                // Remote branches should have a remote name
+                assert!(branch.remote.is_some());
+                // Name should contain remote prefix (e.g., "origin/main")
+                assert!(branch.name.contains('/'));
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_branch_main() {
+        // Try to resolve 'main' or 'master' branch
+        let main_result = resolve_branch(".", "main");
+        let master_result = resolve_branch(".", "master");
+
+        // At least one should succeed
+        let resolved = main_result.or(master_result);
+        assert!(resolved.is_ok());
+
+        let sha = resolved.unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_resolve_branch_head() {
+        // HEAD should always resolve
+        let result = resolve_branch(".", "HEAD");
+        assert!(result.is_ok());
+
+        let sha = result.unwrap();
+        assert_eq!(sha.len(), 40);
+    }
+
+    #[test]
+    fn test_branch_exists() {
+        // HEAD always exists
+        let result = branch_exists(".", "HEAD");
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // Nonsense branch should not exist
+        let result = branch_exists(".", "definitely-not-a-real-branch-12345");
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_find_merge_base_same_commit() {
+        // Merge base of HEAD with itself should be HEAD
+        let result = find_merge_base(".", "HEAD", "HEAD");
+        assert!(result.is_ok());
+
+        let base = result.unwrap();
+        let head = resolve_branch(".", "HEAD").unwrap();
+        assert_eq!(base, head);
+    }
+
+    #[test]
+    fn test_find_merge_base_with_parent() {
+        // Merge base of HEAD and HEAD~1 should be HEAD~1
+        let result = find_merge_base(".", "HEAD", "HEAD~1");
+
+        // This might fail if the repo has only one commit
+        if let Ok(base) = result {
+            assert_eq!(base.len(), 40);
+            assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
 }
 
 /// Get git hash for a specific file at a specific commit
@@ -931,6 +1049,133 @@ fn generate_commit_diff_with_symbols(
 
     Ok((diff_output, all_symbols, changed_files))
 }
+
+// ==================== Branch Operations ====================
+
+/// Information about a git branch
+#[derive(Debug, Clone)]
+pub struct BranchRef {
+    /// Branch name (short form, e.g., "main" or "origin/develop")
+    pub name: String,
+    /// Commit SHA at the tip of the branch
+    pub tip_commit: String,
+    /// Whether this is a remote-tracking branch
+    pub is_remote: bool,
+    /// Remote name if this is a remote-tracking branch
+    pub remote: Option<String>,
+}
+
+/// Resolve a branch name to its tip commit SHA
+/// Supports both local branches (e.g., "main") and remote branches (e.g., "origin/develop")
+pub fn resolve_branch<P: AsRef<Path>>(repo_path: P, branch_name: &str) -> Result<String> {
+    let repo = gix::discover(repo_path)?;
+
+    // Try to find as a local branch first
+    let local_ref = format!("refs/heads/{}", branch_name);
+    if let Ok(reference) = repo.find_reference(&local_ref) {
+        if let Ok(commit) = reference.into_fully_peeled_id() {
+            return Ok(commit.to_string());
+        }
+    }
+
+    // Try to find as a remote branch (e.g., "origin/main" -> "refs/remotes/origin/main")
+    let remote_ref = format!("refs/remotes/{}", branch_name);
+    if let Ok(reference) = repo.find_reference(&remote_ref) {
+        if let Ok(commit) = reference.into_fully_peeled_id() {
+            return Ok(commit.to_string());
+        }
+    }
+
+    // Try using resolve_to_commit as a fallback (handles tags and SHAs)
+    let commit = resolve_to_commit(&repo, branch_name)?;
+    Ok(commit.id().to_string())
+}
+
+/// List all branches in the repository
+/// If include_remote is true, also includes remote-tracking branches
+pub fn list_branches<P: AsRef<Path>>(repo_path: P, include_remote: bool) -> Result<Vec<BranchRef>> {
+    let repo = gix::discover(repo_path)?;
+    let mut branches = Vec::new();
+
+    // Get all references
+    let refs = repo.references()?;
+
+    // Process local branches
+    for reference in refs.local_branches()?.flatten() {
+        let name = reference.name().shorten().to_string();
+
+        if let Ok(commit) = reference.into_fully_peeled_id() {
+            branches.push(BranchRef {
+                name,
+                tip_commit: commit.to_string(),
+                is_remote: false,
+                remote: None,
+            });
+        }
+    }
+
+    // Process remote branches if requested
+    if include_remote {
+        let refs = repo.references()?;
+        for reference in refs.remote_branches()?.flatten() {
+            let full_name = reference.name().shorten().to_string();
+
+            // Extract remote name from the branch name (e.g., "origin/main" -> "origin")
+            let remote = full_name.split('/').next().map(String::from);
+
+            if let Ok(commit) = reference.into_fully_peeled_id() {
+                branches.push(BranchRef {
+                    name: full_name,
+                    tip_commit: commit.to_string(),
+                    is_remote: true,
+                    remote,
+                });
+            }
+        }
+    }
+
+    // Sort by name for consistent output
+    branches.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(branches)
+}
+
+/// Find the merge base (common ancestor) between two refs
+/// This is useful for finding the optimal starting point for incremental indexing
+pub fn find_merge_base<P: AsRef<Path>>(repo_path: P, ref_a: &str, ref_b: &str) -> Result<String> {
+    let repo = gix::discover(repo_path)?;
+
+    let commit_a = resolve_to_commit(&repo, ref_a)?;
+    let commit_b = resolve_to_commit(&repo, ref_b)?;
+
+    // Use gix's merge_base method to find the common ancestor
+    let base = repo.merge_base(commit_a.id, commit_b.id)?;
+
+    Ok(base.to_string())
+}
+
+/// Get the current branch name (if on a branch, not detached HEAD)
+pub fn get_current_branch<P: AsRef<Path>>(repo_path: P) -> Result<Option<String>> {
+    let repo = gix::discover(repo_path)?;
+
+    match repo.head_name()? {
+        Some(name) => {
+            let short_name = name.shorten().to_string();
+            Ok(Some(short_name))
+        }
+        None => Ok(None), // Detached HEAD
+    }
+}
+
+/// Check if a branch exists in the repository
+pub fn branch_exists<P: AsRef<Path>>(repo_path: P, branch_name: &str) -> Result<bool> {
+    match resolve_branch(repo_path, branch_name) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+// ==================== End Branch Operations ====================
 
 /// Write a unified diff and extract symbols from changed lines
 /// This is the same logic used during indexing
