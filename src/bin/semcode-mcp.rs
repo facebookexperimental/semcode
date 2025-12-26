@@ -5093,7 +5093,9 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
                             let response = server.handle_request(request).await;
                             if let Ok(response_str) = serde_json::to_string(&response) {
                                 let mut stdout_guard = stdout.lock().await;
-                                if let Err(e) = stdout_guard.write_all(response_str.as_bytes()).await {
+                                if let Err(e) =
+                                    stdout_guard.write_all(response_str.as_bytes()).await
+                                {
                                     eprintln!("Failed to write response: {e}");
                                     break;
                                 }
