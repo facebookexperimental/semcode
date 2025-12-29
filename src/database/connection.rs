@@ -9,6 +9,7 @@ use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::ExecutableQuery;
 use lancedb::query::QueryBase;
 
+use crate::database::branches::IndexedBranchStore;
 use crate::database::functions::FunctionStore;
 use crate::database::schema::SchemaManager;
 use crate::database::search::{SearchManager, VectorSearchManager};
@@ -36,6 +37,7 @@ pub struct DatabaseManager {
     processed_file_store: ProcessedFileStore,
     content_store: ContentStore,
     symbol_filename_store: SymbolFilenameStore,
+    branch_store: IndexedBranchStore,
 }
 
 impl DatabaseManager {
@@ -54,6 +56,7 @@ impl DatabaseManager {
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
+            branch_store: IndexedBranchStore::new(connection.clone()),
         })
     }
 
@@ -79,6 +82,7 @@ impl DatabaseManager {
             "symbol_filename",
             "git_commits",
             "lore",
+            "indexed_branches",
         ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
                 table.delete("1=1").await?;
@@ -2497,6 +2501,80 @@ impl DatabaseManager {
         // Use the optimized method that only loads the two needed columns
         self.processed_file_store.get_all_file_git_sha_pairs().await
     }
+
+    // ==================== Branch Management ====================
+
+    /// Record that a branch has been indexed at a specific commit
+    pub async fn record_branch_indexed(
+        &self,
+        branch_name: &str,
+        tip_commit: &str,
+        remote: Option<&str>,
+    ) -> Result<()> {
+        use crate::database::branches::IndexedBranchInfo;
+        let info = IndexedBranchInfo {
+            branch_name: branch_name.to_string(),
+            tip_commit: tip_commit.to_string(),
+            indexed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            remote: remote.map(|s| s.to_string()),
+        };
+        self.branch_store.record_branch_indexed(&info).await
+    }
+
+    /// Get the tip commit for a specific branch
+    pub async fn get_branch_tip(&self, branch_name: &str) -> Result<Option<String>> {
+        self.branch_store.get_branch_tip(branch_name).await
+    }
+
+    /// Get full information about a specific indexed branch
+    pub async fn get_indexed_branch_info(
+        &self,
+        branch_name: &str,
+    ) -> Result<Option<crate::database::branches::IndexedBranchInfo>> {
+        self.branch_store.get_branch_info(branch_name).await
+    }
+
+    /// List all indexed branches
+    pub async fn list_indexed_branches(
+        &self,
+    ) -> Result<Vec<crate::database::branches::IndexedBranchInfo>> {
+        self.branch_store.list_indexed_branches().await
+    }
+
+    /// Check if a branch is indexed at the current tip commit
+    pub async fn is_branch_current(&self, branch_name: &str, current_tip: &str) -> Result<bool> {
+        self.branch_store
+            .is_branch_current(branch_name, current_tip)
+            .await
+    }
+
+    /// Remove a branch record (used when branch is deleted)
+    pub async fn remove_indexed_branch(&self, branch_name: &str) -> Result<()> {
+        self.branch_store.remove_branch(branch_name).await
+    }
+
+    /// Remove all branches for a specific remote
+    pub async fn remove_branches_by_remote(&self, remote: &str) -> Result<usize> {
+        self.branch_store.remove_branches_by_remote(remote).await
+    }
+
+    /// Get all branches that point to a specific commit
+    pub async fn get_branches_at_commit(
+        &self,
+        commit_sha: &str,
+    ) -> Result<Vec<crate::database::branches::IndexedBranchInfo>> {
+        self.branch_store.get_branches_at_commit(commit_sha).await
+    }
+
+    /// Get count of indexed branches
+    pub async fn get_indexed_branch_count(&self) -> Result<usize> {
+        self.branch_store.count().await
+    }
+
+    // ==================== End Branch Management ====================
 
     pub async fn get_existing_function_names(&self) -> Result<std::collections::HashSet<String>> {
         use futures::TryStreamExt;
