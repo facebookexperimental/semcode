@@ -13,7 +13,7 @@
         "name": "Semcode"
       },
       "homepage": "https://github.com/masoncl/semcode",
-      "source": "./semcode",
+      "source": "./plugin/semcode",
       "mcpServers": [
         "./mcp/semcode.json"
       ]
