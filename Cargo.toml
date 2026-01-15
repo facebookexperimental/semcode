@@ -6,54 +6,54 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-lancedb = "0.22"
+lancedb = "0.23.1"
 arrow = "56.2"
 arrow-array = "56.2"
 arrow-schema = "56.2"
-tokio = { version = "1.47.1", features = ["full"] }
-serde = { version = "1.0.219", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 serde_bytes = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 walkdir = "2.5"
-indicatif = "0.18.0"
+indicatif = "0.18.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustyline = "17.0"
 colored = "3.0"
 futures = "0.3.31"
-ndarray = "0.16"
-regex = "1.11"
-rayon = "1.10"
-dirs = "5.0"
-num_cpus = "1.16"
-tree-sitter = "0.24"
-tree-sitter-c = "0.23"
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
+ndarray = "0.17"
+regex = "1.12"
+rayon = "1.11"
+dirs = "6.0"
+num_cpus = "1.17"
+tree-sitter = "0.26"
+tree-sitter-c = "0.24"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
 streaming-iterator = "0.1"
-once_cell = "1.20"
+once_cell = "1.21"
 crossbeam-channel = "0.5"
 sha1 = "0.10"
-blake3 = "1.8.2"
+blake3 = "1.8.3"
 hex = "0.4"
 dashmap = "6.1"
-tempfile = "3.14"
-axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
-tokio-tungstenite = "0.24"
+tempfile = "3.24"
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tokio-tungstenite = "0.28"
 anstream = "0.6"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
 owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
-gix = { version = "0.73", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl"] }
+gix = { version = "0.77", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl"] }
 model2vec-rs = "0.1.4"
 tower-lsp = "0.20"      # Language Server Protocol framework for LSP server
 url = "2.5"             # URL parsing for file URIs in LSP
 similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for commit diffs
 shlex = "1.3"           # Shell-like parsing for quoted strings in CLI
-reqwest = { version = "0.11", features = ["blocking", "gzip"] }  # HTTP client for manifest downloads
-flate2 = "1.0"          # gzip compression/decompression
-chrono = "0.4.42"
+reqwest = { version = "0.13", features = ["blocking", "gzip"] }  # HTTP client for manifest downloads
+flate2 = "1.1"          # gzip compression/decompression
+chrono = "0.4.43"
 chrono-english = "0.1"  # Natural language date parsing
 
 [[bin]]
