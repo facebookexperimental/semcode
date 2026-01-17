@@ -2798,6 +2798,7 @@ impl McpServer {
             // Lazy loading meta-tools
             "list_categories" => self.handle_list_categories().await,
             "get_tools" => self.handle_get_tools(arguments).await,
+            "call_tool" => self.handle_call_tool(arguments).await,
             _ => json!({
                 "error": format!("Unknown tool: {}", name),
                 "isError": true
@@ -2858,6 +2859,53 @@ impl McpServer {
                             "Unknown category: '{}'\nAvailable categories: {}",
                             category,
                             available.join(", ")
+                        )
+                    }]
+                })
+            }
+        }
+    }
+
+    async fn handle_call_tool(&self, args: &Value) -> Value {
+        let tool_name = args["tool_name"].as_str().unwrap_or("");
+        let empty_obj = json!({});
+        let tool_args = args.get("arguments").unwrap_or(&empty_obj);
+
+        // Dispatch to the underlying tool handler directly
+        // (avoids async recursion through handle_tool_call)
+        match tool_name {
+            "find_function" => self.handle_find_function(tool_args).await,
+            "find_type" => self.handle_find_type(tool_args).await,
+            "find_callers" => self.handle_find_callers(tool_args).await,
+            "find_calls" => self.handle_find_calls(tool_args).await,
+            "find_callchain" => self.handle_find_callchain(tool_args).await,
+            "diff_functions" => self.handle_diff_functions(tool_args).await,
+            "grep_functions" => self.handle_grep_functions(tool_args).await,
+            "vgrep_functions" => self.handle_vgrep_functions(tool_args).await,
+            "find_commit" => self.handle_find_commit(tool_args).await,
+            "vcommit_similar_commits" => self.handle_vcommit_similar_commits(tool_args).await,
+            "lore_search" => self.handle_lore_search(tool_args).await,
+            "dig" => self.handle_dig(tool_args).await,
+            "vlore_similar_emails" => self.handle_vlore_similar_emails(tool_args).await,
+            "indexing_status" => self.handle_indexing_status().await,
+            "list_branches" => self.handle_list_branches().await,
+            "compare_branches" => self.handle_compare_branches(tool_args).await,
+            // Meta-tools cannot be called via call_tool
+            "list_categories" | "get_tools" | "call_tool" => {
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Cannot call meta-tool '{}' via call_tool. Use it directly.", tool_name)
+                    }]
+                })
+            }
+            _ => {
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "Unknown tool: '{}'\nUse list_categories and get_tools to discover available tools.",
+                            tool_name
                         )
                     }]
                 })
