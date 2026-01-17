@@ -1343,10 +1343,7 @@ pub async fn handle_command(
                     }
                 }
 
-                if commit_ish.is_none() {
-                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] <commit>".red());
-                    println!("  Missing commit argument");
-                } else {
+                if let Some(commit_ref) = commit_ish {
                     // Parse dates using the date_utils module
                     let since_date = if let Some(date_str) = since_date_str {
                         match semcode::date_utils::parse_date(&date_str) {
@@ -1389,14 +1386,11 @@ pub async fn handle_command(
                         since_date: since_date.as_deref(),
                         until_date: until_date.as_deref(),
                     };
-                    lore_search_by_commit(
-                        db,
-                        commit_ish.unwrap(),
-                        git_repo_path,
-                        show_all,
-                        &options,
-                    )
-                    .await?;
+                    lore_search_by_commit(db, commit_ref, git_repo_path, show_all, &options)
+                        .await?;
+                } else {
+                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] <commit>".red());
+                    println!("  Missing commit argument");
                 }
             }
         }

@@ -1878,6 +1878,10 @@ struct Args {
     /// Path to custom model directory (defaults to ~/.cache/semcode/models/)
     #[arg(long)]
     model_path: Option<String>,
+
+    /// Enable lazy tool loading (reduces initial context by ~96%)
+    #[arg(long, default_value = "false")]
+    lazy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1983,6 +1987,55 @@ struct VCommitParams<'a> {
     model_path: &'a Option<String>,
 }
 
+/// Tool category for lazy loading
+#[allow(dead_code)]
+struct ToolCategory {
+    name: &'static str,
+    description: &'static str,
+    tool_names: &'static [&'static str],
+}
+
+/// Tool categories for lazy loading - groups the 16 tools into logical categories
+#[allow(dead_code)]
+const TOOL_CATEGORIES: &[ToolCategory] = &[
+    ToolCategory {
+        name: "code_lookup",
+        description: "Functions and type definition lookup - find specific functions, types, and their call relationships",
+        tool_names: &[
+            "find_function",
+            "find_type",
+            "find_callers",
+            "find_calls",
+            "find_callchain",
+        ],
+    },
+    ToolCategory {
+        name: "code_search",
+        description: "Pattern and semantic search in code - regex search, semantic similarity, diff analysis",
+        tool_names: &["grep_functions", "vgrep_functions", "diff_functions"],
+    },
+    ToolCategory {
+        name: "git_history",
+        description: "Git commit analysis - search commits, compare branches, history analysis",
+        tool_names: &[
+            "find_commit",
+            "vcommit_similar_commits",
+            "list_branches",
+            "compare_branches",
+        ],
+    },
+    ToolCategory {
+        name: "lore_email",
+        description: "Kernel mailing list search - find patch discussions and email threads from lore.kernel.org",
+        tool_names: &["lore_search", "vlore_similar_emails", "dig"],
+    },
+    ToolCategory {
+        name: "status",
+        description: "System status - check background indexing progress",
+        tool_names: &["indexing_status"],
+    },
+];
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
@@ -1991,6 +2044,8 @@ struct McpServer {
     page_cache: PageCache,
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
     notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    #[allow(dead_code)] // Used in commit 6: Wire up lazy mode
+    lazy_mode: bool,
 }
 
 impl McpServer {
@@ -1998,6 +2053,7 @@ impl McpServer {
         database_path: &str,
         git_repo_path: &str,
         model_path: Option<String>,
+        lazy_mode: bool,
     ) -> Result<Self> {
         let db = Arc::new(DatabaseManager::new(database_path, git_repo_path.to_string()).await?);
 
@@ -2027,6 +2083,7 @@ impl McpServer {
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode,
         })
     }
 
@@ -5423,13 +5480,18 @@ async fn main() -> Result<()> {
         args.database.as_deref().unwrap_or("(auto-detect)")
     );
     eprintln!("Git repository: {}", args.git_repo);
+    eprintln!(
+        "Lazy loading: {}",
+        if args.lazy { "enabled" } else { "disabled" }
+    );
     eprintln!("Transport: stdio");
 
     // Process database path with search order: 1) -d flag, 2) current directory
     let database_path = process_database_path(args.database.as_deref(), None);
 
     // Create MCP server
-    let server = Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path).await?);
+    let server =
+        Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path, args.lazy).await?);
 
     // Spawn background task to index current commit if needed
     eprintln!("[Background] Spawning background indexing task");
@@ -5546,6 +5608,7 @@ mod tests {
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
         };
 
         let result = server.handle_indexing_status().await;
@@ -5580,6 +5643,7 @@ mod tests {
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
         };
 
         let result = server.handle_indexing_status().await;
@@ -5616,6 +5680,7 @@ mod tests {
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
         };
 
         let result = server.handle_indexing_status().await;
@@ -5649,6 +5714,7 @@ mod tests {
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
         };
 
         let result = server.handle_indexing_status().await;
