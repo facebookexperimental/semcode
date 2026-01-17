@@ -2036,6 +2036,578 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
     },
 ];
 
+/// Get the JSON schema for a specific tool by name
+fn get_tool_schema(name: &str) -> Option<Value> {
+    match name {
+        "find_function" => Some(json!({
+            "name": "find_function",
+            "description": "Find a function or macro by exact name, optionally at a specific git commit or branch",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The exact name of the function or macro to find"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["name"]
+            }
+        })),
+        "find_type" => Some(json!({
+            "name": "find_type",
+            "description": "Find a type, struct, union, or typedef by exact name, optionally at a specific git commit or branch",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the type to find, without the 'struct/enum/typedef' keyboard (e.g., 'task_struct', 'size_t')"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["name"]
+            }
+        })),
+        "find_callers" => Some(json!({
+            "name": "find_callers",
+            "description": "Find all functions that call a specific function, optionally at a specific git commit or branch",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the function to find callers for"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["name"]
+            }
+        })),
+        "find_calls" => Some(json!({
+            "name": "find_calls",
+            "description": "Find all functions called by a specific function, optionally at a specific git commit or branch",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the function to find calls for"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["name"]
+            }
+        })),
+        "find_callchain" => Some(json!({
+            "name": "find_callchain",
+            "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit or branch",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the function to analyze the call chain for"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    },
+                    "up_levels": {
+                        "type": "integer",
+                        "description": "Number of caller levels to show (default: 2, 0 = no limit)",
+                        "default": 2,
+                        "minimum": 0
+                    },
+                    "down_levels": {
+                        "type": "integer",
+                        "description": "Number of callee levels to show (default: 3, 0 = no limit)",
+                        "default": 3,
+                        "minimum": 0
+                    },
+                    "calls_limit": {
+                        "type": "integer",
+                        "description": "Maximum calls to show per level (default: 15, 0 = no limit)",
+                        "default": 15,
+                        "minimum": 0
+                    }
+                },
+                "required": ["name"]
+            }
+        })),
+        "diff_functions" => Some(json!({
+            "name": "diff_functions",
+            "description": "Extract and list functions from a unified diff",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "diff_content": {
+                        "type": "string",
+                        "description": "The unified diff content to analyze"
+                    }
+                },
+                "required": ["diff_content"]
+            }
+        })),
+        "grep_functions" => Some(json!({
+            "name": "grep_functions",
+            "description": "Search function bodies using regex patterns. Shows matching lines by default, full function bodies with verbose flag",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for in function bodies"
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "Show full function bodies instead of just matching lines (default: false)",
+                        "default": false
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    },
+                    "path_pattern": {
+                        "type": "string",
+                        "description": "Optional regex pattern to filter results by file path"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 100, 0 = unlimited)",
+                        "default": 100,
+                        "minimum": 0
+                    }
+                },
+                "required": ["pattern"]
+            }
+        })),
+        "vgrep_functions" => Some(json!({
+            "name": "vgrep_functions",
+            "description": "Search for functions similar to the provided text using semantic vector embeddings. Requires vectors to be generated first with 'semcode-index --vectors'",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query_text": {
+                        "type": "string",
+                        "description": "Text describing the kind of functions to find (e.g., 'memory allocation function', 'string comparison')"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    },
+                    "path_pattern": {
+                        "type": "string",
+                        "description": "Optional regex pattern to filter results by file path"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 10, max: 100)",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 100
+                    }
+                },
+                "required": ["query_text"]
+            }
+        })),
+        "find_commit" => Some(json!({
+            "name": "find_commit",
+            "description": "Find and display metadata for a git commit or range of commits. Accepts flexible git references like SHA, short SHA, branch names, HEAD, or git ranges. Supports filtering by author name/email (OR logic), subject (OR logic), commit message and diff (AND logic), symbol list (AND logic), and file paths (OR logic). Results can be paginated with 50 lines per page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "git_ref": {
+                        "type": "string",
+                        "description": "Git reference to look up (SHA, short SHA, branch name, HEAD, etc.). Not required if git_range is specified."
+                    },
+                    "git_range": {
+                        "type": "string",
+                        "description": "Optional git range to show multiple commits (e.g., 'HEAD~10..HEAD', 'abc123..def456'). Mutually exclusive with git_ref."
+                    },
+                    "author_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter commits by author name/email - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
+                    },
+                    "subject_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter commits by subject line - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
+                    },
+                    "regex_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter commits - ALL patterns must match against the combined commit message and unified diff (AND logic). Equivalent to passing -r multiple times."
+                    },
+                    "symbol_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter commits by symbols - ALL patterns must match at least one symbol in the commit (AND logic). Equivalent to passing -g multiple times."
+                    },
+                    "path_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter commits by file paths - ANY pattern must match at least one file path in the commit (OR logic). Equivalent to passing -p multiple times."
+                    },
+                    "reachable_sha": {
+                        "type": "string",
+                        "description": "Optional git SHA to filter results to only commits reachable from (i.e., ancestors of) the specified commit. Equivalent to --reachable in the query tool."
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "Show full diff in addition to metadata (default: false)",
+                        "default": false
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                        "minimum": 1
+                    }
+                }
+            }
+        })),
+        "vcommit_similar_commits" => Some(json!({
+            "name": "vcommit_similar_commits",
+            "description": "Search for commits similar to the provided text using semantic vector embeddings. Requires commit vectors to be generated first with 'semcode-index --vectors'. Supports filtering by author name/email (OR logic), subject (OR logic), message/diff (AND logic), symbols (AND logic), and paths (OR logic). Results can be paginated with 50 lines per page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query_text": {
+                        "type": "string",
+                        "description": "Text describing the kind of commits to find (e.g., 'fix memory leak', 'refactor parser', 'performance optimization')"
+                    },
+                    "git_range": {
+                        "type": "string",
+                        "description": "Optional git range to filter results (e.g., 'HEAD~100..HEAD', 'main~50..HEAD')"
+                    },
+                    "author_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter results by author name/email - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
+                    },
+                    "subject_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter results by subject line - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
+                    },
+                    "regex_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter results by commit message and diff - ALL patterns must match (AND logic). Equivalent to passing -r multiple times."
+                    },
+                    "symbol_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter results by symbols - ALL patterns must match at least one symbol in the commit (AND logic). Equivalent to passing -g multiple times."
+                    },
+                    "path_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter results by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
+                    },
+                    "reachable_sha": {
+                        "type": "string",
+                        "description": "Optional git SHA to filter results to only commits reachable from (i.e., ancestors of) the specified commit. Equivalent to --reachable in the query tool."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 10, max: 50)",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 50
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["query_text"]
+            }
+        })),
+        "lore_search" => Some(json!({
+            "name": "lore_search",
+            "description": "Search lore.kernel.org email archives with regex filters. Supports multiple field filters (from, subject, body, symbols, recipients) with OR logic within each field and AND logic across fields. Can show full threads. Results can be paginated with 50 lines per page. Same functionality as query tool's 'lore' command.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by from field (OR logic). Equivalent to passing -f multiple times in query tool."
+                    },
+                    "subject_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by subject (OR logic). Equivalent to passing -s multiple times in query tool."
+                    },
+                    "body_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by message body (OR logic). Equivalent to passing -b multiple times in query tool."
+                    },
+                    "symbols_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by symbols mentioned in patches (OR logic). Equivalent to passing -g multiple times in query tool."
+                    },
+                    "recipients_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by recipients field (OR logic). Equivalent to passing -t multiple times in query tool."
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Optional exact message ID for direct lookup (equivalent to -m flag in query tool)"
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "Show full message body (default: false, shows only headers)",
+                        "default": false
+                    },
+                    "show_thread": {
+                        "type": "boolean",
+                        "description": "Show full email thread for each match (default: false)",
+                        "default": false
+                    },
+                    "show_replies": {
+                        "type": "boolean",
+                        "description": "Show all replies/subthreads under each match (default: false, mutually exclusive with show_thread)",
+                        "default": false
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default: 100, 0 = unlimited)",
+                        "default": 100,
+                        "minimum": 0
+                    },
+                    "since_date": {
+                        "type": "string",
+                        "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                    },
+                    "until_date": {
+                        "type": "string",
+                        "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                        "minimum": 1
+                    }
+                }
+            }
+        })),
+        "dig" => Some(json!({
+            "name": "dig",
+            "description": "Search for lore.kernel.org emails related to a git commit. Orders results by date (newest first). Same functionality as query tool's 'dig' command.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "commit": {
+                        "type": "string",
+                        "description": "Git commit reference (SHA, short SHA, HEAD, branch name, etc.)"
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "Show full message body (default: false)",
+                        "default": false
+                    },
+                    "show_all": {
+                        "type": "boolean",
+                        "description": "Show all duplicate results, not just most recent (equivalent to -a flag in query tool)",
+                        "default": false
+                    },
+                    "show_thread": {
+                        "type": "boolean",
+                        "description": "Show full thread for each result (use with show_all, equivalent to --thread flag in query tool)",
+                        "default": false
+                    },
+                    "show_replies": {
+                        "type": "boolean",
+                        "description": "Show all replies/subthreads under each result (use with show_all, mutually exclusive with show_thread)",
+                        "default": false
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                        "minimum": 1
+                    },
+                    "since_date": {
+                        "type": "string",
+                        "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                    },
+                    "until_date": {
+                        "type": "string",
+                        "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                    }
+                },
+                "required": ["commit"]
+            }
+        })),
+        "vlore_similar_emails" => Some(json!({
+            "name": "vlore_similar_emails",
+            "description": "Search lore.kernel.org emails similar to the provided text using semantic vector embeddings. Requires lore vectors to be generated first. Supports filtering by from address, subject, body, symbols, and recipients patterns. Results can be paginated with 50 lines per page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query_text": {
+                        "type": "string",
+                        "description": "Text describing the kind of emails to find (e.g., 'memory leak fix', 'patch review', 'performance optimization')"
+                    },
+                    "from_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by from field - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
+                    },
+                    "subject_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by subject - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
+                    },
+                    "body_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by message body - ANY pattern must match (OR logic). Equivalent to passing -b multiple times."
+                    },
+                    "symbols_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by symbols mentioned in patches - ANY pattern must match (OR logic). Equivalent to passing -g multiple times."
+                    },
+                    "recipients_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional array of regex patterns to filter by recipients (To/Cc) - ANY pattern must match (OR logic). Equivalent to passing -t multiple times."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 20, max: 100)",
+                        "default": 20,
+                        "minimum": 1,
+                        "maximum": 100
+                    },
+                    "since_date": {
+                        "type": "string",
+                        "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                    },
+                    "until_date": {
+                        "type": "string",
+                        "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["query_text"]
+            }
+        })),
+        "indexing_status" => Some(json!({
+            "name": "indexing_status",
+            "description": "Check the status of the background indexing operation. Returns current state, progress, and any errors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        })),
+        "list_branches" => Some(json!({
+            "name": "list_branches",
+            "description": "List all indexed branches with their status (up-to-date or outdated)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        })),
+        "compare_branches" => Some(json!({
+            "name": "compare_branches",
+            "description": "Compare two branches showing their relationship (merge base, which is ahead/behind)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "branch1": {
+                        "type": "string",
+                        "description": "First branch name (e.g., 'main', 'develop')"
+                    },
+                    "branch2": {
+                        "type": "string",
+                        "description": "Second branch name (e.g., 'feature-branch', 'origin/main')"
+                    }
+                },
+                "required": ["branch1", "branch2"]
+            }
+        })),
+        _ => None,
+    }
+}
+
+/// Get all tool schemas as a vector
+fn get_all_tool_schemas() -> Vec<Value> {
+    let tool_names = [
+        "find_function",
+        "find_type",
+        "find_callers",
+        "find_calls",
+        "find_callchain",
+        "diff_functions",
+        "grep_functions",
+        "vgrep_functions",
+        "find_commit",
+        "vcommit_similar_commits",
+        "lore_search",
+        "dig",
+        "vlore_similar_emails",
+        "indexing_status",
+        "list_branches",
+        "compare_branches",
+    ];
+    tool_names
+        .iter()
+        .filter_map(|name| get_tool_schema(name))
+        .collect()
+}
+
 struct McpServer {
     db: Arc<DatabaseManager>,
     default_git_sha: Option<String>,
@@ -2200,587 +2772,7 @@ impl McpServer {
 
     async fn handle_list_tools(&self) -> Value {
         json!({
-            "tools": [
-                {
-                    "name": "find_function",
-                    "description": "Find a function or macro by exact name, optionally at a specific git commit or branch",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The exact name of the function or macro to find"
-                            },
-                            "git_sha": {
-                                "type": "string",
-                                "description": "Optional git commit SHA to search at (defaults to current HEAD)"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
-                            }
-                        },
-                        "required": ["name"]
-                    }
-                },
-                {
-                    "name": "find_type",
-                    "description": "Find a type, struct, union, or typedef by exact name, optionally at a specific git commit or branch",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The name of the type to find, without the 'struct/enum/typedef' keyboard (e.g., 'task_struct', 'size_t')"
-                            },
-                            "git_sha": {
-                                "type": "string",
-                                "description": "Optional git commit SHA to search at (defaults to current HEAD)"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
-                            }
-                        },
-                        "required": ["name"]
-                    }
-                },
-                {
-                    "name": "find_callers",
-                    "description": "Find all functions that call a specific function, optionally at a specific git commit or branch",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The name of the function to find callers for"
-                            },
-                            "git_sha": {
-                                "type": "string",
-                                "description": "Optional git commit SHA to search at (defaults to current HEAD)"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
-                            }
-                        },
-                        "required": ["name"]
-                    }
-                },
-                {
-                    "name": "find_calls",
-                    "description": "Find all functions called by a specific function, optionally at a specific git commit or branch",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The name of the function to find calls for"
-                            },
-                            "git_sha": {
-                                "type": "string",
-                                "description": "Optional git commit SHA to search at (defaults to current HEAD)"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
-                            }
-                        },
-                        "required": ["name"]
-                    }
-                },
-                {
-                    "name": "find_callchain",
-                    "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit or branch",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The name of the function to analyze the call chain for"
-                            },
-                            "git_sha": {
-                                "type": "string",
-                                "description": "Optional git commit SHA to search at (defaults to current HEAD)"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
-                            },
-                            "up_levels": {
-                                "type": "integer",
-                                "description": "Number of caller levels to show (default: 2, 0 = no limit)",
-                                "default": 2,
-                                "minimum": 0
-                            },
-                            "down_levels": {
-                                "type": "integer",
-                                "description": "Number of callee levels to show (default: 3, 0 = no limit)",
-                                "default": 3,
-                                "minimum": 0
-                            },
-                            "calls_limit": {
-                                "type": "integer",
-                                "description": "Maximum calls to show per level (default: 15, 0 = no limit)",
-                                "default": 15,
-                                "minimum": 0
-                            }
-                        },
-                        "required": ["name"]
-                    }
-                },
-                {
-                    "name": "diff_functions",
-                    "description": "Extract and list functions from a unified diff",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "diff_content": {
-                                "type": "string",
-                                "description": "The unified diff content to analyze"
-                            }
-                        },
-                        "required": ["diff_content"]
-                    }
-                },
-                {
-                    "name": "grep_functions",
-                    "description": "Search function bodies using regex patterns. Shows matching lines by default, full function bodies with verbose flag",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "string",
-                                "description": "Regex pattern to search for in function bodies"
-                            },
-                            "verbose": {
-                                "type": "boolean",
-                                "description": "Show full function bodies instead of just matching lines (default: false)",
-                                "default": false
-                            },
-                            "git_sha": {
-                                "type": "string",
-                                "description": "Optional git commit SHA to search at (defaults to current HEAD)"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
-                            },
-                            "path_pattern": {
-                                "type": "string",
-                                "description": "Optional regex pattern to filter results by file path"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of results to return (default: 100, 0 = unlimited)",
-                                "default": 100,
-                                "minimum": 0
-                            }
-                        },
-                        "required": ["pattern"]
-                    }
-                },
-                {
-                    "name": "vgrep_functions",
-                    "description": "Search for functions similar to the provided text using semantic vector embeddings. Requires vectors to be generated first with 'semcode-index --vectors'",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query_text": {
-                                "type": "string",
-                                "description": "Text describing the kind of functions to find (e.g., 'memory allocation function', 'string comparison')"
-                            },
-                            "git_sha": {
-                                "type": "string",
-                                "description": "Optional git commit SHA to search at (defaults to current HEAD)"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
-                            },
-                            "path_pattern": {
-                                "type": "string",
-                                "description": "Optional regex pattern to filter results by file path"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of results to return (default: 10, max: 100)",
-                                "default": 10,
-                                "minimum": 1,
-                                "maximum": 100
-                            }
-                        },
-                        "required": ["query_text"]
-                    }
-                },
-                {
-                    "name": "find_commit",
-                    "description": "Find and display metadata for a git commit or range of commits. Accepts flexible git references like SHA, short SHA, branch names, HEAD, or git ranges. Supports filtering by author name/email (OR logic), subject (OR logic), commit message and diff (AND logic), symbol list (AND logic), and file paths (OR logic). Results can be paginated with 50 lines per page.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "git_ref": {
-                                "type": "string",
-                                "description": "Git reference to look up (SHA, short SHA, branch name, HEAD, etc.). Not required if git_range is specified."
-                            },
-                            "git_range": {
-                                "type": "string",
-                                "description": "Optional git range to show multiple commits (e.g., 'HEAD~10..HEAD', 'abc123..def456'). Mutually exclusive with git_ref."
-                            },
-                            "author_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter commits by author name/email - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
-                            },
-                            "subject_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter commits by subject line - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
-                            },
-                            "regex_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter commits - ALL patterns must match against the combined commit message and unified diff (AND logic). Equivalent to passing -r multiple times."
-                            },
-                            "symbol_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter commits by symbols - ALL patterns must match at least one symbol in the commit (AND logic). Equivalent to passing -g multiple times."
-                            },
-                            "path_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter commits by file paths - ANY pattern must match at least one file path in the commit (OR logic). Equivalent to passing -p multiple times."
-                            },
-                            "reachable_sha": {
-                                "type": "string",
-                                "description": "Optional git SHA to filter results to only commits reachable from (i.e., ancestors of) the specified commit. Equivalent to --reachable in the query tool."
-                            },
-                            "verbose": {
-                                "type": "boolean",
-                                "description": "Show full diff in addition to metadata (default: false)",
-                                "default": false
-                            },
-                            "page": {
-                                "type": "integer",
-                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
-                                "minimum": 1
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "vcommit_similar_commits",
-                    "description": "Search for commits similar to the provided text using semantic vector embeddings. Requires commit vectors to be generated first with 'semcode-index --vectors'. Supports filtering by author name/email (OR logic), subject (OR logic), message/diff (AND logic), symbols (AND logic), and paths (OR logic). Results can be paginated with 50 lines per page.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query_text": {
-                                "type": "string",
-                                "description": "Text describing the kind of commits to find (e.g., 'fix memory leak', 'refactor parser', 'performance optimization')"
-                            },
-                            "git_range": {
-                                "type": "string",
-                                "description": "Optional git range to filter results (e.g., 'HEAD~100..HEAD', 'main~50..HEAD')"
-                            },
-                            "author_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter results by author name/email - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
-                            },
-                            "subject_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter results by subject line - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
-                            },
-                            "regex_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter results by commit message and diff - ALL patterns must match (AND logic). Equivalent to passing -r multiple times."
-                            },
-                            "symbol_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter results by symbols - ALL patterns must match at least one symbol in the commit (AND logic). Equivalent to passing -g multiple times."
-                            },
-                            "path_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter results by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
-                            },
-                            "reachable_sha": {
-                                "type": "string",
-                                "description": "Optional git SHA to filter results to only commits reachable from (i.e., ancestors of) the specified commit. Equivalent to --reachable in the query tool."
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of results to return (default: 10, max: 50)",
-                                "default": 10,
-                                "minimum": 1,
-                                "maximum": 50
-                            },
-                            "page": {
-                                "type": "integer",
-                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
-                                "minimum": 1
-                            }
-                        },
-                        "required": ["query_text"]
-                    }
-                },
-                {
-                    "name": "lore_search",
-                    "description": "Search lore.kernel.org email archives with regex filters. Supports multiple field filters (from, subject, body, symbols, recipients) with OR logic within each field and AND logic across fields. Can show full threads. Results can be paginated with 50 lines per page. Same functionality as query tool's 'lore' command.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "from_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by from field (OR logic). Equivalent to passing -f multiple times in query tool."
-                            },
-                            "subject_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by subject (OR logic). Equivalent to passing -s multiple times in query tool."
-                            },
-                            "body_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by message body (OR logic). Equivalent to passing -b multiple times in query tool."
-                            },
-                            "symbols_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by symbols mentioned in patches (OR logic). Equivalent to passing -g multiple times in query tool."
-                            },
-                            "recipients_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by recipients field (OR logic). Equivalent to passing -t multiple times in query tool."
-                            },
-                            "message_id": {
-                                "type": "string",
-                                "description": "Optional exact message ID for direct lookup (equivalent to -m flag in query tool)"
-                            },
-                            "verbose": {
-                                "type": "boolean",
-                                "description": "Show full message body (default: false, shows only headers)",
-                                "default": false
-                            },
-                            "show_thread": {
-                                "type": "boolean",
-                                "description": "Show full email thread for each match (default: false)",
-                                "default": false
-                            },
-                            "show_replies": {
-                                "type": "boolean",
-                                "description": "Show all replies/subthreads under each match (default: false, mutually exclusive with show_thread)",
-                                "default": false
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of results (default: 100, 0 = unlimited)",
-                                "default": 100,
-                                "minimum": 0
-                            },
-                            "since_date": {
-                                "type": "string",
-                                "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
-                            },
-                            "until_date": {
-                                "type": "string",
-                                "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
-                            },
-                            "page": {
-                                "type": "integer",
-                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
-                                "minimum": 1
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "dig",
-                    "description": "Search for lore.kernel.org emails related to a git commit. Orders results by date (newest first). Same functionality as query tool's 'dig' command.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "commit": {
-                                "type": "string",
-                                "description": "Git commit reference (SHA, short SHA, HEAD, branch name, etc.)"
-                            },
-                            "verbose": {
-                                "type": "boolean",
-                                "description": "Show full message body (default: false)",
-                                "default": false
-                            },
-                            "show_all": {
-                                "type": "boolean",
-                                "description": "Show all duplicate results, not just most recent (equivalent to -a flag in query tool)",
-                                "default": false
-                            },
-                            "show_thread": {
-                                "type": "boolean",
-                                "description": "Show full thread for each result (use with show_all, equivalent to --thread flag in query tool)",
-                                "default": false
-                            },
-                            "show_replies": {
-                                "type": "boolean",
-                                "description": "Show all replies/subthreads under each result (use with show_all, mutually exclusive with show_thread)",
-                                "default": false
-                            },
-                            "page": {
-                                "type": "integer",
-                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
-                                "minimum": 1
-                            },
-                            "since_date": {
-                                "type": "string",
-                                "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
-                            },
-                            "until_date": {
-                                "type": "string",
-                                "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
-                            }
-                        },
-                        "required": ["commit"]
-                    }
-                },
-                {
-                    "name": "vlore_similar_emails",
-                    "description": "Search lore.kernel.org emails similar to the provided text using semantic vector embeddings. Requires lore vectors to be generated first. Supports filtering by from address, subject, body, symbols, and recipients patterns. Results can be paginated with 50 lines per page.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query_text": {
-                                "type": "string",
-                                "description": "Text describing the kind of emails to find (e.g., 'memory leak fix', 'patch review', 'performance optimization')"
-                            },
-                            "from_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by from field - ANY pattern must match (OR logic). Equivalent to passing -f multiple times."
-                            },
-                            "subject_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by subject - ANY pattern must match (OR logic). Equivalent to passing -s multiple times."
-                            },
-                            "body_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by message body - ANY pattern must match (OR logic). Equivalent to passing -b multiple times."
-                            },
-                            "symbols_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by symbols mentioned in patches - ANY pattern must match (OR logic). Equivalent to passing -g multiple times."
-                            },
-                            "recipients_patterns": {
-                                "type": "array",
-                                "items": {
-                                    "type": "string"
-                                },
-                                "description": "Optional array of regex patterns to filter by recipients (To/Cc) - ANY pattern must match (OR logic). Equivalent to passing -t multiple times."
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of results to return (default: 20, max: 100)",
-                                "default": 20,
-                                "minimum": 1,
-                                "maximum": 100
-                            },
-                            "since_date": {
-                                "type": "string",
-                                "description": "Optional date to filter emails from this date onwards. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
-                            },
-                            "until_date": {
-                                "type": "string",
-                                "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
-                            },
-                            "page": {
-                                "type": "integer",
-                                "description": "Optional page number for pagination (1-based). If not provided, returns entire result. Each page contains 50 lines. Results indicate current page and total pages.",
-                                "minimum": 1
-                            }
-                        },
-                        "required": ["query_text"]
-                    }
-                },
-                {
-                    "name": "indexing_status",
-                    "description": "Check the status of the background indexing operation. Returns current state, progress, and any errors.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                },
-                {
-                    "name": "list_branches",
-                    "description": "List all indexed branches with their status (up-to-date or outdated)",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                },
-                {
-                    "name": "compare_branches",
-                    "description": "Compare two branches showing their relationship (merge base, which is ahead/behind)",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "branch1": {
-                                "type": "string",
-                                "description": "First branch name (e.g., 'main', 'develop')"
-                            },
-                            "branch2": {
-                                "type": "string",
-                                "description": "Second branch name (e.g., 'feature-branch', 'origin/main')"
-                            }
-                        },
-                        "required": ["branch1", "branch2"]
-                    }
-                }
-            ]
+            "tools": get_all_tool_schemas()
         })
     }
 
