@@ -5871,4 +5871,287 @@ mod tests {
         let content = result["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("Failed: Connection timeout"));
     }
+
+    // Lazy loading tests
+    #[test]
+    fn test_get_tool_schema_returns_valid_schemas() {
+        // Test that all known tools return valid schemas
+        let known_tools = [
+            "find_function",
+            "find_type",
+            "find_callers",
+            "find_calls",
+            "find_callchain",
+            "diff_functions",
+            "grep_functions",
+            "vgrep_functions",
+            "find_commit",
+            "vcommit_similar_commits",
+            "lore_search",
+            "dig",
+            "vlore_similar_emails",
+            "indexing_status",
+            "list_branches",
+            "compare_branches",
+        ];
+
+        for tool_name in known_tools {
+            let schema = get_tool_schema(tool_name);
+            assert!(schema.is_some(), "Schema for {} should exist", tool_name);
+            let schema = schema.unwrap();
+            assert_eq!(
+                schema["name"].as_str().unwrap(),
+                tool_name,
+                "Schema name should match"
+            );
+            assert!(
+                schema.get("inputSchema").is_some(),
+                "Schema for {} should have inputSchema",
+                tool_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_tool_schema_returns_none_for_unknown() {
+        assert!(get_tool_schema("nonexistent_tool").is_none());
+        assert!(get_tool_schema("").is_none());
+    }
+
+    #[test]
+    fn test_get_all_tool_schemas_returns_16_tools() {
+        let schemas = get_all_tool_schemas();
+        assert_eq!(schemas.len(), 16, "Should return all 16 tool schemas");
+    }
+
+    #[test]
+    fn test_tool_categories_cover_all_tools() {
+        // Collect all tool names from categories
+        let mut tools_in_categories: Vec<&str> = TOOL_CATEGORIES
+            .iter()
+            .flat_map(|cat| cat.tool_names.iter().copied())
+            .collect();
+        tools_in_categories.sort();
+
+        // Get all known tools from get_all_tool_schemas
+        let all_schemas = get_all_tool_schemas();
+        let mut all_tools: Vec<&str> = all_schemas
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        all_tools.sort();
+
+        assert_eq!(
+            tools_in_categories, all_tools,
+            "Categories should cover all tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_list_categories_returns_all_categories() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: true,
+        };
+
+        let result = server.handle_list_categories().await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+
+        // Check all 5 categories are listed
+        assert!(content.contains("code_lookup"));
+        assert!(content.contains("code_search"));
+        assert!(content.contains("git_history"));
+        assert!(content.contains("lore_email"));
+        assert!(content.contains("status"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_tools_returns_schemas_for_category() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: true,
+        };
+
+        let result = server
+            .handle_get_tools(&json!({"category": "code_lookup"}))
+            .await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+
+        // Should contain the 5 code_lookup tools
+        assert!(content.contains("find_function"));
+        assert!(content.contains("find_type"));
+        assert!(content.contains("find_callers"));
+        assert!(content.contains("find_calls"));
+        assert!(content.contains("find_callchain"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_tools_invalid_category() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: true,
+        };
+
+        let result = server
+            .handle_get_tools(&json!({"category": "invalid_category"}))
+            .await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+
+        assert!(content.contains("Unknown category"));
+        assert!(content.contains("invalid_category"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_tool_unknown_tool() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: true,
+        };
+
+        let result = server
+            .handle_call_tool(&json!({"tool_name": "nonexistent_tool"}))
+            .await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+
+        assert!(content.contains("Unknown tool"));
+        assert!(content.contains("nonexistent_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_call_tool_prevents_meta_tool_recursion() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: true,
+        };
+
+        // Try to call meta-tools via call_tool
+        for meta_tool in &["list_categories", "get_tools", "call_tool"] {
+            let result = server
+                .handle_call_tool(&json!({"tool_name": meta_tool}))
+                .await;
+            let content = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                content.contains("Cannot call meta-tool"),
+                "Should prevent calling {} via call_tool",
+                meta_tool
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_mode_returns_meta_tools_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: true, // Enable lazy mode
+        };
+
+        let result = server.handle_list_tools().await;
+        let tools = result["tools"].as_array().unwrap();
+
+        // Should return exactly 3 meta-tools
+        assert_eq!(tools.len(), 3, "Lazy mode should return 3 meta-tools");
+
+        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(tool_names.contains(&"list_categories"));
+        assert!(tool_names.contains(&"get_tools"));
+        assert!(tool_names.contains(&"call_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_non_lazy_mode_returns_all_tools() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false, // Disable lazy mode
+        };
+
+        let result = server.handle_list_tools().await;
+        let tools = result["tools"].as_array().unwrap();
+
+        // Should return all 16 tools
+        assert_eq!(tools.len(), 16, "Non-lazy mode should return all 16 tools");
+    }
 }
