@@ -92,6 +92,32 @@ commit.  You can also pass a specific commit you're interested in, or a branch n
   - No parameters required
   - Shows current indexing progress, errors, and timing
 
+## Lazy Loading
+
+To reduce the initial context size consumed by the MCP server (saving ~96% of initial tokens), you can start the server in **lazy mode** using the `--lazy` flag.
+
+In lazy mode, the server initially exposes only 3 meta-tools:
+
+**list_categories**: List available tool categories
+  - No parameters required
+  - Returns a list of categories (e.g., `code_lookup`, `code_search`) and their descriptions
+  - Use this first to discover what semcode can do
+
+**get_tools**: Get full schemas for tools in a category
+  - category: The name of the category to inspect (from `list_categories`)
+  - Returns the full tool definitions for all tools in that category
+  - Use this to learn how to call specific tools
+
+**call_tool**: Execute a specific tool
+  - tool_name: Name of the tool to execute (e.g., `find_function`)
+  - arguments: Object containing the arguments for the tool
+  - Use this to run tools after you've discovered them
+
+**Workflow**:
+1. Call `list_categories` to see available functionality
+2. Call `get_tools` for a relevant category (e.g., `code_lookup`)
+3. Call `call_tool` to execute the desired tool (e.g., `find_function`)
+
 ## Recipes
 
 ### Searching for commits reachable from HEAD (or any other git sha)
