@@ -2797,6 +2797,7 @@ impl McpServer {
             "compare_branches" => self.handle_compare_branches(arguments).await,
             // Lazy loading meta-tools
             "list_categories" => self.handle_list_categories().await,
+            "get_tools" => self.handle_get_tools(arguments).await,
             _ => json!({
                 "error": format!("Unknown tool: {}", name),
                 "isError": true
@@ -2823,6 +2824,45 @@ impl McpServer {
         json!({
             "content": [{"type": "text", "text": output}]
         })
+    }
+
+    async fn handle_get_tools(&self, args: &Value) -> Value {
+        let category = args["category"].as_str().unwrap_or("");
+
+        // Find the category
+        let cat = TOOL_CATEGORIES.iter().find(|c| c.name == category);
+
+        match cat {
+            Some(category) => {
+                // Collect full schemas for all tools in this category
+                let tools: Vec<Value> = category
+                    .tool_names
+                    .iter()
+                    .filter_map(|name| get_tool_schema(name))
+                    .collect();
+
+                // Return as JSON formatted text
+                let output = serde_json::to_string_pretty(&json!({"tools": tools}))
+                    .unwrap_or_else(|_| "Error formatting tools".to_string());
+
+                json!({
+                    "content": [{"type": "text", "text": output}]
+                })
+            }
+            None => {
+                let available: Vec<&str> = TOOL_CATEGORIES.iter().map(|c| c.name).collect();
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "Unknown category: '{}'\nAvailable categories: {}",
+                            category,
+                            available.join(", ")
+                        )
+                    }]
+                })
+            }
+        }
     }
 
     // Tool implementation methods
