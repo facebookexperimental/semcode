@@ -1988,7 +1988,6 @@ struct VCommitParams<'a> {
 }
 
 /// Tool category for lazy loading
-#[allow(dead_code)]
 struct ToolCategory {
     name: &'static str,
     description: &'static str,
@@ -1996,7 +1995,6 @@ struct ToolCategory {
 }
 
 /// Tool categories for lazy loading - groups the 16 tools into logical categories
-#[allow(dead_code)]
 const TOOL_CATEGORIES: &[ToolCategory] = &[
     ToolCategory {
         name: "code_lookup",
@@ -2797,11 +2795,34 @@ impl McpServer {
             "indexing_status" => self.handle_indexing_status().await,
             "list_branches" => self.handle_list_branches().await,
             "compare_branches" => self.handle_compare_branches(arguments).await,
+            // Lazy loading meta-tools
+            "list_categories" => self.handle_list_categories().await,
             _ => json!({
                 "error": format!("Unknown tool: {}", name),
                 "isError": true
             }),
         }
+    }
+
+    // Lazy loading meta-tool handlers
+    async fn handle_list_categories(&self) -> Value {
+        let mut output = String::from("Available semcode tool categories:\n\n");
+
+        for (i, cat) in TOOL_CATEGORIES.iter().enumerate() {
+            output.push_str(&format!(
+                "{}. {} - {}\n   Tools: {}\n\n",
+                i + 1,
+                cat.name,
+                cat.description,
+                cat.tool_names.join(", ")
+            ));
+        }
+
+        output.push_str("Use get_tools with a category name to see full tool schemas.");
+
+        json!({
+            "content": [{"type": "text", "text": output}]
+        })
     }
 
     // Tool implementation methods
