@@ -2614,7 +2614,6 @@ struct McpServer {
     page_cache: PageCache,
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
     notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
-    #[allow(dead_code)] // Used in commit 6: Wire up lazy mode
     lazy_mode: bool,
 }
 
@@ -2769,9 +2768,59 @@ impl McpServer {
     }
 
     async fn handle_list_tools(&self) -> Value {
-        json!({
-            "tools": get_all_tool_schemas()
-        })
+        if self.lazy_mode {
+            // Return only meta-tools for lazy loading (~96% context reduction)
+            json!({
+                "tools": [
+                    {
+                        "name": "list_categories",
+                        "description": "List available tool categories. Call this first to discover what semcode can do.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    },
+                    {
+                        "name": "get_tools",
+                        "description": "Get the full schema for tools in a category. Use this to get tool details before calling them.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "category": {
+                                    "type": "string",
+                                    "description": "Category name from list_categories (e.g., 'code_lookup', 'code_search', 'git_history', 'lore_email', 'status')"
+                                }
+                            },
+                            "required": ["category"]
+                        }
+                    },
+                    {
+                        "name": "call_tool",
+                        "description": "Execute a semcode tool by name with given arguments. Use get_tools first to see the required arguments.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "tool_name": {
+                                    "type": "string",
+                                    "description": "Name of the tool to call (e.g., 'find_function', 'grep_functions')"
+                                },
+                                "arguments": {
+                                    "type": "object",
+                                    "description": "Arguments to pass to the tool (see get_tools for schema)"
+                                }
+                            },
+                            "required": ["tool_name"]
+                        }
+                    }
+                ]
+            })
+        } else {
+            // Return all tools (existing behavior)
+            json!({
+                "tools": get_all_tool_schemas()
+            })
+        }
     }
 
     async fn handle_tool_call(&self, params: &Value) -> Value {
