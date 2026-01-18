@@ -5437,7 +5437,7 @@ async fn main() -> Result<()> {
     let git_repo_for_indexing = args.git_repo.clone();
     let indexing_state_for_bg = server.indexing_state.clone();
     let notification_tx_for_bg = server.notification_tx.clone();
-    let _indexing_handle = tokio::spawn(async move {
+    let indexing_handle = tokio::spawn(async move {
         // Ensure tables exist before indexing
         if let Err(e) = db_for_indexing.create_tables().await {
             eprintln!("[Background] Error creating/verifying tables: {}", e);
@@ -5457,6 +5457,10 @@ async fn main() -> Result<()> {
 
     // Run MCP server on stdio
     run_stdio_server(server).await?;
+
+    // Gracefully shutdown the background indexing task
+    indexing_handle.abort();
+    let _ = indexing_handle.await;
 
     Ok(())
 }
