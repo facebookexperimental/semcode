@@ -1120,7 +1120,7 @@ pub async fn query_function_or_macro_to_writer_verbose(
 }
 
 /// Check if a function is actually a definition (has implementation) vs just a declaration
-fn is_function_definition(func: &crate::FunctionInfo) -> bool {
+pub fn is_function_definition(func: &crate::FunctionInfo) -> bool {
     if func.body.is_empty() {
         return false; // Empty body is definitely a declaration
     }

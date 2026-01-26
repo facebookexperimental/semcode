@@ -2,8 +2,8 @@
 use anyhow::Result;
 use clap::Parser;
 use semcode::{
-    git, pages::PageCache, process_database_path, search::LoreSearchOptions, DatabaseManager,
-    LoreEmailFilters,
+    git, pages::PageCache, process_database_path, search::is_function_definition,
+    search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
 };
 use serde_json::{json, Value};
 use std::io::Write;
@@ -40,15 +40,78 @@ async fn mcp_query_function_or_macro(
     name: &str,
     git_sha: &str,
 ) -> Result<String> {
-    // Use the same method as the query tool - find the single best matches
-    let func_opt = db.find_function_git_aware(name, git_sha).await?;
-    let macro_result = db.find_function_git_aware(name, git_sha).await?;
+    // Find all functions/macros at the specific git SHA, then filter to definitions only
+    // This matches the query tool behavior which avoids returning call sites
+    let all_matches = db.find_all_functions_git_aware(name, git_sha).await?;
 
-    let result = match (func_opt, macro_result) {
-        (Some(func), None) => {
-            // Found function only
-            let mut result = String::new();
+    // Filter to only keep actual definitions (not declarations or call sites)
+    let definitions: Vec<_> = all_matches
+        .into_iter()
+        .filter(is_function_definition)
+        .collect();
 
+    let result = if definitions.is_empty() {
+        // No exact match found, try regex search
+        let regex_functions = db
+            .search_functions_regex_git_aware(name, git_sha)
+            .await
+            .unwrap_or_default();
+
+        if !regex_functions.is_empty() {
+            let mut result = format!("No exact match found for '{name}' at git SHA {git_sha}, but found matches using it as a regex pattern:\n\n");
+
+            result.push_str("=== Functions (includes macros stored as functions) ===\n");
+            for func in regex_functions.iter().take(10) {
+                let params_str = func
+                    .parameters
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, p.type_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                result.push_str(&format!(
+                    "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\n\n",
+                    func.name,
+                    git_sha,
+                    func.file_path,
+                    func.line_start,
+                    func.line_end,
+                    func.return_type,
+                    params_str
+                ));
+            }
+
+            result
+        } else {
+            format!("Function '{name}' not found at git SHA {git_sha}")
+        }
+    } else if definitions.len() == 1 {
+        // Single definition found
+        let entity = &definitions[0];
+
+        if entity.return_type.is_empty() {
+            // Found macro (stored as function with empty return_type)
+            let params_str = entity
+                .parameters
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // Get macro call relationships to show counts
+            let macro_calls = entity.calls.clone().unwrap_or_default();
+            let macro_callers = db
+                .get_function_callers_git_aware(&entity.name, git_sha)
+                .await
+                .unwrap_or_default();
+
+            format!(
+                "Macro: {} (git SHA: {})\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}",
+                entity.name, git_sha, entity.file_path, entity.line_start, params_str, macro_calls.len(), macro_callers.len(), entity.body
+            )
+        } else {
+            // Found function
+            let func = entity;
             let params_str = func
                 .parameters
                 .iter()
@@ -67,7 +130,7 @@ async fn mcp_query_function_or_macro(
                 .await
                 .unwrap_or_default();
 
-            result.push_str(&format!(
+            format!(
                 "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
                 func.name,
                 git_sha,
@@ -79,113 +142,72 @@ async fn mcp_query_function_or_macro(
                 calls.len(),
                 callers.len(),
                 func.body
-            ));
-
-            result
-        }
-        (None, Some(mac)) => {
-            // Found macro only (stored as function)
-            let params_str = mac
-                .parameters
-                .iter()
-                .map(|p| format!("{}: {}", p.name, p.type_name))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            // Get macro call relationships to show counts
-            let macro_calls = mac.calls.clone().unwrap_or_default();
-            let macro_callers = db
-                .get_function_callers_git_aware(&mac.name, git_sha)
-                .await
-                .unwrap_or_default();
-
-            format!(
-                "Macro: {} (git SHA: {})\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}",
-                mac.name, git_sha, mac.file_path, mac.line_start, params_str, macro_calls.len(), macro_callers.len(), mac.body
             )
         }
-        (Some(func), Some(mac)) => {
-            // Found both function and macro
-            let mut result =
-                format!("Found function and macro with name '{name}' (git SHA: {git_sha})\n\n");
+    } else {
+        // Multiple definitions found - display all of them
+        let mut result = format!(
+            "Found {} definitions with name '{}' at git SHA {}:\n\n",
+            definitions.len(),
+            name,
+            git_sha
+        );
 
-            // Display function
-            let func_params_str = func
-                .parameters
-                .iter()
-                .map(|p| format!("{}: {}", p.name, p.type_name))
-                .collect::<Vec<_>>()
-                .join(", ");
+        for (i, entity) in definitions.iter().enumerate() {
+            result.push_str(&format!("=== Definition {} of {} ===\n", i + 1, definitions.len()));
 
-            // Get call relationships for counts
-            let func_calls = db
-                .get_function_callees_git_aware(&func.name, git_sha)
-                .await
-                .unwrap_or_default();
+            if entity.return_type.is_empty() {
+                // Macro
+                let params_str = entity
+                    .parameters
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
-            let func_callers = db
-                .get_function_callers_git_aware(name, git_sha)
-                .await
-                .unwrap_or_default();
-
-            result.push_str(&format!(
-                "Function: {}\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
-                func.name, func.file_path, func.line_start, func.line_end, func.return_type, func_params_str, func_calls.len(), func_callers.len(), func.body
-            ));
-
-            // Display macro (stored as function)
-            let macro_params_str = mac
-                .parameters
-                .iter()
-                .map(|p| format!("{}: {}", p.name, p.type_name))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let macro_calls = mac.calls.clone().unwrap_or_default();
-
-            result.push_str(&format!(
-                "==> Macro:\nMacro: {}\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}\n\n",
-                mac.name, mac.file_path, mac.line_start, macro_params_str, macro_calls.len(), func_callers.len(), mac.body
-            ));
-
-            result
-        }
-        (None, None) => {
-            // No exact match found, try regex search
-            let regex_functions = db
-                .search_functions_regex_git_aware(name, git_sha)
-                .await
-                .unwrap_or_default();
-
-            if !regex_functions.is_empty() {
-                let mut result = format!("No exact match found for '{name}' at git SHA {git_sha}, but found matches using it as a regex pattern:\n\n");
-
-                result.push_str("=== Functions (includes macros stored as functions) ===\n");
-                for func in regex_functions.iter().take(10) {
-                    let params_str = func
-                        .parameters
-                        .iter()
-                        .map(|p| format!("{}: {}", p.name, p.type_name))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-
-                    result.push_str(&format!(
-                        "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\n\n",
-                        func.name,
-                        git_sha,
-                        func.file_path,
-                        func.line_start,
-                        func.line_end,
-                        func.return_type,
-                        params_str
-                    ));
-                }
-
-                result
+                result.push_str(&format!(
+                    "Macro: {}\nFile: {}:{}\nParameters: ({})\nDefinition:\n{}\n\n",
+                    entity.name, entity.file_path, entity.line_start, params_str, entity.body
+                ));
             } else {
-                format!("Function '{name}' not found at git SHA {git_sha}")
+                // Function
+                let params_str = entity
+                    .parameters
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, p.type_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                result.push_str(&format!(
+                    "Function: {}\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nBody:\n{}\n\n",
+                    entity.name,
+                    entity.file_path,
+                    entity.line_start,
+                    entity.line_end,
+                    entity.return_type,
+                    params_str,
+                    entity.body
+                ));
             }
         }
+
+        // Show callers once for all definitions
+        let callers = db
+            .get_function_callers_git_aware(name, git_sha)
+            .await
+            .unwrap_or_default();
+
+        if !callers.is_empty() {
+            result.push_str(&format!("=== Called by {} functions ===\n", callers.len()));
+            for caller in callers.iter().take(20) {
+                result.push_str(&format!("  - {}\n", caller));
+            }
+            if callers.len() > 20 {
+                result.push_str(&format!("  ... and {} more\n", callers.len() - 20));
+            }
+        }
+
+        result
     };
 
     Ok(result)
@@ -246,23 +268,29 @@ async fn mcp_show_callers(
     // Write the header message
     writeln!(buffer, "Finding all functions that call: {function_name}")?;
 
-    // Use the same method as the query tool - find the single best function match
-    let func_opt = db.find_function_git_aware(function_name, git_sha).await?;
-    let macro_opt = db.find_function_git_aware(function_name, git_sha).await?;
+    // Find function or macro - both are stored in the functions table
+    // Macros are distinguished by having an empty return_type
+    let entity_opt = db.find_function_git_aware(function_name, git_sha).await?;
 
-    match (func_opt, macro_opt) {
-        (Some(_func), None) => {
-            // Found function only - get callers
+    match entity_opt {
+        Some(entity) => {
+            let is_macro = entity.return_type.is_empty();
+            let entity_type = if is_macro { "macro" } else { "function" };
+
+            // Get callers
             let callers = db
                 .get_function_callers_git_aware(function_name, git_sha)
                 .await?;
             if callers.is_empty() {
-                writeln!(buffer, "Info: No functions call '{function_name}'")?;
+                writeln!(
+                    buffer,
+                    "Info: No functions call {entity_type} '{function_name}'"
+                )?;
             } else if callers.len() > 1000 {
                 // Just show count when there are too many
                 writeln!(
                     buffer,
-                    "{} functions call '{}' (too many to display)",
+                    "{} functions call {entity_type} '{}' (too many to display)",
                     callers.len(),
                     function_name
                 )?;
@@ -270,7 +298,7 @@ async fn mcp_show_callers(
                 writeln!(buffer, "\n=== Direct Callers ===")?;
                 writeln!(
                     buffer,
-                    "{} functions directly call '{}':",
+                    "{} functions directly call {entity_type} '{}':",
                     callers.len(),
                     function_name
                 )?;
@@ -278,71 +306,30 @@ async fn mcp_show_callers(
                 for (i, caller) in callers.iter().enumerate() {
                     writeln!(buffer, "  {}. {}", i + 1, caller)?;
 
-                    // Try to get more info about the caller (function or macro)
-                    if let Ok(Some(caller_func)) = db.find_function_git_aware(caller, git_sha).await
-                    {
-                        writeln!(
-                            buffer,
-                            "     {} ({}:{})",
-                            caller_func.return_type, caller_func.file_path, caller_func.line_start
-                        )?;
-                    } else if let Ok(Some(caller_macro)) =
+                    // Try to get more info about the caller
+                    if let Ok(Some(caller_entity)) =
                         db.find_function_git_aware(caller, git_sha).await
                     {
-                        writeln!(
-                            buffer,
-                            "     macro ({}:{})",
-                            caller_macro.file_path, caller_macro.line_start
-                        )?;
+                        if caller_entity.return_type.is_empty() {
+                            writeln!(
+                                buffer,
+                                "     macro ({}:{})",
+                                caller_entity.file_path, caller_entity.line_start
+                            )?;
+                        } else {
+                            writeln!(
+                                buffer,
+                                "     {} ({}:{})",
+                                caller_entity.return_type,
+                                caller_entity.file_path,
+                                caller_entity.line_start
+                            )?;
+                        }
                     }
                 }
             }
         }
-        (None, Some(_macro_info)) => {
-            // Found macro only - get callers
-            let callers = db
-                .get_function_callers_git_aware(function_name, git_sha)
-                .await?;
-            if callers.is_empty() {
-                writeln!(buffer, "Info: No functions call macro '{function_name}'")?;
-            } else {
-                writeln!(buffer, "\n=== Direct Callers ===")?;
-                writeln!(
-                    buffer,
-                    "{} functions directly call macro '{}':",
-                    callers.len(),
-                    function_name
-                )?;
-
-                for (i, caller) in callers.iter().enumerate() {
-                    writeln!(buffer, "  {}. {}", i + 1, caller)?;
-                }
-            }
-        }
-        (Some(_func), Some(_macro_info)) => {
-            // Found both - show function callers
-            let callers = db
-                .get_function_callers_git_aware(function_name, git_sha)
-                .await?;
-            writeln!(buffer, "Note: Found both a function and a macro with this name! Showing function call relationships.")?;
-
-            if callers.is_empty() {
-                writeln!(buffer, "Info: No functions call function '{function_name}'")?;
-            } else {
-                writeln!(buffer, "\n=== Direct Callers (Function) ===")?;
-                writeln!(
-                    buffer,
-                    "{} functions directly call function '{}':",
-                    callers.len(),
-                    function_name
-                )?;
-
-                for (i, caller) in callers.iter().enumerate() {
-                    writeln!(buffer, "  {}. {}", i + 1, caller)?;
-                }
-            }
-        }
-        (None, None) => {
+        None => {
             writeln!(
                 buffer,
                 "Error: Function or macro '{function_name}' not found in database"
@@ -363,26 +350,33 @@ async fn mcp_show_calls(
     // Write the header message
     writeln!(buffer, "Finding all functions called by: {function_name}")?;
 
-    // Use the same method as the query tool - find the single best function match
-    let func_opt = db.find_function_git_aware(function_name, git_sha).await?;
-    let macro_opt = db.find_function_git_aware(function_name, git_sha).await?;
+    // Find function or macro - both are stored in the functions table
+    // Macros are distinguished by having an empty return_type
+    let entity_opt = db.find_function_git_aware(function_name, git_sha).await?;
 
-    match (func_opt, macro_opt) {
-        (Some(_func), None) => {
-            // Found function only - get callees
-            let calls = db
-                .get_function_callees_git_aware(function_name, git_sha)
-                .await?;
+    match entity_opt {
+        Some(entity) => {
+            let is_macro = entity.return_type.is_empty();
+            let entity_type = if is_macro { "Macro" } else { "Function" };
+
+            // Get callees - for macros, use the calls field; for functions, use db lookup
+            let calls = if is_macro {
+                entity.calls.clone().unwrap_or_default()
+            } else {
+                db.get_function_callees_git_aware(function_name, git_sha)
+                    .await?
+            };
+
             if calls.is_empty() {
                 writeln!(
                     buffer,
-                    "Info: Function '{function_name}' doesn't call any other functions"
+                    "Info: {entity_type} '{function_name}' doesn't call any other functions"
                 )?;
             } else if calls.len() > 1000 {
                 // Just show count when there are too many
                 writeln!(
                     buffer,
-                    "Function '{}' calls {} functions (too many to display)",
+                    "{entity_type} '{}' calls {} functions (too many to display)",
                     function_name,
                     calls.len()
                 )?;
@@ -390,7 +384,7 @@ async fn mcp_show_calls(
                 writeln!(buffer, "\n=== Direct Calls ===")?;
                 writeln!(
                     buffer,
-                    "Function '{}' directly calls {} functions:",
+                    "{entity_type} '{}' directly calls {} functions:",
                     function_name,
                     calls.len()
                 )?;
@@ -398,86 +392,30 @@ async fn mcp_show_calls(
                 for (i, callee) in calls.iter().enumerate() {
                     writeln!(buffer, "  {}. {}", i + 1, callee)?;
 
-                    // Try to get more info about the callee (function or macro)
-                    if let Ok(Some(callee_func)) = db.find_function_git_aware(callee, git_sha).await
-                    {
-                        writeln!(
-                            buffer,
-                            "     {} ({}:{})",
-                            callee_func.return_type, callee_func.file_path, callee_func.line_start
-                        )?;
-                    } else if let Ok(Some(callee_macro)) =
+                    // Try to get more info about the callee
+                    if let Ok(Some(callee_entity)) =
                         db.find_function_git_aware(callee, git_sha).await
                     {
-                        writeln!(
-                            buffer,
-                            "     macro ({}:{})",
-                            callee_macro.file_path, callee_macro.line_start
-                        )?;
+                        if callee_entity.return_type.is_empty() {
+                            writeln!(
+                                buffer,
+                                "     macro ({}:{})",
+                                callee_entity.file_path, callee_entity.line_start
+                            )?;
+                        } else {
+                            writeln!(
+                                buffer,
+                                "     {} ({}:{})",
+                                callee_entity.return_type,
+                                callee_entity.file_path,
+                                callee_entity.line_start
+                            )?;
+                        }
                     }
                 }
             }
         }
-        (None, Some(macro_info)) => {
-            // Found macro only - get calls from macro's calls field
-            let calls = macro_info.calls.clone().unwrap_or_default();
-            if calls.is_empty() {
-                writeln!(
-                    buffer,
-                    "Info: Macro '{function_name}' doesn't call any other functions"
-                )?;
-            } else {
-                writeln!(buffer, "\n=== Direct Calls ===")?;
-                writeln!(
-                    buffer,
-                    "Macro '{}' directly calls {} functions:",
-                    function_name,
-                    calls.len()
-                )?;
-
-                for (i, callee) in calls.iter().enumerate() {
-                    writeln!(buffer, "  {}. {}", i + 1, callee)?;
-                }
-            }
-        }
-        (Some(_func), Some(macro_info)) => {
-            // Found both - show function calls
-            let calls = db
-                .get_function_callees_git_aware(function_name, git_sha)
-                .await?;
-            writeln!(buffer, "Note: Found both a function and a macro with this name! Showing function call relationships.")?;
-
-            if calls.is_empty() {
-                writeln!(
-                    buffer,
-                    "Info: Function '{function_name}' doesn't call any other functions"
-                )?;
-
-                // Also check macro calls
-                let macro_calls = macro_info.calls.clone().unwrap_or_default();
-                if !macro_calls.is_empty() {
-                    writeln!(
-                        buffer,
-                        "Note: But macro '{}' calls {} functions",
-                        function_name,
-                        macro_calls.len()
-                    )?;
-                }
-            } else {
-                writeln!(buffer, "\n=== Direct Calls (Function) ===")?;
-                writeln!(
-                    buffer,
-                    "Function '{}' directly calls {} functions:",
-                    function_name,
-                    calls.len()
-                )?;
-
-                for (i, callee) in calls.iter().enumerate() {
-                    writeln!(buffer, "  {}. {}", i + 1, callee)?;
-                }
-            }
-        }
-        (None, None) => {
+        None => {
             writeln!(
                 buffer,
                 "Error: Function or macro '{function_name}' not found in database"
