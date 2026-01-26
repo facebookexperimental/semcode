@@ -100,9 +100,10 @@ struct Args {
     #[arg(long, default_value = "2")]
     db_threads: usize,
 
-    /// Clone and index a lore.kernel.org archive into <db_dir>/lore/<repo>
-    #[arg(long, value_name = "URL")]
-    lore: Option<String>,
+    /// Clone and index lore.kernel.org archives into <db_dir>/lore/<repo>
+    /// Accepts comma-separated list of archives (e.g., --lore bpf,netdev,lkml/0)
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    lore: Vec<String>,
 
     // ==================== Multi-Branch Indexing ====================
     /// Index a specific branch (can be specified multiple times)
@@ -709,156 +710,225 @@ async fn main() -> Result<()> {
     // Process database path first (needed for lore cloning)
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
 
-    // Handle --lore option if provided - clone and index entire archive
-    if let Some(ref lore_url) = args.lore {
-        info!("Lore archive processing requested");
+    // Handle --lore option if provided - clone and index archives
+    if !args.lore.is_empty() {
+        info!(
+            "Lore archive processing requested for {} archives",
+            args.lore.len()
+        );
 
-        // Clone the repository
-        let clone_path = clone_lore_repository(lore_url, &database_path).await?;
-        info!("Lore archive cloned to: {}", clone_path.display());
-
-        // Create database manager
+        // Create database manager once for all archives
         let db_manager =
             DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
         db_manager.create_tables().await?;
+        let db_manager = Arc::new(db_manager);
 
-        // Get all commits from the lore repository
-        info!("Discovering all commits in lore archive...");
-        let lore_repo = gix::discover(&clone_path)?;
-
-        // Get the remote tracking branch to include all fetched commits
-        // Try refs/remotes/origin/master first, then refs/remotes/origin/main as fallback
-        let mut start_ref = lore_repo
-            .find_reference("refs/remotes/origin/master")
-            .or_else(|_| lore_repo.find_reference("refs/remotes/origin/main"))
-            .or_else(|_| {
-                // Fallback to HEAD if remote tracking branches don't exist (shouldn't happen after fetch)
-                info!("Remote tracking branch not found, using HEAD");
-                lore_repo
-                    .head()?
-                    .try_into_referent()
-                    .ok_or_else(|| anyhow::anyhow!("HEAD is not a symbolic reference"))
-            })?;
-
-        let start_commit = start_ref.peel_to_commit()?;
-
-        // Use rev_walk to get all commits reachable from the remote tracking branch
-        let walk = lore_repo
-            .rev_walk([start_commit.id()])
-            .sorting(gix::revision::walk::Sorting::ByCommitTime(
-                Default::default(),
-            ))
-            .all()?;
-
-        let mut all_commit_shas = Vec::new();
-        for info in walk {
-            let info = info?;
-            all_commit_shas.push(info.id().to_string());
-        }
-
-        // Reverse to get chronological order (oldest first)
-        all_commit_shas.reverse();
-
-        let total_commits = all_commit_shas.len();
-        info!("Found {} total commits in lore archive", total_commits);
-
-        // Get already indexed commits from database
-        println!("Checking for already-indexed commits...");
-        let existing_commits: HashSet<String> = {
-            let table = db_manager.connection().open_table("lore").execute().await?;
-            let stream = table
-                .query()
-                .select(lancedb::query::Select::Columns(vec![
-                    "git_commit_sha".to_string()
-                ]))
-                .execute()
-                .await?;
-
-            use futures::TryStreamExt;
-            let batches: Vec<_> = stream.try_collect().await?;
-
-            let mut shas = HashSet::new();
-            for batch in batches {
-                if let Some(column) = batch.column_by_name("git_commit_sha") {
-                    if let Some(string_array) =
-                        column.as_any().downcast_ref::<arrow::array::StringArray>()
-                    {
-                        for i in 0..string_array.len() {
-                            shas.insert(string_array.value(i).to_string());
-                        }
-                    }
-                }
-            }
-            shas
-        };
-
-        // Filter out already indexed commits
-        let new_commits: Vec<String> = all_commit_shas
-            .into_iter()
-            .filter(|sha| !existing_commits.contains(sha))
-            .collect();
-
-        let already_indexed = total_commits - new_commits.len();
-        if already_indexed > 0 {
-            println!(
-                "{} commits already indexed, processing {} new commits",
-                already_indexed,
-                new_commits.len()
-            );
-        } else {
-            println!("Processing all {} commits", new_commits.len());
-        }
-
-        if new_commits.is_empty() {
-            println!("All commits in lore archive are already indexed!");
-            return Ok(());
-        }
-
-        // Process new commits
         let start_time = std::time::Instant::now();
         let batch_size = 1024;
         let num_workers = num_cpus::get();
 
-        let db_manager = Arc::new(db_manager);
-        process_lore_commits_pipeline(
-            &clone_path,
-            new_commits.clone(),
-            db_manager.clone(),
-            batch_size,
-            num_workers,
-            args.db_threads,
-        )
-        .await?;
+        let mut total_new_emails = 0usize;
+        let mut total_emails_all_archives = 0usize;
+
+        // Process each lore archive
+        for lore_url in &args.lore {
+            println!("\n=== Processing lore archive: {} ===", lore_url);
+            info!("Processing lore archive: {}", lore_url);
+
+            // Clone the repository
+            let clone_path = match clone_lore_repository(lore_url, &database_path).await {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("Error cloning {}: {}", lore_url, e);
+                    continue;
+                }
+            };
+            info!("Lore archive cloned to: {}", clone_path.display());
+
+            // Get all commits from the lore repository
+            info!("Discovering all commits in lore archive...");
+            let lore_repo = match gix::discover(&clone_path) {
+                Ok(repo) => repo,
+                Err(e) => {
+                    eprintln!("Error opening repository {}: {}", clone_path.display(), e);
+                    continue;
+                }
+            };
+
+            // Get the remote tracking branch to include all fetched commits
+            // Try refs/remotes/origin/master first, then refs/remotes/origin/main as fallback
+            let mut start_ref = match lore_repo
+                .find_reference("refs/remotes/origin/master")
+                .or_else(|_| lore_repo.find_reference("refs/remotes/origin/main"))
+                .or_else(|_| {
+                    // Fallback to HEAD if remote tracking branches don't exist (shouldn't happen after fetch)
+                    info!("Remote tracking branch not found, using HEAD");
+                    lore_repo
+                        .head()?
+                        .try_into_referent()
+                        .ok_or_else(|| anyhow::anyhow!("HEAD is not a symbolic reference"))
+                }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error finding reference in {}: {}", lore_url, e);
+                    continue;
+                }
+            };
+
+            let start_commit = match start_ref.peel_to_commit() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error getting start commit for {}: {}", lore_url, e);
+                    continue;
+                }
+            };
+
+            // Use rev_walk to get all commits reachable from the remote tracking branch
+            let walk = match lore_repo
+                .rev_walk([start_commit.id()])
+                .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                    Default::default(),
+                ))
+                .all()
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Error walking commits in {}: {}", lore_url, e);
+                    continue;
+                }
+            };
+
+            let mut all_commit_shas = Vec::new();
+            let mut walk_error = false;
+            for info in walk {
+                match info {
+                    Ok(info) => all_commit_shas.push(info.id().to_string()),
+                    Err(e) => {
+                        eprintln!("Error walking commit in {}: {}", lore_url, e);
+                        walk_error = true;
+                        break;
+                    }
+                }
+            }
+            if walk_error {
+                continue;
+            }
+
+            // Reverse to get chronological order (oldest first)
+            all_commit_shas.reverse();
+
+            let total_commits = all_commit_shas.len();
+            info!("Found {} total commits in lore archive", total_commits);
+            total_emails_all_archives += total_commits;
+
+            // Get already indexed commits from database
+            println!("Checking for already-indexed commits...");
+            let existing_commits: HashSet<String> = {
+                let table = db_manager.connection().open_table("lore").execute().await?;
+                let stream = table
+                    .query()
+                    .select(lancedb::query::Select::Columns(vec![
+                        "git_commit_sha".to_string()
+                    ]))
+                    .execute()
+                    .await?;
+
+                use futures::TryStreamExt;
+                let batches: Vec<_> = stream.try_collect().await?;
+
+                let mut shas = HashSet::new();
+                for batch in batches {
+                    if let Some(column) = batch.column_by_name("git_commit_sha") {
+                        if let Some(string_array) =
+                            column.as_any().downcast_ref::<arrow::array::StringArray>()
+                        {
+                            for i in 0..string_array.len() {
+                                shas.insert(string_array.value(i).to_string());
+                            }
+                        }
+                    }
+                }
+                shas
+            };
+
+            // Filter out already indexed commits
+            let new_commits: Vec<String> = all_commit_shas
+                .into_iter()
+                .filter(|sha| !existing_commits.contains(sha))
+                .collect();
+
+            let already_indexed = total_commits - new_commits.len();
+            if already_indexed > 0 {
+                println!(
+                    "{} commits already indexed, processing {} new commits",
+                    already_indexed,
+                    new_commits.len()
+                );
+            } else {
+                println!("Processing all {} commits", new_commits.len());
+            }
+
+            if new_commits.is_empty() {
+                println!("All commits in {} are already indexed!", lore_url);
+                continue;
+            }
+
+            total_new_emails += new_commits.len();
+
+            // Process new commits
+            process_lore_commits_pipeline(
+                &clone_path,
+                new_commits.clone(),
+                db_manager.clone(),
+                batch_size,
+                num_workers,
+                args.db_threads,
+            )
+            .await?;
+
+            println!(
+                "Indexed {} new emails from {} (total in archive: {})",
+                new_commits.len(),
+                lore_url,
+                total_commits
+            );
+        }
 
         let total_time = start_time.elapsed();
 
         println!("\n=== Lore Email Indexing Complete ===");
         println!("Total time: {:.1}s", total_time.as_secs_f64());
-        println!("New emails indexed: {}", new_commits.len());
-        println!("Total emails in archive: {}", total_commits);
+        println!("Archives processed: {}", args.lore.len());
+        println!("New emails indexed: {}", total_new_emails);
+        println!(
+            "Total emails across archives: {}",
+            total_emails_all_archives
+        );
 
         // Create FTS indices for lore table after data is inserted
-        println!("\nCreating FTS indices for lore table...");
-        match db_manager.create_lore_fts_indices().await {
-            Ok(_) => println!("✓ FTS indices created successfully"),
-            Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
-        }
-
-        // Check if optimization is needed after lore indexing
-        match db_manager.check_optimization_health().await {
-            Ok((needs_optimization, message)) => {
-                if needs_optimization {
-                    println!("\n{}", message);
-                    match db_manager.optimize_database().await {
-                        Ok(_) => println!("Database optimization completed successfully"),
-                        Err(e) => error!("Failed to optimize database: {}", e),
-                    }
-                } else {
-                    println!("\n{}", message);
-                }
+        if total_new_emails > 0 {
+            println!("\nCreating FTS indices for lore table...");
+            match db_manager.create_lore_fts_indices().await {
+                Ok(_) => println!("✓ FTS indices created successfully"),
+                Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
             }
-            Err(e) => {
-                error!("Failed to check database health: {}", e);
+
+            // Check if optimization is needed after lore indexing
+            match db_manager.check_optimization_health().await {
+                Ok((needs_optimization, message)) => {
+                    if needs_optimization {
+                        println!("\n{}", message);
+                        match db_manager.optimize_database().await {
+                            Ok(_) => println!("Database optimization completed successfully"),
+                            Err(e) => error!("Failed to optimize database: {}", e),
+                        }
+                    } else {
+                        println!("\n{}", message);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to check database health: {}", e);
+                }
             }
         }
 

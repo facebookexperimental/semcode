@@ -154,7 +154,11 @@ async fn mcp_query_function_or_macro(
         );
 
         for (i, entity) in definitions.iter().enumerate() {
-            result.push_str(&format!("=== Definition {} of {} ===\n", i + 1, definitions.len()));
+            result.push_str(&format!(
+                "=== Definition {} of {} ===\n",
+                i + 1,
+                definitions.len()
+            ));
 
             if entity.return_type.is_empty() {
                 // Macro
