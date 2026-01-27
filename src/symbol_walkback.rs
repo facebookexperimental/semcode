@@ -36,7 +36,9 @@ fn extract_symbol_name_from_declaration(decl_line: &str) -> Option<String> {
         return extract_macro_name(trimmed).map(|name| format!("#{}", name));
     }
 
-    // Check for struct/union/enum
+    // Check for struct/union/enum DEFINITION (not a function returning a struct pointer)
+    // A struct/union/enum definition has '{' but no '(' before it
+    // e.g., "struct foo {" is a definition, but "struct foo *func(" is a function
     if trimmed.starts_with("struct ")
         || trimmed.starts_with("union ")
         || trimmed.starts_with("enum ")
@@ -44,6 +46,27 @@ fn extract_symbol_name_from_declaration(decl_line: &str) -> Option<String> {
         || trimmed.starts_with("typedef union ")
         || trimmed.starts_with("typedef enum ")
     {
+        // Check if this is a function returning a struct/union/enum pointer
+        // Functions have '(' before '{' or at end of line (multi-line signature)
+        let has_paren = trimmed.contains('(');
+        let has_brace = trimmed.contains('{');
+
+        // If it has '(' but no '{', or '(' comes before '{', it's likely a function
+        if has_paren {
+            if !has_brace {
+                // No brace on this line, but has paren - it's a function
+                return extract_function_name(trimmed).map(|name| format!("{}()", name));
+            }
+            // Has both - check which comes first
+            let paren_pos = trimmed.find('(').unwrap();
+            let brace_pos = trimmed.find('{').unwrap();
+            if paren_pos < brace_pos {
+                // Paren before brace - it's a function
+                return extract_function_name(trimmed).map(|name| format!("{}()", name));
+            }
+        }
+
+        // No paren, or brace before paren - treat as type definition
         return is_type_definition(trimmed);
     }
 
@@ -299,6 +322,20 @@ fn extract_typedef_name(line: &str) -> Option<String> {
     }
 }
 
+/// Extract function name from a symbol/declaration line
+/// This is a public wrapper around extract_function_name for use by diffdump
+pub fn extract_function_name_from_symbol(symbol: &str) -> Option<String> {
+    let trimmed = symbol.trim();
+
+    // If it's already a formatted function symbol like "func_name()"
+    if trimmed.ends_with("()") {
+        return Some(trimmed.trim_end_matches("()").to_string());
+    }
+
+    // Try to extract function name from a declaration line
+    extract_function_name(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +377,41 @@ mod tests {
         assert_eq!(
             is_type_definition("typedef struct bar {"),
             Some("struct bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_symbol_name_from_declaration_struct_vs_function() {
+        // Struct definition should be detected
+        assert_eq!(
+            extract_symbol_name_from_declaration("struct widget {"),
+            Some("struct widget".to_string())
+        );
+
+        // Function returning struct pointer should be detected as function
+        assert_eq!(
+            extract_symbol_name_from_declaration("struct widget *create_widget(int id)"),
+            Some("create_widget()".to_string())
+        );
+
+        // Multi-line function signature (no brace on first line)
+        assert_eq!(
+            extract_symbol_name_from_declaration(
+                "struct eea_ring *ering_alloc(u32 index, u32 num, struct eea_device *edev,"
+            ),
+            Some("ering_alloc()".to_string())
+        );
+
+        // Union definition
+        assert_eq!(
+            extract_symbol_name_from_declaration("union data {"),
+            Some("union data".to_string())
+        );
+
+        // Function returning union pointer
+        assert_eq!(
+            extract_symbol_name_from_declaration("union data *get_data(void)"),
+            Some("get_data()".to_string())
         );
     }
 }

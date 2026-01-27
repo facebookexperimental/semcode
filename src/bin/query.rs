@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use rustyline::DefaultEditor;
 use semcode::{process_database_path, DatabaseManager};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -32,6 +33,11 @@ struct Args {
     /// Example: --branch main
     #[arg(long, value_name = "BRANCH")]
     branch: Option<String>,
+
+    /// Parse a diff file and output per-hunk JSON with types, callers, and calls.
+    /// Reads from stdin if no file is specified.
+    #[arg(long, value_name = "FILE")]
+    diffinfo: Option<Option<String>>,
 }
 
 /// Check if the current commit needs indexing and perform incremental indexing if needed
@@ -151,6 +157,130 @@ async fn main() -> Result<()> {
 
     // Ensure tables exist
     db_manager.create_tables().await?;
+
+    // Handle --diffinfo flag: process diff and exit
+    if args.diffinfo.is_some() {
+        let file_path = args.diffinfo.unwrap();
+
+        // Get git SHA
+        let git_sha = semcode::git::get_git_sha(&args.git_repo)?
+            .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
+
+        // Read diff content
+        let diff_content = if let Some(ref path) = file_path {
+            // Resolve path (handle ~ expansion)
+            let expanded_path = if let Some(stripped) = path.strip_prefix("~/") {
+                if let Some(home_dir) = std::env::var_os("HOME") {
+                    std::path::Path::new(&home_dir)
+                        .join(stripped)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    path.to_string()
+                }
+            } else {
+                path.to_string()
+            };
+
+            std::fs::read_to_string(&expanded_path)?
+        } else {
+            // Read from stdin
+            let mut content = String::new();
+            std::io::stdin().read_to_string(&mut content)?;
+            content
+        };
+
+        // Parse the diff to extract all modified functions, types, macros
+        let parse_result = semcode::diffdump::parse_unified_diff(&diff_content)?;
+
+        // Collect all modified functions with their info
+        let mut functions_info = Vec::new();
+        let mut sorted_functions: Vec<_> = parse_result.modified_functions.iter().collect();
+        sorted_functions.sort();
+
+        for func_name in sorted_functions {
+            // Get info from database (for existing functions)
+            let func_opt = db_manager
+                .find_function_git_aware(func_name, &git_sha)
+                .await?;
+
+            let types: Vec<String> = if let Some(ref func) = func_opt {
+                func.types.clone().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            let callers = db_manager
+                .get_function_callers_git_aware(func_name, &git_sha)
+                .await
+                .unwrap_or_default();
+
+            // Get calls from the diff parsing (what this function calls in the patch)
+            let mut calls_from_diff: Vec<String> = parse_result
+                .function_calls
+                .get(func_name)
+                .map(|set| {
+                    let mut v: Vec<_> = set
+                        .iter()
+                        .filter(|call| *call != func_name) // Exclude self-references
+                        .cloned()
+                        .collect();
+                    v.sort();
+                    v
+                })
+                .unwrap_or_default();
+
+            // Also try to get calls from database and merge
+            let calls_from_db = db_manager
+                .get_function_callees_git_aware(func_name, &git_sha)
+                .await
+                .unwrap_or_default();
+
+            // Merge database calls into diff calls (avoiding duplicates)
+            for call in calls_from_db {
+                if !calls_from_diff.contains(&call) {
+                    calls_from_diff.push(call);
+                }
+            }
+            calls_from_diff.sort();
+
+            let mut func_info = serde_json::Map::new();
+            func_info.insert("name".to_string(), serde_json::json!(func_name));
+            func_info.insert("types".to_string(), serde_json::json!(types));
+            func_info.insert("callers".to_string(), serde_json::json!(callers));
+            func_info.insert("calls".to_string(), serde_json::json!(calls_from_diff));
+            functions_info.push(serde_json::Value::Object(func_info));
+        }
+
+        // Build output JSON
+        let mut output = serde_json::Map::new();
+
+        // Modified functions with database info
+        output.insert(
+            "modified_functions".to_string(),
+            serde_json::json!(functions_info),
+        );
+
+        // Modified types (sorted)
+        let mut sorted_types: Vec<_> = parse_result.modified_types.iter().collect();
+        sorted_types.sort();
+        output.insert(
+            "modified_types".to_string(),
+            serde_json::json!(sorted_types),
+        );
+
+        // Modified macros (sorted)
+        let mut sorted_macros: Vec<_> = parse_result.modified_macros.iter().collect();
+        sorted_macros.sort();
+        output.insert(
+            "modified_macros".to_string(),
+            serde_json::json!(sorted_macros),
+        );
+
+        println!("{}", serde_json::to_string_pretty(&output)?);
+
+        return Ok(());
+    }
 
     // Perform incremental indexing if needed
     if let Err(e) = index_current_commit_if_needed(db_manager.clone(), &args.git_repo).await {

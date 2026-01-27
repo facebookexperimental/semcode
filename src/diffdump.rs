@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use colored::*;
-use std::collections::HashSet;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
 #[derive(Debug)]
 pub struct DiffParseResult {
     pub modified_functions: HashSet<String>, // Functions that are actually modified (from hunk headers and definitions)
-    pub called_functions: HashSet<String>,   // Functions that are called in added/removed lines
-    pub modified_types: HashSet<String>,     // Types that are modified
-    pub modified_macros: HashSet<String>,    // Macros that are modified
+    pub called_functions: HashSet<String>, // Functions that are called in added/removed lines (global)
+    pub modified_types: HashSet<String>,   // Types that are modified
+    pub modified_macros: HashSet<String>,  // Macros that are modified
+    pub function_calls: HashMap<String, HashSet<String>>, // Per-function: which functions does each modified function call
+}
+
+/// Per-hunk information for diffinfo output
+#[derive(Debug, Clone, Serialize)]
+pub struct HunkInfo {
+    pub file_path: String,
+    pub hunk_header: String,
+    pub modifies: Option<String>, // The function being modified (from hunk header)
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -60,6 +70,7 @@ pub fn parse_unified_diff(diff_content: &str) -> Result<DiffParseResult> {
     let mut called_functions = HashSet::new();
     let mut modified_types = HashSet::new();
     let mut modified_macros = HashSet::new();
+    let mut function_calls: HashMap<String, HashSet<String>> = HashMap::new();
     let lines: Vec<&str> = diff_content.lines().collect();
     let mut i = 0;
 
@@ -85,10 +96,15 @@ pub fn parse_unified_diff(diff_content: &str) -> Result<DiffParseResult> {
                 if hunk_line.starts_with("@@") {
                     // Parse the hunk to find function context and modifications using walk-back algorithm
                     let hunk_result = parse_hunk_with_walkback(&lines, &mut i, &file_path)?;
-                    modified_functions.extend(hunk_result.modified_functions);
-                    called_functions.extend(hunk_result.called_functions);
+                    modified_functions.extend(hunk_result.modified_functions.iter().cloned());
+                    called_functions.extend(hunk_result.called_functions.iter().cloned());
                     modified_types.extend(hunk_result.modified_types);
                     modified_macros.extend(hunk_result.modified_macros);
+
+                    // Merge per-function calls
+                    for (func_name, calls) in hunk_result.function_calls {
+                        function_calls.entry(func_name).or_default().extend(calls);
+                    }
                 } else if hunk_line.starts_with("---") || hunk_line.starts_with("+++") {
                     // Start of next file
                     break;
@@ -106,7 +122,64 @@ pub fn parse_unified_diff(diff_content: &str) -> Result<DiffParseResult> {
         called_functions,
         modified_types,
         modified_macros,
+        function_calls,
     })
+}
+
+/// Parse a unified diff and return per-hunk information
+/// Each hunk becomes a HunkInfo entry with the function being modified
+pub fn parse_unified_diff_hunks(diff_content: &str) -> Result<Vec<HunkInfo>> {
+    let mut hunks = Vec::new();
+    let lines: Vec<&str> = diff_content.lines().collect();
+    let mut i = 0;
+    let mut current_file = String::new();
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Look for file headers for C/C++ files
+        if line.starts_with("+++")
+            && (line.contains(".c")
+                || line.contains(".h")
+                || line.contains(".cpp")
+                || line.contains(".cc")
+                || line.contains(".cxx"))
+        {
+            // Parse the file being modified
+            current_file = extract_file_path(line);
+            i += 1;
+        } else if line.starts_with("@@") && !current_file.is_empty() {
+            // Found a hunk header
+            let hunk_header = line.to_string();
+            let modifies = extract_function_from_hunk_header(line);
+
+            hunks.push(HunkInfo {
+                file_path: current_file.clone(),
+                hunk_header,
+                modifies,
+            });
+
+            // Skip to next hunk or file
+            i += 1;
+            while i < lines.len() {
+                let next_line = lines[i];
+                if next_line.starts_with("@@")
+                    || next_line.starts_with("---")
+                    || next_line.starts_with("+++")
+                {
+                    break;
+                }
+                i += 1;
+            }
+        } else if line.starts_with("---") {
+            // Reset current file when we see a new file start
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    Ok(hunks)
 }
 
 fn extract_file_path(line: &str) -> String {
@@ -177,16 +250,22 @@ fn parse_hunk_with_walkback(
     let mut called_functions = HashSet::new();
     let mut modified_types = HashSet::new();
     let mut modified_macros = HashSet::new();
+    let mut function_calls: HashMap<String, HashSet<String>> = HashMap::new();
 
     // Collect all lines from the hunk (context + modified)
     let mut hunk_lines = Vec::new();
     let mut modified_line_numbers = HashSet::new(); // Track which lines were modified
     let mut current_line = 0;
 
+    // Track calls per line index so we can attribute them to functions later
+    let mut line_to_calls: HashMap<usize, HashSet<String>> = HashMap::new();
+
     // First, extract function name from the hunk header (@@ line)
+    let mut header_func_name: Option<String> = None;
     if *i < lines.len() {
         let hunk_header = lines[*i];
         if let Some(func_name) = extract_function_from_hunk_header(hunk_header) {
+            header_func_name = Some(func_name.clone());
             modified_functions.insert(func_name);
         }
     }
@@ -207,18 +286,22 @@ fn parse_hunk_with_walkback(
             // Added line - track as modified
             hunk_lines.push(stripped); // Remove + prefix
             modified_line_numbers.insert(current_line);
-            current_line += 1;
 
-            // Also extract function calls from added lines
-            let line_called_functions = extract_function_calls(stripped);
-            called_functions.extend(line_called_functions);
+            // Extract function calls from added lines and track by line
+            let line_calls = extract_function_calls(stripped);
+            called_functions.extend(line_calls.iter().cloned());
+            if !line_calls.is_empty() {
+                line_to_calls.insert(current_line, line_calls);
+            }
+
+            current_line += 1;
         } else if let Some(stripped) = line.strip_prefix("-") {
             // Removed line - track as modified but don't include in reconstructed code
             modified_line_numbers.insert(current_line);
 
-            // Extract function calls from removed lines
-            let line_called_functions = extract_function_calls(stripped);
-            called_functions.extend(line_called_functions);
+            // Extract function calls from removed lines (for global tracking)
+            let line_calls = extract_function_calls(stripped);
+            called_functions.extend(line_calls);
             // Don't increment current_line for removed lines
         } else if !line.starts_with("@@") && !line.starts_with("---") && !line.starts_with("+++") {
             // Context line - include in reconstructed code
@@ -229,9 +312,10 @@ fn parse_hunk_with_walkback(
         *i += 1;
     }
 
-    // Use walk-back algorithm to find modified symbols
+    // Use walk-back algorithm to find modified symbols and attribute calls
     if !hunk_lines.is_empty() {
         let reconstructed_code = hunk_lines.join("\n");
+        let reconstructed_lines: Vec<&str> = reconstructed_code.lines().collect();
 
         // Use walk-back algorithm to extract symbols from modified lines
         let symbols = crate::symbol_walkback::extract_symbols_by_walkback(
@@ -240,7 +324,7 @@ fn parse_hunk_with_walkback(
         );
 
         // Parse symbols and categorize them
-        for symbol in symbols {
+        for symbol in &symbols {
             if let Some(stripped) = symbol.strip_prefix('#') {
                 // Macro: "#MACRO_NAME"
                 modified_macros.insert(stripped.to_string());
@@ -252,10 +336,34 @@ fn parse_hunk_with_walkback(
                 || symbol.starts_with("enum ")
             {
                 // Type: "struct foo", "union bar", "enum baz"
-                modified_types.insert(symbol);
+                modified_types.insert(symbol.clone());
             } else if symbol.starts_with("typedef ") {
                 // Typedef: "typedef foo"
-                modified_types.insert(symbol);
+                modified_types.insert(symbol.clone());
+            }
+        }
+
+        // Attribute calls to functions using walk-back
+        // For each modified line with calls, find which function it belongs to
+        for (line_idx, calls) in &line_to_calls {
+            if let Some(containing_func) =
+                crate::symbol_walkback::find_symbol_for_line(&reconstructed_lines, *line_idx)
+            {
+                // Extract function name from the symbol
+                if let Some(func_name) =
+                    crate::symbol_walkback::extract_function_name_from_symbol(&containing_func)
+                {
+                    function_calls
+                        .entry(func_name)
+                        .or_default()
+                        .extend(calls.iter().cloned());
+                }
+            } else if let Some(ref func_name) = header_func_name {
+                // Fall back to hunk header function
+                function_calls
+                    .entry(func_name.clone())
+                    .or_default()
+                    .extend(calls.iter().cloned());
             }
         }
     }
@@ -265,6 +373,7 @@ fn parse_hunk_with_walkback(
         called_functions,
         modified_types,
         modified_macros,
+        function_calls,
     })
 }
 
@@ -552,4 +661,189 @@ pub async fn diffinfo(input_file: Option<&str>) -> Result<()> {
     println!("{}", "=".repeat(60));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_function_in_middle_of_hunk() {
+        // Bug: A new function that starts in the middle of a hunk should be detected
+        // as a modified function, even though the hunk header shows a different function
+        let diff = r#"diff --git a/test.c b/test.c
+index abc123..def456 100644
+--- a/test.c
++++ b/test.c
+@@ -10,5 +10,20 @@ static void existing_function(void)
+ 	context_line();
++	new_line_added();
++}
++
++static void __eea_pci_remove(struct pci_dev *pdev)
++{
++	pci_disable_device(pdev);
++	kfree(pdev->driver_data);
+ }
+"#;
+
+        let result = parse_unified_diff(diff).unwrap();
+
+        println!("Modified functions: {:?}", result.modified_functions);
+        println!("Called functions: {:?}", result.called_functions);
+
+        // Both functions should be detected as modified
+        assert!(
+            result.modified_functions.contains("existing_function"),
+            "Should find existing_function from hunk header"
+        );
+        assert!(
+            result.modified_functions.contains("__eea_pci_remove"),
+            "Should find __eea_pci_remove - new function in middle of hunk"
+        );
+    }
+
+    #[test]
+    fn test_new_file_with_multiple_functions() {
+        // New file scenario: all lines are added, no hunk header context
+        let diff = r#"diff --git a/drivers/net/test.c b/drivers/net/test.c
+new file mode 100644
+index 0000000..abc123
+--- /dev/null
++++ b/drivers/net/test.c
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/pci.h>
++
++static void first_function(void)
++{
++	do_something();
++}
++
++static void second_function(int arg)
++{
++	do_other();
++}
++
++static int __eea_pci_remove(struct pci_dev *pdev)
++{
++	pci_disable_device(pdev);
++	return 0;
++}
+"#;
+
+        let result = parse_unified_diff(diff).unwrap();
+
+        println!(
+            "New file - Modified functions: {:?}",
+            result.modified_functions
+        );
+
+        // All three functions should be detected
+        assert!(
+            result.modified_functions.contains("first_function"),
+            "Should find first_function"
+        );
+        assert!(
+            result.modified_functions.contains("second_function"),
+            "Should find second_function"
+        );
+        assert!(
+            result.modified_functions.contains("__eea_pci_remove"),
+            "Should find __eea_pci_remove"
+        );
+    }
+
+    #[test]
+    fn test_bug_diff_functions() {
+        // Test with the actual bug.diff content pattern - new files with multiple functions
+        let diff = std::fs::read_to_string("/home/clm/local/src/semcode/bug.diff")
+            .unwrap_or_else(|_| "".to_string());
+
+        if diff.is_empty() {
+            println!("Skipping test - bug.diff not found");
+            return;
+        }
+
+        let result = parse_unified_diff(&diff).unwrap();
+
+        println!(
+            "Bug.diff - Modified functions ({}):",
+            result.modified_functions.len()
+        );
+        let mut funcs: Vec<_> = result.modified_functions.iter().collect();
+        funcs.sort();
+        for f in &funcs {
+            println!("  {}", f);
+        }
+
+        // ering_alloc should be found - it's a multi-line function signature
+        assert!(
+            result.modified_functions.contains("ering_alloc"),
+            "Should find ering_alloc (multi-line signature)"
+        );
+    }
+
+    #[test]
+    fn test_multiline_function_signature() {
+        // Bug: Multi-line function signatures should be detected
+        let diff = r#"diff --git a/test.c b/test.c
+new file mode 100644
+--- /dev/null
++++ b/test.c
+@@ -0,0 +1,20 @@
++#include <linux/types.h>
++
++struct eea_ring *ering_alloc(u32 index, u32 num, struct eea_device *edev,
++			     u8 sq_desc_size, u8 cq_desc_size,
++			     const char *name)
++{
++	struct eea_ring *ering;
++
++	ering = kzalloc(sizeof(*ering), GFP_KERNEL);
++	if (!ering)
++		return NULL;
++
++	return ering;
++}
+"#;
+
+        let result = parse_unified_diff(diff).unwrap();
+
+        assert!(
+            result.modified_functions.contains("ering_alloc"),
+            "Should find ering_alloc despite multi-line signature"
+        );
+    }
+
+    #[test]
+    fn test_function_returning_struct_pointer() {
+        // Functions returning struct pointers should not be confused with struct definitions
+        let diff = r#"diff --git a/test.c b/test.c
+--- a/test.c
++++ b/test.c
+@@ -10,0 +10,10 @@
++struct widget *create_widget(int id)
++{
++	struct widget *w = malloc(sizeof(*w));
++	return w;
++}
++
++union data *get_data(void)
++{
++	return &global_data;
++}
+"#;
+
+        let result = parse_unified_diff(diff).unwrap();
+
+        assert!(
+            result.modified_functions.contains("create_widget"),
+            "Should find create_widget (returns struct pointer)"
+        );
+        assert!(
+            result.modified_functions.contains("get_data"),
+            "Should find get_data (returns union pointer)"
+        );
+    }
 }

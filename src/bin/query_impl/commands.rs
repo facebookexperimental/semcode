@@ -1690,23 +1690,131 @@ pub async fn handle_command(
             }
         }
         "diffinfo" | "di" => {
-            // Parse arguments for -i input_file flag
+            // Parse arguments for -i input_file flag and --json flag
             let mut input_file = None;
+            let mut json_output = false;
             let mut i = 1;
 
             while i < parts.len() {
                 if parts[i] == "-i" && i + 1 < parts.len() {
                     input_file = Some(parts[i + 1].to_string());
                     i += 2;
+                } else if parts[i] == "--json" {
+                    json_output = true;
+                    i += 1;
                 } else {
-                    println!("{}", "Usage: diffinfo [-i <diff_file>]".red());
+                    println!("{}", "Usage: diffinfo [--json] [-i <diff_file>]".red());
                     println!("  If -i is not specified, reads diff from stdin");
+                    println!("  --json: Output per-hunk JSON with types, callers, and calls");
                     return Ok(false);
                 }
             }
 
-            use semcode::diffdump::diffinfo;
-            diffinfo(input_file.as_deref()).await?;
+            if json_output {
+                // Read diff content
+                let diff_content = if let Some(ref path) = input_file {
+                    // Resolve path (handle ~ expansion)
+                    let expanded_path = if let Some(stripped) = path.strip_prefix("~/") {
+                        if let Some(home_dir) = std::env::var_os("HOME") {
+                            std::path::Path::new(&home_dir)
+                                .join(stripped)
+                                .to_string_lossy()
+                                .to_string()
+                        } else {
+                            path.to_string()
+                        }
+                    } else {
+                        path.to_string()
+                    };
+
+                    match std::fs::read_to_string(&expanded_path) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            println!(
+                                "{} Failed to read diff file '{}': {}",
+                                "Error:".red(),
+                                expanded_path,
+                                e
+                            );
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    // Read from stdin
+                    let mut content = String::new();
+                    if let Err(e) =
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut content)
+                    {
+                        println!("{} Failed to read from stdin: {}", "Error:".red(), e);
+                        return Ok(false);
+                    }
+                    content
+                };
+
+                // Parse the diff to get per-hunk information
+                let hunks = match semcode::diffdump::parse_unified_diff_hunks(&diff_content) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        println!("{} Failed to parse diff: {}", "Error:".red(), e);
+                        return Ok(false);
+                    }
+                };
+
+                // For each hunk, output JSON with function info
+                for (idx, hunk) in hunks.iter().enumerate() {
+                    if let Some(func_name) = &hunk.modifies {
+                        // Look up function in database
+                        let func_opt = db.find_function_git_aware(func_name, &git_sha).await?;
+
+                        let types: Vec<String> = if let Some(ref func) = func_opt {
+                            func.types.clone().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+
+                        let callers = db
+                            .get_function_callers_git_aware(func_name, &git_sha)
+                            .await
+                            .unwrap_or_default();
+                        let calls = db
+                            .get_function_callees_git_aware(func_name, &git_sha)
+                            .await
+                            .unwrap_or_default();
+
+                        // Build JSON output with hunk number first
+                        let mut output = serde_json::Map::new();
+                        output.insert("hunk".to_string(), serde_json::json!(idx));
+                        output.insert("filename".to_string(), serde_json::json!(hunk.file_path));
+                        output.insert("modifies".to_string(), serde_json::json!(func_name));
+                        output.insert("types".to_string(), serde_json::json!(types));
+                        output.insert("callers".to_string(), serde_json::json!(callers));
+                        output.insert("calls".to_string(), serde_json::json!(calls));
+
+                        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+                    } else {
+                        // Hunk doesn't modify a known function (e.g., global scope changes)
+                        let mut output = serde_json::Map::new();
+                        output.insert("hunk".to_string(), serde_json::json!(idx));
+                        output.insert("filename".to_string(), serde_json::json!(hunk.file_path));
+                        output.insert("modifies".to_string(), serde_json::Value::Null);
+                        output.insert("types".to_string(), serde_json::json!(Vec::<String>::new()));
+                        output.insert(
+                            "callers".to_string(),
+                            serde_json::json!(Vec::<String>::new()),
+                        );
+                        output.insert("calls".to_string(), serde_json::json!(Vec::<String>::new()));
+
+                        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+                    }
+                }
+
+                if hunks.is_empty() {
+                    println!("{}", "No C/C++ hunks found in diff".yellow());
+                }
+            } else {
+                use semcode::diffdump::diffinfo;
+                diffinfo(input_file.as_deref()).await?;
+            }
         }
         "check_health" | "health" | "check_db" => match db.check_optimization_health().await {
             Ok((needs_optimization, message)) => {
