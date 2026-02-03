@@ -2,6 +2,7 @@
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
+use futures::stream::{self, StreamExt};
 use semcode::indexer::{
     list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline,
 };
@@ -102,6 +103,10 @@ struct Args {
     /// Accepts comma-separated list of archives (e.g., --lore bpf,netdev,lkml/0)
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     lore: Vec<String>,
+
+    /// Refresh all existing lore archives (fetch new emails and index them)
+    #[arg(long)]
+    refresh_lore: bool,
 
     // ==================== Multi-Branch Indexing ====================
     /// Index a specific branch (can be specified multiple times)
@@ -422,6 +427,102 @@ async fn clone_lore_repository(lore_url: &str, db_path: &str) -> Result<PathBuf>
     );
 
     Ok(clone_path)
+}
+
+/// Discover all existing lore archive repositories in <db_dir>/lore/
+fn discover_lore_archives(db_path: &str) -> Result<Vec<PathBuf>> {
+    use std::fs;
+
+    let lore_base_dir = PathBuf::from(db_path).join("lore");
+
+    if !lore_base_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut archives = Vec::new();
+
+    // Recursively find directories that are git repositories
+    fn find_git_repos(dir: &Path, repos: &mut Vec<PathBuf>) -> Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        // Check if this directory is a git repo (has .git or is a bare repo with objects/)
+        let git_dir = dir.join(".git");
+        let objects_dir = dir.join("objects");
+        if git_dir.exists() || objects_dir.exists() {
+            repos.push(dir.to_path_buf());
+            return Ok(());
+        }
+
+        // Otherwise recurse into subdirectories
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                find_git_repos(&path, repos)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    find_git_repos(&lore_base_dir, &mut archives)?;
+
+    // Sort for consistent ordering
+    archives.sort();
+
+    Ok(archives)
+}
+
+/// Fetch new commits from remote for an existing lore archive.
+/// Returns the opened repository on success so callers don't need to re-discover it.
+///
+/// This function wraps blocking git I/O in spawn_blocking to avoid blocking the
+/// async executor thread during network operations.
+async fn fetch_lore_archive(repo_path: PathBuf) -> Result<gix::Repository> {
+    info!(
+        "Fetching new commits from remote for {}...",
+        repo_path.display()
+    );
+
+    // Run blocking git operations on the blocking thread pool
+    let repo = tokio::task::spawn_blocking(move || -> Result<gix::Repository> {
+        let repo = gix::discover(&repo_path)?;
+
+        // Find the remote named "origin"
+        let remote = repo.find_remote("origin")?;
+
+        // Connect and fetch
+        let connection = remote
+            .connect(gix::remote::Direction::Fetch)?
+            .prepare_fetch(gix::progress::Discard, Default::default())?;
+
+        let fetch_outcome =
+            connection.receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+
+        match &fetch_outcome.status {
+            gix::remote::fetch::Status::NoPackReceived { update_refs, .. } => {
+                info!(
+                    "No new pack received. {} references checked, {} updated",
+                    update_refs.updates.len(),
+                    update_refs.edits.len()
+                );
+            }
+            gix::remote::fetch::Status::Change { update_refs, .. } => {
+                info!(
+                    "Fetch complete: {} references checked, {} updated",
+                    update_refs.updates.len(),
+                    update_refs.edits.len()
+                );
+            }
+        }
+
+        Ok(repo)
+    })
+    .await??;
+
+    Ok(repo)
 }
 
 /// Result of indexing a single lore archive
@@ -901,6 +1002,173 @@ async fn main() -> Result<()> {
             }
 
             // Check if optimization is needed after lore indexing
+            match db_manager.check_optimization_health().await {
+                Ok((needs_optimization, message)) => {
+                    if needs_optimization {
+                        println!("\n{}", message);
+                        match db_manager.optimize_database().await {
+                            Ok(_) => println!("Database optimization completed successfully"),
+                            Err(e) => error!("Failed to optimize database: {}", e),
+                        }
+                    } else {
+                        println!("\n{}", message);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to check database health: {}", e);
+                }
+            }
+        }
+
+        println!("\nTo query this database, run:");
+        println!("  semcode --database {}", database_path);
+
+        return Ok(());
+    }
+
+    // Handle --refresh-lore option - update all existing lore archives
+    if args.refresh_lore {
+        info!("Refreshing all existing lore archives");
+
+        // Discover existing lore archives
+        let archives = discover_lore_archives(&database_path)?;
+
+        if archives.is_empty() {
+            println!("No lore archives found in {}/lore/", database_path);
+            println!("Use --lore <list> to clone archives first.");
+            return Ok(());
+        }
+
+        // Pre-compute lore_base and display names once
+        let lore_base = PathBuf::from(&database_path).join("lore");
+        let archives_with_names: Vec<(PathBuf, String)> = archives
+            .into_iter()
+            .map(|archive| {
+                let display_name = archive
+                    .strip_prefix(&lore_base)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| archive.display().to_string());
+                (archive, display_name)
+            })
+            .collect();
+
+        println!(
+            "Found {} lore archive(s) to refresh:",
+            archives_with_names.len()
+        );
+        for (_, display_name) in &archives_with_names {
+            println!("  - {}", display_name);
+        }
+        println!();
+
+        // Create database manager once for all archives
+        let db_manager =
+            DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
+        db_manager.create_tables().await?;
+        let db_manager = Arc::new(db_manager);
+
+        let start_time = std::time::Instant::now();
+        let batch_size = 1024;
+        let num_workers = num_cpus::get();
+        let db_threads = args.db_threads;
+        let total_archives = archives_with_names.len();
+
+        // Process archives in parallel (up to 4 concurrent fetches/indexes)
+        // This provides significant speedup when tracking multiple mailing lists
+        let concurrency = std::cmp::min(4, total_archives);
+
+        println!(
+            "Processing {} archives with concurrency {}...",
+            total_archives, concurrency
+        );
+
+        let results: Vec<Result<(String, LoreIndexResult), (String, anyhow::Error)>> =
+            stream::iter(archives_with_names)
+                .map(|(archive_path, display_name)| {
+                    let db_manager = db_manager.clone();
+                    async move {
+                        println!("\n=== Refreshing lore archive: {} ===", display_name);
+
+                        // Fetch new commits from remote (async, runs on blocking thread pool)
+                        println!("[{}] Fetching updates from remote...", display_name);
+                        let lore_repo = match fetch_lore_archive(archive_path.clone()).await {
+                            Ok(repo) => repo,
+                            Err(e) => {
+                                return Err((display_name, e));
+                            }
+                        };
+
+                        // Index the archive using the shared function
+                        match index_lore_archive(
+                            lore_repo,
+                            &archive_path,
+                            &display_name,
+                            &db_manager,
+                            batch_size,
+                            num_workers,
+                            db_threads,
+                        )
+                        .await
+                        {
+                            Ok(result) => Ok((display_name, result)),
+                            Err(e) => Err((display_name, e)),
+                        }
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+        // Aggregate results
+        let mut total_new_emails = 0usize;
+        let mut total_emails_all_archives = 0usize;
+        let mut archives_processed = 0usize;
+        let mut failed_archives: Vec<(String, String)> = Vec::new();
+
+        for result in results {
+            match result {
+                Ok((_, index_result)) => {
+                    total_new_emails += index_result.new_emails;
+                    total_emails_all_archives += index_result.total_emails;
+                    archives_processed += 1;
+                }
+                Err((name, e)) => {
+                    failed_archives.push((name, e.to_string()));
+                }
+            }
+        }
+
+        let total_time = start_time.elapsed();
+
+        println!("\n=== Lore Archive Refresh Complete ===");
+        println!("Total time: {:.1}s", total_time.as_secs_f64());
+        println!(
+            "Archives refreshed: {}/{}",
+            archives_processed, total_archives
+        );
+        println!("New emails indexed: {}", total_new_emails);
+        println!(
+            "Total emails across archives: {}",
+            total_emails_all_archives
+        );
+
+        // Report failed archives if any
+        if !failed_archives.is_empty() {
+            eprintln!("\nFailed archives:");
+            for (name, err) in &failed_archives {
+                eprintln!("  {}: {}", name, err);
+            }
+        }
+
+        // Create FTS indices for lore table after data is inserted
+        if total_new_emails > 0 {
+            println!("\nCreating FTS indices for lore table...");
+            match db_manager.create_lore_fts_indices().await {
+                Ok(_) => println!("FTS indices created successfully"),
+                Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
+            }
+
+            // Check if optimization is needed
             match db_manager.check_optimization_health().await {
                 Ok((needs_optimization, message)) => {
                     if needs_optimization {
