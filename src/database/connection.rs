@@ -21,6 +21,7 @@ use crate::database::processed_files::{ProcessedFileRecord, ProcessedFileStore};
 use crate::database::vectors::VectorStore;
 use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
+use std::collections::HashSet;
 
 // Optimal batch size for LanceDB operations
 pub const OPTIMAL_BATCH_SIZE: usize = 65536;
@@ -5328,5 +5329,56 @@ impl DatabaseManager {
         }
 
         Ok(commits)
+    }
+
+    /// Filter a list of commit SHAs to return only those that already exist in the lore table.
+    /// Uses batched IN queries to avoid full table scans.
+    /// Returns a HashSet of SHAs that exist in the database.
+    pub async fn filter_existing_lore_commits(
+        &self,
+        commit_shas: &[String],
+    ) -> Result<HashSet<String>> {
+        if commit_shas.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let mut existing = HashSet::with_capacity(commit_shas.len() / 2); // Pre-allocate for typical case
+
+        // Process in chunks to avoid SQL query size limits
+        // LanceDB/DuckDB can handle large IN clauses, but 1000 is a safe batch size
+        const BATCH_SIZE: usize = 1000;
+
+        for chunk in commit_shas.chunks(BATCH_SIZE) {
+            // Build SQL IN clause with properly escaped SHAs
+            let escaped_shas: Vec<String> = chunk
+                .iter()
+                .map(|sha| format!("'{}'", sha.replace("'", "''")))
+                .collect();
+            let filter = format!("git_commit_sha IN ({})", escaped_shas.join(", "));
+
+            let stream = table
+                .query()
+                .select(lancedb::query::Select::Columns(vec![
+                    "git_commit_sha".to_string()
+                ]))
+                .only_if(&filter)
+                .execute()
+                .await?;
+
+            let batches: Vec<_> = stream.try_collect().await?;
+
+            for batch in batches {
+                if let Some(column) = batch.column_by_name("git_commit_sha") {
+                    if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
+                        for i in 0..string_array.len() {
+                            existing.insert(string_array.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(existing)
     }
 }

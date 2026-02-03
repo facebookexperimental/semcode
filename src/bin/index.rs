@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
-use arrow::array::Array;
 use clap::Parser;
 use colored::Colorize;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use semcode::indexer::{
     list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline,
 };
@@ -11,7 +9,7 @@ use semcode::{measure, process_database_path, CodeVectorizer, DatabaseManager};
 // Temporary call relationships are now embedded in function JSON columns
 use semcode::perf_monitor::PERF_STATS;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -426,6 +424,112 @@ async fn clone_lore_repository(lore_url: &str, db_path: &str) -> Result<PathBuf>
     Ok(clone_path)
 }
 
+/// Result of indexing a single lore archive
+struct LoreIndexResult {
+    new_emails: usize,
+    total_emails: usize,
+}
+
+/// Index a lore archive repository, filtering out already-indexed commits.
+/// This is the common logic shared by both --lore and --refresh-lore handlers.
+async fn index_lore_archive(
+    lore_repo: gix::Repository,
+    archive_path: &Path,
+    display_name: &str,
+    db_manager: &Arc<DatabaseManager>,
+    batch_size: usize,
+    num_workers: usize,
+    db_threads: usize,
+) -> Result<LoreIndexResult> {
+    // Get the remote tracking branch to include all fetched commits
+    // Try refs/remotes/origin/master first, then refs/remotes/origin/main as fallback
+    let mut start_ref = lore_repo
+        .find_reference("refs/remotes/origin/master")
+        .or_else(|_| lore_repo.find_reference("refs/remotes/origin/main"))
+        .or_else(|_| {
+            info!("Remote tracking branch not found, using HEAD");
+            lore_repo
+                .head()?
+                .try_into_referent()
+                .ok_or_else(|| anyhow::anyhow!("HEAD is not a symbolic reference"))
+        })?;
+
+    let start_commit = start_ref.peel_to_commit()?;
+
+    // Use rev_walk to get all commits reachable from the remote tracking branch
+    let walk = lore_repo
+        .rev_walk([start_commit.id()])
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            Default::default(),
+        ))
+        .all()?;
+
+    let mut all_commit_shas = Vec::new();
+    for info in walk {
+        all_commit_shas.push(info?.id().to_string());
+    }
+
+    // Reverse to get chronological order (oldest first)
+    all_commit_shas.reverse();
+
+    let total_commits = all_commit_shas.len();
+    info!("Found {} total commits in lore archive", total_commits);
+
+    // Get already indexed commits from database using efficient batched queries
+    println!("Checking for already-indexed commits...");
+    let existing_commits = db_manager
+        .filter_existing_lore_commits(&all_commit_shas)
+        .await?;
+
+    // Filter out already indexed commits
+    let new_commits: Vec<String> = all_commit_shas
+        .into_iter()
+        .filter(|sha| !existing_commits.contains(sha))
+        .collect();
+
+    let already_indexed = total_commits - new_commits.len();
+    if already_indexed > 0 {
+        println!(
+            "{} commits already indexed, processing {} new commits",
+            already_indexed,
+            new_commits.len()
+        );
+    } else {
+        println!("Processing all {} commits", new_commits.len());
+    }
+
+    if new_commits.is_empty() {
+        println!("All commits in {} are already indexed!", display_name);
+        return Ok(LoreIndexResult {
+            new_emails: 0,
+            total_emails: total_commits,
+        });
+    }
+
+    let new_count = new_commits.len();
+
+    // Process new commits
+    process_lore_commits_pipeline(
+        archive_path,
+        new_commits,
+        db_manager.clone(),
+        batch_size,
+        num_workers,
+        db_threads,
+    )
+    .await?;
+
+    println!(
+        "Indexed {} new emails from {} (total in archive: {})",
+        new_count, display_name, total_commits
+    );
+
+    Ok(LoreIndexResult {
+        new_emails: new_count,
+        total_emails: total_commits,
+    })
+}
+
 // ==================== Branch Indexing Support ====================
 
 /// Collect branches to index from the various branch-related CLI flags
@@ -745,8 +849,7 @@ async fn main() -> Result<()> {
             };
             info!("Lore archive cloned to: {}", clone_path.display());
 
-            // Get all commits from the lore repository
-            info!("Discovering all commits in lore archive...");
+            // Open the repository
             let lore_repo = match gix::discover(&clone_path) {
                 Ok(repo) => repo,
                 Err(e) => {
@@ -755,143 +858,27 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Get the remote tracking branch to include all fetched commits
-            // Try refs/remotes/origin/master first, then refs/remotes/origin/main as fallback
-            let mut start_ref = match lore_repo
-                .find_reference("refs/remotes/origin/master")
-                .or_else(|_| lore_repo.find_reference("refs/remotes/origin/main"))
-                .or_else(|_| {
-                    // Fallback to HEAD if remote tracking branches don't exist (shouldn't happen after fetch)
-                    info!("Remote tracking branch not found, using HEAD");
-                    lore_repo
-                        .head()?
-                        .try_into_referent()
-                        .ok_or_else(|| anyhow::anyhow!("HEAD is not a symbolic reference"))
-                }) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Error finding reference in {}: {}", lore_url, e);
-                    continue;
-                }
-            };
-
-            let start_commit = match start_ref.peel_to_commit() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error getting start commit for {}: {}", lore_url, e);
-                    continue;
-                }
-            };
-
-            // Use rev_walk to get all commits reachable from the remote tracking branch
-            let walk = match lore_repo
-                .rev_walk([start_commit.id()])
-                .sorting(gix::revision::walk::Sorting::ByCommitTime(
-                    Default::default(),
-                ))
-                .all()
-            {
-                Ok(w) => w,
-                Err(e) => {
-                    eprintln!("Error walking commits in {}: {}", lore_url, e);
-                    continue;
-                }
-            };
-
-            let mut all_commit_shas = Vec::new();
-            let mut walk_error = false;
-            for info in walk {
-                match info {
-                    Ok(info) => all_commit_shas.push(info.id().to_string()),
-                    Err(e) => {
-                        eprintln!("Error walking commit in {}: {}", lore_url, e);
-                        walk_error = true;
-                        break;
-                    }
-                }
-            }
-            if walk_error {
-                continue;
-            }
-
-            // Reverse to get chronological order (oldest first)
-            all_commit_shas.reverse();
-
-            let total_commits = all_commit_shas.len();
-            info!("Found {} total commits in lore archive", total_commits);
-            total_emails_all_archives += total_commits;
-
-            // Get already indexed commits from database
-            println!("Checking for already-indexed commits...");
-            let existing_commits: HashSet<String> = {
-                let table = db_manager.connection().open_table("lore").execute().await?;
-                let stream = table
-                    .query()
-                    .select(lancedb::query::Select::Columns(vec![
-                        "git_commit_sha".to_string()
-                    ]))
-                    .execute()
-                    .await?;
-
-                use futures::TryStreamExt;
-                let batches: Vec<_> = stream.try_collect().await?;
-
-                let mut shas = HashSet::new();
-                for batch in batches {
-                    if let Some(column) = batch.column_by_name("git_commit_sha") {
-                        if let Some(string_array) =
-                            column.as_any().downcast_ref::<arrow::array::StringArray>()
-                        {
-                            for i in 0..string_array.len() {
-                                shas.insert(string_array.value(i).to_string());
-                            }
-                        }
-                    }
-                }
-                shas
-            };
-
-            // Filter out already indexed commits
-            let new_commits: Vec<String> = all_commit_shas
-                .into_iter()
-                .filter(|sha| !existing_commits.contains(sha))
-                .collect();
-
-            let already_indexed = total_commits - new_commits.len();
-            if already_indexed > 0 {
-                println!(
-                    "{} commits already indexed, processing {} new commits",
-                    already_indexed,
-                    new_commits.len()
-                );
-            } else {
-                println!("Processing all {} commits", new_commits.len());
-            }
-
-            if new_commits.is_empty() {
-                println!("All commits in {} are already indexed!", lore_url);
-                continue;
-            }
-
-            total_new_emails += new_commits.len();
-
-            // Process new commits
-            process_lore_commits_pipeline(
+            // Index the archive using the shared function
+            match index_lore_archive(
+                lore_repo,
                 &clone_path,
-                new_commits.clone(),
-                db_manager.clone(),
+                lore_url,
+                &db_manager,
                 batch_size,
                 num_workers,
                 args.db_threads,
             )
-            .await?;
-
-            println!(
-                "Indexed {} new emails from {} (total in archive: {})",
-                new_commits.len(),
-                lore_url,
-                total_commits
-            );
+            .await
+            {
+                Ok(result) => {
+                    total_new_emails += result.new_emails;
+                    total_emails_all_archives += result.total_emails;
+                }
+                Err(e) => {
+                    eprintln!("Error indexing {}: {}", lore_url, e);
+                    continue;
+                }
+            }
         }
 
         let total_time = start_time.elapsed();
@@ -909,7 +896,7 @@ async fn main() -> Result<()> {
         if total_new_emails > 0 {
             println!("\nCreating FTS indices for lore table...");
             match db_manager.create_lore_fts_indices().await {
-                Ok(_) => println!("✓ FTS indices created successfully"),
+                Ok(_) => println!("FTS indices created successfully"),
                 Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
             }
 
