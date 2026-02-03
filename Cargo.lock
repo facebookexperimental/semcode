@@ -7508,6 +7508,7 @@ dependencies = [
  "ndarray 0.17.2",
  "num_cpus",
  "once_cell",
+ "oneshot",
  "owo-colors",
  "rayon",
  "regex",
