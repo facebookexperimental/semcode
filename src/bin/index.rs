@@ -475,6 +475,93 @@ fn discover_lore_archives(db_path: &str) -> Result<Vec<PathBuf>> {
     Ok(archives)
 }
 
+/// Extract list name and archive number from a local lore archive path.
+/// Returns (list_name, archive_number) if the path follows the expected structure.
+///
+/// Expected path structure: `<db_path>/lore/<list_name>/<archive_number>`
+/// Example: `.semcode.db/lore/lkml/17` -> ("lkml", 17)
+fn parse_lore_archive_path(archive_path: &Path, lore_base: &Path) -> Option<(String, u32)> {
+    // Get the path relative to lore base
+    let relative = archive_path.strip_prefix(lore_base).ok()?;
+    let components: Vec<_> = relative.components().collect();
+
+    if components.len() != 2 {
+        return None;
+    }
+
+    let list_name = components[0].as_os_str().to_str()?;
+    let archive_num_str = components[1].as_os_str().to_str()?;
+    let archive_num = archive_num_str.parse::<u32>().ok()?;
+
+    Some((list_name.to_string(), archive_num))
+}
+
+/// Check for new lore archives available on lore.kernel.org that are not locally cached.
+/// Returns a list of (list_name, new_archive_numbers) for lists with newer archives.
+fn find_new_lore_archives(
+    local_archives: &[PathBuf],
+    lore_base: &Path,
+    manifest: &serde_json::Value,
+) -> Vec<(String, Vec<u32>)> {
+    use std::collections::HashMap;
+
+    // Build a map of list_name -> max local archive number
+    let mut local_max: HashMap<String, u32> = HashMap::new();
+    for archive_path in local_archives {
+        if let Some((list_name, archive_num)) = parse_lore_archive_path(archive_path, lore_base) {
+            local_max
+                .entry(list_name)
+                .and_modify(|max| {
+                    if archive_num > *max {
+                        *max = archive_num;
+                    }
+                })
+                .or_insert(archive_num);
+        }
+    }
+
+    if local_max.is_empty() {
+        return Vec::new();
+    }
+
+    let lists = match manifest.as_object() {
+        Some(obj) => obj,
+        None => return Vec::new(),
+    };
+
+    let mut new_archives: Vec<(String, Vec<u32>)> = Vec::new();
+
+    for (list_name, max_local) in &local_max {
+        // Find all archives for this list in the manifest
+        let pattern = format!("/{}/git/", list_name);
+        let mut remote_archives: Vec<u32> = Vec::new();
+
+        for key in lists.keys() {
+            if key.starts_with(&pattern) && key.ends_with(".git") {
+                if let Some(num_str) = key
+                    .strip_prefix(&pattern)
+                    .and_then(|s| s.strip_suffix(".git"))
+                {
+                    if let Ok(num) = num_str.parse::<u32>() {
+                        if num > *max_local {
+                            remote_archives.push(num);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !remote_archives.is_empty() {
+            remote_archives.sort();
+            new_archives.push((list_name.clone(), remote_archives));
+        }
+    }
+
+    // Sort by list name for consistent output
+    new_archives.sort_by(|a, b| a.0.cmp(&b.0));
+    new_archives
+}
+
 /// Fetch new commits from remote for an existing lore archive.
 /// Returns the opened repository on success so callers don't need to re-discover it.
 ///
@@ -1041,6 +1128,8 @@ async fn main() -> Result<()> {
 
         // Pre-compute lore_base and display names once
         let lore_base = PathBuf::from(&database_path).join("lore");
+        // Keep a copy of archive paths for checking new archives later
+        let archive_paths: Vec<PathBuf> = archives.to_vec();
         let archives_with_names: Vec<(PathBuf, String)> = archives
             .into_iter()
             .map(|archive| {
@@ -1184,6 +1273,40 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     error!("Failed to check database health: {}", e);
                 }
+            }
+        }
+
+        // Check for new archives available on lore.kernel.org
+        println!("\nChecking for new lore archives...");
+        match fetch_lore_manifest() {
+            Ok(manifest) => {
+                let new_archives = find_new_lore_archives(&archive_paths, &lore_base, &manifest);
+                if new_archives.is_empty() {
+                    println!("All tracked mailing lists are up to date.");
+                } else {
+                    println!(
+                        "\n{}",
+                        "New archives available on lore.kernel.org:".yellow()
+                    );
+                    for (list_name, archive_nums) in &new_archives {
+                        let nums_str: Vec<String> =
+                            archive_nums.iter().map(|n| n.to_string()).collect();
+                        println!("  {}: archive(s) {}", list_name.cyan(), nums_str.join(", "));
+                    }
+                    println!("\nTo add these archives, run:");
+                    for (list_name, archive_nums) in &new_archives {
+                        for num in archive_nums {
+                            println!("  semcode-index --lore {}/{}", list_name, num);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Could not check for new archives: {}", e);
+                println!(
+                    "Note: Could not fetch lore manifest to check for new archives: {}",
+                    e
+                );
             }
         }
 
