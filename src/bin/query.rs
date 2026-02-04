@@ -160,7 +160,6 @@ async fn main() -> Result<()> {
 
     // Handle --diffinfo flag: process diff and exit
     if let Some(file_path) = args.diffinfo {
-
         // Get git SHA
         let git_sha = semcode::git::get_git_sha(&args.git_repo)?
             .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());

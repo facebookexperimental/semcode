@@ -11,6 +11,16 @@ use lancedb::table::OptimizeAction;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Outcome of a single table optimization operation.
+pub enum OptimizeOutcome {
+    /// Table was successfully optimized (all operations completed)
+    Optimized,
+    /// Table was skipped (too small to benefit from optimization)
+    Skipped,
+    /// Optimization was attempted but one or more operations failed
+    PartialFailure,
+}
+
 pub struct SchemaManager {
     connection: Connection,
 }
@@ -890,6 +900,7 @@ impl SchemaManager {
 
         let total_tables = tables_to_compact.len();
         let tables_optimized = Arc::new(AtomicUsize::new(0));
+        let tables_skipped = Arc::new(AtomicUsize::new(0));
         let tables_failed = Arc::new(AtomicUsize::new(0));
         let tables_processed = Arc::new(AtomicUsize::new(0));
 
@@ -900,20 +911,23 @@ impl SchemaManager {
             .map(|table_name| {
                 let connection = self.connection.clone();
                 let optimized = Arc::clone(&tables_optimized);
+                let skipped = Arc::clone(&tables_skipped);
                 let failed = Arc::clone(&tables_failed);
                 let processed = Arc::clone(&tables_processed);
 
                 async move {
-                    let result =
-                        Self::optimize_single_table(&connection, &table_name).await;
+                    let result = Self::optimize_single_table(&connection, &table_name).await;
                     let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::info!("Optimized table {}/{}: {}", done, total_tables, table_name);
+                    tracing::info!("Processed table {}/{}: {}", done, total_tables, table_name);
                     match result {
-                        Ok(true) => {
+                        Ok(OptimizeOutcome::Optimized) => {
                             optimized.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(false) => {
+                        Ok(OptimizeOutcome::PartialFailure) => {
                             failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(OptimizeOutcome::Skipped) => {
+                            skipped.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => {
                             tracing::warn!("Failed to optimize table {}: {}", table_name, e);
@@ -927,11 +941,17 @@ impl SchemaManager {
             .await;
 
         let optimized = tables_optimized.load(Ordering::Relaxed);
+        let skipped = tables_skipped.load(Ordering::Relaxed);
         let failed = tables_failed.load(Ordering::Relaxed);
 
         println!(
-            "    Optimized {} tables{}",
+            "    Optimized {} tables{}{}",
             optimized,
+            if skipped > 0 {
+                format!(", {} skipped", skipped)
+            } else {
+                String::new()
+            },
             if failed > 0 {
                 format!(", {} failed", failed)
             } else {
@@ -943,12 +963,32 @@ impl SchemaManager {
     }
 
     /// Optimize a single table - runs compact, prune, and index operations
-    async fn optimize_single_table(connection: &Connection, table_name: &str) -> Result<bool> {
-        tracing::info!("Compacting table: {}", table_name);
+    ///
+    /// Tables with fewer than 1000 rows are skipped since the overhead of
+    /// optimization exceeds any benefit for small tables.
+    async fn optimize_single_table(
+        connection: &Connection,
+        table_name: &str,
+    ) -> Result<OptimizeOutcome> {
+        // Minimum row count for optimization to be worthwhile
+        const MIN_ROWS_FOR_OPTIMIZATION: usize = 1000;
+
         let table = connection.open_table(table_name).execute().await?;
 
         let count = table.count_rows(None).await?;
-        tracing::info!("Table {} has {} rows", table_name, count);
+
+        // Skip optimization for small tables - overhead exceeds benefit
+        if count < MIN_ROWS_FOR_OPTIMIZATION {
+            tracing::info!(
+                "Skipping optimization for table {} ({} rows < {} threshold)",
+                table_name,
+                count,
+                MIN_ROWS_FOR_OPTIMIZATION
+            );
+            return Ok(OptimizeOutcome::Skipped);
+        }
+
+        tracing::info!("Optimizing table {} ({} rows)", table_name, count);
 
         let mut success = true;
 
@@ -999,7 +1039,11 @@ impl SchemaManager {
             );
         }
 
-        Ok(success)
+        Ok(if success {
+            OptimizeOutcome::Optimized
+        } else {
+            OptimizeOutcome::PartialFailure
+        })
     }
 
     /// Drop and recreate tables for maximum space savings
