@@ -159,8 +159,7 @@ async fn main() -> Result<()> {
     db_manager.create_tables().await?;
 
     // Handle --diffinfo flag: process diff and exit
-    if args.diffinfo.is_some() {
-        let file_path = args.diffinfo.unwrap();
+    if let Some(file_path) = args.diffinfo {
 
         // Get git SHA
         let git_sha = semcode::git::get_git_sha(&args.git_repo)?

@@ -3,11 +3,12 @@ use anyhow::Result;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
-use futures::TryStreamExt;
+use futures::{stream, StreamExt, TryStreamExt};
 use lancedb::connection::Connection;
 use lancedb::index::{scalar::BTreeIndexBuilder, scalar::FtsIndexBuilder, Index as LanceIndex};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::OptimizeAction;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub struct SchemaManager {
@@ -861,180 +862,144 @@ impl SchemaManager {
     pub async fn compact_and_cleanup(&self) -> Result<()> {
         tracing::info!("Running database compaction and cleanup...");
 
-        // For each table, run compaction
         let table_names = self.connection.table_names().execute().await?;
 
-        let mut tables_to_compact = vec![
-            "functions",
-            "types",
-            "vectors",
-            "commit_vectors",
-            "lore_vectors",
-            "processed_files",
-            "symbol_filename",
-            "git_commits",
-            "lore",
-            "indexed_branches",
+        let mut tables_to_compact: Vec<String> = vec![
+            "functions".to_string(),
+            "types".to_string(),
+            "vectors".to_string(),
+            "commit_vectors".to_string(),
+            "lore_vectors".to_string(),
+            "processed_files".to_string(),
+            "symbol_filename".to_string(),
+            "git_commits".to_string(),
+            "lore".to_string(),
+            "indexed_branches".to_string(),
         ];
 
         // Add all content shard tables
         for shard in 0..16u8 {
-            tables_to_compact.push(Box::leak(format!("content_{shard}").into_boxed_str()));
+            tables_to_compact.push(format!("content_{shard}"));
         }
 
-        let mut tables_optimized = 0;
-        let mut tables_failed = 0;
+        // Filter to only existing tables
+        let tables_to_compact: Vec<String> = tables_to_compact
+            .into_iter()
+            .filter(|name| table_names.iter().any(|n| n == name))
+            .collect();
 
-        for table_name in &tables_to_compact {
-            if table_names.iter().any(|n| n == table_name) {
-                let table_start = std::time::Instant::now();
-                tracing::info!("Compacting table: {}", table_name);
-                let table = self.connection.open_table(*table_name).execute().await?;
+        let total_tables = tables_to_compact.len();
+        let tables_optimized = Arc::new(AtomicUsize::new(0));
+        let tables_failed = Arc::new(AtomicUsize::new(0));
+        let tables_processed = Arc::new(AtomicUsize::new(0));
 
-                // Get table version information
-                match table.count_rows(None).await {
-                    Ok(count) => {
-                        tracing::info!("Table {} has {} rows", table_name, count);
+        // Process tables in parallel with bounded concurrency
+        const PARALLEL_TABLES: usize = 8;
 
-                        // Proper LanceDB cleanup sequence
-                        let mut table_success = true;
+        stream::iter(tables_to_compact)
+            .map(|table_name| {
+                let connection = self.connection.clone();
+                let optimized = Arc::clone(&tables_optimized);
+                let failed = Arc::clone(&tables_failed);
+                let processed = Arc::clone(&tables_processed);
 
-                        // 1. Compact files
-                        match table
-                            .optimize(OptimizeAction::Compact {
-                                options: Default::default(),
-                                remap_options: None,
-                            })
-                            .await
-                        {
-                            Ok(_stats) => {
-                                tracing::info!("Compacted table {}", table_name);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to compact table {}: {}", table_name, e);
-                                table_success = false;
-                            }
+                async move {
+                    let result =
+                        Self::optimize_single_table(&connection, &table_name).await;
+                    let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::info!("Optimized table {}/{}: {}", done, total_tables, table_name);
+                    match result {
+                        Ok(true) => {
+                            optimized.fetch_add(1, Ordering::Relaxed);
                         }
-
-                        // 2. Prune ALL old versions (not just >7 days)
-                        // Set older_than to 0 seconds and delete_unverified to true
-                        match table
-                            .optimize(OptimizeAction::Prune {
-                                older_than: Some(
-                                    lancedb::table::Duration::try_seconds(0)
-                                        .expect("valid duration"),
-                                ),
-                                delete_unverified: Some(true),
-                                error_if_tagged_old_versions: Some(false),
-                            })
-                            .await
-                        {
-                            Ok(_stats) => {
-                                tracing::info!("Pruned all old versions from table {}", table_name);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to prune old versions from table {}: {}",
-                                    table_name,
-                                    e
-                                );
-                                table_success = false;
-                            }
+                        Ok(false) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
                         }
-
-                        // 3. Optimize indices
-                        match table
-                            .optimize(OptimizeAction::Index(Default::default()))
-                            .await
-                        {
-                            Ok(_stats) => {
-                                tracing::info!("Optimized indices for table {}", table_name);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to optimize indices for table {}: {}",
-                                    table_name,
-                                    e
-                                );
-                                table_success = false;
-                            }
+                        Err(e) => {
+                            tracing::warn!("Failed to optimize table {}: {}", table_name, e);
+                            failed.fetch_add(1, Ordering::Relaxed);
                         }
-
-                        // 4. CRITICAL: Checkout latest version to release old handles
-                        match table.checkout_latest().await {
-                            Ok(_) => {
-                                tracing::info!(
-                                    "Checked out latest version for table {}",
-                                    table_name
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to checkout latest version for table {}: {}",
-                                    table_name,
-                                    e
-                                );
-                            }
-                        }
-
-                        // 5. Force garbage collection by dropping the table handle
-                        // In some LanceDB versions, this helps trigger cleanup of old versions
-                        std::mem::drop(table);
-
-                        // 6. Additional cleanup attempt - force a small query to trigger background cleanup
-                        match self.connection.open_table(*table_name).execute().await {
-                            Ok(fresh_table) => {
-                                // Perform a minimal operation to trigger potential cleanup
-                                let _ = fresh_table.count_rows(None).await;
-                                tracing::info!(
-                                    "Triggered cleanup for table {} with fresh handle",
-                                    table_name
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Could not reopen table {} for cleanup: {}",
-                                    table_name,
-                                    e
-                                );
-                            }
-                        }
-
-                        // Large tables benefit more from these operations
-                        if count > 10000 {
-                            tracing::info!("Large table {} ({} rows) should see significant space savings after optimization",
-                                         table_name, count);
-                        }
-
-                        let _table_elapsed = table_start.elapsed();
-
-                        if table_success {
-                            tables_optimized += 1;
-                        } else {
-                            tables_failed += 1;
-                        }
-
-                        // Handle dropping is managed above
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to count rows in {}: {}", table_name, e);
-                        tables_failed += 1;
                     }
                 }
-            }
-        }
+            })
+            .buffer_unordered(PARALLEL_TABLES)
+            .collect::<Vec<()>>()
+            .await;
+
+        let optimized = tables_optimized.load(Ordering::Relaxed);
+        let failed = tables_failed.load(Ordering::Relaxed);
 
         println!(
             "    Optimized {} tables{}",
-            tables_optimized,
-            if tables_failed > 0 {
-                format!(", {} failed", tables_failed)
+            optimized,
+            if failed > 0 {
+                format!(", {} failed", failed)
             } else {
                 String::new()
             }
         );
 
         Ok(())
+    }
+
+    /// Optimize a single table - runs compact, prune, and index operations
+    async fn optimize_single_table(connection: &Connection, table_name: &str) -> Result<bool> {
+        tracing::info!("Compacting table: {}", table_name);
+        let table = connection.open_table(table_name).execute().await?;
+
+        let count = table.count_rows(None).await?;
+        tracing::info!("Table {} has {} rows", table_name, count);
+
+        let mut success = true;
+
+        // 1. Compact files
+        if let Err(e) = table
+            .optimize(OptimizeAction::Compact {
+                options: Default::default(),
+                remap_options: None,
+            })
+            .await
+        {
+            tracing::warn!("Failed to compact table {}: {}", table_name, e);
+            success = false;
+        }
+
+        // 2. Prune ALL old versions
+        if let Err(e) = table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(lancedb::table::Duration::try_seconds(0).expect("valid duration")),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await
+        {
+            tracing::warn!(
+                "Failed to prune old versions from table {}: {}",
+                table_name,
+                e
+            );
+            success = false;
+        }
+
+        // 3. Optimize indices
+        if let Err(e) = table
+            .optimize(OptimizeAction::Index(Default::default()))
+            .await
+        {
+            tracing::warn!("Failed to optimize indices for table {}: {}", table_name, e);
+            success = false;
+        }
+
+        // 4. Checkout latest version to release old handles
+        if let Err(e) = table.checkout_latest().await {
+            tracing::warn!(
+                "Failed to checkout latest version for table {}: {}",
+                table_name,
+                e
+            );
+        }
+
+        Ok(success)
     }
 
     /// Drop and recreate tables for maximum space savings
