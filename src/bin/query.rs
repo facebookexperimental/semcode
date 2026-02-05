@@ -193,27 +193,28 @@ async fn main() -> Result<()> {
         // Parse the diff to extract all modified functions, types, macros
         let parse_result = semcode::diffdump::parse_unified_diff(&diff_content)?;
 
+        // Generate git manifest ONCE for all lookups (fast)
+        let git_manifest = db_manager.generate_git_manifest(&git_sha).await?;
+
+        // Build caller index ONCE with one table scan (instead of N LIKE queries)
+        let caller_index = db_manager
+            .build_caller_index_with_manifest(&git_manifest)
+            .await?;
+
         // Collect all modified functions with their info
         let mut functions_info = Vec::new();
         let mut sorted_functions: Vec<_> = parse_result.modified_functions.iter().collect();
         sorted_functions.sort();
 
         for func_name in sorted_functions {
-            // Get info from database (for existing functions)
-            let func_opt = db_manager
-                .find_function_git_aware(func_name, &git_sha)
-                .await?;
-
-            let types: Vec<String> = if let Some(ref func) = func_opt {
-                func.types.clone().unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            let callers = db_manager
-                .get_function_callers_git_aware(func_name, &git_sha)
+            // Get types directly without fetching body (very fast)
+            let types = db_manager
+                .get_function_types_with_manifest(func_name, &git_manifest)
                 .await
                 .unwrap_or_default();
+
+            // Use caller index for instant lookup (no table scan)
+            let callers = caller_index.get(func_name).cloned().unwrap_or_default();
 
             // Get calls from the diff parsing (what this function calls in the patch)
             let mut calls_from_diff: Vec<String> = parse_result
@@ -232,7 +233,7 @@ async fn main() -> Result<()> {
 
             // Also try to get calls from database and merge
             let calls_from_db = db_manager
-                .get_function_callees_git_aware(func_name, &git_sha)
+                .get_function_callees_with_manifest(func_name, &git_manifest)
                 .await
                 .unwrap_or_default();
 

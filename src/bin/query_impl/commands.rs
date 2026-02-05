@@ -1760,26 +1760,47 @@ pub async fn handle_command(
                     }
                 };
 
+                // Generate git manifest ONCE for all lookups
+                let git_manifest = db.generate_git_manifest(&git_sha).await?;
+
+                // Build caller index ONCE with one table scan (instead of N LIKE queries)
+                let caller_index = db.build_caller_index_with_manifest(&git_manifest).await?;
+
+                // Cache for function lookups to avoid duplicate database queries
+                // Key: function name, Value: (types, calls)
+                #[allow(clippy::type_complexity)]
+                let mut func_cache: std::collections::HashMap<
+                    String,
+                    (Vec<String>, Vec<String>),
+                > = std::collections::HashMap::new();
+
                 // For each hunk, output JSON with function info
                 for (idx, hunk) in hunks.iter().enumerate() {
                     if let Some(func_name) = &hunk.modifies {
-                        // Look up function in database
-                        let func_opt = db.find_function_git_aware(func_name, &git_sha).await?;
+                        // Callers come from pre-built index (instant O(1) lookup)
+                        let callers = caller_index.get(func_name).cloned().unwrap_or_default();
 
-                        let types: Vec<String> = if let Some(ref func) = func_opt {
-                            func.types.clone().unwrap_or_default()
+                        // Check cache for types and calls
+                        let (types, calls) = if let Some(cached) = func_cache.get(func_name) {
+                            cached.clone()
                         } else {
-                            Vec::new()
-                        };
+                            // Get types directly without fetching body (very fast)
+                            let types = db
+                                .get_function_types_with_manifest(func_name, &git_manifest)
+                                .await
+                                .unwrap_or_default();
 
-                        let callers = db
-                            .get_function_callers_git_aware(func_name, &git_sha)
-                            .await
-                            .unwrap_or_default();
-                        let calls = db
-                            .get_function_callees_git_aware(func_name, &git_sha)
-                            .await
-                            .unwrap_or_default();
+                            // Get callees with manifest (fast - no manifest regeneration)
+                            let calls = db
+                                .get_function_callees_with_manifest(func_name, &git_manifest)
+                                .await
+                                .unwrap_or_default();
+
+                            // Cache the results
+                            func_cache.insert(func_name.clone(), (types.clone(), calls.clone()));
+
+                            (types, calls)
+                        };
 
                         // Build JSON output with hunk number first
                         let mut output = serde_json::Map::new();
