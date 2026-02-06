@@ -34,6 +34,11 @@ struct Args {
     #[arg(long, value_name = "BRANCH")]
     branch: Option<String>,
 
+    /// Execute a query and exit (non-interactive mode)
+    /// Example: -q "lore -f user@example.com -b keyword"
+    #[arg(short = 'q', long = "query", value_name = "QUERY")]
+    query: Option<String>,
+
     /// Parse a diff file and output per-hunk JSON with types, callers, and calls.
     /// Reads from stdin if no file is specified.
     #[arg(long, value_name = "FILE")]
@@ -279,6 +284,43 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&output)?);
 
         return Ok(());
+    }
+
+    // Handle -q/--query option: execute a single query and exit
+    if let Some(query_str) = &args.query {
+        // Parse the query string using shell-like parsing (handles quoted strings)
+        let parts_owned = match shlex::split(query_str) {
+            Some(parts) => parts,
+            None => {
+                eprintln!("Error: Invalid query syntax (unclosed quotes?)");
+                std::process::exit(1);
+            }
+        };
+
+        if parts_owned.is_empty() {
+            eprintln!("Error: Empty query");
+            std::process::exit(1);
+        }
+
+        // Convert to Vec<&str> for handle_command
+        let parts: Vec<&str> = parts_owned.iter().map(|s| s.as_str()).collect();
+
+        // Execute the command
+        match handle_command(
+            &parts,
+            &db_manager,
+            &args.git_repo,
+            &args.model_path,
+            &args.branch,
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     // Perform incremental indexing if needed
