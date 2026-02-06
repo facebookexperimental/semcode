@@ -87,6 +87,19 @@ semcode-index --lore https://lore.kernel.org/lkml/0
 # In this example: .semcode.db/lore/linux-kernel
 ```
 
+### Refreshing Existing Archives
+
+To fetch new emails and index them without re-specifying archive names:
+
+```bash
+# Refresh all previously cloned lore archives
+semcode-index --refresh-lore
+```
+
+This discovers all git repositories under `<db_dir>/lore/`, fetches new
+commits from each remote, and indexes any emails not yet in the database.
+Use this for a simple one-command workflow to keep lore archives up to date.
+
 ### Optional: Generate Vector Embeddings for Semantic Search
 
 To enable semantic search with the `vlore` command:
