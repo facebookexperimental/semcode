@@ -15,9 +15,10 @@ use semcode::lore_writers::{
 };
 use semcode::search::{
     dump_calls, dump_content, dump_functions, dump_git_commits, dump_lore, dump_macros,
-    dump_processed_files, dump_symbol_filename, dump_typedefs, dump_types, lore_get_by_message_id,
-    lore_search_by_commit, lore_search_multi_field, lore_search_with_thread,
-    query_function_or_macro_verbose, query_type_or_typedef, show_tables, LoreSearchOptions,
+    dump_processed_files, dump_symbol_filename, dump_typedefs, dump_types,
+    lore_get_by_message_id_with_options, lore_search_by_commit, lore_search_multi_field,
+    lore_search_with_thread, query_function_or_macro_verbose, query_type_or_typedef, show_tables,
+    LoreSearchOptions,
 };
 
 /// Parameters for vector-based commit similarity search
@@ -1385,6 +1386,7 @@ pub async fn handle_command(
                         show_replies: false,
                         since_date: since_date.as_deref(),
                         until_date: until_date.as_deref(),
+                        mbox_output: false,
                     };
                     lore_search_by_commit(db, commit_ref, git_repo_path, show_all, &options)
                         .await?;
@@ -1396,7 +1398,7 @@ pub async fn handle_command(
         }
         "lore" => {
             if parts.len() < 2 {
-                println!("{}", "Usage: lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--since <date>] [--until <date>] [--thread] [--replies] [-o <output_file>]".red());
+                println!("{}", "Usage: lore [-v] [-m <message_id>] [-f <regex>] [-s <regex>] [-b <regex>] [-t <regex>] [-g <regex>] [--limit <N>] [--since <date>] [--until <date>] [--thread] [--replies] [--mbox] [-o <output_file>]".red());
                 println!("  Search lore emails with regex filters");
                 println!("  Options:");
                 println!("    -v              Show full message body");
@@ -1421,6 +1423,7 @@ pub async fn handle_command(
                 println!(
                     "    --replies       Show all replies/subthreads under each matching email"
                 );
+                println!("    --mbox          Output in MBOX format (full headers and body)");
                 println!("    -o <file>       Write output to file instead of stdout");
                 println!("  Date formats: 'yesterday', 'N days ago', 'N weeks ago', 'YYYY-MM-DD'");
                 println!("  Multiple conditions:");
@@ -1448,7 +1451,7 @@ pub async fn handle_command(
                 println!("    dump-lore <file> - Export all emails to JSON");
                 println!("    dig <commit>     - Find emails for a git commit");
             } else {
-                // Parse flags: -v, -m, -f, -s, -b, -t, -g, --limit, --since, --until, --thread, --replies, -o
+                // Parse flags: -v, -m, -f, -s, -b, -t, -g, --limit, --since, --until, --thread, --replies, --mbox, -o
                 let mut verbose: usize = 0;
                 let mut message_id: Option<String> = None;
                 let mut from_patterns = Vec::new();
@@ -1461,6 +1464,7 @@ pub async fn handle_command(
                 let mut until_date_str: Option<String> = None;
                 let mut show_thread = false;
                 let mut show_replies = false;
+                let mut mbox_output = false;
                 let mut output_file: Option<String> = None;
                 let mut i = 1;
 
@@ -1522,6 +1526,10 @@ pub async fn handle_command(
                         }
                         "--replies" => {
                             show_replies = true;
+                            i += 1;
+                        }
+                        "--mbox" => {
+                            mbox_output = true;
                             i += 1;
                         }
                         "-o" if i + 1 < parts.len() => {
@@ -1611,11 +1619,19 @@ pub async fn handle_command(
                             show_replies,
                             since_date: None,
                             until_date: None,
+                            mbox_output,
                         };
                         lore_get_by_message_id_to_writer(db, &msg_id, &options, writer).await?;
                     } else {
-                        lore_get_by_message_id(db, &msg_id, verbose, show_thread, show_replies)
-                            .await?;
+                        let options = LoreSearchOptions {
+                            verbose,
+                            show_thread,
+                            show_replies,
+                            since_date: None,
+                            until_date: None,
+                            mbox_output,
+                        };
+                        lore_get_by_message_id_with_options(db, &msg_id, &options).await?;
                     }
                 } else {
                     // Build field_patterns from the collected patterns
@@ -1650,6 +1666,7 @@ pub async fn handle_command(
                             show_replies,
                             since_date: since_date.as_deref(),
                             until_date: until_date.as_deref(),
+                            mbox_output,
                         };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];
@@ -1674,6 +1691,7 @@ pub async fn handle_command(
                             show_replies,
                             since_date: since_date.as_deref(),
                             until_date: until_date.as_deref(),
+                            mbox_output,
                         };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];

@@ -7,7 +7,85 @@ use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 
 use crate::search::LoreSearchOptions;
+use crate::types::LoreEmailInfo;
 use crate::DatabaseManager;
+
+/// Format a lore email in MBOX format and write it to the writer
+///
+/// MBOX format:
+/// - "From " separator line with sender and date in asctime format
+/// - Full RFC 5322 headers
+/// - Blank line
+/// - Message body
+/// - Final blank line
+pub fn write_email_as_mbox(email: &LoreEmailInfo, writer: &mut dyn Write) -> Result<()> {
+    // Extract sender email for the From line
+    // The from field is typically "Name <email@example.com>" or just "email@example.com"
+    let sender = extract_email_address(&email.from);
+
+    // Convert RFC 2822 date to asctime format (24 chars, e.g., "Thu Jan  1 00:00:00 1970")
+    let asctime_date = convert_to_asctime(&email.date);
+
+    // Write the "From " separator line
+    writeln!(writer, "From {} {}", sender, asctime_date)?;
+
+    // Write the headers (already includes the original message headers)
+    write!(writer, "{}", email.headers)?;
+
+    // Ensure there's a blank line between headers and body
+    if !email.headers.ends_with('\n') {
+        writeln!(writer)?;
+    }
+    if !email.headers.ends_with("\n\n") {
+        writeln!(writer)?;
+    }
+
+    // Write the body
+    write!(writer, "{}", email.body)?;
+
+    // Ensure the message ends with a newline
+    if !email.body.ends_with('\n') {
+        writeln!(writer)?;
+    }
+
+    // Write the blank line that terminates the message
+    writeln!(writer)?;
+
+    Ok(())
+}
+
+/// Extract email address from a "Name <email@example.com>" string
+fn extract_email_address(from: &str) -> String {
+    // Look for email in angle brackets
+    if let Some(start) = from.find('<') {
+        if let Some(end) = from.find('>') {
+            if end > start {
+                return from[start + 1..end].to_string();
+            }
+        }
+    }
+    // No angle brackets, assume the whole string is the email
+    // Remove any surrounding whitespace
+    from.trim().to_string()
+}
+
+/// Convert RFC 2822 date to asctime format
+/// Input: "Thu, 01 Jan 1970 00:00:00 +0000"
+/// Output: "Thu Jan  1 00:00:00 1970"
+fn convert_to_asctime(rfc2822_date: &str) -> String {
+    use chrono::DateTime;
+
+    match DateTime::parse_from_rfc2822(rfc2822_date) {
+        Ok(dt) => {
+            // Format as asctime: "Thu Jan  1 00:00:00 1970"
+            dt.format("%a %b %e %H:%M:%S %Y").to_string()
+        }
+        Err(_) => {
+            // If parsing fails, return a default date
+            "Thu Jan  1 00:00:00 1970".to_string()
+        }
+    }
+}
 
 /// Sort emails by date (oldest first) using RFC 2822 date parsing
 pub fn sort_emails_by_date(emails: &mut [crate::types::LoreEmailInfo]) {
@@ -305,11 +383,13 @@ pub async fn lore_search_with_thread_to_writer(
     options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    writeln!(
-        writer,
-        "Searching lore emails where {} matches pattern: {}",
-        field, pattern
-    )?;
+    if !options.mbox_output {
+        writeln!(
+            writer,
+            "Searching lore emails where {} matches pattern: {}",
+            field, pattern
+        )?;
+    }
 
     let mut emails = db
         .search_lore_emails(
@@ -322,12 +402,22 @@ pub async fn lore_search_with_thread_to_writer(
         .await?;
 
     if emails.is_empty() {
-        writeln!(writer, "Info: No matching emails found")?;
+        if !options.mbox_output {
+            writeln!(writer, "Info: No matching emails found")?;
+        }
         return Ok(());
     }
 
     // Sort by date (oldest first)
     sort_emails_by_date(&mut emails);
+
+    // Handle MBOX output format
+    if options.mbox_output {
+        for email in &emails {
+            write_email_as_mbox(email, writer)?;
+        }
+        return Ok(());
+    }
 
     if options.show_thread {
         // Show full threads for all matching emails
@@ -418,9 +508,11 @@ pub async fn lore_search_multi_field_to_writer(
     options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    writeln!(writer, "Searching lore emails with multiple filters:")?;
-    for (field, pattern) in &field_patterns {
-        writeln!(writer, "  {} matches pattern: {}", field, pattern)?;
+    if !options.mbox_output {
+        writeln!(writer, "Searching lore emails with multiple filters:")?;
+        for (field, pattern) in &field_patterns {
+            writeln!(writer, "  {} matches pattern: {}", field, pattern)?;
+        }
     }
 
     let mut emails = db
@@ -433,12 +525,22 @@ pub async fn lore_search_multi_field_to_writer(
         .await?;
 
     if emails.is_empty() {
-        writeln!(writer, "Info: No matching emails found")?;
+        if !options.mbox_output {
+            writeln!(writer, "Info: No matching emails found")?;
+        }
         return Ok(());
     }
 
     // Sort by date (oldest first)
     sort_emails_by_date(&mut emails);
+
+    // Handle MBOX output format
+    if options.mbox_output {
+        for email in &emails {
+            write_email_as_mbox(email, writer)?;
+        }
+        return Ok(());
+    }
 
     if options.show_thread {
         // Show full threads for all matching emails
@@ -611,7 +713,18 @@ pub async fn dig_lore_by_commit_to_writer(
 
     // Sort by date (newest first)
     let mut sorted_emails = emails;
-    sorted_emails.sort_by(|a, b| b.date.cmp(&a.date));
+    sorted_emails.sort_by(|a, b| {
+        // Parse RFC 2822 dates for proper chronological comparison
+        let a_date = chrono::DateTime::parse_from_rfc2822(&a.date).ok();
+        let b_date = chrono::DateTime::parse_from_rfc2822(&b.date).ok();
+
+        match (b_date, a_date) {
+            (Some(b_dt), Some(a_dt)) => b_dt.cmp(&a_dt), // Descending order (newest first)
+            (Some(_), None) => std::cmp::Ordering::Less, // b is valid, a is not - b comes first
+            (None, Some(_)) => std::cmp::Ordering::Greater, // a is valid, b is not - a comes first
+            (None, None) => b.date.cmp(&a.date), // Both invalid - fall back to string comparison
+        }
+    });
 
     writeln!(
         writer,

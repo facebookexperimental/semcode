@@ -27,6 +27,7 @@ pub struct LoreSearchOptions<'a> {
     pub show_replies: bool,
     pub since_date: Option<&'a str>,
     pub until_date: Option<&'a str>,
+    pub mbox_output: bool,
 }
 
 /// Get functions called by the given function name - git-aware version
@@ -475,6 +476,7 @@ pub async fn lore_search(
         show_replies: false,
         since_date: None,
         until_date: None,
+        mbox_output: false,
     };
     lore_search_with_thread(db, field, pattern, limit, &options).await
 }
@@ -492,16 +494,18 @@ pub async fn lore_search_multi_field(
         field_map.entry(field).or_default().push(pattern);
     }
 
-    println!("Searching lore emails with conditions:");
-    for (field, patterns) in &field_map {
-        if patterns.len() == 1 {
-            println!("  {} matches: {}", field.cyan(), patterns[0].yellow());
-        } else {
-            println!(
-                "  {} matches (OR): {}",
-                field.cyan(),
-                patterns.join(" OR ").yellow()
-            );
+    if !options.mbox_output {
+        println!("Searching lore emails with conditions:");
+        for (field, patterns) in &field_map {
+            if patterns.len() == 1 {
+                println!("  {} matches: {}", field.cyan(), patterns[0].yellow());
+            } else {
+                println!(
+                    "  {} matches (OR): {}",
+                    field.cyan(),
+                    patterns.join(" OR ").yellow()
+                );
+            }
         }
     }
 
@@ -515,12 +519,23 @@ pub async fn lore_search_multi_field(
         .await?;
 
     if emails.is_empty() {
-        println!("{} No matching emails found", "Info:".yellow());
+        if !options.mbox_output {
+            println!("{} No matching emails found", "Info:".yellow());
+        }
         return Ok(());
     }
 
     // Sort by date (oldest first)
     crate::lore_writers::sort_emails_by_date(&mut emails);
+
+    // Handle MBOX output format
+    if options.mbox_output {
+        let mut stdout = std::io::stdout();
+        for email in &emails {
+            crate::lore_writers::write_email_as_mbox(email, &mut stdout)?;
+        }
+        return Ok(());
+    }
 
     if options.show_thread {
         // Show full threads for all matching emails
@@ -599,11 +614,13 @@ pub async fn lore_search_with_thread(
     limit: usize,
     options: &LoreSearchOptions<'_>,
 ) -> Result<()> {
-    println!(
-        "Searching lore emails where {} matches pattern: {}",
-        field.cyan(),
-        pattern.yellow()
-    );
+    if !options.mbox_output {
+        println!(
+            "Searching lore emails where {} matches pattern: {}",
+            field.cyan(),
+            pattern.yellow()
+        );
+    }
 
     let mut emails = db
         .search_lore_emails(
@@ -616,12 +633,23 @@ pub async fn lore_search_with_thread(
         .await?;
 
     if emails.is_empty() {
-        println!("{} No matching emails found", "Info:".yellow());
+        if !options.mbox_output {
+            println!("{} No matching emails found", "Info:".yellow());
+        }
         return Ok(());
     }
 
     // Sort by date (oldest first)
     crate::lore_writers::sort_emails_by_date(&mut emails);
+
+    // Handle MBOX output format
+    if options.mbox_output {
+        let mut stdout = std::io::stdout();
+        for email in &emails {
+            crate::lore_writers::write_email_as_mbox(email, &mut stdout)?;
+        }
+        return Ok(());
+    }
 
     if options.show_thread {
         // Show full threads for all matching emails
@@ -761,6 +789,78 @@ pub async fn lore_get_by_message_id(
 
                 // Show full message body only when verbose
                 if verbose >= 1 {
+                    println!("\n{}", "   --- Message Body ---".bright_black());
+                    // Body is already separated from headers
+                    for line in email.body.lines() {
+                        println!("   {}", line);
+                    }
+                    println!("{}", "   --- End Message ---".bright_black());
+                }
+
+                println!();
+            }
+        }
+        None => {
+            println!(
+                "{} Email not found with message_id: {}",
+                "Info:".yellow(),
+                message_id
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Get a lore email by message_id with full options support (including mbox output)
+pub async fn lore_get_by_message_id_with_options(
+    db: &DatabaseManager,
+    message_id: &str,
+    options: &LoreSearchOptions<'_>,
+) -> Result<()> {
+    if !options.mbox_output {
+        println!("Looking up email with message_id: {}", message_id.cyan());
+    }
+
+    let email_opt = db.get_lore_email_by_message_id(message_id).await?;
+
+    match email_opt {
+        Some(email) => {
+            if options.mbox_output {
+                // Output in MBOX format
+                let mut stdout = std::io::stdout();
+                crate::lore_writers::write_email_as_mbox(&email, &mut stdout)?;
+            } else if options.show_thread {
+                // Show the full thread for this message
+                println!();
+                lore_show_thread(db, &email.message_id, options.verbose).await?;
+            } else if options.show_replies {
+                // Show only replies/descendants
+                println!();
+                lore_show_replies(db, &email.message_id, options.verbose).await?;
+            } else {
+                // Show just this single message
+                println!("\n{}\n", "Email found:".green());
+                println!("{} - {}", email.date.bright_black(), email.subject.cyan());
+
+                // Always show database column headers
+                println!("   From: {}", email.from.yellow());
+                println!("   Message-ID: {}", email.message_id.bright_black());
+
+                if let Some(ref in_reply_to) = email.in_reply_to {
+                    println!("   In-Reply-To: {}", in_reply_to.bright_black());
+                }
+
+                if let Some(ref references) = email.references {
+                    println!("   References: {}", references.bright_black());
+                }
+
+                if !email.recipients.is_empty() {
+                    println!("   Recipients: {}", email.recipients.bright_black());
+                }
+
+                // Show full message body only when verbose
+                if options.verbose >= 1 {
                     println!("\n{}", "   --- Message Body ---".bright_black());
                     // Body is already separated from headers
                     for line in email.body.lines() {

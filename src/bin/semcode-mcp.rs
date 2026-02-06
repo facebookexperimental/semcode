@@ -1886,6 +1886,7 @@ struct LoreSearchParams<'a> {
     show_replies: bool,
     since_date: Option<&'a str>,
     until_date: Option<&'a str>,
+    mbox_output: bool,
 }
 
 /// Parameters for dig lore by commit operations
@@ -2369,6 +2370,11 @@ fn get_tool_schema(name: &str) -> Option<Value> {
                     "until_date": {
                         "type": "string",
                         "description": "Optional date to filter emails up to this date. Supports: 'yesterday', 'N days ago', 'N weeks ago', 'N months ago', 'YYYY-MM-DD', ISO 8601 format."
+                    },
+                    "mbox": {
+                        "type": "boolean",
+                        "description": "Output in MBOX format with full headers and body (default: false). Useful for exporting emails.",
+                        "default": false
                     },
                     "page": {
                         "type": "integer",
@@ -3381,6 +3387,7 @@ impl McpServer {
         let verbose = args["verbose"].as_bool().unwrap_or(false) as usize; // Convert to usize for function signature
         let show_thread = args["show_thread"].as_bool().unwrap_or(false);
         let show_replies = args["show_replies"].as_bool().unwrap_or(false);
+        let mbox_output = args["mbox"].as_bool().unwrap_or(false);
         let limit = args["limit"].as_u64().unwrap_or(100) as usize;
         let page = args["page"].as_u64().map(|p| p as usize);
 
@@ -3508,6 +3515,7 @@ impl McpServer {
                 show_replies,
                 since_date: since_date.as_deref(),
                 until_date: until_date.as_deref(),
+                mbox_output,
             };
             match mcp_lore_search_multi_field(&self.db, &search_params).await {
                 Ok(output) => {
@@ -4375,6 +4383,7 @@ async fn mcp_lore_get_by_message_id(
         show_replies,
         since_date: None,
         until_date: None,
+        mbox_output: false,
     };
     semcode::lore_writers::lore_get_by_message_id_to_writer(db, message_id, &options, &mut buffer)
         .await?;
@@ -4424,6 +4433,7 @@ async fn mcp_lore_search_multi_field(
         show_replies: params.show_replies,
         since_date: params.since_date,
         until_date: params.until_date,
+        mbox_output: params.mbox_output,
     };
     semcode::lore_writers::lore_search_multi_field_to_writer(
         db,
@@ -4450,6 +4460,7 @@ async fn mcp_dig_lore_by_commit(
         show_replies: params.show_replies,
         since_date: params.since_date,
         until_date: params.until_date,
+        mbox_output: false,
     };
     semcode::lore_writers::dig_lore_by_commit_to_writer(
         db,
