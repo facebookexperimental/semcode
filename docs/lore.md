@@ -81,7 +81,10 @@ Before searching, you need to clone and index a lore archive:
 
 ```bash
 # Index a lore archive (e.g., linux kernel mailing list)
-semcode-index --lore https://lore.kernel.org/lkml/0
+semcode-index --lore lkml
+
+# Index multiple lists at once
+semcode-index --lore lkml,bpf
 
 # The archive will be cloned to <db_dir>/lore/<repo_name>
 # In this example: .semcode.db/lore/linux-kernel
@@ -93,12 +96,13 @@ To fetch new emails and index them without re-specifying archive names:
 
 ```bash
 # Refresh all previously cloned lore archives
-semcode-index --refresh-lore
+semcode-index --lore
 ```
 
-This discovers all git repositories under `<db_dir>/lore/`, fetches new
-commits from each remote, and indexes any emails not yet in the database.
-Use this for a simple one-command workflow to keep lore archives up to date.
+When called without arguments, `--lore` discovers all git repositories under
+`<db_dir>/lore/`, fetches new commits from each remote, and indexes any emails
+not yet in the database. Use this for a simple one-command workflow to keep
+lore archives up to date.
 
 ### Optional: Generate Vector Embeddings for Semantic Search
 
@@ -106,7 +110,7 @@ To enable semantic search with the `vlore` command:
 
 ```bash
 # Generate vector embeddings for indexed emails
-semcode-index --lore https://lore.kernel.org/linux-kernel --vectors
+semcode-index --lore lkml --vectors
 ```
 
 Note: Vector generation is optional but required for the `vlore` command.

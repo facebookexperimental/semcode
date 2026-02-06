@@ -9,8 +9,8 @@ both exact matches and semantic similarity.
 Rust indexing is now supported.  This just uses treesitter, but all the
 semcode features are there.
 
-Now with lore indexing!  semcode-index --lore lkml (or any list name) will
-pull down the latest git archive from that list.  See [the lore documentation](docs/lore.md)
+Now with lore indexing!  semcode-index --lore lkml,netdev (or any list names) will
+pull down the latest git archive from those lists.  See [the lore documentation](docs/lore.md)
 for more details.  This is a database schema change, so you'll need to reindex.
 
 Recent commits introduced indexes for git commit history, as well as
