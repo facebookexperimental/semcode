@@ -10,8 +10,8 @@ use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use semcode::display::print_help;
 use semcode::lore_writers::{
-    lore_get_by_message_id_to_writer, lore_search_multi_field_to_writer,
-    lore_search_with_thread_to_writer,
+    dig_lore_by_commit_to_writer, lore_get_by_message_id_to_writer,
+    lore_search_multi_field_to_writer, lore_search_with_thread_to_writer,
 };
 use semcode::search::{
     dump_calls, dump_content, dump_functions, dump_git_commits, dump_lore, dump_macros,
@@ -1281,7 +1281,7 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] <commit>"
+                    "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>"
                         .red()
                 );
                 println!("  Search for lore emails related to a git commit");
@@ -1292,6 +1292,8 @@ pub async fn handle_command(
                 println!("    --thread        Show full thread for each result (use with -a)");
                 println!("    --since <date>  Only show emails from this date onwards");
                 println!("    --until <date>  Only show emails up to this date");
+                println!("    --mbox          Output in MBOX format (full headers and body)");
+                println!("    -o <file>       Write output to file instead of stdout");
                 println!("  Date formats: 'yesterday', 'N days ago', 'N weeks ago', 'YYYY-MM-DD'");
                 println!("  Examples:");
                 println!("    dig HEAD                    # Show most recent match thread");
@@ -1304,6 +1306,7 @@ pub async fn handle_command(
                 println!(
                     "    dig --since \"1 week ago\" HEAD  # Show recent emails for HEAD commit"
                 );
+                println!("    dig --mbox -o emails.mbox HEAD  # Export to MBOX file");
             } else {
                 // Parse flags directly in a loop
                 let mut verbose_level = 0;
@@ -1311,6 +1314,8 @@ pub async fn handle_command(
                 let mut show_thread = false;
                 let mut since_date_str: Option<String> = None;
                 let mut until_date_str: Option<String> = None;
+                let mut mbox_output = false;
+                let mut output_file: Option<String> = None;
                 let mut commit_ish: Option<&str> = None;
                 let mut i = 1;
 
@@ -1334,6 +1339,14 @@ pub async fn handle_command(
                         }
                         "--until" if i + 1 < parts.len() => {
                             until_date_str = Some(parts[i + 1].to_string());
+                            i += 2;
+                        }
+                        "--mbox" => {
+                            mbox_output = true;
+                            i += 1;
+                        }
+                        "-o" if i + 1 < parts.len() => {
+                            output_file = Some(parts[i + 1].to_string());
                             i += 2;
                         }
                         _ => {
@@ -1380,18 +1393,53 @@ pub async fn handle_command(
                         None
                     };
 
+                    // Handle output file if specified
+                    use std::fs::File;
+
+                    let mut file_writer: Option<File> = None;
+                    if let Some(ref path) = output_file {
+                        match File::create(path) {
+                            Ok(f) => {
+                                file_writer = Some(f);
+                                println!("Writing output to: {}", path);
+                            }
+                            Err(e) => {
+                                println!(
+                                    "{} Failed to create output file '{}': {}",
+                                    "Error:".red(),
+                                    path,
+                                    e
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    }
+
                     let options = LoreSearchOptions {
                         verbose: verbose_level,
                         show_thread,
                         show_replies: false,
                         since_date: since_date.as_deref(),
                         until_date: until_date.as_deref(),
-                        mbox_output: false,
+                        mbox_output,
                     };
-                    lore_search_by_commit(db, commit_ref, git_repo_path, show_all, &options)
+
+                    if let Some(ref mut writer) = file_writer {
+                        dig_lore_by_commit_to_writer(
+                            db,
+                            commit_ref,
+                            git_repo_path,
+                            show_all,
+                            &options,
+                            writer,
+                        )
                         .await?;
+                    } else {
+                        lore_search_by_commit(db, commit_ref, git_repo_path, show_all, &options)
+                            .await?;
+                    }
                 } else {
-                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] <commit>".red());
+                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>".red());
                     println!("  Missing commit argument");
                 }
             }

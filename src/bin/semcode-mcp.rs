@@ -3487,8 +3487,15 @@ impl McpServer {
 
         // Handle message_id lookup (same as query tool's -m flag)
         if let Some(msg_id) = message_id {
-            match mcp_lore_get_by_message_id(&self.db, msg_id, verbose, show_thread, show_replies)
-                .await
+            match mcp_lore_get_by_message_id(
+                &self.db,
+                msg_id,
+                verbose,
+                show_thread,
+                show_replies,
+                mbox_output,
+            )
+            .await
             {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
@@ -4373,6 +4380,7 @@ async fn mcp_lore_get_by_message_id(
     verbose: usize,
     show_thread: bool,
     show_replies: bool,
+    mbox_output: bool,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
@@ -4383,7 +4391,7 @@ async fn mcp_lore_get_by_message_id(
         show_replies,
         since_date: None,
         until_date: None,
-        mbox_output: false,
+        mbox_output,
     };
     semcode::lore_writers::lore_get_by_message_id_to_writer(db, message_id, &options, &mut buffer)
         .await?;

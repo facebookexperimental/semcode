@@ -106,20 +106,24 @@ pub fn sort_emails_by_date(emails: &mut [crate::types::LoreEmailInfo]) {
 pub async fn lore_show_thread_to_writer(
     db: &DatabaseManager,
     message_id: &str,
-    verbose: usize,
+    options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    writeln!(writer, "Finding thread root for message: {}", message_id)?;
+    if !options.mbox_output {
+        writeln!(writer, "Finding thread root for message: {}", message_id)?;
+    }
 
     // Step 1: Walk up the in_reply_to chain to find the root message
     let mut current_email = match db.get_lore_email_by_message_id(message_id).await? {
         Some(email) => email,
         None => {
-            writeln!(
-                writer,
-                "Error: Email not found with message_id: {}",
-                message_id
-            )?;
+            if !options.mbox_output {
+                writeln!(
+                    writer,
+                    "Error: Email not found with message_id: {}",
+                    message_id
+                )?;
+            }
             return Ok(());
         }
     };
@@ -147,7 +151,9 @@ pub async fn lore_show_thread_to_writer(
     }
 
     let root_message_id = current_email.message_id.clone();
-    writeln!(writer, "Found thread root: {}\n", root_message_id)?;
+    if !options.mbox_output {
+        writeln!(writer, "Found thread root: {}\n", root_message_id)?;
+    }
 
     // Step 2: Now walk down from root to collect all messages in thread
     let mut all_emails = Vec::new();
@@ -180,6 +186,14 @@ pub async fn lore_show_thread_to_writer(
     // Sort emails in thread order (respecting reply structure, then by date)
     let sorted_emails = crate::search::sort_emails_by_thread_order(&all_emails);
 
+    // Handle MBOX output format
+    if options.mbox_output {
+        for email in &sorted_emails {
+            write_email_as_mbox(email, writer)?;
+        }
+        return Ok(());
+    }
+
     writeln!(
         writer,
         "Thread: Found {} message(s) in thread:\n",
@@ -206,7 +220,7 @@ pub async fn lore_show_thread_to_writer(
             writeln!(writer, "   Recipients: {}", email.recipients)?;
         }
 
-        if verbose >= 1 {
+        if options.verbose >= 1 {
             writeln!(writer, "\n   --- Message Body ---")?;
             for line in email.body.lines() {
                 writeln!(writer, "   {}", line)?;
@@ -224,23 +238,27 @@ pub async fn lore_show_thread_to_writer(
 pub async fn lore_show_replies_to_writer(
     db: &DatabaseManager,
     message_id: &str,
-    verbose: usize,
+    options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
     #[allow(unused)] // verbose is used in conditional compilation
     use std::collections::{HashSet, VecDeque};
 
-    writeln!(writer, "Finding all replies to message: {}", message_id)?;
+    if !options.mbox_output {
+        writeln!(writer, "Finding all replies to message: {}", message_id)?;
+    }
 
     // Get the starting message
     let root_email = match db.get_lore_email_by_message_id(message_id).await? {
         Some(email) => email,
         None => {
-            writeln!(
-                writer,
-                "Error: Email not found with message_id: {}",
-                message_id
-            )?;
+            if !options.mbox_output {
+                writeln!(
+                    writer,
+                    "Error: Email not found with message_id: {}",
+                    message_id
+                )?;
+            }
             return Ok(());
         }
     };
@@ -275,12 +293,26 @@ pub async fn lore_show_replies_to_writer(
 
     if all_emails.len() == 1 {
         // Only the root message, no replies
-        writeln!(writer, "\nInfo: No replies found")?;
+        if !options.mbox_output {
+            writeln!(writer, "\nInfo: No replies found")?;
+        }
+        // For mbox, still output the root message
+        if options.mbox_output {
+            write_email_as_mbox(&all_emails[0], writer)?;
+        }
         return Ok(());
     }
 
     // Sort emails in thread order (respecting reply structure, then by date)
     let sorted_emails = crate::search::sort_emails_by_thread_order(&all_emails);
+
+    // Handle MBOX output format
+    if options.mbox_output {
+        for email in &sorted_emails {
+            write_email_as_mbox(email, writer)?;
+        }
+        return Ok(());
+    }
 
     writeln!(
         writer,
@@ -301,7 +333,7 @@ pub async fn lore_show_replies_to_writer(
         }
 
         // Show full message body only when verbose
-        if verbose >= 1 {
+        if options.verbose >= 1 {
             writeln!(writer, "\n   --- Message Body ---")?;
             for line in email.body.lines() {
                 writeln!(writer, "   {}", line)?;
@@ -322,7 +354,9 @@ pub async fn lore_get_by_message_id_to_writer(
     options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    writeln!(writer, "Looking up email with message_id: {}\n", message_id)?;
+    if !options.mbox_output {
+        writeln!(writer, "Looking up email with message_id: {}\n", message_id)?;
+    }
 
     let email_opt = db.get_lore_email_by_message_id(message_id).await?;
 
@@ -330,10 +364,13 @@ pub async fn lore_get_by_message_id_to_writer(
         Some(email) => {
             if options.show_thread {
                 // Show the full thread for this message
-                lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
+                lore_show_thread_to_writer(db, &email.message_id, options, writer).await?;
             } else if options.show_replies {
                 // Show only replies/descendants
-                lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
+                lore_show_replies_to_writer(db, &email.message_id, options, writer).await?;
+            } else if options.mbox_output {
+                // Output single message in mbox format
+                write_email_as_mbox(&email, writer)?;
             } else {
                 // Show just this single message
                 writeln!(writer, "Email found:\n")?;
@@ -363,11 +400,13 @@ pub async fn lore_get_by_message_id_to_writer(
             }
         }
         None => {
-            writeln!(
-                writer,
-                "Info: Email not found with message_id: {}",
-                message_id
-            )?;
+            if !options.mbox_output {
+                writeln!(
+                    writer,
+                    "Info: Email not found with message_id: {}",
+                    message_id
+                )?;
+            }
         }
     }
 
@@ -411,46 +450,56 @@ pub async fn lore_search_with_thread_to_writer(
     // Sort by date (oldest first)
     sort_emails_by_date(&mut emails);
 
-    // Handle MBOX output format
+    // Handle show_thread first - lore_show_thread_to_writer handles mbox_output internally
+    if options.show_thread {
+        // Show full threads for all matching emails
+        if !options.mbox_output {
+            writeln!(
+                writer,
+                "\n{} matches found, showing threads:\n",
+                emails.len()
+            )?;
+        }
+
+        for (idx, email) in emails.iter().enumerate() {
+            if !options.mbox_output && idx > 0 {
+                writeln!(writer, "\n{}\n", "=".repeat(80))?;
+            }
+            if !options.mbox_output {
+                writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
+            }
+            lore_show_thread_to_writer(db, &email.message_id, options, writer).await?;
+        }
+        return Ok(());
+    }
+
+    // Handle show_replies - lore_show_replies_to_writer handles mbox_output internally
+    if options.show_replies {
+        // Show replies for all matching emails
+        if !options.mbox_output {
+            writeln!(
+                writer,
+                "\n{} matches found, showing replies:\n",
+                emails.len()
+            )?;
+        }
+
+        for (idx, email) in emails.iter().enumerate() {
+            if !options.mbox_output && idx > 0 {
+                writeln!(writer, "\n{}\n", "=".repeat(80))?;
+            }
+            if !options.mbox_output {
+                writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
+            }
+            lore_show_replies_to_writer(db, &email.message_id, options, writer).await?;
+        }
+        return Ok(());
+    }
+
+    // Handle MBOX output format (without show_thread/show_replies)
     if options.mbox_output {
         for email in &emails {
             write_email_as_mbox(email, writer)?;
-        }
-        return Ok(());
-    }
-
-    if options.show_thread {
-        // Show full threads for all matching emails
-        writeln!(
-            writer,
-            "\n{} matches found, showing threads:\n",
-            emails.len()
-        )?;
-
-        for (idx, email) in emails.iter().enumerate() {
-            if idx > 0 {
-                writeln!(writer, "\n{}\n", "=".repeat(80))?;
-            }
-            writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
-            lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
-        }
-        return Ok(());
-    }
-
-    if options.show_replies {
-        // Show replies for all matching emails
-        writeln!(
-            writer,
-            "\n{} matches found, showing replies:\n",
-            emails.len()
-        )?;
-
-        for (idx, email) in emails.iter().enumerate() {
-            if idx > 0 {
-                writeln!(writer, "\n{}\n", "=".repeat(80))?;
-            }
-            writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
-            lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
         }
         return Ok(());
     }
@@ -534,46 +583,56 @@ pub async fn lore_search_multi_field_to_writer(
     // Sort by date (oldest first)
     sort_emails_by_date(&mut emails);
 
-    // Handle MBOX output format
+    // Handle show_thread first - lore_show_thread_to_writer handles mbox_output internally
+    if options.show_thread {
+        // Show full threads for all matching emails
+        if !options.mbox_output {
+            writeln!(
+                writer,
+                "\n{} matches found, showing threads:\n",
+                emails.len()
+            )?;
+        }
+
+        for (idx, email) in emails.iter().enumerate() {
+            if !options.mbox_output && idx > 0 {
+                writeln!(writer, "\n{}\n", "=".repeat(80))?;
+            }
+            if !options.mbox_output {
+                writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
+            }
+            lore_show_thread_to_writer(db, &email.message_id, options, writer).await?;
+        }
+        return Ok(());
+    }
+
+    // Handle show_replies - lore_show_replies_to_writer handles mbox_output internally
+    if options.show_replies {
+        // Show replies for all matching emails
+        if !options.mbox_output {
+            writeln!(
+                writer,
+                "\n{} matches found, showing replies:\n",
+                emails.len()
+            )?;
+        }
+
+        for (idx, email) in emails.iter().enumerate() {
+            if !options.mbox_output && idx > 0 {
+                writeln!(writer, "\n{}\n", "=".repeat(80))?;
+            }
+            if !options.mbox_output {
+                writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
+            }
+            lore_show_replies_to_writer(db, &email.message_id, options, writer).await?;
+        }
+        return Ok(());
+    }
+
+    // Handle MBOX output format (without show_thread/show_replies)
     if options.mbox_output {
         for email in &emails {
             write_email_as_mbox(email, writer)?;
-        }
-        return Ok(());
-    }
-
-    if options.show_thread {
-        // Show full threads for all matching emails
-        writeln!(
-            writer,
-            "\n{} matches found, showing threads:\n",
-            emails.len()
-        )?;
-
-        for (idx, email) in emails.iter().enumerate() {
-            if idx > 0 {
-                writeln!(writer, "\n{}\n", "=".repeat(80))?;
-            }
-            writeln!(writer, "===> Thread {} of {}:", idx + 1, emails.len())?;
-            lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
-        }
-        return Ok(());
-    }
-
-    if options.show_replies {
-        // Show replies for all matching emails
-        writeln!(
-            writer,
-            "\n{} matches found, showing replies:\n",
-            emails.len()
-        )?;
-
-        for (idx, email) in emails.iter().enumerate() {
-            if idx > 0 {
-                writeln!(writer, "\n{}\n", "=".repeat(80))?;
-            }
-            writeln!(writer, "===> Replies {} of {}:", idx + 1, emails.len())?;
-            lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
         }
         return Ok(());
     }
@@ -635,21 +694,23 @@ pub async fn dig_lore_by_commit_to_writer(
 ) -> Result<()> {
     use crate::git;
 
-    writeln!(
-        writer,
-        "Searching for lore emails related to git commit: {}",
-        commit_ish
-    )?;
-    if show_all {
-        writeln!(writer, "  (showing all matches)")?;
-    } else {
-        writeln!(writer, "  (showing most recent match only)")?;
-    }
-    if options.show_thread {
-        writeln!(writer, "  (with full threads)")?;
-    }
-    if options.show_replies {
-        writeln!(writer, "  (with all replies)")?;
+    if !options.mbox_output {
+        writeln!(
+            writer,
+            "Searching for lore emails related to git commit: {}",
+            commit_ish
+        )?;
+        if show_all {
+            writeln!(writer, "  (showing all matches)")?;
+        } else {
+            writeln!(writer, "  (showing most recent match only)")?;
+        }
+        if options.show_thread {
+            writeln!(writer, "  (with full threads)")?;
+        }
+        if options.show_replies {
+            writeln!(writer, "  (with all replies)")?;
+        }
     }
 
     // Resolve git commit-ish to full SHA and get commit info (reuse git resolution logic)
@@ -685,21 +746,25 @@ pub async fn dig_lore_by_commit_to_writer(
     };
 
     if subject.is_empty() {
-        writeln!(
-            writer,
-            "Error: Commit {} has no subject line",
-            &git_sha[..12]
-        )?;
+        if !options.mbox_output {
+            writeln!(
+                writer,
+                "Error: Commit {} has no subject line",
+                &git_sha[..12]
+            )?;
+        }
         return Ok(());
     }
 
-    writeln!(
-        writer,
-        "Looking up commit: {} ({})",
-        commit_ish,
-        &git_sha[..12]
-    )?;
-    writeln!(writer, "  Commit subject: {}\n", subject)?;
+    if !options.mbox_output {
+        writeln!(
+            writer,
+            "Looking up commit: {} ({})",
+            commit_ish,
+            &git_sha[..12]
+        )?;
+        writeln!(writer, "  Commit subject: {}\n", subject)?;
+    }
 
     // Search lore emails by exact subject match (reuse database function)
     let emails = db
@@ -707,7 +772,9 @@ pub async fn dig_lore_by_commit_to_writer(
         .await?;
 
     if emails.is_empty() {
-        writeln!(writer, "Info: No matching emails found")?;
+        if !options.mbox_output {
+            writeln!(writer, "Info: No matching emails found")?;
+        }
         return Ok(());
     }
 
@@ -726,49 +793,79 @@ pub async fn dig_lore_by_commit_to_writer(
         }
     });
 
-    writeln!(
-        writer,
-        "Searching lore emails where subject matches pattern: {}",
-        subject
-    )?;
+    // Handle MBOX output format (only for simple case without thread/replies)
+    if options.mbox_output && !options.show_thread && !options.show_replies {
+        // For mbox, sort by date (oldest first) for proper chronological order in mailbox
+        sort_emails_by_date(&mut sorted_emails);
+
+        let emails_to_output = if show_all {
+            &sorted_emails[..]
+        } else {
+            // Just the most recent (which is now at the end after sorting oldest first)
+            if sorted_emails.is_empty() {
+                &[]
+            } else {
+                &sorted_emails[sorted_emails.len() - 1..]
+            }
+        };
+
+        for email in emails_to_output {
+            write_email_as_mbox(email, writer)?;
+        }
+        return Ok(());
+    }
+
+    if !options.mbox_output {
+        writeln!(
+            writer,
+            "Searching lore emails where subject matches pattern: {}",
+            subject
+        )?;
+    }
 
     if show_all {
         // Show all matching emails
-        writeln!(
-            writer,
-            "\nResults: Found {} matching email(s):\n",
-            sorted_emails.len()
-        )?;
+        if !options.mbox_output {
+            writeln!(
+                writer,
+                "\nResults: Found {} matching email(s):\n",
+                sorted_emails.len()
+            )?;
+        }
 
         if options.show_thread {
             // Show full threads
             for (idx, email) in sorted_emails.iter().enumerate() {
-                if idx > 0 {
-                    writeln!(writer, "\n{}\n", "=".repeat(80))?;
+                if !options.mbox_output {
+                    if idx > 0 {
+                        writeln!(writer, "\n{}\n", "=".repeat(80))?;
+                    }
+                    writeln!(
+                        writer,
+                        "===> Thread {} of {} ({}):",
+                        idx + 1,
+                        sorted_emails.len(),
+                        email.date
+                    )?;
                 }
-                writeln!(
-                    writer,
-                    "===> Thread {} of {} ({}):",
-                    idx + 1,
-                    sorted_emails.len(),
-                    email.date
-                )?;
-                lore_show_thread_to_writer(db, &email.message_id, options.verbose, writer).await?;
+                lore_show_thread_to_writer(db, &email.message_id, options, writer).await?;
             }
         } else if options.show_replies {
             // Show all replies
             for (idx, email) in sorted_emails.iter().enumerate() {
-                if idx > 0 {
-                    writeln!(writer, "\n{}\n", "=".repeat(80))?;
+                if !options.mbox_output {
+                    if idx > 0 {
+                        writeln!(writer, "\n{}\n", "=".repeat(80))?;
+                    }
+                    writeln!(
+                        writer,
+                        "===> Replies {} of {} ({}):",
+                        idx + 1,
+                        sorted_emails.len(),
+                        email.date
+                    )?;
                 }
-                writeln!(
-                    writer,
-                    "===> Replies {} of {} ({}):",
-                    idx + 1,
-                    sorted_emails.len(),
-                    email.date
-                )?;
-                lore_show_replies_to_writer(db, &email.message_id, options.verbose, writer).await?;
+                lore_show_replies_to_writer(db, &email.message_id, options, writer).await?;
             }
         } else {
             // Show summary of all matching emails
@@ -790,20 +887,24 @@ pub async fn dig_lore_by_commit_to_writer(
     } else {
         // Show only most recent match
         if let Some(most_recent) = sorted_emails.first() {
-            writeln!(
-                writer,
-                "\nResults: Found {} matching email(s), showing most recent:\n",
-                sorted_emails.len()
-            )?;
+            if !options.mbox_output {
+                writeln!(
+                    writer,
+                    "\nResults: Found {} matching email(s), showing most recent:\n",
+                    sorted_emails.len()
+                )?;
+            }
 
             if options.show_thread {
-                writeln!(writer, "===> Most Recent Thread:")?;
-                lore_show_thread_to_writer(db, &most_recent.message_id, options.verbose, writer)
-                    .await?;
+                if !options.mbox_output {
+                    writeln!(writer, "===> Most Recent Thread:")?;
+                }
+                lore_show_thread_to_writer(db, &most_recent.message_id, options, writer).await?;
             } else if options.show_replies {
-                writeln!(writer, "===> Replies to Most Recent:")?;
-                lore_show_replies_to_writer(db, &most_recent.message_id, options.verbose, writer)
-                    .await?;
+                if !options.mbox_output {
+                    writeln!(writer, "===> Replies to Most Recent:")?;
+                }
+                lore_show_replies_to_writer(db, &most_recent.message_id, options, writer).await?;
             } else {
                 writeln!(writer, "1. {} - {}", most_recent.date, most_recent.subject)?;
                 writeln!(writer, "   From: {}", most_recent.from)?;
@@ -818,7 +919,7 @@ pub async fn dig_lore_by_commit_to_writer(
                 }
             }
 
-            if sorted_emails.len() > 1 {
+            if !options.mbox_output && sorted_emails.len() > 1 {
                 writeln!(
                     writer,
                     "\nNote: {} older match(es) not shown. Use -a flag to see all.",
