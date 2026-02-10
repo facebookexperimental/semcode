@@ -3731,9 +3731,7 @@ impl DatabaseManager {
 
     /// Insert lore emails into the database
     pub async fn insert_lore_emails(&self, emails: &[crate::types::LoreEmailInfo]) -> Result<()> {
-        use arrow::array::{ArrayRef, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
 
         if emails.is_empty() {
@@ -3779,19 +3777,99 @@ impl DatabaseManager {
             );
         }
 
-        let mut git_commit_shas = Vec::new();
-        let mut from_addrs = Vec::new();
-        let mut dates = Vec::new();
-        let mut message_ids = Vec::new();
-        let mut in_reply_tos = Vec::new();
-        let mut subjects = Vec::new();
-        let mut references_list = Vec::new();
-        let mut recipients_list = Vec::new();
-        let mut headers_list = Vec::new();
-        let mut bodies = Vec::new();
-        let mut symbols_list = Vec::new();
+        let table = self.connection.open_table("lore").execute().await?;
 
-        for &idx in &dedup_indices {
+        // Try inserting the full batch first -- a single merge_insert
+        // is far cheaper than many small ones because each call is a
+        // full read-modify-write cycle in LanceDB.  Fall back to
+        // chunked insertion only when the batch exhausts DataFusion's
+        // memory pool (the RepartitionExec OOM described in the
+        // comment below).
+        //
+        // Retrying the full set of indices on failure is safe:
+        // merge_insert is not transactional, so a failed call may
+        // have persisted some rows before the error.  Because the
+        // upsert key is message_id, re-inserting those rows is
+        // idempotent.
+        if let Err(e) =
+            Self::merge_insert_lore_chunk(&table, emails, &dedup_indices, &schema).await
+        {
+            tracing::warn!(
+                "insert_lore_emails: full batch of {} failed ({}), \
+                 falling back to chunked insertion",
+                dedup_indices.len(),
+                e
+            );
+
+            // Lore emails carry full headers and bodies, so each row
+            // is large compared to code-analysis records.  LanceDB
+            // merge_insert uses DataFusion's RepartitionExec, whose
+            // memory pool can be exhausted by a single oversized
+            // RecordBatch.  Insert in sub-batches to bound peak
+            // memory per operation.
+            const MAX_CHUNK: usize = 128;
+
+            for chunk in dedup_indices.chunks(MAX_CHUNK) {
+                if let Err(e) =
+                    Self::merge_insert_lore_chunk(&table, emails, chunk, &schema).await
+                {
+                    tracing::warn!(
+                        "insert_lore_emails: chunk of {} failed ({}), \
+                         retrying individually",
+                        chunk.len(),
+                        e
+                    );
+                    for &idx in chunk {
+                        if let Err(e2) =
+                            Self::merge_insert_lore_chunk(
+                                &table, emails, &[idx], &schema,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "insert_lore_emails: skipping \
+                                 message_id={}: {}",
+                                emails[idx].message_id,
+                                e2
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!("insert_lore_emails: Batch insertion complete");
+
+        Ok(())
+    }
+
+    /// Build a [`RecordBatch`] from the given email indices and
+    /// merge-insert it into the lore table.
+    async fn merge_insert_lore_chunk(
+        table: &lancedb::Table,
+        emails: &[crate::types::LoreEmailInfo],
+        indices: &[usize],
+        schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        debug_assert!(indices.iter().all(|&i| i < emails.len()));
+
+        let mut git_commit_shas = Vec::with_capacity(indices.len());
+        let mut from_addrs = Vec::with_capacity(indices.len());
+        let mut dates = Vec::with_capacity(indices.len());
+        let mut message_ids = Vec::with_capacity(indices.len());
+        let mut in_reply_tos = Vec::with_capacity(indices.len());
+        let mut subjects = Vec::with_capacity(indices.len());
+        let mut references_list = Vec::with_capacity(indices.len());
+        let mut recipients_list = Vec::with_capacity(indices.len());
+        let mut headers_list = Vec::with_capacity(indices.len());
+        let mut bodies = Vec::with_capacity(indices.len());
+        let mut symbols_list = Vec::with_capacity(indices.len());
+
+        for &idx in indices {
             let email = &emails[idx];
             git_commit_shas.push(email.git_commit_sha.clone());
             from_addrs.push(email.from.clone());
@@ -3803,9 +3881,7 @@ impl DatabaseManager {
             recipients_list.push(email.recipients.clone());
             headers_list.push(email.headers.clone());
             bodies.push(email.body.clone());
-            // Convert Vec<String> to JSON array string
-            let symbols_json = serde_json::to_string(&email.symbols)?;
-            symbols_list.push(symbols_json);
+            symbols_list.push(serde_json::to_string(&email.symbols)?);
         }
 
         let columns: Vec<ArrayRef> = vec![
@@ -3825,19 +3901,16 @@ impl DatabaseManager {
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
         let batches = vec![Ok(batch)];
         let batch_iterator =
-            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+            arrow::record_batch::RecordBatchIterator::new(
+                batches.into_iter(),
+                schema.clone(),
+            );
 
-        let table = self.connection.open_table("lore").execute().await?;
-
-        // Use merge_insert for upsert functionality (update if exists, insert if not)
         let mut merge_insert = table.merge_insert(&["message_id"]);
         merge_insert
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
         merge_insert.execute(Box::new(batch_iterator)).await?;
-
-        tracing::info!("insert_lore_emails: Batch insertion complete");
-
         Ok(())
     }
 
