@@ -1016,15 +1016,49 @@ impl SchemaManager {
         let mut success = true;
 
         // 1. Compact files
-        if let Err(e) = table
-            .optimize(OptimizeAction::Compact {
-                options: Default::default(),
-                remap_options: None,
-            })
-            .await
-        {
-            tracing::warn!("Failed to compact table {}: {}", table_name, e);
-            success = false;
+        const MAX_COMPACT_FRAGMENTS: usize = 500;
+
+        let should_compact = match table.stats().await {
+            Ok(stats)
+                if stats.fragment_stats.num_fragments
+                    > MAX_COMPACT_FRAGMENTS =>
+            {
+                tracing::warn!(
+                    "Skipping compaction for table {} \
+                     ({} fragments exceeds {} limit -- \
+                     rebuild with --clear to resolve)",
+                    table_name,
+                    stats.fragment_stats.num_fragments,
+                    MAX_COMPACT_FRAGMENTS
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read stats for table {}: {}",
+                    table_name,
+                    e
+                );
+                true
+            }
+        };
+
+        if should_compact {
+            if let Err(e) = table
+                .optimize(OptimizeAction::Compact {
+                    options: Default::default(),
+                    remap_options: None,
+                })
+                .await
+            {
+                tracing::warn!(
+                    "Failed to compact table {}: {}",
+                    table_name,
+                    e
+                );
+                success = false;
+            }
         }
 
         // 2. Prune ALL old versions
