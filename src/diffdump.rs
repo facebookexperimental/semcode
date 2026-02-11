@@ -126,6 +126,151 @@ pub fn parse_unified_diff(diff_content: &str) -> Result<DiffParseResult> {
     })
 }
 
+/// Extract a function name from a line of C/C++ code.
+/// Looks for the last identifier before '(' and validates it.
+fn extract_function_name_from_line(line: &str) -> Option<String> {
+    let paren_pos = line.find('(')?;
+    let before_paren = &line[..paren_pos];
+    let last_word = before_paren.split_whitespace().last()?;
+    let func_name = last_word.trim_start_matches('*');
+    if is_valid_identifier(func_name) && !is_keyword(func_name) {
+        Some(func_name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Check if a hunk body contains a function definition where the actual
+/// modifications are, which may differ from the @@ header function.
+///
+/// The @@ header shows the function in scope at the start of the hunk, but
+/// if the hunk starts with trailing context from a preceding function and
+/// then enters a new function definition, the @@ header function is wrong.
+///
+/// Returns (func_name, line_index) if a definition is found in the hunk body
+/// with modifications after it. Returns None if no such definition exists.
+fn find_changed_function_in_hunk(hunk_lines: &[&str]) -> Option<(String, usize)> {
+    for (i, &line) in hunk_lines.iter().enumerate() {
+        // Get content without diff prefix
+        let content = if let Some(stripped) = line.strip_prefix(' ') {
+            stripped
+        } else if let Some(stripped) = line.strip_prefix('+') {
+            stripped
+        } else if let Some(stripped) = line.strip_prefix('-') {
+            stripped
+        } else if line.is_empty() {
+            continue;
+        } else {
+            line
+        };
+
+        // Function definitions start at column 0 (no leading whitespace)
+        if content.is_empty() || content.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+
+        let stripped = content.trim();
+        if stripped.is_empty() {
+            continue;
+        }
+
+        // Skip comments and preprocessor
+        if stripped.starts_with("//")
+            || stripped.starts_with("/*")
+            || stripped.starts_with('*')
+            || stripped.starts_with('#')
+        {
+            continue;
+        }
+
+        // Skip closing braces and labels
+        if stripped == "}" || (stripped.ends_with(':') && !stripped.contains('(')) {
+            continue;
+        }
+
+        // Must have parens (function parameters)
+        if !stripped.contains('(') {
+            continue;
+        }
+
+        // Skip control flow keywords
+        if let Some(before_paren) = stripped.split('(').next() {
+            if let Some(last_word) = before_paren.split_whitespace().last() {
+                if matches!(
+                    last_word,
+                    "if" | "while"
+                        | "for"
+                        | "switch"
+                        | "return"
+                        | "sizeof"
+                        | "typeof"
+                        | "case"
+                        | "else"
+                ) {
+                    continue;
+                }
+            }
+        }
+
+        // Check for opening brace on this or following lines
+        let mut has_brace = stripped.contains('{');
+        if !has_brace {
+            for jline in hunk_lines.iter().skip(i + 1).take(19) {
+                let jcontent = if let Some(s) = jline.strip_prefix(' ') {
+                    s
+                } else if let Some(s) = jline.strip_prefix('+') {
+                    s
+                } else if let Some(s) = jline.strip_prefix('-') {
+                    s
+                } else if jline.is_empty() {
+                    continue;
+                } else {
+                    jline
+                };
+
+                if jcontent.contains('{') {
+                    has_brace = true;
+                    break;
+                }
+
+                let jstripped = jcontent.trim();
+                if jstripped.is_empty() {
+                    continue;
+                }
+
+                // Continuation of function signature (indented or ends with , ( ) )
+                let is_continuation = jcontent.starts_with(|c: char| c.is_whitespace())
+                    || jstripped.ends_with(',')
+                    || jstripped.ends_with('(')
+                    || jstripped.ends_with(')');
+                if !is_continuation {
+                    break;
+                }
+            }
+        }
+
+        if !has_brace {
+            continue;
+        }
+
+        // Extract function name
+        if let Some(func_name) = extract_function_name_from_line(stripped) {
+            // Verify there are modifications after this definition
+            let has_mods_after = hunk_lines[i + 1..].iter().any(|l| {
+                (l.starts_with('+') || l.starts_with('-'))
+                    && !l.starts_with("+++")
+                    && !l.starts_with("---")
+            });
+            if has_mods_after {
+                return Some((func_name, i));
+            }
+            return None;
+        }
+    }
+
+    None
+}
+
 /// Parse a unified diff and return per-hunk information
 /// Each hunk becomes a HunkInfo entry with the function being modified
 pub fn parse_unified_diff_hunks(diff_content: &str) -> Result<Vec<HunkInfo>> {
@@ -151,15 +296,10 @@ pub fn parse_unified_diff_hunks(diff_content: &str) -> Result<Vec<HunkInfo>> {
         } else if line.starts_with("@@") && !current_file.is_empty() {
             // Found a hunk header
             let hunk_header = line.to_string();
-            let modifies = extract_function_from_hunk_header(line);
+            let header_func = extract_function_from_hunk_header(line);
 
-            hunks.push(HunkInfo {
-                file_path: current_file.clone(),
-                hunk_header,
-                modifies,
-            });
-
-            // Skip to next hunk or file
+            // Collect hunk body lines
+            let mut hunk_body: Vec<&str> = Vec::new();
             i += 1;
             while i < lines.len() {
                 let next_line = lines[i];
@@ -169,7 +309,47 @@ pub fn parse_unified_diff_hunks(diff_content: &str) -> Result<Vec<HunkInfo>> {
                 {
                     break;
                 }
+                hunk_body.push(next_line);
                 i += 1;
+            }
+
+            // Check if the hunk body contains a function definition that
+            // differs from the @@ header, with modifications after it
+            if let Some((body_func, body_func_line)) = find_changed_function_in_hunk(&hunk_body) {
+                // Check if there are also modifications before the body function
+                let has_mods_before = hunk_body[..body_func_line].iter().any(|l| {
+                    (l.starts_with('+') || l.starts_with('-'))
+                        && !l.starts_with("+++")
+                        && !l.starts_with("---")
+                });
+
+                if has_mods_before {
+                    // Split: emit two hunks, one for header function, one for body function
+                    hunks.push(HunkInfo {
+                        file_path: current_file.clone(),
+                        hunk_header: hunk_header.clone(),
+                        modifies: header_func,
+                    });
+                    hunks.push(HunkInfo {
+                        file_path: current_file.clone(),
+                        hunk_header,
+                        modifies: Some(body_func),
+                    });
+                } else {
+                    // Only the body function is modified
+                    hunks.push(HunkInfo {
+                        file_path: current_file.clone(),
+                        hunk_header,
+                        modifies: Some(body_func),
+                    });
+                }
+            } else {
+                // No body function found, use header function
+                hunks.push(HunkInfo {
+                    file_path: current_file.clone(),
+                    hunk_header,
+                    modifies: header_func,
+                });
             }
         } else if line.starts_with("---") {
             // Reset current file when we see a new file start
@@ -261,12 +441,13 @@ fn parse_hunk_with_walkback(
     let mut line_to_calls: HashMap<usize, HashSet<String>> = HashMap::new();
 
     // First, extract function name from the hunk header (@@ line)
+    // Don't add to modified_functions yet - only if walk-back can't attribute
+    // modifications to a function definition found in the hunk body.
     let mut header_func_name: Option<String> = None;
     if *i < lines.len() {
         let hunk_header = lines[*i];
         if let Some(func_name) = extract_function_from_hunk_header(hunk_header) {
-            header_func_name = Some(func_name.clone());
-            modified_functions.insert(func_name);
+            header_func_name = Some(func_name);
         }
     }
 
@@ -304,8 +485,10 @@ fn parse_hunk_with_walkback(
             called_functions.extend(line_calls);
             // Don't increment current_line for removed lines
         } else if !line.starts_with("@@") && !line.starts_with("---") && !line.starts_with("+++") {
-            // Context line - include in reconstructed code
-            hunk_lines.push(line);
+            // Context line - strip the leading space (diff context prefix) to
+            // reconstruct actual source code for walk-back analysis
+            let content = line.strip_prefix(' ').unwrap_or(line);
+            hunk_lines.push(content);
             current_line += 1;
         }
 
@@ -340,6 +523,21 @@ fn parse_hunk_with_walkback(
             } else if symbol.starts_with("typedef ") {
                 // Typedef: "typedef foo"
                 modified_types.insert(symbol.clone());
+            }
+        }
+
+        // If any modified lines weren't attributed to a walk-back symbol,
+        // the @@ header function is the correct attribution for those changes.
+        // This handles the case where modifications are in the header function's
+        // body (which is above the hunk start and not visible to walk-back).
+        if let Some(ref func_name) = header_func_name {
+            let has_unattributed = modified_line_numbers.iter().any(|&line_idx| {
+                line_idx < reconstructed_lines.len()
+                    && crate::symbol_walkback::find_symbol_for_line(&reconstructed_lines, line_idx)
+                        .is_none()
+            });
+            if has_unattributed {
+                modified_functions.insert(func_name.clone());
             }
         }
 
@@ -845,5 +1043,128 @@ new file mode 100644
             result.modified_functions.contains("get_data"),
             "Should find get_data (returns union pointer)"
         );
+    }
+
+    #[test]
+    fn test_header_function_not_modified() {
+        // Bug: When a hunk starts with context from the @@ header function
+        // and then enters a new function, the header function should NOT be
+        // marked as modified if it has no actual modifications.
+        let diff = r#"diff --git a/test.c b/test.c
+index abc123..def456 100644
+--- a/test.c
++++ b/test.c
+@@ -10,8 +10,9 @@ static void old_function(void)
+ 	return 0;
+ }
+
+ static void new_function(void)
+ {
++	added_line();
+ 	existing_line();
+ }
+"#;
+
+        let result = parse_unified_diff(diff).unwrap();
+
+        println!("Modified functions: {:?}", result.modified_functions);
+
+        // new_function should be detected (it has actual modifications)
+        assert!(
+            result.modified_functions.contains("new_function"),
+            "Should find new_function (has modifications)"
+        );
+
+        // old_function should NOT be detected (only context from @@ header)
+        assert!(
+            !result.modified_functions.contains("old_function"),
+            "Should NOT find old_function (only context, no modifications)"
+        );
+    }
+
+    #[test]
+    fn test_split_hunk_both_functions_modified() {
+        // When a hunk has modifications in both the @@ header function
+        // and a subsequent function, both should be reported.
+        let diff = r#"diff --git a/test.c b/test.c
+index abc123..def456 100644
+--- a/test.c
++++ b/test.c
+@@ -10,8 +10,10 @@ static void old_function(void)
++	added_in_old();
+ 	return 0;
+ }
+
+ static void new_function(void)
+ {
++	added_in_new();
+ 	existing_line();
+ }
+"#;
+
+        let result = parse_unified_diff(diff).unwrap();
+
+        println!("Modified functions: {:?}", result.modified_functions);
+
+        assert!(
+            result.modified_functions.contains("old_function"),
+            "Should find old_function (has modifications before new function)"
+        );
+        assert!(
+            result.modified_functions.contains("new_function"),
+            "Should find new_function (has modifications)"
+        );
+    }
+
+    #[test]
+    fn test_hunks_header_function_not_modified() {
+        // parse_unified_diff_hunks should also correctly attribute to the
+        // body function, not the @@ header function
+        let diff = r#"diff --git a/test.c b/test.c
+index abc123..def456 100644
+--- a/test.c
++++ b/test.c
+@@ -10,8 +10,9 @@ static void old_function(void)
+ 	return 0;
+ }
+
+ static void new_function(void)
+ {
++	added_line();
+ 	existing_line();
+ }
+"#;
+
+        let hunks = parse_unified_diff_hunks(diff).unwrap();
+
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].modifies, Some("new_function".to_string()));
+    }
+
+    #[test]
+    fn test_hunks_split_both_functions_modified() {
+        // parse_unified_diff_hunks should emit two hunk entries when
+        // both the header function and a body function are modified
+        let diff = r#"diff --git a/test.c b/test.c
+index abc123..def456 100644
+--- a/test.c
++++ b/test.c
+@@ -10,8 +10,10 @@ static void old_function(void)
++	added_in_old();
+ 	return 0;
+ }
+
+ static void new_function(void)
+ {
++	added_in_new();
+ 	existing_line();
+ }
+"#;
+
+        let hunks = parse_unified_diff_hunks(diff).unwrap();
+
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].modifies, Some("old_function".to_string()));
+        assert_eq!(hunks[1].modifies, Some("new_function".to_string()));
     }
 }
