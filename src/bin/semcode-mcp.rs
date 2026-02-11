@@ -2711,7 +2711,8 @@ impl McpServer {
             "serverInfo": {
                 "name": "semcode-mcp",
                 "version": "0.1.0"
-            }
+            },
+            "instructions": include_str!("../../docs/semcode-mcp.md")
         })
     }
 
