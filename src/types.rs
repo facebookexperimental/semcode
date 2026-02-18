@@ -131,7 +131,8 @@ pub struct GitCommitInfo {
 pub struct LoreEmailInfo {
     pub git_commit_sha: String,      // Git commit SHA containing this email
     pub from: String,                // From header in the email
-    pub date: String,                // Date field
+    pub date: String,                // Date field (RFC 2822 format)
+    pub date_timestamp: i64,         // Unix timestamp for efficient date filtering
     pub message_id: String,          // Message-ID header
     pub in_reply_to: Option<String>, // In-Reply-To header (nullable)
     pub subject: String,             // Subject line
