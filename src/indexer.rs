@@ -387,6 +387,17 @@ fn generate_commit_diff(
     Ok((diff_output, all_symbols, changed_files))
 }
 
+/// Parse RFC 2822 date string to Unix timestamp
+/// Returns 0 if parsing fails (fallback for malformed dates)
+fn parse_rfc2822_to_timestamp(date_str: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc2822(date_str)
+        .map(|dt| dt.timestamp())
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to parse RFC 2822 date '{}': {}", date_str, e);
+            0
+        })
+}
+
 /// Parse email from a lore commit's 'm' file
 /// Extracts headers and body from an email message
 pub fn parse_email_from_commit(
@@ -469,10 +480,14 @@ pub fn parse_email_from_commit(
     // Extract symbols from any diffs found in the email body
     let symbols = extract_symbols_from_email_body(&body);
 
+    // Parse date to Unix timestamp for efficient database filtering
+    let date_timestamp = parse_rfc2822_to_timestamp(&headers.date);
+
     Ok(crate::LoreEmailInfo {
         git_commit_sha: commit_sha.to_string(),
         from: headers.from,
         date: headers.date,
+        date_timestamp,
         message_id: headers.message_id,
         in_reply_to: headers.in_reply_to,
         subject: headers.subject,

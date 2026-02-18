@@ -2795,7 +2795,7 @@ impl VectorSearchManager {
         while let Some(batch) = temp_stream.try_next().await? {
             total_emails += batch.num_rows();
             let message_id_array = batch
-                .column(3)
+                .column(4)
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
                 .unwrap();
@@ -2907,7 +2907,7 @@ impl VectorSearchManager {
                                 tokio::task::spawn_blocking(move || -> Result<Vec<VectorEntry>> {
                                     // Extract email data from RecordBatch
                                     let message_id_array = record_batch
-                                        .column(3)
+                                        .column(4)
                                         .as_any()
                                         .downcast_ref::<arrow::array::StringArray>()
                                         .unwrap();
@@ -2917,17 +2917,17 @@ impl VectorSearchManager {
                                         .downcast_ref::<arrow::array::StringArray>()
                                         .unwrap();
                                     let subject_array = record_batch
-                                        .column(5)
+                                        .column(6)
                                         .as_any()
                                         .downcast_ref::<arrow::array::StringArray>()
                                         .unwrap();
                                     let recipients_array = record_batch
-                                        .column(7)
+                                        .column(8)
                                         .as_any()
                                         .downcast_ref::<arrow::array::StringArray>()
                                         .unwrap();
                                     let body_array = record_batch
-                                        .column(9)
+                                        .column(10)
                                         .as_any()
                                         .downcast_ref::<arrow::array::StringArray>()
                                         .unwrap();
@@ -3601,43 +3601,48 @@ impl VectorSearchManager {
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let message_id_array = batch
+                let date_timestamp_array = batch
                     .column(3)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
+                    .downcast_ref::<arrow::array::Int64Array>()
                     .unwrap();
-                let in_reply_to_array = batch
+                let message_id_array = batch
                     .column(4)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let subject_array = batch
+                let in_reply_to_array = batch
                     .column(5)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let references_array = batch
+                let subject_array = batch
                     .column(6)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let recipients_array = batch
+                let references_array = batch
                     .column(7)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let headers_array = batch
+                let recipients_array = batch
                     .column(8)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let body_array = batch
+                let headers_array = batch
                     .column(9)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let symbols_array = batch
+                let body_array = batch
                     .column(10)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let symbols_array = batch
+                    .column(11)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
@@ -3701,12 +3706,16 @@ impl VectorSearchManager {
                     let symbols: Vec<String> =
                         serde_json::from_str(symbols_json).unwrap_or_default();
 
+                    // Get date_timestamp from the batch
+                    let date_timestamp = date_timestamp_array.value(i);
+
                     results.push((
                         crate::types::LoreEmailInfo {
                             git_commit_sha: git_commit_sha_array.value(i).to_string(),
                             message_id,
                             from: from_array.value(i).to_string(),
                             date: email_date_str,
+                            date_timestamp,
                             subject: subject_array.value(i).to_string(),
                             in_reply_to: if in_reply_to_array.is_null(i) {
                                 None

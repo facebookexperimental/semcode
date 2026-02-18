@@ -268,7 +268,8 @@ impl SchemaManager {
         let schema = Arc::new(Schema::new(vec![
             Field::new("git_commit_sha", DataType::Utf8, false), // Git commit SHA containing this email
             Field::new("from", DataType::Utf8, false),           // From header in the email
-            Field::new("date", DataType::Utf8, false),           // Date field
+            Field::new("date", DataType::Utf8, false),           // Date field (RFC 2822 format)
+            Field::new("date_timestamp", DataType::Int64, false), // Unix timestamp for efficient date filtering
             Field::new("message_id", DataType::Utf8, false),     // Message-ID header
             Field::new("in_reply_to", DataType::Utf8, true),     // In-Reply-To header (nullable)
             Field::new("subject", DataType::Utf8, false),        // Subject line

@@ -2262,7 +2262,7 @@ impl DatabaseManager {
         Ok(())
     }
 
-    /// Optimize database files and consolidate data fragments  
+    /// Optimize database files and consolidate data fragments
     pub async fn compact_database(&self) -> Result<()> {
         tracing::info!("Running database optimization to reduce file size...");
 
@@ -3730,7 +3730,7 @@ impl DatabaseManager {
 
     /// Insert lore emails into the database
     pub async fn insert_lore_emails(&self, emails: &[crate::types::LoreEmailInfo]) -> Result<()> {
-        use arrow::array::{ArrayRef, StringArray};
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
@@ -3748,6 +3748,7 @@ impl DatabaseManager {
             Field::new("git_commit_sha", DataType::Utf8, false),
             Field::new("from", DataType::Utf8, false),
             Field::new("date", DataType::Utf8, false),
+            Field::new("date_timestamp", DataType::Int64, false),
             Field::new("message_id", DataType::Utf8, false),
             Field::new("in_reply_to", DataType::Utf8, true),
             Field::new("subject", DataType::Utf8, false),
@@ -3761,6 +3762,7 @@ impl DatabaseManager {
         let mut git_commit_shas = Vec::new();
         let mut from_addrs = Vec::new();
         let mut dates = Vec::new();
+        let mut date_timestamps = Vec::new();
         let mut message_ids = Vec::new();
         let mut in_reply_tos = Vec::new();
         let mut subjects = Vec::new();
@@ -3774,6 +3776,7 @@ impl DatabaseManager {
             git_commit_shas.push(email.git_commit_sha.clone());
             from_addrs.push(email.from.clone());
             dates.push(email.date.clone());
+            date_timestamps.push(email.date_timestamp);
             message_ids.push(email.message_id.clone());
             in_reply_tos.push(email.in_reply_to.clone());
             subjects.push(email.subject.clone());
@@ -3790,6 +3793,7 @@ impl DatabaseManager {
             Arc::new(StringArray::from(git_commit_shas)),
             Arc::new(StringArray::from(from_addrs)),
             Arc::new(StringArray::from(dates)),
+            Arc::new(Int64Array::from(date_timestamps)),
             Arc::new(StringArray::from(message_ids)),
             Arc::new(StringArray::from(in_reply_tos)),
             Arc::new(StringArray::from(subjects)),
@@ -3846,6 +3850,12 @@ impl DatabaseManager {
                 .column_by_name("date")
                 .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
                 .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -3888,6 +3898,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
+                    date_timestamp: date_timestamps.value(i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -3924,21 +3935,31 @@ impl DatabaseManager {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
 
-        // Parse filter dates once (they're in RFC 2822 format)
-        let since_datetime = since_date
+        // Parse filter dates to Unix timestamps for database-level filtering
+        let since_timestamp = since_date
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        let until_datetime = until_date
+            .map(|dt| dt.timestamp());
+        let until_timestamp = until_date
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+            .map(|dt| dt.timestamp());
 
         tracing::info!(
-            "lore search: field='{}' pattern='{}' since={:?} until={:?}",
+            "lore search: field='{}' pattern='{}' since_timestamp={:?} until_timestamp={:?}",
             field,
             pattern,
-            since_datetime,
-            until_datetime
+            since_timestamp,
+            until_timestamp
         );
+
+        // Build date filter clause for database-level filtering
+        let date_filter = match (since_timestamp, until_timestamp) {
+            (Some(since), Some(until)) => {
+                Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
+            }
+            (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
+            (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
+            (None, None) => None,
+        };
 
         let table = self.connection.open_table("lore").execute().await?;
 
@@ -3958,14 +3979,22 @@ impl DatabaseManager {
         // Incremental search: start with reasonable limit, expand until matches stop increasing
         let mut fts_limit = if limit > 0 { limit * 10 } else { 10000 };
         let mut previous_count = 0;
+        let mut first_iteration = true;
 
         loop {
             let fts_query =
                 FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
 
-            let stream = table
+            let mut query_builder = table
                 .query()
-                .full_text_search(fts_query)
+                .full_text_search(fts_query);
+
+            // Apply date filter at database level so limit applies to date-filtered results
+            if let Some(ref filter) = date_filter {
+                query_builder = query_builder.only_if(filter);
+            }
+
+            let stream = query_builder
                 .limit(fts_limit)
                 .execute()
                 .await?;
@@ -3998,6 +4027,12 @@ impl DatabaseManager {
                     .column_by_name("date")
                     .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
                     .as_string::<i32>();
+                let date_timestamps = batch
+                    .column_by_name("date_timestamp")
+                    .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
                 let message_ids = batch
                     .column_by_name("message_id")
                     .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4047,44 +4082,6 @@ impl DatabaseManager {
                         continue;
                     }
 
-                    // Apply date filtering with proper temporal comparison
-                    let email_date_str = dates.value(i);
-                    let email_datetime = match chrono::DateTime::parse_from_rfc2822(email_date_str)
-                    {
-                        Ok(dt) => dt.with_timezone(&chrono::Utc),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse email date '{}': {}, skipping",
-                                email_date_str,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-
-                    if let Some(since) = since_datetime {
-                        if email_datetime < since {
-                            tracing::debug!(
-                                "Email {} dated {} is before since filter {}, skipping",
-                                message_ids.value(i),
-                                email_datetime,
-                                since
-                            );
-                            continue;
-                        }
-                    }
-                    if let Some(until) = until_datetime {
-                        if email_datetime > until {
-                            tracing::debug!(
-                                "Email {} dated {} is after until filter {}, skipping",
-                                message_ids.value(i),
-                                email_datetime,
-                                until
-                            );
-                            continue;
-                        }
-                    }
-
                     // Check limit
                     if limit > 0 && emails.len() >= limit {
                         break;
@@ -4099,6 +4096,7 @@ impl DatabaseManager {
                         git_commit_sha: git_commit_shas.value(i).to_string(),
                         from: from_addrs.value(i).to_string(),
                         date: dates.value(i).to_string(),
+                        date_timestamp: date_timestamps.value(i),
                         message_id: message_ids.value(i).to_string(),
                         in_reply_to: if in_reply_tos.is_null(i) {
                             None
@@ -4135,7 +4133,8 @@ impl DatabaseManager {
             }
 
             // Stop if count didn't increase (no more matches available)
-            if emails.len() == previous_count {
+            // Skip this check on the first iteration to allow at least one expansion
+            if !first_iteration && emails.len() == previous_count {
                 tracing::info!(
                     "Found {} results, count stopped increasing at FTS limit {}",
                     emails.len(),
@@ -4143,6 +4142,8 @@ impl DatabaseManager {
                 );
                 break;
             }
+
+            first_iteration = false;
 
             // Stop if we've searched a very large set
             if fts_limit >= 1000000 {
@@ -4422,75 +4423,155 @@ impl DatabaseManager {
             return Ok(Vec::new());
         }
 
-        // Parse filter dates once (they're in RFC 2822 format)
-        let since_datetime = since_date
+        // Parse filter dates to Unix timestamps for database-level filtering
+        let since_timestamp = since_date
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        let until_datetime = until_date
+            .map(|dt| dt.timestamp());
+        let until_timestamp = until_date
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+            .map(|dt| dt.timestamp());
 
         tracing::info!(
-            "lore multi_field search: since={:?} until={:?}",
-            since_datetime,
-            until_datetime
+            "lore multi_field search: since_timestamp={:?} until_timestamp={:?}",
+            since_timestamp,
+            until_timestamp
         );
 
-        // Fetch full email records for the intersection
-        let mut final_emails = Vec::new();
-        let count_limit = if limit > 0 { limit } else { intersection.len() };
-
-        for message_id in intersection.iter().take(count_limit) {
-            if let Some(email) = self.get_lore_email_by_message_id(message_id).await? {
-                // Apply date filtering with proper temporal comparison
-                let email_datetime = match chrono::DateTime::parse_from_rfc2822(&email.date) {
-                    Ok(dt) => dt.with_timezone(&chrono::Utc),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse email date '{}': {}, skipping",
-                            email.date,
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                if let Some(since) = since_datetime {
-                    if email_datetime < since {
-                        tracing::debug!(
-                            "Email {} dated {} is before since filter {}, skipping",
-                            email.message_id,
-                            email_datetime,
-                            since
-                        );
-                        continue;
-                    }
-                }
-                if let Some(until) = until_datetime {
-                    if email_datetime > until {
-                        tracing::debug!(
-                            "Email {} dated {} is after until filter {}, skipping",
-                            email.message_id,
-                            email_datetime,
-                            until
-                        );
-                        continue;
-                    }
-                }
-
-                final_emails.push(email);
-            } else {
-                tracing::warn!("Message ID in intersection not found: {}", message_id);
+        // Build date filter clause for database-level filtering
+        let date_filter = match (since_timestamp, until_timestamp) {
+            (Some(since), Some(until)) => {
+                Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
             }
-        }
+            (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
+            (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
+            (None, None) => None,
+        };
+
+        // Fetch emails with date filtering at database level
+        let final_emails = self
+            .fetch_lore_emails_by_message_ids_with_filter(
+                &intersection,
+                date_filter.as_deref(),
+                limit,
+            )
+            .await?;
 
         tracing::info!(
-            "Fetched {} email records from {} message_ids",
+            "Fetched {} email records matching date filter from {} message_ids",
             final_emails.len(),
-            count_limit
+            intersection.len()
         );
 
         Ok(final_emails)
+    }
+
+    /// Fetch lore emails by message IDs with optional SQL filter and limit
+    /// This allows efficient database-level filtering (e.g., by date_timestamp)
+    async fn fetch_lore_emails_by_message_ids_with_filter(
+        &self,
+        message_ids: &std::collections::HashSet<String>,
+        filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Build message_id IN clause
+        let escaped_ids: Vec<String> = message_ids
+            .iter()
+            .map(|id| {
+                let escaped = id.replace('\'', "''");
+                format!("'{}'", escaped)
+            })
+            .collect();
+        let in_clause = format!("message_id IN ({})", escaped_ids.join(", "));
+
+        // Combine with optional filter
+        let where_clause = match filter {
+            Some(f) => format!("{} AND {}", in_clause, f),
+            None => in_clause,
+        };
+
+        tracing::debug!("Lore query with filter: {}", where_clause);
+
+        // Query with filter, ordered by date_timestamp descending (newest first)
+        let effective_limit = if limit > 0 { limit } else { message_ids.len() };
+        let results = table
+            .query()
+            .only_if(&where_clause)
+            .limit(effective_limit)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut emails = Vec::new();
+        for batch in results {
+            let git_commit_sha_col = batch.column_by_name("git_commit_sha").unwrap();
+            let from_col = batch.column_by_name("from").unwrap();
+            let date_col = batch.column_by_name("date").unwrap();
+            let date_timestamp_col = batch.column_by_name("date_timestamp").unwrap();
+            let message_id_col = batch.column_by_name("message_id").unwrap();
+            let in_reply_to_col = batch.column_by_name("in_reply_to").unwrap();
+            let subject_col = batch.column_by_name("subject").unwrap();
+            let references_col = batch.column_by_name("references").unwrap();
+            let recipients_col = batch.column_by_name("recipients").unwrap();
+            let headers_col = batch.column_by_name("headers").unwrap();
+            let body_col = batch.column_by_name("body").unwrap();
+            let symbols_col = batch.column_by_name("symbols").unwrap();
+
+            let git_commit_sha_arr = git_commit_sha_col.as_string::<i32>();
+            let from_arr = from_col.as_string::<i32>();
+            let date_arr = date_col.as_string::<i32>();
+            let date_timestamp_arr = date_timestamp_col
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            let message_id_arr = message_id_col.as_string::<i32>();
+            let in_reply_to_arr = in_reply_to_col.as_string::<i32>();
+            let subject_arr = subject_col.as_string::<i32>();
+            let references_arr = references_col.as_string::<i32>();
+            let recipients_arr = recipients_col.as_string::<i32>();
+            let headers_arr = headers_col.as_string::<i32>();
+            let body_arr = body_col.as_string::<i32>();
+            let symbols_arr = symbols_col.as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                let symbols_json = symbols_arr.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                emails.push(crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_sha_arr.value(i).to_string(),
+                    from: from_arr.value(i).to_string(),
+                    date: date_arr.value(i).to_string(),
+                    date_timestamp: date_timestamp_arr.value(i),
+                    message_id: message_id_arr.value(i).to_string(),
+                    in_reply_to: if in_reply_to_arr.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_to_arr.value(i).to_string())
+                    },
+                    subject: subject_arr.value(i).to_string(),
+                    references: if references_arr.is_null(i) {
+                        None
+                    } else {
+                        Some(references_arr.value(i).to_string())
+                    },
+                    recipients: recipients_arr.value(i).to_string(),
+                    headers: headers_arr.value(i).to_string(),
+                    body: body_arr.value(i).to_string(),
+                    symbols,
+                });
+            }
+        }
+
+        Ok(emails)
     }
 
     /// Get a lore email by exact message_id match
@@ -4534,6 +4615,12 @@ impl DatabaseManager {
                 .column_by_name("date")
                 .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
                 .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4576,6 +4663,7 @@ impl DatabaseManager {
                 git_commit_sha: git_commit_shas.value(0).to_string(),
                 from: from_addrs.value(0).to_string(),
                 date: dates.value(0).to_string(),
+                date_timestamp: date_timestamps.value(0),
                 message_id: message_ids.value(0).to_string(),
                 in_reply_to: if in_reply_tos.is_null(0) {
                     None
@@ -4649,6 +4737,12 @@ impl DatabaseManager {
                 .column_by_name("date")
                 .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
                 .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4698,6 +4792,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
+                    date_timestamp: date_timestamps.value(i),
                     message_id,
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -4733,19 +4828,28 @@ impl DatabaseManager {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
 
-        // Parse filter dates once (they're in RFC 2822 format)
-        let since_datetime = since_date
+        // Parse filter dates to Unix timestamps for database-level filtering
+        let since_timestamp = since_date
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        let until_datetime = until_date
+            .map(|dt| dt.timestamp());
+        let until_timestamp = until_date
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+            .map(|dt| dt.timestamp());
 
         // Escape SQL string literal
         let escaped_subject = subject.replace("'", "''");
 
-        // Use LIKE for substring matching (case-sensitive in LanceDB)
-        let where_clause = format!("subject LIKE '%{}%'", escaped_subject);
+        // Build WHERE clause with subject filter and optional date filters
+        let mut where_parts = vec![format!("subject LIKE '%{}%'", escaped_subject)];
+
+        if let Some(since) = since_timestamp {
+            where_parts.push(format!("date_timestamp >= {}", since));
+        }
+        if let Some(until) = until_timestamp {
+            where_parts.push(format!("date_timestamp <= {}", until));
+        }
+
+        let where_clause = where_parts.join(" AND ");
 
         let table = self.connection.open_table("lore").execute().await?;
         let mut query = table.query().only_if(&where_clause);
@@ -4777,6 +4881,12 @@ impl DatabaseManager {
                 .column_by_name("date")
                 .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
                 .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4819,6 +4929,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
+                    date_timestamp: date_timestamps.value(i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -4836,34 +4947,6 @@ impl DatabaseManager {
                     body: bodies.value(i).to_string(),
                     symbols,
                 };
-
-                // Apply date filtering (dates are in RFC 2822 format)
-                if since_datetime.is_some() || until_datetime.is_some() {
-                    let email_date_str = &email.date;
-                    let email_datetime = match chrono::DateTime::parse_from_rfc2822(email_date_str)
-                    {
-                        Ok(dt) => dt.with_timezone(&chrono::Utc),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse email date '{}': {}",
-                                email_date_str,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-
-                    if let Some(since) = since_datetime {
-                        if email_datetime < since {
-                            continue;
-                        }
-                    }
-                    if let Some(until) = until_datetime {
-                        if email_datetime > until {
-                            continue;
-                        }
-                    }
-                }
 
                 emails.push(email);
             }
@@ -4908,6 +4991,12 @@ impl DatabaseManager {
                 .column_by_name("date")
                 .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
                 .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4950,6 +5039,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
+                    date_timestamp: date_timestamps.value(i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
