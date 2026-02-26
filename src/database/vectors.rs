@@ -89,7 +89,12 @@ impl VectorStore {
 
         let batches = vec![Ok(batch)];
         let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+
+        let mut merge_insert = table.merge_insert(&["content_hash"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
     }
