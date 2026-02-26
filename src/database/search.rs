@@ -3122,7 +3122,12 @@ async fn insert_lore_vectors_batch_with_table(
 
     let batches = vec![Ok(batch)];
     let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-    lore_vectors_table.add(batch_iterator).execute().await?;
+
+    let mut merge_insert = lore_vectors_table.merge_insert(&["message_id"]);
+    merge_insert
+        .when_matched_update_all(None)
+        .when_not_matched_insert_all();
+    merge_insert.execute(Box::new(batch_iterator)).await?;
 
     Ok(())
 }
