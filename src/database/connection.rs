@@ -83,6 +83,7 @@ impl DatabaseManager {
             "symbol_filename",
             "git_commits",
             "lore",
+            "lore_indexed_commits",
             "indexed_branches",
         ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
@@ -3730,9 +3731,7 @@ impl DatabaseManager {
 
     /// Insert lore emails into the database
     pub async fn insert_lore_emails(&self, emails: &[crate::types::LoreEmailInfo]) -> Result<()> {
-        use arrow::array::{ArrayRef, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
 
         if emails.is_empty() {
@@ -3758,19 +3757,120 @@ impl DatabaseManager {
             Field::new("symbols", DataType::Utf8, false),
         ]));
 
-        let mut git_commit_shas = Vec::new();
-        let mut from_addrs = Vec::new();
-        let mut dates = Vec::new();
-        let mut message_ids = Vec::new();
-        let mut in_reply_tos = Vec::new();
-        let mut subjects = Vec::new();
-        let mut references_list = Vec::new();
-        let mut recipients_list = Vec::new();
-        let mut headers_list = Vec::new();
-        let mut bodies = Vec::new();
-        let mut symbols_list = Vec::new();
+        // Deduplicate by message_id within the batch. A lore archive
+        // can contain the same email in multiple git commits, and
+        // LanceDB merge_insert requires each target row to be matched
+        // by at most one source row. Keep the last occurrence.
+        let mut seen = std::collections::HashMap::with_capacity(emails.len());
+        for (i, email) in emails.iter().enumerate() {
+            seen.insert(&email.message_id, i);
+        }
+        let mut dedup_indices: Vec<usize> = seen.into_values().collect();
+        dedup_indices.sort_unstable();
 
-        for email in emails {
+        let dedup_count = emails.len() - dedup_indices.len();
+        if dedup_count > 0 {
+            tracing::info!(
+                "insert_lore_emails: Removed {} duplicate message_ids from batch of {}",
+                dedup_count,
+                emails.len()
+            );
+        }
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Try inserting the full batch first -- a single merge_insert
+        // is far cheaper than many small ones because each call is a
+        // full read-modify-write cycle in LanceDB.  Fall back to
+        // chunked insertion only when the batch exhausts DataFusion's
+        // memory pool (the RepartitionExec OOM described in the
+        // comment below).
+        //
+        // Retrying the full set of indices on failure is safe:
+        // merge_insert is not transactional, so a failed call may
+        // have persisted some rows before the error.  Because the
+        // upsert key is message_id, re-inserting those rows is
+        // idempotent.
+        if let Err(e) =
+            Self::merge_insert_lore_chunk(&table, emails, &dedup_indices, &schema).await
+        {
+            tracing::warn!(
+                "insert_lore_emails: full batch of {} failed ({}), \
+                 falling back to chunked insertion",
+                dedup_indices.len(),
+                e
+            );
+
+            // Lore emails carry full headers and bodies, so each row
+            // is large compared to code-analysis records.  LanceDB
+            // merge_insert uses DataFusion's RepartitionExec, whose
+            // memory pool can be exhausted by a single oversized
+            // RecordBatch.  Insert in sub-batches to bound peak
+            // memory per operation.
+            const MAX_CHUNK: usize = 128;
+
+            for chunk in dedup_indices.chunks(MAX_CHUNK) {
+                if let Err(e) =
+                    Self::merge_insert_lore_chunk(&table, emails, chunk, &schema).await
+                {
+                    tracing::warn!(
+                        "insert_lore_emails: chunk of {} failed ({}), \
+                         retrying individually",
+                        chunk.len(),
+                        e
+                    );
+                    for &idx in chunk {
+                        if let Err(e2) =
+                            Self::merge_insert_lore_chunk(
+                                &table, emails, &[idx], &schema,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "insert_lore_emails: skipping \
+                                 message_id={}: {}",
+                                emails[idx].message_id,
+                                e2
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!("insert_lore_emails: Batch insertion complete");
+
+        Ok(())
+    }
+
+    /// Build a [`RecordBatch`] from the given email indices and
+    /// merge-insert it into the lore table.
+    async fn merge_insert_lore_chunk(
+        table: &lancedb::Table,
+        emails: &[crate::types::LoreEmailInfo],
+        indices: &[usize],
+        schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        debug_assert!(indices.iter().all(|&i| i < emails.len()));
+
+        let mut git_commit_shas = Vec::with_capacity(indices.len());
+        let mut from_addrs = Vec::with_capacity(indices.len());
+        let mut dates = Vec::with_capacity(indices.len());
+        let mut message_ids = Vec::with_capacity(indices.len());
+        let mut in_reply_tos = Vec::with_capacity(indices.len());
+        let mut subjects = Vec::with_capacity(indices.len());
+        let mut references_list = Vec::with_capacity(indices.len());
+        let mut recipients_list = Vec::with_capacity(indices.len());
+        let mut headers_list = Vec::with_capacity(indices.len());
+        let mut bodies = Vec::with_capacity(indices.len());
+        let mut symbols_list = Vec::with_capacity(indices.len());
+
+        for &idx in indices {
+            let email = &emails[idx];
             git_commit_shas.push(email.git_commit_sha.clone());
             from_addrs.push(email.from.clone());
             dates.push(email.date.clone());
@@ -3781,9 +3881,7 @@ impl DatabaseManager {
             recipients_list.push(email.recipients.clone());
             headers_list.push(email.headers.clone());
             bodies.push(email.body.clone());
-            // Convert Vec<String> to JSON array string
-            let symbols_json = serde_json::to_string(&email.symbols)?;
-            symbols_list.push(symbols_json);
+            symbols_list.push(serde_json::to_string(&email.symbols)?);
         }
 
         let columns: Vec<ArrayRef> = vec![
@@ -3803,19 +3901,16 @@ impl DatabaseManager {
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
         let batches = vec![Ok(batch)];
         let batch_iterator =
-            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+            arrow::record_batch::RecordBatchIterator::new(
+                batches.into_iter(),
+                schema.clone(),
+            );
 
-        let table = self.connection.open_table("lore").execute().await?;
-
-        // Use merge_insert for upsert functionality (update if exists, insert if not)
         let mut merge_insert = table.merge_insert(&["message_id"]);
         merge_insert
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
         merge_insert.execute(Box::new(batch_iterator)).await?;
-
-        tracing::info!("insert_lore_emails: Batch insertion complete");
-
         Ok(())
     }
 
@@ -5331,54 +5426,77 @@ impl DatabaseManager {
         Ok(commits)
     }
 
-    /// Filter a list of commit SHAs to return only those that already exist in the lore table.
-    /// Uses batched IN queries to avoid full table scans.
-    /// Returns a HashSet of SHAs that exist in the database.
-    pub async fn filter_existing_lore_commits(
-        &self,
-        commit_shas: &[String],
-    ) -> Result<HashSet<String>> {
-        if commit_shas.is_empty() {
-            return Ok(HashSet::new());
-        }
+    /// Return the set of commit SHAs already recorded in the
+    /// lore_indexed_commits table. The table contains only short
+    /// SHA strings, so reading it entirely into memory is cheap.
+    pub async fn get_indexed_lore_commits(&self) -> Result<HashSet<String>> {
+        let table = match self.connection.open_table("lore_indexed_commits").execute().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to open lore_indexed_commits table: {}", e);
+                return Ok(HashSet::new());
+            }
+        };
 
-        let table = self.connection.open_table("lore").execute().await?;
-        let mut existing = HashSet::with_capacity(commit_shas.len() / 2); // Pre-allocate for typical case
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "git_commit_sha".to_string(),
+            ]))
+            .execute()
+            .await?;
 
-        // Process in chunks to avoid SQL query size limits
-        // LanceDB/DuckDB can handle large IN clauses, but 1000 is a safe batch size
-        const BATCH_SIZE: usize = 1000;
-
-        for chunk in commit_shas.chunks(BATCH_SIZE) {
-            // Build SQL IN clause with properly escaped SHAs
-            let escaped_shas: Vec<String> = chunk
-                .iter()
-                .map(|sha| format!("'{}'", sha.replace("'", "''")))
-                .collect();
-            let filter = format!("git_commit_sha IN ({})", escaped_shas.join(", "));
-
-            let stream = table
-                .query()
-                .select(lancedb::query::Select::Columns(vec![
-                    "git_commit_sha".to_string()
-                ]))
-                .only_if(&filter)
-                .execute()
-                .await?;
-
-            let batches: Vec<_> = stream.try_collect().await?;
-
-            for batch in batches {
-                if let Some(column) = batch.column_by_name("git_commit_sha") {
-                    if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
-                        for i in 0..string_array.len() {
-                            existing.insert(string_array.value(i).to_string());
-                        }
+        let batches: Vec<_> = stream.try_collect().await?;
+        let mut existing = HashSet::new();
+        for batch in batches {
+            if let Some(column) = batch.column_by_name("git_commit_sha") {
+                if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
+                    existing.reserve(string_array.len());
+                    for i in 0..string_array.len() {
+                        existing.insert(string_array.value(i).to_string());
                     }
                 }
             }
         }
 
         Ok(existing)
+    }
+
+    /// Record git commit SHAs that have been processed for lore indexing.
+    pub async fn insert_lore_indexed_commits(&self, commit_shas: &[String]) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if commit_shas.is_empty() {
+            return Ok(());
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+        ]));
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(commit_shas.to_vec())),
+        ];
+
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        let batches = vec![Ok(batch)];
+        let batch_iterator =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+
+        let table = self
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await?;
+        let mut merge_insert = table.merge_insert(&["git_commit_sha"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
+
+        Ok(())
     }
 }
