@@ -3636,18 +3636,13 @@ impl VectorSearchManager {
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let headers_array = batch
+                let body_array = batch
                     .column(8)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let body_array = batch
-                    .column(9)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
                 let symbols_array = batch
-                    .column(10)
+                    .column(9)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
@@ -3729,7 +3724,6 @@ impl VectorSearchManager {
                                 Some(references_array.value(i).to_string())
                             },
                             recipients: recipients_array.value(i).to_string(),
-                            headers: headers_array.value(i).to_string(),
                             body: body_array.value(i).to_string(),
                             symbols,
                         },

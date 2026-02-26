@@ -415,7 +415,6 @@ pub fn parse_email_from_commit(
     // Split headers and body
     let mut lines = email_content.lines();
     let mut in_headers = true;
-    let mut header_lines = Vec::new();
     let mut body_lines = Vec::new();
     let mut current_header: Option<(String, String)> = None;
 
@@ -429,9 +428,6 @@ pub fn parse_email_from_commit(
                 in_headers = false;
                 continue;
             }
-
-            // Store the header line as-is
-            header_lines.push(line);
 
             // Check if this is a continuation line (starts with whitespace)
             if line.starts_with(' ') || line.starts_with('\t') {
@@ -463,7 +459,6 @@ pub fn parse_email_from_commit(
     }
 
     let recipients = headers.recipients_list.join(", ");
-    let header_text = header_lines.join("\n");
     let body = body_lines.join("\n");
 
     // Extract symbols from any diffs found in the email body
@@ -478,7 +473,6 @@ pub fn parse_email_from_commit(
         subject: headers.subject,
         references: headers.references,
         recipients,
-        headers: header_text,
         body,
         symbols,
     })

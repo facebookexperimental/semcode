@@ -3752,7 +3752,6 @@ impl DatabaseManager {
             Field::new("subject", DataType::Utf8, false),
             Field::new("references", DataType::Utf8, true),
             Field::new("recipients", DataType::Utf8, false),
-            Field::new("headers", DataType::Utf8, false),
             Field::new("body", DataType::Utf8, false),
             Field::new("symbols", DataType::Utf8, false),
         ]));
@@ -3801,8 +3800,8 @@ impl DatabaseManager {
                 e
             );
 
-            // Lore emails carry full headers and bodies, so each row
-            // is large compared to code-analysis records.  LanceDB
+            // Lore emails carry full bodies, so each row is large
+            // compared to code-analysis records.  LanceDB
             // merge_insert uses DataFusion's RepartitionExec, whose
             // memory pool can be exhausted by a single oversized
             // RecordBatch.  Insert in sub-batches to bound peak
@@ -3865,7 +3864,6 @@ impl DatabaseManager {
         let mut subjects = Vec::with_capacity(indices.len());
         let mut references_list = Vec::with_capacity(indices.len());
         let mut recipients_list = Vec::with_capacity(indices.len());
-        let mut headers_list = Vec::with_capacity(indices.len());
         let mut bodies = Vec::with_capacity(indices.len());
         let mut symbols_list = Vec::with_capacity(indices.len());
 
@@ -3879,7 +3877,6 @@ impl DatabaseManager {
             subjects.push(email.subject.clone());
             references_list.push(email.references.clone());
             recipients_list.push(email.recipients.clone());
-            headers_list.push(email.headers.clone());
             bodies.push(email.body.clone());
             symbols_list.push(serde_json::to_string(&email.symbols)?);
         }
@@ -3893,7 +3890,6 @@ impl DatabaseManager {
             Arc::new(StringArray::from(subjects)),
             Arc::new(StringArray::from(references_list)),
             Arc::new(StringArray::from(recipients_list)),
-            Arc::new(StringArray::from(headers_list)),
             Arc::new(StringArray::from(bodies)),
             Arc::new(StringArray::from(symbols_list)),
         ];
@@ -3961,10 +3957,6 @@ impl DatabaseManager {
                 .column_by_name("recipients")
                 .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
                 .as_string::<i32>();
-            let headers_list = batch
-                .column_by_name("headers")
-                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
-                .as_string::<i32>();
             let bodies = batch
                 .column_by_name("body")
                 .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
@@ -3996,7 +3988,6 @@ impl DatabaseManager {
                         Some(references_list.value(i).to_string())
                     },
                     recipients: recipients_list.value(i).to_string(),
-                    headers: headers_list.value(i).to_string(),
                     body: bodies.value(i).to_string(),
                     symbols,
                 };
@@ -4113,10 +4104,6 @@ impl DatabaseManager {
                     .column_by_name("recipients")
                     .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
                     .as_string::<i32>();
-                let headers_list = batch
-                    .column_by_name("headers")
-                    .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
-                    .as_string::<i32>();
                 let bodies = batch
                     .column_by_name("body")
                     .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
@@ -4207,7 +4194,6 @@ impl DatabaseManager {
                             Some(references_list.value(i).to_string())
                         },
                         recipients: recipients_list.value(i).to_string(),
-                        headers: headers_list.value(i).to_string(),
                         body: bodies.value(i).to_string(),
                         symbols,
                     };
@@ -4649,10 +4635,6 @@ impl DatabaseManager {
                 .column_by_name("recipients")
                 .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
                 .as_string::<i32>();
-            let headers_list = batch
-                .column_by_name("headers")
-                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
-                .as_string::<i32>();
             let bodies = batch
                 .column_by_name("body")
                 .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
@@ -4684,7 +4666,6 @@ impl DatabaseManager {
                     Some(references_list.value(0).to_string())
                 },
                 recipients: recipients_list.value(0).to_string(),
-                headers: headers_list.value(0).to_string(),
                 body: bodies.value(0).to_string(),
                 symbols,
             };
@@ -4764,10 +4745,6 @@ impl DatabaseManager {
                 .column_by_name("recipients")
                 .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
                 .as_string::<i32>();
-            let headers_list = batch
-                .column_by_name("headers")
-                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
-                .as_string::<i32>();
             let bodies = batch
                 .column_by_name("body")
                 .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
@@ -4806,7 +4783,6 @@ impl DatabaseManager {
                         Some(references_list.value(i).to_string())
                     },
                     recipients: recipients_list.value(i).to_string(),
-                    headers: headers_list.value(i).to_string(),
                     body: bodies.value(i).to_string(),
                     symbols,
                 };
@@ -4892,10 +4868,6 @@ impl DatabaseManager {
                 .column_by_name("recipients")
                 .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
                 .as_string::<i32>();
-            let headers_list = batch
-                .column_by_name("headers")
-                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
-                .as_string::<i32>();
             let bodies = batch
                 .column_by_name("body")
                 .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
@@ -4927,7 +4899,6 @@ impl DatabaseManager {
                         Some(references_list.value(i).to_string())
                     },
                     recipients: recipients_list.value(i).to_string(),
-                    headers: headers_list.value(i).to_string(),
                     body: bodies.value(i).to_string(),
                     symbols,
                 };
@@ -5023,10 +4994,6 @@ impl DatabaseManager {
                 .column_by_name("recipients")
                 .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
                 .as_string::<i32>();
-            let headers_list = batch
-                .column_by_name("headers")
-                .ok_or_else(|| anyhow::anyhow!("Missing headers column"))?
-                .as_string::<i32>();
             let bodies = batch
                 .column_by_name("body")
                 .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
@@ -5058,7 +5025,6 @@ impl DatabaseManager {
                         Some(references_list.value(i).to_string())
                     },
                     recipients: recipients_list.value(i).to_string(),
-                    headers: headers_list.value(i).to_string(),
                     body: bodies.value(i).to_string(),
                     symbols,
                 };

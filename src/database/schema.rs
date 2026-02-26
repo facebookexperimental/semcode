@@ -63,6 +63,8 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "lore") {
             self.create_lore_table().await?;
+        } else {
+            self.migrate_lore_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "lore_indexed_commits") {
@@ -278,7 +280,6 @@ impl SchemaManager {
             Field::new("subject", DataType::Utf8, false),        // Subject line
             Field::new("references", DataType::Utf8, true), // Full list of references (nullable)
             Field::new("recipients", DataType::Utf8, false), // Full list of cc/to recipients
-            Field::new("headers", DataType::Utf8, false), // Email headers (everything before first blank line)
             Field::new("body", DataType::Utf8, false), // Email body (everything after first blank line)
             Field::new("symbols", DataType::Utf8, false), // JSON array of symbols referenced in email
         ]));
@@ -293,6 +294,39 @@ impl SchemaManager {
             .await?;
 
         tracing::info!("Created lore table for email archive indexing");
+        Ok(())
+    }
+
+    /// Migrate an existing lore table to the current schema.
+    async fn migrate_lore_table(&self) -> Result<()> {
+        let table = self.connection.open_table("lore").execute().await?;
+        let schema = table.schema().await?;
+
+        // Drop the "headers" column if it exists; individual header
+        // fields are stored in their own columns and reconstructed
+        // on demand for MBOX output.
+        if schema.column_with_name("headers").is_some() {
+            tracing::info!("Migrating lore table: dropping 'headers' column");
+            table.drop_columns(&["headers"]).await?;
+
+            // drop_columns() is a schema-only operation; old data
+            // fragments still carry the headers bytes on disk.
+            // Compact to rewrite fragments without the column,
+            // then prune to delete the stale files.
+            tracing::info!("Compacting lore table to reclaim space");
+            match Self::optimize_single_table(&self.connection, "lore").await? {
+                OptimizeOutcome::Optimized => {
+                    tracing::info!("Lore table migration complete");
+                }
+                OptimizeOutcome::Skipped => {
+                    tracing::info!("Lore table compaction skipped (table too small)");
+                }
+                OptimizeOutcome::PartialFailure => {
+                    tracing::warn!("Lore table compaction partially failed");
+                }
+            }
+        }
+
         Ok(())
     }
 

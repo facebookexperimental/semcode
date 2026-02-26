@@ -307,7 +307,6 @@ in_reply_to         (Utf8, nullable)     - Message-ID of parent email
 subject             (Utf8, NOT NULL)     - Email subject line
 references          (Utf8, nullable)     - Space-separated Message-IDs of thread ancestors
 recipients          (Utf8, NOT NULL)     - Comma-separated To/Cc recipients
-headers             (Utf8, NOT NULL)     - Full email headers
 body                (Utf8, NOT NULL)     - Email body content
 symbols             (Utf8, NOT NULL)     - JSON array of symbols found in patches/diffs
 ```
@@ -319,7 +318,6 @@ symbols             (Utf8, NOT NULL)     - JSON array of symbols found in patche
 - BTree on `date` (chronological queries)
 - BTree on `in_reply_to` (threading queries)
 - BTree on `references` (threading queries)
-- BTree on `headers` (header searches)
 - **FTS (Full Text Search) on `from`** - Fast keyword search on sender
 - **FTS on `subject`** - Fast keyword search on subject lines
 - **FTS on `body`** - Fast keyword search on email bodies
