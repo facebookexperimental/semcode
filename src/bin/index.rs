@@ -660,10 +660,10 @@ async fn index_lore_archive(
     let total_commits = all_commit_shas.len();
     info!("Found {} total commits in lore archive", total_commits);
 
-    // Get already indexed commits from database using efficient batched queries
+    // Get already indexed commits from database
     println!("Checking for already-indexed commits...");
     let existing_commits = db_manager
-        .filter_existing_lore_commits(&all_commit_shas)
+        .get_indexed_lore_commits()
         .await?;
 
     // Filter out already indexed commits

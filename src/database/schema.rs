@@ -65,6 +65,10 @@ impl SchemaManager {
             self.create_lore_table().await?;
         }
 
+        if !table_names.iter().any(|n| n == "lore_indexed_commits") {
+            self.create_lore_indexed_commits_table().await?;
+        }
+
         if !table_names.iter().any(|n| n == "lore_vectors") {
             self.create_lore_vectors_table().await?;
         }
@@ -289,6 +293,24 @@ impl SchemaManager {
             .await?;
 
         tracing::info!("Created lore table for email archive indexing");
+        Ok(())
+    }
+
+    async fn create_lore_indexed_commits_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = vec![Ok(empty_batch)];
+        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        self.connection
+            .create_table("lore_indexed_commits", batch_iterator)
+            .execute()
+            .await?;
+
+        tracing::info!("Created lore_indexed_commits table");
         Ok(())
     }
 
@@ -885,6 +907,7 @@ impl SchemaManager {
             "git_commits".to_string(),
             "lore".to_string(),
             "indexed_branches".to_string(),
+            "lore_indexed_commits".to_string(),
         ];
 
         // Add all content shard tables
@@ -1064,6 +1087,7 @@ impl SchemaManager {
             "git_commits",
             "lore",
             "indexed_branches",
+            "lore_indexed_commits",
         ];
 
         // Add all content shard tables
@@ -1235,6 +1259,7 @@ impl SchemaManager {
             "symbol_filename" => self.create_symbol_filename_table().await,
             "git_commits" => self.create_git_commits_table().await,
             "lore" => self.create_lore_table().await,
+            "lore_indexed_commits" => self.create_lore_indexed_commits_table().await,
             "indexed_branches" => self.create_indexed_branches_table().await,
             "content" => self.create_content_table().await,
             name if name.starts_with("content_") => {

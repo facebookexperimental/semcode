@@ -83,6 +83,7 @@ impl DatabaseManager {
             "symbol_filename",
             "git_commits",
             "lore",
+            "lore_indexed_commits",
             "indexed_branches",
         ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
@@ -3758,6 +3759,26 @@ impl DatabaseManager {
             Field::new("symbols", DataType::Utf8, false),
         ]));
 
+        // Deduplicate by message_id within the batch. A lore archive
+        // can contain the same email in multiple git commits, and
+        // LanceDB merge_insert requires each target row to be matched
+        // by at most one source row. Keep the last occurrence.
+        let mut seen = std::collections::HashMap::with_capacity(emails.len());
+        for (i, email) in emails.iter().enumerate() {
+            seen.insert(&email.message_id, i);
+        }
+        let mut dedup_indices: Vec<usize> = seen.into_values().collect();
+        dedup_indices.sort_unstable();
+
+        let dedup_count = emails.len() - dedup_indices.len();
+        if dedup_count > 0 {
+            tracing::info!(
+                "insert_lore_emails: Removed {} duplicate message_ids from batch of {}",
+                dedup_count,
+                emails.len()
+            );
+        }
+
         let mut git_commit_shas = Vec::new();
         let mut from_addrs = Vec::new();
         let mut dates = Vec::new();
@@ -3770,7 +3791,8 @@ impl DatabaseManager {
         let mut bodies = Vec::new();
         let mut symbols_list = Vec::new();
 
-        for email in emails {
+        for &idx in &dedup_indices {
+            let email = &emails[idx];
             git_commit_shas.push(email.git_commit_sha.clone());
             from_addrs.push(email.from.clone());
             dates.push(email.date.clone());
@@ -5331,54 +5353,77 @@ impl DatabaseManager {
         Ok(commits)
     }
 
-    /// Filter a list of commit SHAs to return only those that already exist in the lore table.
-    /// Uses batched IN queries to avoid full table scans.
-    /// Returns a HashSet of SHAs that exist in the database.
-    pub async fn filter_existing_lore_commits(
-        &self,
-        commit_shas: &[String],
-    ) -> Result<HashSet<String>> {
-        if commit_shas.is_empty() {
-            return Ok(HashSet::new());
-        }
+    /// Return the set of commit SHAs already recorded in the
+    /// lore_indexed_commits table. The table contains only short
+    /// SHA strings, so reading it entirely into memory is cheap.
+    pub async fn get_indexed_lore_commits(&self) -> Result<HashSet<String>> {
+        let table = match self.connection.open_table("lore_indexed_commits").execute().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to open lore_indexed_commits table: {}", e);
+                return Ok(HashSet::new());
+            }
+        };
 
-        let table = self.connection.open_table("lore").execute().await?;
-        let mut existing = HashSet::with_capacity(commit_shas.len() / 2); // Pre-allocate for typical case
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "git_commit_sha".to_string(),
+            ]))
+            .execute()
+            .await?;
 
-        // Process in chunks to avoid SQL query size limits
-        // LanceDB/DuckDB can handle large IN clauses, but 1000 is a safe batch size
-        const BATCH_SIZE: usize = 1000;
-
-        for chunk in commit_shas.chunks(BATCH_SIZE) {
-            // Build SQL IN clause with properly escaped SHAs
-            let escaped_shas: Vec<String> = chunk
-                .iter()
-                .map(|sha| format!("'{}'", sha.replace("'", "''")))
-                .collect();
-            let filter = format!("git_commit_sha IN ({})", escaped_shas.join(", "));
-
-            let stream = table
-                .query()
-                .select(lancedb::query::Select::Columns(vec![
-                    "git_commit_sha".to_string()
-                ]))
-                .only_if(&filter)
-                .execute()
-                .await?;
-
-            let batches: Vec<_> = stream.try_collect().await?;
-
-            for batch in batches {
-                if let Some(column) = batch.column_by_name("git_commit_sha") {
-                    if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
-                        for i in 0..string_array.len() {
-                            existing.insert(string_array.value(i).to_string());
-                        }
+        let batches: Vec<_> = stream.try_collect().await?;
+        let mut existing = HashSet::new();
+        for batch in batches {
+            if let Some(column) = batch.column_by_name("git_commit_sha") {
+                if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
+                    existing.reserve(string_array.len());
+                    for i in 0..string_array.len() {
+                        existing.insert(string_array.value(i).to_string());
                     }
                 }
             }
         }
 
         Ok(existing)
+    }
+
+    /// Record git commit SHAs that have been processed for lore indexing.
+    pub async fn insert_lore_indexed_commits(&self, commit_shas: &[String]) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if commit_shas.is_empty() {
+            return Ok(());
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+        ]));
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(commit_shas.to_vec())),
+        ];
+
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        let batches = vec![Ok(batch)];
+        let batch_iterator =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+
+        let table = self
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await?;
+        let mut merge_insert = table.merge_insert(&["git_commit_sha"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
+
+        Ok(())
     }
 }
