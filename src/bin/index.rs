@@ -1080,15 +1080,9 @@ async fn main() -> Result<()> {
                 total_emails_all_archives
             );
 
-            // Create FTS indices for lore table after data is inserted
+            // Optimize before creating FTS indices so that compaction
+            // does not orphan the index data that was just built.
             if total_new_emails > 0 {
-                println!("\nCreating FTS indices for lore table...");
-                match db_manager.create_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices created successfully"),
-                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
-                }
-
-                // Check if optimization is needed after lore indexing
                 match db_manager.check_optimization_health().await {
                     Ok((needs_optimization, message)) => {
                         if needs_optimization {
@@ -1104,6 +1098,12 @@ async fn main() -> Result<()> {
                     Err(e) => {
                         error!("Failed to check database health: {}", e);
                     }
+                }
+
+                println!("\nCreating FTS indices for lore table...");
+                match db_manager.create_lore_fts_indices().await {
+                    Ok(_) => println!("FTS indices created successfully"),
+                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
                 }
             }
 
@@ -1248,15 +1248,9 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Create FTS indices for lore table after data is inserted
+            // Optimize before creating FTS indices so that compaction
+            // does not orphan the index data that was just built.
             if total_new_emails > 0 {
-                println!("\nCreating FTS indices for lore table...");
-                match db_manager.create_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices created successfully"),
-                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
-                }
-
-                // Check if optimization is needed
                 match db_manager.check_optimization_health().await {
                     Ok((needs_optimization, message)) => {
                         if needs_optimization {
@@ -1272,6 +1266,12 @@ async fn main() -> Result<()> {
                     Err(e) => {
                         error!("Failed to check database health: {}", e);
                     }
+                }
+
+                println!("\nCreating FTS indices for lore table...");
+                match db_manager.create_lore_fts_indices().await {
+                    Ok(_) => println!("FTS indices created successfully"),
+                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
                 }
             }
 
