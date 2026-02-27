@@ -510,6 +510,7 @@ pub async fn lore_show_replies_to_writer(
     let mut to_process = VecDeque::new();
 
     // Start with the root message
+    let root_message_id = root_email.message_id.clone();
     seen_message_ids.insert(root_email.message_id.clone());
     to_process.push_back(root_email.message_id.clone());
     all_emails.push(root_email);
@@ -534,6 +535,10 @@ pub async fn lore_show_replies_to_writer(
 
     if all_emails.len() == 1 {
         // Only the root message, no replies
+        if options.replies_only {
+            // In replies_only mode, nothing to output if there are no replies
+            return Ok(());
+        }
         if !options.mbox_output {
             writeln!(writer, "\nInfo: No replies found")?;
         }
@@ -547,22 +552,45 @@ pub async fn lore_show_replies_to_writer(
     // Sort emails in thread order (respecting reply structure, then by date)
     let sorted_emails = crate::search::sort_emails_by_thread_order(&all_emails);
 
+    // Filter out root email if replies_only mode
+    let emails_to_output: Vec<_> = if options.replies_only {
+        sorted_emails
+            .iter()
+            .filter(|e| e.message_id != root_message_id)
+            .collect()
+    } else {
+        sorted_emails.iter().collect()
+    };
+
+    if options.replies_only && emails_to_output.is_empty() {
+        // No replies to output
+        return Ok(());
+    }
+
     // Handle MBOX output format
     if options.mbox_output {
-        for email in &sorted_emails {
+        for email in &emails_to_output {
             write_email_as_mbox_with_options(email, writer, options.snip_output)?;
         }
         return Ok(());
     }
 
-    writeln!(
-        writer,
-        "\nReplies: Found {} message(s) (including root):\n",
-        all_emails.len()
-    )?;
+    if options.replies_only {
+        writeln!(
+            writer,
+            "\nReplies: Found {} reply message(s):\n",
+            emails_to_output.len()
+        )?;
+    } else {
+        writeln!(
+            writer,
+            "\nReplies: Found {} message(s) (including root):\n",
+            all_emails.len()
+        )?;
+    }
 
     // Display all emails in the subthread
-    for (idx, email) in sorted_emails.iter().enumerate() {
+    for (idx, email) in emails_to_output.iter().enumerate() {
         writeln!(writer, "{}. {} - {}", idx + 1, email.date, email.subject)?;
 
         // Always show database column headers
@@ -935,6 +963,9 @@ pub async fn dig_lore_by_commit_to_writer(
         if options.show_replies {
             writeln!(writer, "  (with all replies)")?;
         }
+        if options.replies_only {
+            writeln!(writer, "  (showing only replies, not original patches)")?;
+        }
     }
 
     // Resolve git commit-ish to full SHA and get commit info (reuse git resolution logic)
@@ -1017,8 +1048,9 @@ pub async fn dig_lore_by_commit_to_writer(
         }
     });
 
-    // Handle MBOX output format (only for simple case without thread/replies)
-    if options.mbox_output && !options.show_thread && !options.show_replies {
+    // Handle MBOX output format (only for simple case without thread/replies/replies_only)
+    if options.mbox_output && !options.show_thread && !options.show_replies && !options.replies_only
+    {
         // For mbox, sort by date (oldest first) for proper chronological order in mailbox
         sort_emails_by_date(&mut sorted_emails);
 
@@ -1074,7 +1106,7 @@ pub async fn dig_lore_by_commit_to_writer(
                 }
                 lore_show_thread_to_writer(db, &email.message_id, options, writer).await?;
             }
-        } else if options.show_replies {
+        } else if options.show_replies || options.replies_only {
             // Filter to only original patches (not "Re:" replies) so we show replies
             // for each version of the patch (v1, v2, RFC, etc.) but not replies to replies
             let original_patches: Vec<_> = sorted_emails
@@ -1099,7 +1131,7 @@ pub async fn dig_lore_by_commit_to_writer(
                 }
 
                 for (idx, email) in original_patches.iter().enumerate() {
-                    if !options.mbox_output {
+                    if !options.mbox_output && !options.replies_only {
                         if idx > 0 {
                             writeln!(writer, "\n{}\n", "=".repeat(80))?;
                         }
@@ -1131,8 +1163,8 @@ pub async fn dig_lore_by_commit_to_writer(
         }
     } else {
         // Show only most recent match
-        // For --replies, find the most recent original patch (not a "Re:" reply)
-        let target_email = if options.show_replies {
+        // For --replies/--replies-only, find the most recent original patch (not a "Re:" reply)
+        let target_email = if options.show_replies || options.replies_only {
             sorted_emails
                 .iter()
                 .find(|e| !e.subject.trim_start().to_lowercase().starts_with("re:"))
@@ -1141,7 +1173,7 @@ pub async fn dig_lore_by_commit_to_writer(
         };
 
         if let Some(most_recent) = target_email {
-            if !options.mbox_output {
+            if !options.mbox_output && !options.replies_only {
                 writeln!(
                     writer,
                     "\nResults: Found {} matching email(s), showing most recent:\n",
@@ -1154,8 +1186,8 @@ pub async fn dig_lore_by_commit_to_writer(
                     writeln!(writer, "===> Most Recent Thread:")?;
                 }
                 lore_show_thread_to_writer(db, &most_recent.message_id, options, writer).await?;
-            } else if options.show_replies {
-                if !options.mbox_output {
+            } else if options.show_replies || options.replies_only {
+                if !options.mbox_output && !options.replies_only {
                     writeln!(writer, "===> Replies to Most Recent Patch:")?;
                     writeln!(writer, "     Subject: {}", most_recent.subject)?;
                     writeln!(writer, "     From: {}", most_recent.from)?;

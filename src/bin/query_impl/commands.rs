@@ -1281,7 +1281,7 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: dig [-v] [-a] [--thread] [--replies] [--snip] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>"
+                    "Usage: dig [-v] [-a] [--thread] [--replies] [--replies-only] [--snip] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>"
                         .red()
                 );
                 println!("  Search for lore emails related to a git commit");
@@ -1292,6 +1292,9 @@ pub async fn handle_command(
                 println!("    --thread        Show full thread for each result (use with -a)");
                 println!(
                     "    --replies       Show only replies to the commit email (not full thread)"
+                );
+                println!(
+                    "    --replies-only  Output ONLY the reply emails (skip original patches)"
                 );
                 println!("    --since <date>  Only show emails from this date onwards");
                 println!("    --until <date>  Only show emails up to this date");
@@ -1317,6 +1320,7 @@ pub async fn handle_command(
                 let mut show_all = false;
                 let mut show_thread = false;
                 let mut show_replies = false;
+                let mut replies_only = false;
                 let mut snip_output = false;
                 let mut since_date_str: Option<String> = None;
                 let mut until_date_str: Option<String> = None;
@@ -1341,6 +1345,10 @@ pub async fn handle_command(
                         }
                         "--replies" => {
                             show_replies = true;
+                            i += 1;
+                        }
+                        "--replies-only" => {
+                            replies_only = true;
                             i += 1;
                         }
                         "--since" if i + 1 < parts.len() => {
@@ -1442,6 +1450,7 @@ pub async fn handle_command(
                         verbose: verbose_level,
                         show_thread,
                         show_replies,
+                        replies_only,
                         since_date: since_date.as_deref(),
                         until_date: until_date.as_deref(),
                         mbox_output,
@@ -1463,7 +1472,7 @@ pub async fn handle_command(
                             .await?;
                     }
                 } else {
-                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--replies] [--snip] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>".red());
+                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--replies] [--replies-only] [--snip] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>".red());
                     println!("  Missing commit argument");
                 }
             }
@@ -1689,6 +1698,7 @@ pub async fn handle_command(
                             verbose,
                             show_thread,
                             show_replies,
+                            replies_only: false,
                             since_date: None,
                             until_date: None,
                             mbox_output,
@@ -1700,6 +1710,7 @@ pub async fn handle_command(
                             verbose,
                             show_thread,
                             show_replies,
+                            replies_only: false,
                             since_date: None,
                             until_date: None,
                             mbox_output,
@@ -1738,6 +1749,7 @@ pub async fn handle_command(
                             verbose,
                             show_thread,
                             show_replies,
+                            replies_only: false,
                             since_date: since_date.as_deref(),
                             until_date: until_date.as_deref(),
                             mbox_output,
@@ -1764,6 +1776,7 @@ pub async fn handle_command(
                             verbose,
                             show_thread,
                             show_replies,
+                            replies_only: false,
                             since_date: since_date.as_deref(),
                             until_date: until_date.as_deref(),
                             mbox_output,
