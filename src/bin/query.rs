@@ -43,6 +43,12 @@ struct Args {
     /// Reads from stdin if no file is specified.
     #[arg(long, value_name = "FILE")]
     diffinfo: Option<Option<String>>,
+
+    /// Control callstack depth for --diffinfo: UP/DOWN levels (e.g., 2/3).
+    /// UP = how many caller levels, DOWN = how many callee levels.
+    /// Default: 1/1 (direct callers and callees only).
+    #[arg(long, value_name = "UP/DOWN", requires = "diffinfo")]
+    depth: Option<String>,
 }
 
 /// Check if the current commit needs indexing and perform incremental indexing if needed
@@ -135,6 +141,51 @@ async fn index_current_commit_if_needed(
     Ok(())
 }
 
+/// Walk a chain index (caller or callee) up to `depth` levels from `start`.
+/// Returns a flat JSON array when depth=1, or a nested array of arrays when depth>1.
+/// Each level contains only newly-discovered functions (cycle-safe).
+fn collect_chain_levels(
+    start: &str,
+    depth: usize,
+    index: &std::collections::HashMap<String, Vec<String>>,
+) -> serde_json::Value {
+    if depth == 0 {
+        return serde_json::json!([]);
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(start.to_string());
+    let mut current_names = vec![start.to_string()];
+    let mut levels: Vec<Vec<String>> = Vec::new();
+
+    for _ in 0..depth {
+        let mut next_level = Vec::new();
+        for name in &current_names {
+            if let Some(related) = index.get(name) {
+                for r in related {
+                    if seen.insert(r.clone()) {
+                        next_level.push(r.clone());
+                    }
+                }
+            }
+        }
+        next_level.sort();
+        next_level.dedup();
+        if next_level.is_empty() {
+            break;
+        }
+        levels.push(next_level.clone());
+        current_names = next_level;
+    }
+
+    if depth == 1 {
+        // Flat array for backwards compatibility
+        serde_json::json!(levels.into_iter().next().unwrap_or_default())
+    } else {
+        serde_json::json!(levels)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Suppress ORT verbose logging
@@ -160,6 +211,26 @@ async fn main() -> Result<()> {
 
     // Handle --diffinfo flag: process diff and exit
     if let Some(file_path) = args.diffinfo {
+        // Parse --depth UP/DOWN (default: 1/1)
+        let (up_depth, down_depth) = if let Some(ref depth_str) = args.depth {
+            let parts: Vec<&str> = depth_str.split('/').collect();
+            if parts.len() != 2 {
+                eprintln!("Error: --depth must be in UP/DOWN format (e.g., 2/3)");
+                std::process::exit(1);
+            }
+            let up: usize = parts[0].parse().unwrap_or_else(|_| {
+                eprintln!("Error: invalid UP value in --depth: {}", parts[0]);
+                std::process::exit(1);
+            });
+            let down: usize = parts[1].parse().unwrap_or_else(|_| {
+                eprintln!("Error: invalid DOWN value in --depth: {}", parts[1]);
+                std::process::exit(1);
+            });
+            (up, down)
+        } else {
+            (1, 1)
+        };
+
         // Get git SHA
         let git_sha = semcode::git::get_git_sha(&args.git_repo)?
             .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
@@ -195,9 +266,23 @@ async fn main() -> Result<()> {
         let git_manifest = db_manager.generate_git_manifest(&git_sha).await?;
 
         // Build caller index ONCE with one table scan (instead of N LIKE queries)
+        // This maps callee -> [callers], used for walking UP the callstack
         let caller_index = db_manager
             .build_caller_index_with_manifest(&git_manifest)
             .await?;
+
+        // Build callee index from the same data: caller -> [callees]
+        // This is the reverse of caller_index, used for walking DOWN the callstack
+        let callee_index = {
+            let mut idx: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (callee, callers) in &caller_index {
+                for caller in callers {
+                    idx.entry(caller.clone()).or_default().push(callee.clone());
+                }
+            }
+            idx
+        };
 
         // Collect all modified functions with their info
         let mut functions_info = Vec::new();
@@ -211,11 +296,11 @@ async fn main() -> Result<()> {
                 .await
                 .unwrap_or_default();
 
-            // Use caller index for instant lookup (no table scan)
-            let callers = caller_index.get(func_name).cloned().unwrap_or_default();
+            // Walk UP the callstack to collect callers at each level
+            let callers = collect_chain_levels(func_name, up_depth, &caller_index);
 
-            // Get calls from the diff parsing (what this function calls in the patch)
-            let mut calls_from_diff: Vec<String> = parse_result
+            // Get direct calls from the diff parsing and database
+            let mut direct_calls: Vec<String> = parse_result
                 .function_calls
                 .get(func_name)
                 .map(|set| {
@@ -237,17 +322,53 @@ async fn main() -> Result<()> {
 
             // Merge database calls into diff calls (avoiding duplicates)
             for call in calls_from_db {
-                if !calls_from_diff.contains(&call) {
-                    calls_from_diff.push(call);
+                if !direct_calls.contains(&call) {
+                    direct_calls.push(call);
                 }
             }
-            calls_from_diff.sort();
+            direct_calls.sort();
+
+            // Walk DOWN the callstack using the callee index
+            let calls = if down_depth <= 1 {
+                serde_json::json!(direct_calls)
+            } else {
+                // Use direct_calls as level 1, then walk deeper via callee_index
+                let mut levels: Vec<serde_json::Value> = Vec::new();
+                let mut current_level = direct_calls.clone();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                seen.insert(func_name.to_string());
+
+                for _ in 0..down_depth {
+                    // Deduplicate against already-seen functions
+                    current_level.retain(|f| seen.insert(f.clone()));
+                    current_level.sort();
+                    if current_level.is_empty() {
+                        break;
+                    }
+                    levels.push(serde_json::json!(current_level));
+
+                    // Collect the next level from callee_index
+                    let mut next_level = Vec::new();
+                    for f in &current_level {
+                        if let Some(callees) = callee_index.get(f) {
+                            for callee in callees {
+                                if !next_level.contains(callee) {
+                                    next_level.push(callee.clone());
+                                }
+                            }
+                        }
+                    }
+                    current_level = next_level;
+                }
+
+                serde_json::json!(levels)
+            };
 
             let mut func_info = serde_json::Map::new();
             func_info.insert("name".to_string(), serde_json::json!(func_name));
             func_info.insert("types".to_string(), serde_json::json!(types));
-            func_info.insert("callers".to_string(), serde_json::json!(callers));
-            func_info.insert("calls".to_string(), serde_json::json!(calls_from_diff));
+            func_info.insert("callers".to_string(), callers);
+            func_info.insert("calls".to_string(), calls);
             functions_info.push(serde_json::Value::Object(func_info));
         }
 
