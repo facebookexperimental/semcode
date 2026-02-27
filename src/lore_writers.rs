@@ -856,21 +856,46 @@ pub async fn dig_lore_by_commit_to_writer(
                 lore_show_thread_to_writer(db, &email.message_id, options, writer).await?;
             }
         } else if options.show_replies {
-            // Show all replies
-            for (idx, email) in sorted_emails.iter().enumerate() {
+            // Filter to only original patches (not "Re:" replies) so we show replies
+            // for each version of the patch (v1, v2, RFC, etc.) but not replies to replies
+            let original_patches: Vec<_> = sorted_emails
+                .iter()
+                .filter(|e| !e.subject.trim_start().to_lowercase().starts_with("re:"))
+                .collect();
+
+            if original_patches.is_empty() {
                 if !options.mbox_output {
-                    if idx > 0 {
-                        writeln!(writer, "\n{}\n", "=".repeat(80))?;
-                    }
                     writeln!(
                         writer,
-                        "===> Replies {} of {} ({}):",
-                        idx + 1,
-                        sorted_emails.len(),
-                        email.date
+                        "Info: No original patch emails found (only replies)"
                     )?;
                 }
-                lore_show_replies_to_writer(db, &email.message_id, options, writer).await?;
+            } else {
+                if !options.mbox_output {
+                    writeln!(
+                        writer,
+                        "Found {} patch version(s):\n",
+                        original_patches.len()
+                    )?;
+                }
+
+                for (idx, email) in original_patches.iter().enumerate() {
+                    if !options.mbox_output {
+                        if idx > 0 {
+                            writeln!(writer, "\n{}\n", "=".repeat(80))?;
+                        }
+                        writeln!(
+                            writer,
+                            "===> Patch version {} of {} ({}):",
+                            idx + 1,
+                            original_patches.len(),
+                            email.date
+                        )?;
+                        writeln!(writer, "     Subject: {}", email.subject)?;
+                        writeln!(writer, "     From: {}", email.from)?;
+                    }
+                    lore_show_replies_to_writer(db, &email.message_id, options, writer).await?;
+                }
             }
         } else {
             // Show summary of all matching emails
@@ -891,7 +916,16 @@ pub async fn dig_lore_by_commit_to_writer(
         }
     } else {
         // Show only most recent match
-        if let Some(most_recent) = sorted_emails.first() {
+        // For --replies, find the most recent original patch (not a "Re:" reply)
+        let target_email = if options.show_replies {
+            sorted_emails
+                .iter()
+                .find(|e| !e.subject.trim_start().to_lowercase().starts_with("re:"))
+        } else {
+            sorted_emails.first()
+        };
+
+        if let Some(most_recent) = target_email {
             if !options.mbox_output {
                 writeln!(
                     writer,
@@ -907,7 +941,9 @@ pub async fn dig_lore_by_commit_to_writer(
                 lore_show_thread_to_writer(db, &most_recent.message_id, options, writer).await?;
             } else if options.show_replies {
                 if !options.mbox_output {
-                    writeln!(writer, "===> Replies to Most Recent:")?;
+                    writeln!(writer, "===> Replies to Most Recent Patch:")?;
+                    writeln!(writer, "     Subject: {}", most_recent.subject)?;
+                    writeln!(writer, "     From: {}", most_recent.from)?;
                 }
                 lore_show_replies_to_writer(db, &most_recent.message_id, options, writer).await?;
             } else {

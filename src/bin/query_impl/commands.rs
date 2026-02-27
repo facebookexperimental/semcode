@@ -1281,7 +1281,7 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>"
+                    "Usage: dig [-v] [-a] [--thread] [--replies] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>"
                         .red()
                 );
                 println!("  Search for lore emails related to a git commit");
@@ -1290,6 +1290,9 @@ pub async fn handle_command(
                 println!("    -v              Show full message body");
                 println!("    -a              Show all duplicate results (not just most recent)");
                 println!("    --thread        Show full thread for each result (use with -a)");
+                println!(
+                    "    --replies       Show only replies to the commit email (not full thread)"
+                );
                 println!("    --since <date>  Only show emails from this date onwards");
                 println!("    --until <date>  Only show emails up to this date");
                 println!("    --mbox          Output in MBOX format (full headers and body)");
@@ -1312,6 +1315,7 @@ pub async fn handle_command(
                 let mut verbose_level = 0;
                 let mut show_all = false;
                 let mut show_thread = false;
+                let mut show_replies = false;
                 let mut since_date_str: Option<String> = None;
                 let mut until_date_str: Option<String> = None;
                 let mut mbox_output = false;
@@ -1331,6 +1335,10 @@ pub async fn handle_command(
                         }
                         "--thread" => {
                             show_thread = true;
+                            i += 1;
+                        }
+                        "--replies" => {
+                            show_replies = true;
                             i += 1;
                         }
                         "--since" if i + 1 < parts.len() => {
@@ -1415,10 +1423,19 @@ pub async fn handle_command(
                         }
                     }
 
+                    // --thread and --replies are mutually exclusive
+                    if show_thread && show_replies {
+                        println!(
+                            "{} --thread and --replies are mutually exclusive",
+                            "Error:".red()
+                        );
+                        return Ok(false);
+                    }
+
                     let options = LoreSearchOptions {
                         verbose: verbose_level,
                         show_thread,
-                        show_replies: false,
+                        show_replies,
                         since_date: since_date.as_deref(),
                         until_date: until_date.as_deref(),
                         mbox_output,
@@ -1439,7 +1456,7 @@ pub async fn handle_command(
                             .await?;
                     }
                 } else {
-                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>".red());
+                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--replies] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>".red());
                     println!("  Missing commit argument");
                 }
             }
