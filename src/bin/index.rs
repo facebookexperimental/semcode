@@ -963,6 +963,8 @@ async fn main() -> Result<()> {
         }
 
         analysis_threads
+    } else if let Ok(env_jobs) = std::env::var("SEMCODE_JOBS") {
+        env_jobs.parse::<usize>().unwrap_or(0)
     } else {
         0
     };
