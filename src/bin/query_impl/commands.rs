@@ -1281,7 +1281,7 @@ pub async fn handle_command(
             if parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: dig [-v] [-a] [--thread] [--replies] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>"
+                    "Usage: dig [-v] [-a] [--thread] [--replies] [--snip] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>"
                         .red()
                 );
                 println!("  Search for lore emails related to a git commit");
@@ -1296,6 +1296,7 @@ pub async fn handle_command(
                 println!("    --since <date>  Only show emails from this date onwards");
                 println!("    --until <date>  Only show emails up to this date");
                 println!("    --mbox          Output in MBOX format (full headers and body)");
+                println!("    --snip          Snip quoted text, keeping 6 lines of context");
                 println!("    -o <file>       Write output to file instead of stdout");
                 println!("  Date formats: 'yesterday', 'N days ago', 'N weeks ago', 'YYYY-MM-DD'");
                 println!("  Examples:");
@@ -1316,6 +1317,7 @@ pub async fn handle_command(
                 let mut show_all = false;
                 let mut show_thread = false;
                 let mut show_replies = false;
+                let mut snip_output = false;
                 let mut since_date_str: Option<String> = None;
                 let mut until_date_str: Option<String> = None;
                 let mut mbox_output = false;
@@ -1351,6 +1353,10 @@ pub async fn handle_command(
                         }
                         "--mbox" => {
                             mbox_output = true;
+                            i += 1;
+                        }
+                        "--snip" => {
+                            snip_output = true;
                             i += 1;
                         }
                         "-o" if i + 1 < parts.len() => {
@@ -1439,6 +1445,7 @@ pub async fn handle_command(
                         since_date: since_date.as_deref(),
                         until_date: until_date.as_deref(),
                         mbox_output,
+                        snip_output,
                     };
 
                     if let Some(ref mut writer) = file_writer {
@@ -1456,7 +1463,7 @@ pub async fn handle_command(
                             .await?;
                     }
                 } else {
-                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--replies] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>".red());
+                    println!("{}", "Usage: dig [-v] [-a] [--thread] [--replies] [--snip] [--since <date>] [--until <date>] [--mbox] [-o <file>] <commit>".red());
                     println!("  Missing commit argument");
                 }
             }
@@ -1685,6 +1692,7 @@ pub async fn handle_command(
                             since_date: None,
                             until_date: None,
                             mbox_output,
+                            snip_output: false,
                         };
                         lore_get_by_message_id_to_writer(db, &msg_id, &options, writer).await?;
                     } else {
@@ -1695,6 +1703,7 @@ pub async fn handle_command(
                             since_date: None,
                             until_date: None,
                             mbox_output,
+                            snip_output: false,
                         };
                         lore_get_by_message_id_with_options(db, &msg_id, &options).await?;
                     }
@@ -1732,6 +1741,7 @@ pub async fn handle_command(
                             since_date: since_date.as_deref(),
                             until_date: until_date.as_deref(),
                             mbox_output,
+                            snip_output: false,
                         };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];
@@ -1757,6 +1767,7 @@ pub async fn handle_command(
                             since_date: since_date.as_deref(),
                             until_date: until_date.as_deref(),
                             mbox_output,
+                            snip_output: false,
                         };
                         if field_patterns.len() == 1 {
                             let (field, pattern) = field_patterns[0];

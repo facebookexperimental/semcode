@@ -10,6 +10,244 @@ use crate::search::LoreSearchOptions;
 use crate::types::LoreEmailInfo;
 use crate::DatabaseManager;
 
+/// Reconstruct RFC 5322 headers from individual fields.
+/// When `snip` is true, only essential headers are emitted.
+fn reconstruct_headers(email: &LoreEmailInfo, snip: bool) -> String {
+    let mut result = String::new();
+
+    result.push_str(&format!("From: {}\n", email.from));
+    result.push_str(&format!("Subject: {}\n", email.subject));
+    result.push_str(&format!("Date: {}\n", email.date));
+    result.push_str(&format!("Message-ID: {}\n", email.message_id));
+
+    if !snip {
+        if let Some(ref in_reply_to) = email.in_reply_to {
+            result.push_str(&format!("In-Reply-To: {}\n", in_reply_to));
+        }
+        if let Some(ref references) = email.references {
+            result.push_str(&format!("References: {}\n", references));
+        }
+    }
+
+    if !email.recipients.is_empty() {
+        result.push_str(&format!("To: {}\n", email.recipients));
+    }
+
+    result
+}
+
+/// Check if a line looks like a reply starter (e.g., "On ... wrote:", "X writes:")
+fn is_reply_starter(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Common patterns:
+    // "On DATE, NAME wrote:"
+    // "On DATE at TIME, NAME wrote:"
+    // "NAME <email> writes:"
+    // "NAME <email> wrote:"
+
+    // Check for lines ending with "wrote:" or "writes:"
+    if trimmed.ends_with("wrote:") || trimmed.ends_with("writes:") {
+        return true;
+    }
+
+    // Check for "On ... wrote:" pattern (starter might be on previous line)
+    if trimmed.starts_with("On ") && trimmed.contains("wrote:") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a line continues a reply starter (for multi-line starters)
+fn continues_reply_starter(line: &str, prev_line: &str) -> bool {
+    let trimmed = line.trim();
+    let prev_trimmed = prev_line.trim();
+
+    // If previous line started with "On " but didn't end with "wrote:"
+    // and this line ends with "wrote:" or "writes:", it's a continuation
+    if prev_trimmed.starts_with("On ")
+        && !prev_trimmed.ends_with("wrote:")
+        && (trimmed.ends_with("wrote:") || trimmed.ends_with("writes:"))
+    {
+        return true;
+    }
+
+    // Handle "> On Fri, 27 Jun 2025 17:00:54 -0400" followed by "> Aaron Conole <...> wrote:"
+    if (prev_trimmed.starts_with("> On ") || prev_trimmed.starts_with(">> On "))
+        && (trimmed.ends_with("wrote:") || trimmed.ends_with("writes:"))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a line is a quote line (starts with > after stripping whitespace)
+fn is_quote_line(line: &str) -> bool {
+    line.trim_start().starts_with('>')
+}
+
+/// Check if a line is a snip marker (e.g., "[...]", "[ ... ]", "[snip]")
+/// These shouldn't trigger context inclusion - they're meta-markers
+fn is_snip_marker(line: &str) -> bool {
+    let trimmed = line.trim();
+    // Match patterns like [...], [ ... ], [snip], etc.
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = &trimmed[1..trimmed.len() - 1].trim();
+        // Common snip markers
+        if inner.is_empty()
+            || *inner == "..."
+            || *inner == "…"
+            || inner.to_lowercase() == "snip"
+            || inner.chars().all(|c| c == '.' || c == ' ')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a line is "real" new content (non-quoted, non-snip-marker, non-empty)
+fn is_real_new_content(line: &str) -> bool {
+    !is_quote_line(line) && !is_snip_marker(line) && !line.trim().is_empty()
+}
+
+/// Snip quoted content in email body, keeping only 6 lines of context
+/// around new (non-quoted) content.
+///
+/// The algorithm:
+/// 1. Identify reply starter blocks (preserved entirely)
+/// 2. Find contiguous blocks of real new content
+/// 3. Keep 6 lines of quoted context before and after each block
+/// 4. Replace snipped sections with "[...]"
+pub fn snip_quoted_body(body: &str, context_lines: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Track which lines to include (true = include, false = snip)
+    let mut include: Vec<bool> = vec![false; lines.len()];
+
+    // First pass: mark reply starters, real new content, and snip markers
+    for (i, line) in lines.iter().enumerate() {
+        // Reply starters are always included
+        if is_reply_starter(line) {
+            include[i] = true;
+            continue;
+        }
+
+        // Multi-line starter continuation
+        if i > 0 && continues_reply_starter(line, lines[i - 1]) {
+            include[i] = true;
+            continue;
+        }
+
+        // Non-quoted lines are included (but snip markers don't trigger context)
+        if !is_quote_line(line) {
+            include[i] = true;
+        }
+    }
+
+    // Second pass: find blocks of real new content and mark context
+    // A "block" is a contiguous run of included non-quoted lines with real content
+    let mut i = 0;
+    while i < lines.len() {
+        // Find start of a block of real new content
+        if include[i] && is_real_new_content(lines[i]) {
+            let block_start = i;
+
+            // Find end of this block (contiguous real new content or blanks between)
+            while i < lines.len() && include[i] && !is_quote_line(lines[i]) {
+                i += 1;
+            }
+            let block_end = i;
+
+            // Mark context BEFORE this block (only quoted lines)
+            let ctx_start = block_start.saturating_sub(context_lines);
+            for j in ctx_start..block_start {
+                if is_quote_line(lines[j]) {
+                    include[j] = true;
+                }
+            }
+
+            // Mark context AFTER this block (only quoted lines)
+            let ctx_end = (block_end + context_lines).min(lines.len());
+            for j in block_end..ctx_end {
+                if is_quote_line(lines[j]) {
+                    include[j] = true;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // Third pass: build output with [...] markers for snipped sections
+    let mut result = String::new();
+    let mut in_snipped_section = false;
+
+    for (i, &line) in lines.iter().enumerate() {
+        if include[i] {
+            if in_snipped_section {
+                // End of snipped section - add marker
+                result.push_str("[...]\n");
+                in_snipped_section = false;
+            }
+            result.push_str(line);
+            result.push('\n');
+        } else {
+            // This line is being snipped
+            if !in_snipped_section && is_quote_line(line) {
+                in_snipped_section = true;
+            }
+        }
+    }
+
+    // Handle trailing snipped section
+    if in_snipped_section {
+        result.push_str("[...]\n");
+    }
+
+    result
+}
+
+/// Apply snipping to an email (headers and body)
+pub fn snip_email(email: &LoreEmailInfo) -> (String, String) {
+    let snipped_headers = reconstruct_headers(email, true);
+    let snipped_body = snip_quoted_body(&email.body, 6);
+    (snipped_headers, snipped_body)
+}
+
+/// Get the email body for display, applying snipping if requested
+fn get_display_body<'a>(
+    email: &'a LoreEmailInfo,
+    options: &LoreSearchOptions<'_>,
+) -> std::borrow::Cow<'a, str> {
+    if options.snip_output {
+        std::borrow::Cow::Owned(snip_quoted_body(&email.body, 6))
+    } else {
+        std::borrow::Cow::Borrowed(&email.body)
+    }
+}
+
+/// Write email body to writer with proper indentation
+fn write_email_body(
+    email: &LoreEmailInfo,
+    options: &LoreSearchOptions<'_>,
+    writer: &mut dyn Write,
+    indent: &str,
+) -> Result<()> {
+    let body = get_display_body(email, options);
+    writeln!(writer, "\n{}--- Message Body ---", indent)?;
+    for line in body.lines() {
+        writeln!(writer, "{}{}", indent, line)?;
+    }
+    writeln!(writer, "{}--- End Message ---", indent)?;
+    Ok(())
+}
+
 /// Format a lore email in MBOX format and write it to the writer
 ///
 /// MBOX format:
@@ -19,6 +257,15 @@ use crate::DatabaseManager;
 /// - Message body
 /// - Final blank line
 pub fn write_email_as_mbox(email: &LoreEmailInfo, writer: &mut dyn Write) -> Result<()> {
+    write_email_as_mbox_with_options(email, writer, false)
+}
+
+/// Format a lore email in MBOX format with optional snipping
+pub fn write_email_as_mbox_with_options(
+    email: &LoreEmailInfo,
+    writer: &mut dyn Write,
+    snip: bool,
+) -> Result<()> {
     // Extract sender email for the From line
     // The from field is typically "Name <email@example.com>" or just "email@example.com"
     let sender = extract_email_address(&email.from);
@@ -29,27 +276,20 @@ pub fn write_email_as_mbox(email: &LoreEmailInfo, writer: &mut dyn Write) -> Res
     // Write the "From " separator line
     writeln!(writer, "From {} {}", sender, asctime_date)?;
 
-    // Reconstruct RFC 5322 headers from individual fields
-    writeln!(writer, "From: {}", email.from)?;
-    writeln!(writer, "Subject: {}", email.subject)?;
-    writeln!(writer, "Date: {}", email.date)?;
-    writeln!(writer, "Message-ID: {}", email.message_id)?;
-    if let Some(ref in_reply_to) = email.in_reply_to {
-        writeln!(writer, "In-Reply-To: {}", in_reply_to)?;
-    }
-    if let Some(ref references) = email.references {
-        writeln!(writer, "References: {}", references)?;
-    }
-    if !email.recipients.is_empty() {
-        writeln!(writer, "To: {}", email.recipients)?;
-    }
+    // Write the headers (snipped or full)
+    write!(writer, "{}", reconstruct_headers(email, snip))?;
     writeln!(writer)?;
 
-    // Write the body
-    write!(writer, "{}", email.body)?;
+    // Write the body (snipped or full)
+    let body = if snip {
+        snip_quoted_body(&email.body, 6)
+    } else {
+        email.body.clone()
+    };
+    write!(writer, "{}", body)?;
 
     // Ensure the message ends with a newline
-    if !email.body.ends_with('\n') {
+    if !body.ends_with('\n') {
         writeln!(writer)?;
     }
 
@@ -194,7 +434,7 @@ pub async fn lore_show_thread_to_writer(
     // Handle MBOX output format
     if options.mbox_output {
         for email in &sorted_emails {
-            write_email_as_mbox(email, writer)?;
+            write_email_as_mbox_with_options(email, writer, options.snip_output)?;
         }
         return Ok(());
     }
@@ -225,12 +465,8 @@ pub async fn lore_show_thread_to_writer(
             writeln!(writer, "   Recipients: {}", email.recipients)?;
         }
 
-        if options.verbose >= 1 {
-            writeln!(writer, "\n   --- Message Body ---")?;
-            for line in email.body.lines() {
-                writeln!(writer, "   {}", line)?;
-            }
-            writeln!(writer, "   --- End Message ---")?;
+        if options.verbose >= 1 || options.snip_output {
+            write_email_body(email, options, writer, "   ")?;
         }
 
         writeln!(writer)?;
@@ -303,7 +539,7 @@ pub async fn lore_show_replies_to_writer(
         }
         // For mbox, still output the root message
         if options.mbox_output {
-            write_email_as_mbox(&all_emails[0], writer)?;
+            write_email_as_mbox_with_options(&all_emails[0], writer, options.snip_output)?;
         }
         return Ok(());
     }
@@ -314,7 +550,7 @@ pub async fn lore_show_replies_to_writer(
     // Handle MBOX output format
     if options.mbox_output {
         for email in &sorted_emails {
-            write_email_as_mbox(email, writer)?;
+            write_email_as_mbox_with_options(email, writer, options.snip_output)?;
         }
         return Ok(());
     }
@@ -337,13 +573,10 @@ pub async fn lore_show_replies_to_writer(
             writeln!(writer, "   In-Reply-To: {}", in_reply_to)?;
         }
 
-        // Show full message body only when verbose
-        if options.verbose >= 1 {
-            writeln!(writer, "\n   --- Message Body ---")?;
-            for line in email.body.lines() {
-                writeln!(writer, "   {}", line)?;
-            }
-            writeln!(writer, "   --- End Message ---\n")?;
+        // Show full message body when verbose or snipping
+        if options.verbose >= 1 || options.snip_output {
+            write_email_body(email, options, writer, "   ")?;
+            writeln!(writer)?;
         } else {
             writeln!(writer)?; // Empty line between messages
         }
@@ -375,7 +608,7 @@ pub async fn lore_get_by_message_id_to_writer(
                 lore_show_replies_to_writer(db, &email.message_id, options, writer).await?;
             } else if options.mbox_output {
                 // Output single message in mbox format
-                write_email_as_mbox(&email, writer)?;
+                write_email_as_mbox_with_options(&email, writer, options.snip_output)?;
             } else {
                 // Show just this single message
                 writeln!(writer, "Email found:\n")?;
@@ -395,12 +628,8 @@ pub async fn lore_get_by_message_id_to_writer(
                     writeln!(writer, "   Recipients: {}", email.recipients)?;
                 }
 
-                if options.verbose >= 1 {
-                    writeln!(writer, "\n   --- Message Body ---")?;
-                    for line in email.body.lines() {
-                        writeln!(writer, "   {}", line)?;
-                    }
-                    writeln!(writer, "   --- End Message ---")?;
+                if options.verbose >= 1 || options.snip_output {
+                    write_email_body(&email, options, writer, "   ")?;
                 }
             }
         }
@@ -504,7 +733,7 @@ pub async fn lore_search_with_thread_to_writer(
     // Handle MBOX output format (without show_thread/show_replies)
     if options.mbox_output {
         for email in &emails {
-            write_email_as_mbox(email, writer)?;
+            write_email_as_mbox_with_options(email, writer, options.snip_output)?;
         }
         return Ok(());
     }
@@ -530,14 +759,9 @@ pub async fn lore_search_with_thread_to_writer(
             writeln!(writer, "   Recipients: {}", email.recipients)?;
         }
 
-        // Show full message body only when verbose
-        if options.verbose >= 1 {
-            writeln!(writer, "\n   --- Message Body ---")?;
-            // Body is already separated from headers
-            for line in email.body.lines() {
-                writeln!(writer, "   {}", line)?;
-            }
-            writeln!(writer, "   --- End Message ---")?;
+        // Show full message body when verbose or snipping
+        if options.verbose >= 1 || options.snip_output {
+            write_email_body(email, options, writer, "   ")?;
         }
 
         writeln!(writer)?;
@@ -637,7 +861,7 @@ pub async fn lore_search_multi_field_to_writer(
     // Handle MBOX output format (without show_thread/show_replies)
     if options.mbox_output {
         for email in &emails {
-            write_email_as_mbox(email, writer)?;
+            write_email_as_mbox_with_options(email, writer, options.snip_output)?;
         }
         return Ok(());
     }
@@ -663,14 +887,9 @@ pub async fn lore_search_multi_field_to_writer(
             writeln!(writer, "   Recipients: {}", email.recipients)?;
         }
 
-        // Show full message body only when verbose
-        if options.verbose >= 1 {
-            writeln!(writer, "\n   --- Message Body ---")?;
-            // Body is already separated from headers
-            for line in email.body.lines() {
-                writeln!(writer, "   {}", line)?;
-            }
-            writeln!(writer, "   --- End Message ---")?;
+        // Show full message body when verbose or snipping
+        if options.verbose >= 1 || options.snip_output {
+            write_email_body(email, options, writer, "   ")?;
         }
 
         writeln!(writer)?;
@@ -815,7 +1034,7 @@ pub async fn dig_lore_by_commit_to_writer(
         };
 
         for email in emails_to_output {
-            write_email_as_mbox(email, writer)?;
+            write_email_as_mbox_with_options(email, writer, options.snip_output)?;
         }
         return Ok(());
     }
@@ -904,12 +1123,8 @@ pub async fn dig_lore_by_commit_to_writer(
                 writeln!(writer, "   From: {}", email.from)?;
                 writeln!(writer, "   Message-ID: {}", email.message_id)?;
 
-                if options.verbose >= 1 {
-                    writeln!(writer, "\n   --- Message Body ---")?;
-                    for line in email.body.lines() {
-                        writeln!(writer, "   {}", line)?;
-                    }
-                    writeln!(writer, "   --- End Message ---")?;
+                if options.verbose >= 1 || options.snip_output {
+                    write_email_body(email, options, writer, "   ")?;
                 }
                 writeln!(writer)?;
             }
@@ -951,12 +1166,8 @@ pub async fn dig_lore_by_commit_to_writer(
                 writeln!(writer, "   From: {}", most_recent.from)?;
                 writeln!(writer, "   Message-ID: {}", most_recent.message_id)?;
 
-                if options.verbose >= 1 {
-                    writeln!(writer, "\n   --- Message Body ---")?;
-                    for line in most_recent.body.lines() {
-                        writeln!(writer, "   {}", line)?;
-                    }
-                    writeln!(writer, "   --- End Message ---")?;
+                if options.verbose >= 1 || options.snip_output {
+                    write_email_body(most_recent, options, writer, "   ")?;
                 }
             }
 

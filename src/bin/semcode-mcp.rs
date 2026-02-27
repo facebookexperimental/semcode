@@ -4393,6 +4393,7 @@ async fn mcp_lore_get_by_message_id(
         since_date: None,
         until_date: None,
         mbox_output,
+        snip_output: false,
     };
     semcode::lore_writers::lore_get_by_message_id_to_writer(db, message_id, &options, &mut buffer)
         .await?;
@@ -4443,6 +4444,7 @@ async fn mcp_lore_search_multi_field(
         since_date: params.since_date,
         until_date: params.until_date,
         mbox_output: params.mbox_output,
+        snip_output: false,
     };
     semcode::lore_writers::lore_search_multi_field_to_writer(
         db,
@@ -4470,6 +4472,7 @@ async fn mcp_dig_lore_by_commit(
         since_date: params.since_date,
         until_date: params.until_date,
         mbox_output: false,
+        snip_output: false,
     };
     semcode::lore_writers::dig_lore_by_commit_to_writer(
         db,

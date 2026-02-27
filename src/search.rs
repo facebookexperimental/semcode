@@ -28,6 +28,7 @@ pub struct LoreSearchOptions<'a> {
     pub since_date: Option<&'a str>,
     pub until_date: Option<&'a str>,
     pub mbox_output: bool,
+    pub snip_output: bool,
 }
 
 /// Get functions called by the given function name - git-aware version
@@ -477,6 +478,7 @@ pub async fn lore_search(
         since_date: None,
         until_date: None,
         mbox_output: false,
+        snip_output: false,
     };
     lore_search_with_thread(db, field, pattern, limit, &options).await
 }
