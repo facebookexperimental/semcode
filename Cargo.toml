@@ -56,6 +56,7 @@ reqwest = { version = "0.13", features = ["blocking", "gzip"] }  # HTTP client f
 flate2 = "1.1"          # gzip compression/decompression
 chrono = "0.4.44"
 chrono-english = "0.1"  # Natural language date parsing
+base64 = "0.22"         # Base64 decoding for MIME-encoded email bodies
 
 [[bin]]
 name = "semcode-index"

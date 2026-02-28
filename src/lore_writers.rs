@@ -6,9 +6,60 @@ use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+
 use crate::search::LoreSearchOptions;
 use crate::types::LoreEmailInfo;
 use crate::DatabaseManager;
+
+/// Detect base64-encoded email bodies by content inspection.
+/// Base64 email bodies have lines wrapped at exactly 76 characters using
+/// only the base64 alphabet [A-Za-z0-9+/=].
+fn looks_like_base64(body: &str) -> bool {
+    let mut full_lines = 0;
+    let mut total_lines = 0;
+
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        total_lines += 1;
+        if !trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+            return false;
+        }
+        if trimmed.len() == 76 {
+            full_lines += 1;
+        }
+    }
+
+    // Need at least a few full-length lines to be confident
+    total_lines >= 3 && full_lines >= 2
+}
+
+/// Decode an email body from base64 to UTF-8 if the body looks base64-encoded.
+/// Returns the decoded body, or the original body if not base64 or on decode error.
+pub fn decode_email_body(email: &LoreEmailInfo) -> std::borrow::Cow<'_, str> {
+    if !looks_like_base64(&email.body) {
+        return std::borrow::Cow::Borrowed(&email.body);
+    }
+
+    // Strip whitespace (base64 in emails is typically line-wrapped)
+    let cleaned: String = email
+        .body
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+
+    match BASE64.decode(cleaned.as_bytes()) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(decoded) => std::borrow::Cow::Owned(decoded),
+            Err(_) => std::borrow::Cow::Borrowed(&email.body),
+        },
+        Err(_) => std::borrow::Cow::Borrowed(&email.body),
+    }
+}
 
 /// Reconstruct RFC 5322 headers from individual fields.
 /// When `snip` is true, only essential headers are emitted.
@@ -216,19 +267,21 @@ pub fn snip_quoted_body(body: &str, context_lines: usize) -> String {
 /// Apply snipping to an email (headers and body)
 pub fn snip_email(email: &LoreEmailInfo) -> (String, String) {
     let snipped_headers = reconstruct_headers(email, true);
-    let snipped_body = snip_quoted_body(&email.body, 6);
+    let body = decode_email_body(email);
+    let snipped_body = snip_quoted_body(&body, 6);
     (snipped_headers, snipped_body)
 }
 
-/// Get the email body for display, applying snipping if requested
+/// Get the email body for display, decoding base64 if needed and applying snipping if requested
 fn get_display_body<'a>(
     email: &'a LoreEmailInfo,
     options: &LoreSearchOptions<'_>,
 ) -> std::borrow::Cow<'a, str> {
+    let body = decode_email_body(email);
     if options.snip_output {
-        std::borrow::Cow::Owned(snip_quoted_body(&email.body, 6))
+        std::borrow::Cow::Owned(snip_quoted_body(&body, 6))
     } else {
-        std::borrow::Cow::Borrowed(&email.body)
+        body
     }
 }
 
@@ -280,11 +333,12 @@ pub fn write_email_as_mbox_with_options(
     write!(writer, "{}", reconstruct_headers(email, snip))?;
     writeln!(writer)?;
 
-    // Write the body (snipped or full)
+    // Write the body (decode base64 if needed, then snip if requested)
+    let decoded_body = decode_email_body(email);
     let body = if snip {
-        snip_quoted_body(&email.body, 6)
+        snip_quoted_body(&decoded_body, 6)
     } else {
-        email.body.clone()
+        decoded_body.into_owned()
     };
     write!(writer, "{}", body)?;
 

@@ -2,8 +2,8 @@
 use anyhow::Result;
 use clap::Parser;
 use semcode::{
-    git, pages::PageCache, process_database_path, search::is_function_definition,
-    search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
+    git, lore_writers::decode_email_body, pages::PageCache, process_database_path,
+    search::is_function_definition, search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
 };
 use serde_json::{json, Value};
 use std::io::Write;
@@ -4662,11 +4662,12 @@ async fn mcp_vlore_similar_emails(
                 writeln!(buffer, "   Subject: {}", email.subject)?;
 
                 // Show first 10 lines of message body
+                let body = decode_email_body(email);
                 writeln!(buffer, "   Message:")?;
-                for line in email.body.lines().take(10) {
+                for line in body.lines().take(10) {
                     writeln!(buffer, "     {}", line)?;
                 }
-                if email.body.lines().count() > 10 {
+                if body.lines().count() > 10 {
                     writeln!(buffer, "     ...")?;
                 }
             }

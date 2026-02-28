@@ -10,7 +10,7 @@ use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use semcode::display::print_help;
 use semcode::lore_writers::{
-    dig_lore_by_commit_to_writer, lore_get_by_message_id_to_writer,
+    decode_email_body, dig_lore_by_commit_to_writer, lore_get_by_message_id_to_writer,
     lore_search_multi_field_to_writer, lore_search_with_thread_to_writer,
 };
 use semcode::search::{
@@ -3626,11 +3626,12 @@ async fn vlore_similar_emails(
                 writeln!(writer, "   {} {}", "Subject:".bold(), email.subject.white())?;
 
                 // Show message body (full if verbose, first 10 lines otherwise)
+                let body = decode_email_body(email);
                 let line_limit = if verbose { usize::MAX } else { 10 };
-                let total_lines = email.body.lines().count();
+                let total_lines = body.lines().count();
 
                 writeln!(writer, "   {}:", "Message:".bold())?;
-                for (idx, line) in email.body.lines().take(line_limit).enumerate() {
+                for (idx, line) in body.lines().take(line_limit).enumerate() {
                     if idx == 0 {
                         writeln!(writer, "     {}", line.bright_white())?;
                     } else {

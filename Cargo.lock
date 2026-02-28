@@ -6203,6 +6203,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "axum",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "chrono-english",

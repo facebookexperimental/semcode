@@ -9,6 +9,7 @@ use std::io::Write;
 use crate::display::{
     display_function_to_writer_with_options, display_type_to_writer, display_typedef_to_writer,
 };
+use crate::lore_writers::decode_email_body;
 
 /// Options for displaying call relationships
 #[derive(Debug, Clone)]
@@ -597,9 +598,9 @@ pub async fn lore_search_multi_field(
 
         // Show full message body only when verbose
         if options.verbose >= 1 {
+            let body = decode_email_body(email);
             println!("\n{}", "   --- Message Body ---".bright_black());
-            // Body is already separated from headers
-            for line in email.body.lines() {
+            for line in body.lines() {
                 println!("   {}", line);
             }
             println!("{}", "   --- End Message ---".bright_black());
@@ -727,9 +728,9 @@ pub async fn lore_search_with_thread(
 
         // Show full message body only when verbose
         if options.verbose >= 1 {
+            let body = decode_email_body(email);
             println!("\n{}", "   --- Message Body ---".bright_black());
-            // Body is already separated from headers
-            for line in email.body.lines() {
+            for line in body.lines() {
                 println!("   {}", line);
             }
             println!("{}", "   --- End Message ---".bright_black());
@@ -793,9 +794,9 @@ pub async fn lore_get_by_message_id(
 
                 // Show full message body only when verbose
                 if verbose >= 1 {
+                    let body = decode_email_body(&email);
                     println!("\n{}", "   --- Message Body ---".bright_black());
-                    // Body is already separated from headers
-                    for line in email.body.lines() {
+                    for line in body.lines() {
                         println!("   {}", line);
                     }
                     println!("{}", "   --- End Message ---".bright_black());
@@ -865,9 +866,9 @@ pub async fn lore_get_by_message_id_with_options(
 
                 // Show full message body only when verbose
                 if options.verbose >= 1 {
+                    let body = decode_email_body(&email);
                     println!("\n{}", "   --- Message Body ---".bright_black());
-                    // Body is already separated from headers
-                    for line in email.body.lines() {
+                    for line in body.lines() {
                         println!("   {}", line);
                     }
                     println!("{}", "   --- End Message ---".bright_black());
@@ -1067,9 +1068,9 @@ pub async fn lore_show_thread(
 
         // Show full message body only when verbose
         if verbose >= 1 {
+            let body = decode_email_body(email);
             println!("\n{}", "   --- Message Body ---".bright_black());
-            // Body is already separated from headers
-            for line in email.body.lines() {
+            for line in body.lines() {
                 println!("   {}", line);
             }
             println!("{}", "   --- End Message ---".bright_black());
@@ -1166,8 +1167,9 @@ pub async fn lore_show_replies(
 
         // Show full message body only when verbose
         if verbose >= 1 {
+            let body = decode_email_body(email);
             println!("\n{}", "   --- Message Body ---".bright_black());
-            for line in email.body.lines() {
+            for line in body.lines() {
                 println!("   {}", line);
             }
             println!("{}\n", "   --- End Message ---".bright_black());
