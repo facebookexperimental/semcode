@@ -116,12 +116,24 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
             .all()?
     } else {
         // Exclude commits reachable from from_spec
-        let from_commit = resolve_to_commit(repo, from_spec)?;
-        let from_id = from_commit.id().detach();
-        repo.rev_walk([to_id])
-            .with_hidden([from_id])
-            .sorting(Sorting::ByCommitTime(Default::default()))
-            .all()?
+        match resolve_to_commit(repo, from_spec) {
+            Ok(from_commit) => {
+                let from_id = from_commit.id().detach();
+                repo.rev_walk([to_id])
+                    .with_hidden([from_id])
+                    .sorting(Sorting::ByCommitTime(Default::default()))
+                    .all()?
+            }
+            Err(e) => {
+                // Parent commit not found in local object store (shallow clone or root commit).
+                // Fall back to returning just the single target commit.
+                info!(
+                    "Could not resolve '{}' ({}); falling back to single-commit indexing",
+                    from_spec, e
+                );
+                return Ok(vec![to_id.to_string()]);
+            }
+        }
     };
 
     let mut shas = Vec::new();
