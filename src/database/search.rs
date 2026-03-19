@@ -9,6 +9,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
 
 use crate::database::content::ContentStore;
+use crate::database::get_column;
 use crate::types::{FieldInfo, FunctionInfo, ParameterInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use std::collections::HashMap;
@@ -2150,11 +2151,8 @@ impl VectorSearchManager {
 
             for batch in &function_results {
                 // Get body_hash column to look up similarity scores
-                let body_hash_array = batch
-                    .column(7) // body_hash is column 7 in functions table
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let body_hash_array =
+                    get_column::<arrow::array::StringArray>(batch, "body_hash")?;
 
                 for i in 0..batch.num_rows() {
                     if let Ok(Some(func)) = self
@@ -2207,46 +2205,14 @@ impl VectorSearchManager {
         row: usize,
         content_store: &ContentStore,
     ) -> Result<Option<FunctionInfo>> {
-        let name_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let file_path_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let git_hash_array = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-        let line_start_array = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let line_end_array = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let return_type_array = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let parameters_array = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let body_hash_array = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let name_array = get_column::<StringArray>(batch, "name")?;
+        let file_path_array = get_column::<StringArray>(batch, "file_path")?;
+        let git_hash_array = get_column::<StringArray>(batch, "git_file_hash")?;
+        let line_start_array = get_column::<arrow::array::Int64Array>(batch, "line_start")?;
+        let line_end_array = get_column::<arrow::array::Int64Array>(batch, "line_end")?;
+        let return_type_array = get_column::<StringArray>(batch, "return_type")?;
+        let parameters_array = get_column::<StringArray>(batch, "parameters")?;
+        let body_hash_array = get_column::<StringArray>(batch, "body_hash")?;
 
         let parameters: Vec<ParameterInfo> = serde_json::from_str(parameters_array.value(row))?;
 
