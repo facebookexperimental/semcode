@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
-use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatchIterator;
+use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchIterator, StringArray, StringBuilder};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -124,22 +122,19 @@ impl ContentStore {
         }
         let blake3_hash_array = blake3_hash_builder.finish();
 
-        let schema = self.get_schema();
-
         let batch = RecordBatch::try_from_iter(vec![
             ("blake3_hash", Arc::new(blake3_hash_array) as ArrayRef),
             ("content", Arc::new(content_builder.finish()) as ArrayRef),
         ])?;
-
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         // Use merge_insert for upsert functionality
         let mut merge_insert = table.merge_insert(&["blake3_hash"]);
         merge_insert
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
-        merge_insert.execute(Box::new(batch_iterator)).await?;
+        let schema = batch.schema();
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        merge_insert.execute(Box::new(batch_reader)).await?;
 
         Ok(())
     }
@@ -345,13 +340,6 @@ impl ContentStore {
         }))
     }
 
-    fn get_schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("blake3_hash", DataType::Utf8, false), // Blake3 hash as hex string
-            Field::new("content", DataType::Utf8, false),     // The actual content
-        ]))
-    }
-
     /// Get statistics about content storage
     pub async fn get_stats(&self) -> Result<ContentStats> {
         let mut total_count = 0i64;
@@ -390,11 +378,7 @@ impl ContentStore {
             }
         }
 
-        let avg_content_size = if sample_count > 0 {
-            total_content_size / sample_count
-        } else {
-            0
-        };
+        let avg_content_size = total_content_size.checked_div(sample_count).unwrap_or(0);
 
         Ok(ContentStats {
             total_entries: total_count,

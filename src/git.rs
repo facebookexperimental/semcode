@@ -946,7 +946,7 @@ fn generate_commit_diff_with_symbols(
                 } => {
                     // Skip non-blob modifications
                     if !previous_entry_mode.is_blob() || !entry_mode.is_blob() {
-                        return Ok::<_, anyhow::Error>(Action::Continue);
+                        return Ok::<_, anyhow::Error>(Action::Continue(()));
                     }
 
                     let path = location.to_string();
@@ -979,7 +979,7 @@ fn generate_commit_diff_with_symbols(
                         }
                     }
 
-                    Ok(Action::Continue)
+                    Ok(Action::Continue(()))
                 }
                 gix::object::tree::diff::Change::Addition {
                     entry_mode,
@@ -988,7 +988,7 @@ fn generate_commit_diff_with_symbols(
                     ..
                 } => {
                     if !entry_mode.is_blob() {
-                        return Ok(Action::Continue);
+                        return Ok(Action::Continue(()));
                     }
 
                     let path = location.to_string();
@@ -1008,7 +1008,7 @@ fn generate_commit_diff_with_symbols(
                         }
                     }
 
-                    Ok(Action::Continue)
+                    Ok(Action::Continue(()))
                 }
                 gix::object::tree::diff::Change::Deletion {
                     entry_mode,
@@ -1017,7 +1017,7 @@ fn generate_commit_diff_with_symbols(
                     ..
                 } => {
                     if !entry_mode.is_blob() {
-                        return Ok(Action::Continue);
+                        return Ok(Action::Continue(()));
                     }
 
                     let path = location.to_string();
@@ -1037,12 +1037,12 @@ fn generate_commit_diff_with_symbols(
                         }
                     }
 
-                    Ok(Action::Continue)
+                    Ok(Action::Continue(()))
                 }
                 gix::object::tree::diff::Change::Rewrite { .. } => {
                     // Rewrite represents a complete file replacement - rare in practice
                     // Skip for now as it's complex to handle properly
-                    Ok::<_, anyhow::Error>(Action::Continue)
+                    Ok::<_, anyhow::Error>(Action::Continue(()))
                 }
             }
         })?;

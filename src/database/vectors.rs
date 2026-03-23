@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, StringArray, StringBuilder};
-use arrow::datatypes::{DataType, Field, Float32Type, Schema};
-use arrow::record_batch::RecordBatchIterator;
+use arrow::datatypes::Float32Type;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -80,16 +79,12 @@ impl VectorStore {
             vector_dim as i32,
         );
 
-        let schema = self.get_schema(vector_dim);
-
         let batch = RecordBatch::try_from_iter(vec![
             ("content_hash", Arc::new(content_hash_array) as ArrayRef),
             ("vector", Arc::new(vector_array) as ArrayRef),
         ])?;
 
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+        table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
@@ -172,20 +167,6 @@ impl VectorStore {
         } else {
             Ok(None)
         }
-    }
-
-    fn get_schema(&self, vector_dim: usize) -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("content_hash", DataType::Utf8, false), // Blake3 content hash as hex string
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    vector_dim as i32,
-                ),
-                false, // Non-nullable - we only store entries that have vectors
-            ),
-        ]))
     }
 
     /// Verify the dimension of vectors stored in the database

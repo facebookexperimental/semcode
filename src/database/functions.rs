@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
-use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatchIterator;
+use arrow::array::{
+    Array, ArrayRef, Int64Builder, RecordBatch, RecordBatchIterator, StringArray, StringBuilder,
+};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -160,8 +160,6 @@ impl FunctionStore {
         }
         let git_file_hash_array = git_file_hash_builder.finish();
 
-        let schema = self.get_schema();
-
         let batch = RecordBatch::try_from_iter(vec![
             ("name", Arc::new(name_builder.finish()) as ArrayRef),
             (
@@ -187,15 +185,14 @@ impl FunctionStore {
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
         ])?;
 
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-
         // Use merge_insert to handle duplicates
         let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
-        merge_insert.execute(Box::new(batch_iterator)).await?;
+        let schema = batch.schema();
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        merge_insert.execute(Box::new(batch_reader)).await?;
 
         Ok(())
     }
@@ -260,7 +257,6 @@ impl FunctionStore {
         }
         let git_file_hash_array = git_file_hash_builder.finish();
 
-        let schema = self.get_schema();
         let batch = RecordBatch::try_from_iter(vec![
             ("name", Arc::new(name_builder.finish()) as ArrayRef),
             (
@@ -286,15 +282,14 @@ impl FunctionStore {
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
         ])?;
 
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-
         // Use merge_insert to handle duplicates
         let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
-        merge_insert.execute(Box::new(batch_iterator)).await?;
+        let schema = batch.schema();
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        merge_insert.execute(Box::new(batch_reader)).await?;
 
         Ok(())
     }
@@ -870,20 +865,5 @@ impl FunctionStore {
             calls,
             types,
         }))
-    }
-
-    fn get_schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("file_path", DataType::Utf8, false),
-            Field::new("git_file_hash", DataType::Utf8, false), // Git file hash as hex string
-            Field::new("line_start", DataType::Int64, false),
-            Field::new("line_end", DataType::Int64, false),
-            Field::new("return_type", DataType::Utf8, false),
-            Field::new("parameters", DataType::Utf8, false),
-            Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
-            Field::new("calls", DataType::Utf8, true), // JSON array of function names called (nullable)
-            Field::new("types", DataType::Utf8, true), // JSON array of type names used (nullable)
-        ]))
     }
 }

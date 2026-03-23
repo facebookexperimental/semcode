@@ -2696,8 +2696,7 @@ impl VectorSearchManager {
         vectors: &[crate::database::vectors::VectorEntry],
     ) -> Result<()> {
         use arrow::array::{ArrayRef, FixedSizeListArray, StringBuilder};
-        use arrow::datatypes::{DataType, Field, Float32Type, Schema};
-        use arrow::record_batch::RecordBatchIterator;
+        use arrow::datatypes::Float32Type;
         use std::sync::Arc;
 
         if vectors.is_empty() {
@@ -2722,26 +2721,12 @@ impl VectorSearchManager {
             vector_dim as i32,
         );
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("git_commit_sha", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    vector_dim as i32,
-                ),
-                false,
-            ),
-        ]));
-
         let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![
             ("git_commit_sha", Arc::new(sha_array) as ArrayRef),
             ("vector", Arc::new(vector_array) as ArrayRef),
         ])?;
 
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        commit_vectors_table.add(batch_iterator).execute().await?;
+        commit_vectors_table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
@@ -2971,7 +2956,7 @@ impl VectorSearchManager {
                                     // Combine with message IDs
                                     let entries: Vec<VectorEntry> = emails_to_vectorize
                                         .iter()
-                                        .zip(vector_results.into_iter())
+                                        .zip(vector_results)
                                         .map(|((message_id, _), vector)| VectorEntry {
                                             content_hash: message_id.clone(),
                                             vector,
@@ -3072,8 +3057,7 @@ async fn insert_lore_vectors_batch_with_table(
     vectors: &[crate::database::vectors::VectorEntry],
 ) -> Result<()> {
     use arrow::array::{ArrayRef, FixedSizeListArray, StringBuilder};
-    use arrow::datatypes::{DataType, Field, Float32Type, Schema};
-    use arrow::record_batch::RecordBatchIterator;
+    use arrow::datatypes::Float32Type;
     use std::sync::Arc;
 
     if vectors.is_empty() {
@@ -3098,26 +3082,12 @@ async fn insert_lore_vectors_batch_with_table(
         vector_dim as i32,
     );
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("message_id", DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                vector_dim as i32,
-            ),
-            false,
-        ),
-    ]));
-
     let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![
         ("message_id", Arc::new(message_id_array) as ArrayRef),
         ("vector", Arc::new(vector_array) as ArrayRef),
     ])?;
 
-    let batches = vec![Ok(batch)];
-    let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-    lore_vectors_table.add(batch_iterator).execute().await?;
+    lore_vectors_table.add(vec![batch]).execute().await?;
 
     Ok(())
 }

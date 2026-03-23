@@ -716,18 +716,16 @@ impl TreeSitterAnalyzer {
                             ));
                         }
                     }
-                    "declaration" => {
+                    "declaration" if function_start_byte == 0 => {
                         // Function declaration without body - skip call/type extraction
                         // Set minimal bounds for declaration-only functions
-                        if function_start_byte == 0 {
-                            function_start_byte = node.start_byte();
-                            function_end_byte = node.end_byte();
-                            if line_end == 0 {
-                                line_end = node.end_position().row as u32 + 1;
-                            }
-                            if line_start == 0 {
-                                line_start = node.start_position().row as u32 + 1;
-                            }
+                        function_start_byte = node.start_byte();
+                        function_end_byte = node.end_byte();
+                        if line_end == 0 {
+                            line_end = node.end_position().row as u32 + 1;
+                        }
+                        if line_start == 0 {
+                            line_start = node.start_position().row as u32 + 1;
                         }
                     }
                     _ => {}
@@ -1598,10 +1596,8 @@ impl TreeSitterAnalyzer {
                 "*" => {
                     type_parts.push("*".to_string());
                 }
-                "identifier" => {
-                    if param_name.is_empty() {
-                        *param_name = text.to_string();
-                    }
+                "identifier" if param_name.is_empty() => {
+                    *param_name = text.to_string();
                 }
                 "pointer_declarator" => {
                     // Nested pointer, recurse
@@ -1631,10 +1627,8 @@ impl TreeSitterAnalyzer {
             let text = &source[current_node.byte_range()];
 
             match current_node.kind() {
-                "identifier" => {
-                    if param_name.is_empty() {
-                        *param_name = text.to_string();
-                    }
+                "identifier" if param_name.is_empty() => {
+                    *param_name = text.to_string();
                 }
                 "[" | "]" => {
                     type_parts.push(text.to_string());

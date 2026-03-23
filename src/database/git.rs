@@ -3,8 +3,6 @@ use anyhow::Result;
 use arrow::array::{
     ArrayRef, RecordBatch, StringBuilder, TimestampMillisecondBuilder, 
 };
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -127,8 +125,6 @@ impl GitStore {
             }
         }
 
-        let schema = self.get_schema();
-
         let batch = RecordBatch::try_from_iter(vec![
             ("current_sha", Arc::new(current_sha_builder.finish()) as ArrayRef),
             ("parent_sha", Arc::new(parent_sha_builder.finish()) as ArrayRef),
@@ -137,9 +133,7 @@ impl GitStore {
             ("description", Arc::new(description_builder.finish()) as ArrayRef),
         ])?;
 
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+        table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
@@ -327,13 +321,4 @@ impl GitStore {
         }))
     }
 
-    fn get_schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("current_sha", DataType::Utf8, false),
-            Field::new("parent_sha", DataType::Utf8, true),
-            Field::new("load_type", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, None), false),
-            Field::new("description", DataType::Utf8, true),
-        ]))
-    }
 }

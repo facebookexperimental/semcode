@@ -6,10 +6,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-lancedb = "0.23.1"
-arrow = "56.2"
-arrow-array = "56.2"
-arrow-schema = "56.2"
+lancedb = "0.27"
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
 tokio = { version = "1.49.0", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -34,7 +34,7 @@ tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 streaming-iterator = "0.1"
 once_cell = "1.21"
-oneshot = "0.1.13"  # Pin transitive dep to fix bug (indirect dep of lancedb)
+oneshot = "0.2"
 crossbeam-channel = "0.5"
 sha1 = "0.10"
 blake3 = "1.8.3"
@@ -43,10 +43,10 @@ dashmap = "6.1"
 tempfile = "3.24"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tokio-tungstenite = "0.28"
-anstream = "0.6"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
+tokio-tungstenite = "0.29"
+anstream = "1.0"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
 owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
-gix = { version = "0.77", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl"] }
+gix = { version = "0.81", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl-openssl"] }
 model2vec-rs = "0.1.4"
 tower-lsp = "0.20"      # Language Server Protocol framework for LSP server
 url = "2.5"             # URL parsing for file URIs in LSP

@@ -1032,7 +1032,7 @@ async fn main() -> Result<()> {
                 let clone_path = match clone_lore_repository(lore_url, &database_path).await {
                     Ok(path) => path,
                     Err(e) => {
-                        eprintln!("Error cloning {}: {}", lore_url, e);
+                        eprintln!("Error cloning {}: {:#}", lore_url, e);
                         continue;
                     }
                 };

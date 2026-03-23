@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
-use arrow::array::{ArrayRef, RecordBatch, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatchIterator;
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchIterator, StringBuilder};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -76,22 +74,19 @@ impl SymbolFilenameStore {
             filename_builder.append_value(file_path);
         }
 
-        let schema = self.get_schema();
-
         let batch = RecordBatch::try_from_iter(vec![
             ("symbol", Arc::new(symbol_builder.finish()) as ArrayRef),
             ("filename", Arc::new(filename_builder.finish()) as ArrayRef),
         ])?;
-
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         // Use merge_insert with composite key (symbol, filename) for deduplication
         let mut merge_insert = table.merge_insert(&["symbol", "filename"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows with same composite key
             .when_not_matched_insert_all(); // Insert new rows
-        merge_insert.execute(Box::new(batch_iterator)).await?;
+        let schema = batch.schema();
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        merge_insert.execute(Box::new(batch_reader)).await?;
 
         Ok(())
     }
@@ -187,12 +182,5 @@ impl SymbolFilenameStore {
         }
 
         Ok(pairs)
-    }
-
-    fn get_schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("symbol", DataType::Utf8, false),
-            Field::new("filename", DataType::Utf8, false),
-        ]))
     }
 }
