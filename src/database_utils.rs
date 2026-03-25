@@ -9,7 +9,9 @@ use std::path::Path;
 /// 1. If `database_arg` is provided:
 ///    - If it's a directory, look for `.semcode.db` within it
 ///    - Otherwise, use the path as-is (direct database path)
-/// 2. If `database_arg` is None:
+/// 2. If `database_arg` is None, check the `SEMCODE_DB` environment variable
+///    (same directory/suffix semantics as the `-d` flag)
+/// 3. If neither is set:
 ///    - For indexing operations: prefer `source_dir/.semcode.db`, fallback to current directory
 ///    - For query operations: use current directory `./.semcode.db`
 ///
@@ -21,23 +23,17 @@ use std::path::Path;
 /// String representation of the database path to use
 pub fn process_database_path(database_arg: Option<&str>, source_dir: Option<&Path>) -> String {
     match database_arg {
-        Some(path) => {
-            let path_obj = Path::new(path);
-
-            // If path already ends with .semcode.db, use it as-is (avoid double appending)
-            if path.ends_with(".semcode.db") {
-                path.to_string()
-            } else if path_obj.is_dir() {
-                // If the path is a directory, look for .semcode.db within it
-                let semcode_db_path = path_obj.join(".semcode.db");
-                semcode_db_path.to_string_lossy().to_string()
-            } else {
-                // If it's a specific file path, use it as-is
-                path.to_string()
-            }
-        }
+        Some(path) => resolve_path(path),
         None => {
-            // No -d flag provided - behavior depends on whether we have a source directory
+            // Check SEMCODE_DB environment variable before falling back to
+            // source-dir or current-dir defaults.
+            if let Ok(env_path) = std::env::var("SEMCODE_DB") {
+                let env_path = env_path.trim();
+                if !env_path.is_empty() {
+                    return resolve_path(env_path);
+                }
+            }
+
             match source_dir {
                 Some(source_path) => {
                     // For indexing operations: prefer source directory unless it's current directory
@@ -58,10 +54,29 @@ pub fn process_database_path(database_arg: Option<&str>, source_dir: Option<&Pat
     }
 }
 
+/// Normalize a database path: append `.semcode.db` to directories, pass
+/// paths that already end with `.semcode.db` through unchanged, and
+/// return anything else as-is.
+fn resolve_path(path: &str) -> String {
+    let path_obj = Path::new(path);
+
+    if path.ends_with(".semcode.db") {
+        path.to_string()
+    } else if path_obj.is_dir() {
+        path_obj.join(".semcode.db").to_string_lossy().to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Serializes tests that read or write the SEMCODE_DB environment variable.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_process_database_path_with_explicit_path() {
@@ -83,24 +98,94 @@ mod tests {
 
     #[test]
     fn test_process_database_path_no_args_no_source() {
-        // Test query mode (no source directory)
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("SEMCODE_DB").ok();
+        std::env::remove_var("SEMCODE_DB");
+
         let result = process_database_path(None, None);
         assert_eq!(result, "./.semcode.db");
+
+        if let Some(v) = saved {
+            std::env::set_var("SEMCODE_DB", v);
+        }
     }
 
     #[test]
     fn test_process_database_path_no_args_with_source() {
-        // Test index mode with source directory
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("SEMCODE_DB").ok();
+        std::env::remove_var("SEMCODE_DB");
+
         let source_path = Path::new("/source/code");
         let result = process_database_path(None, Some(source_path));
         assert_eq!(result, "/source/code/.semcode.db");
+
+        if let Some(v) = saved {
+            std::env::set_var("SEMCODE_DB", v);
+        }
     }
 
     #[test]
     fn test_process_database_path_current_dir_source() {
-        // Test index mode with current directory as source
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("SEMCODE_DB").ok();
+        std::env::remove_var("SEMCODE_DB");
+
         let source_path = Path::new(".");
         let result = process_database_path(None, Some(source_path));
         assert_eq!(result, "./.semcode.db");
+
+        if let Some(v) = saved {
+            std::env::set_var("SEMCODE_DB", v);
+        }
+    }
+
+    #[test]
+    fn test_env_var_used_when_no_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("SEMCODE_DB").ok();
+        std::env::set_var("SEMCODE_DB", "/data/my-project.semcode.db");
+
+        let result = process_database_path(None, None);
+        assert_eq!(result, "/data/my-project.semcode.db");
+
+        // Also overrides source_dir fallback
+        let result = process_database_path(None, Some(Path::new("/source/code")));
+        assert_eq!(result, "/data/my-project.semcode.db");
+
+        match saved {
+            Some(v) => std::env::set_var("SEMCODE_DB", v),
+            None => std::env::remove_var("SEMCODE_DB"),
+        }
+    }
+
+    #[test]
+    fn test_flag_overrides_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("SEMCODE_DB").ok();
+        std::env::set_var("SEMCODE_DB", "/env/path.semcode.db");
+
+        let result = process_database_path(Some("/flag/path.semcode.db"), None);
+        assert_eq!(result, "/flag/path.semcode.db");
+
+        match saved {
+            Some(v) => std::env::set_var("SEMCODE_DB", v),
+            None => std::env::remove_var("SEMCODE_DB"),
+        }
+    }
+
+    #[test]
+    fn test_empty_env_var_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("SEMCODE_DB").ok();
+        std::env::set_var("SEMCODE_DB", "");
+
+        let result = process_database_path(None, None);
+        assert_eq!(result, "./.semcode.db");
+
+        match saved {
+            Some(v) => std::env::set_var("SEMCODE_DB", v),
+            None => std::env::remove_var("SEMCODE_DB"),
+        }
     }
 }

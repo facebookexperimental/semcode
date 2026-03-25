@@ -99,12 +99,14 @@ Semcode uses the following search order to locate the `.semcode.db` database dir
 
 **For semcode-index:**
 1. **-d flag**: If provided, use the specified path (direct database path or parent directory containing `.semcode.db`)
-2. **Source directory**: Look for `.semcode.db` in the source directory specified by `-s`
-3. **Current directory**: Fall back to `./.semcode.db` in the current working directory
+2. **SEMCODE_DB environment variable**: Same path semantics as `-d`
+3. **Source directory**: Look for `.semcode.db` in the source directory specified by `-s`
+4. **Current directory**: Fall back to `./.semcode.db` in the current working directory
 
 **For semcode (query tool), semcode-mcp, and semcode-lsp:**
 1. **-d flag / configuration**: If provided, use the specified path (direct database path or parent directory containing `.semcode.db`)
-2. **Workspace/Current directory**: Use `./.semcode.db` in the workspace or current working directory
+2. **SEMCODE_DB environment variable**: Same path semantics as `-d`
+3. **Workspace/Current directory**: Use `./.semcode.db` in the workspace or current working directory
 
 The `-d` flag can specify either:
 - A direct path to the database directory (e.g., `./my-custom.db`)

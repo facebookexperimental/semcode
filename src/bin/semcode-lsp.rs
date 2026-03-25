@@ -41,6 +41,11 @@ impl SemcodeLspBackend {
 
         // Try to determine database path and git repo path from config or workspace
         let config = self.config.lock().await;
+        let env_db = std::env::var("SEMCODE_DB")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let (db_path, git_repo_path) = if let Some(path) = &config.database_path {
             // Custom database path provided
             let git_repo = std::env::current_dir()
@@ -48,6 +53,13 @@ impl SemcodeLspBackend {
                 .and_then(|p| p.to_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| ".".to_string());
             (path.clone(), git_repo)
+        } else if let Some(env_path) = env_db {
+            // SEMCODE_DB environment variable
+            let git_repo = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| ".".to_string());
+            (env_path, git_repo)
         } else if let Some(uri) = workspace_uri {
             // Use workspace directory (process_database_path will add .semcode.db)
             let workspace_path = uri
