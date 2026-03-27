@@ -4566,6 +4566,7 @@ impl DatabaseManager {
 
     /// Helper function to query lore emails by multiple fields and return intersection
     /// Uses regex alternation for OR within fields, intersection for AND across fields
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn query_lore_by_fields_intersection(
         &self,
         from_patterns: Option<&[String]>,
@@ -4573,18 +4574,35 @@ impl DatabaseManager {
         body_patterns: Option<&[String]>,
         recipients_patterns: Option<&[String]>,
         search_limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<std::collections::HashSet<String>> {
         use std::collections::HashSet;
 
         let lore_table = self.connection.open_table("lore").execute().await?;
         let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
 
-        // Helper function to query a field using FTS with regex post-filtering
+        // Parse date filters into DateTime for temporal comparison
+        // in query_field_impl (RFC 2822 string comparison is not
+        // meaningful for date ordering).
+        let since_dt = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_dt = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        // Helper function to query a field using FTS with regex and
+        // date post-filtering.  Selects the "date" column alongside
+        // the searched field so temporal filtering happens on the
+        // already-fetched FTS candidates without extra lookups.
         async fn query_field_impl(
             lore_table: &lancedb::Table,
             field_name: String,
             pattern: String,
             search_limit: usize,
+            since: Option<chrono::DateTime<chrono::Utc>>,
+            until: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<HashSet<String>> {
             // FTS uses simple tokenizer - normalize pattern by stripping special chars
             let fts_pattern = pattern
@@ -4645,7 +4663,7 @@ impl DatabaseManager {
                     .await?
             };
 
-            // Step 2: Post-filter with regex in memory
+            // Post-filter with regex and date range in memory
             let fts_result_count: usize = results.iter().map(|b| b.num_rows()).sum();
             tracing::info!(
                 "FTS returned {} candidates for field '{}'",
@@ -4656,35 +4674,44 @@ impl DatabaseManager {
             let regex = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()?;
+            let has_date_filter = since.is_some() || until.is_some();
             let mut message_ids = HashSet::new();
-            let mut first_candidate_logged = false;
+            let mut bad_dates: usize = 0;
 
             for batch in &results {
-                let msg_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let field_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let msg_array: &arrow::array::StringArray = super::get_column(batch, "message_id")?;
+                let field_array: &arrow::array::StringArray =
+                    super::get_column(batch, &field_name)?;
+                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
 
                 for i in 0..batch.num_rows() {
-                    let field_value = field_array.value(i);
-
-                    // Log first candidate for debugging
-                    if !first_candidate_logged {
-                        tracing::info!("Sample {} value: '{}'", field_name, field_value);
-                        tracing::info!("Regex pattern: '{}'", pattern);
-                        first_candidate_logged = true;
+                    if !regex.is_match(field_array.value(i)) {
+                        continue;
                     }
-
-                    if regex.is_match(field_value) {
-                        message_ids.insert(msg_array.value(i).to_string());
+                    if has_date_filter {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_array.value(i)) {
+                            let dt_utc = dt.with_timezone(&chrono::Utc);
+                            if since.is_some_and(|s| dt_utc < s) {
+                                continue;
+                            }
+                            if until.is_some_and(|u| dt_utc > u) {
+                                continue;
+                            }
+                        } else {
+                            bad_dates += 1;
+                            continue;
+                        }
                     }
+                    message_ids.insert(msg_array.value(i).to_string());
                 }
+            }
+
+            if bad_dates > 0 {
+                tracing::warn!(
+                    "Skipped {} candidates with unparseable dates for field '{}'",
+                    bad_dates,
+                    field_name
+                );
             }
 
             tracing::info!(
@@ -4696,71 +4723,90 @@ impl DatabaseManager {
             Ok(message_ids)
         }
 
-        // Query from field
+        // Query from field (OR across patterns, then push single set)
         if let Some(patterns) = from_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "from".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore from field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "from".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore from field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query subject field
+        // Query subject field (OR across patterns)
         if let Some(patterns) = subject_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "subject".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore subject field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "subject".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore subject field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query body field
+        // Query body field (OR across patterns)
         if let Some(patterns) = body_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "body".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore body field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "body".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore body field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query recipients field
+        // Query recipients field (OR across patterns)
         if let Some(patterns) = recipients_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                let results = query_field_impl(
-                    &lore_table,
-                    "recipients".to_string(),
-                    combined_pattern,
-                    search_limit,
-                )
-                .await?;
-                tracing::info!("lore recipients field returned {} results", results.len());
-                field_result_sets.push(results);
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "recipients".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!(
+                    "lore recipients field returned {} results",
+                    field_union.len()
+                );
+                field_result_sets.push(field_union);
             }
         }
 
@@ -4826,7 +4872,9 @@ impl DatabaseManager {
         let body_patterns = field_map.get("body").map(|v| v.as_slice());
         let recipients_patterns = field_map.get("recipients").map(|v| v.as_slice());
 
-        // Use helper to get intersection of message_ids
+        // Use helper to get intersection of message_ids.
+        // Date range is pushed into FTS queries so the candidate set
+        // is already bounded before intersection and fetching.
         let intersection = self
             .query_lore_by_fields_intersection(
                 from_patterns,
@@ -4834,6 +4882,8 @@ impl DatabaseManager {
                 body_patterns,
                 recipients_patterns,
                 0, // No limit for individual queries
+                since_date,
+                until_date,
             )
             .await?;
 
@@ -4843,54 +4893,15 @@ impl DatabaseManager {
             return Ok(Vec::new());
         }
 
-        // Parse filter dates to Unix timestamps for database-level filtering
-        let since_timestamp = since_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
-        let until_timestamp = until_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
+        // Fetch full email records for the intersection.
+        // Date filtering was already pushed into the per-field FTS
+        // queries, so the intersection is already date-bounded.
+        let count_limit = if limit > 0 { limit } else { intersection.len() };
+        let ids: Vec<&String> = intersection.iter().take(count_limit).collect();
+        let final_emails = self.fetch_lore_emails_by_message_ids(&ids).await?;
 
         tracing::info!(
-            "lore multi_field search: since_timestamp={:?} until_timestamp={:?}",
-            since_timestamp,
-            until_timestamp
-        );
-
-        // Build date filter clause — only if the column exists in the table
-        let has_date_timestamp = {
-            let table = self.connection.open_table("lore").execute().await?;
-            table
-                .schema()
-                .await
-                .map(|s| s.field_with_name("date_timestamp").is_ok())
-                .unwrap_or(false)
-        };
-        let date_filter = if has_date_timestamp {
-            match (since_timestamp, until_timestamp) {
-                (Some(since), Some(until)) => Some(format!(
-                    "date_timestamp >= {} AND date_timestamp <= {}",
-                    since, until
-                )),
-                (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
-                (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
-                (None, None) => None,
-            }
-        } else {
-            None
-        };
-
-        // Fetch emails with date filtering at database level
-        let final_emails = self
-            .fetch_lore_emails_by_message_ids_with_filter(
-                &intersection,
-                date_filter.as_deref(),
-                limit,
-            )
-            .await?;
-
-        tracing::info!(
-            "Fetched {} email records matching date filter from {} message_ids",
+            "Fetched {} email records from {} message_ids",
             final_emails.len(),
             intersection.len()
         );
@@ -4898,13 +4909,13 @@ impl DatabaseManager {
         Ok(final_emails)
     }
 
-    /// Fetch lore emails by message IDs with optional SQL filter and limit
-    /// This allows efficient database-level filtering (e.g., by date_timestamp)
-    async fn fetch_lore_emails_by_message_ids_with_filter(
+    /// Fetch lore emails by message IDs in batches.
+    ///
+    /// Builds `message_id IN (...)` predicates in chunks to avoid
+    /// per-ID round-trips while keeping predicate size bounded.
+    async fn fetch_lore_emails_by_message_ids(
         &self,
-        message_ids: &std::collections::HashSet<String>,
-        filter: Option<&str>,
-        limit: usize,
+        message_ids: &[&String],
     ) -> Result<Vec<crate::types::LoreEmailInfo>> {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
@@ -4914,88 +4925,99 @@ impl DatabaseManager {
         }
 
         let table = self.connection.open_table("lore").execute().await?;
+        let mut emails = Vec::with_capacity(message_ids.len());
 
-        // Build message_id IN clause
-        let escaped_ids: Vec<String> = message_ids
-            .iter()
-            .map(|id| {
-                let escaped = id.replace('\'', "''");
-                format!("'{}'", escaped)
-            })
-            .collect();
-        let in_clause = format!("message_id IN ({})", escaped_ids.join(", "));
+        for chunk in message_ids.chunks(500) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|id| {
+                    let escaped = id.replace('\'', "''");
+                    format!("'{}'", escaped)
+                })
+                .collect();
+            let predicate = format!("message_id IN ({})", placeholders.join(", "));
 
-        // Combine with optional filter
-        let where_clause = match filter {
-            Some(f) => format!("{} AND {}", in_clause, f),
-            None => in_clause,
-        };
+            let results = table
+                .query()
+                .only_if(&predicate)
+                .limit(chunk.len())
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
 
-        tracing::debug!("Lore query with filter: {}", where_clause);
+            for batch in &results {
+                let git_commit_shas = batch
+                    .column_by_name("git_commit_sha")
+                    .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                    .as_string::<i32>();
+                let from_addrs = batch
+                    .column_by_name("from")
+                    .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                    .as_string::<i32>();
+                let dates = batch
+                    .column_by_name("date")
+                    .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                    .as_string::<i32>();
+                let date_timestamps = batch
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+                let msg_ids = batch
+                    .column_by_name("message_id")
+                    .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                    .as_string::<i32>();
+                let in_reply_tos = batch
+                    .column_by_name("in_reply_to")
+                    .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                    .as_string::<i32>();
+                let subjects = batch
+                    .column_by_name("subject")
+                    .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                    .as_string::<i32>();
+                let references_list = batch
+                    .column_by_name("references")
+                    .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                    .as_string::<i32>();
+                let recipients_list = batch
+                    .column_by_name("recipients")
+                    .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                    .as_string::<i32>();
+                let bodies = batch
+                    .column_by_name("body")
+                    .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                    .as_string::<i32>();
+                let symbols_list = batch
+                    .column_by_name("symbols")
+                    .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                    .as_string::<i32>();
 
-        // Query with filter, ordered by date_timestamp descending (newest first)
-        let effective_limit = if limit > 0 { limit } else { message_ids.len() };
-        let results = table
-            .query()
-            .only_if(&where_clause)
-            .limit(effective_limit)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+                for i in 0..batch.num_rows() {
+                    let symbols_json = symbols_list.value(i);
+                    let symbols: Vec<String> =
+                        serde_json::from_str(symbols_json).unwrap_or_default();
 
-        let mut emails = Vec::new();
-        for batch in results {
-            let git_commit_sha_col = batch.column_by_name("git_commit_sha").unwrap();
-            let from_col = batch.column_by_name("from").unwrap();
-            let date_col = batch.column_by_name("date").unwrap();
-            let date_timestamp_col = batch.column_by_name("date_timestamp");
-            let message_id_col = batch.column_by_name("message_id").unwrap();
-            let in_reply_to_col = batch.column_by_name("in_reply_to").unwrap();
-            let subject_col = batch.column_by_name("subject").unwrap();
-            let references_col = batch.column_by_name("references").unwrap();
-            let recipients_col = batch.column_by_name("recipients").unwrap();
-            let body_col = batch.column_by_name("body").unwrap();
-            let symbols_col = batch.column_by_name("symbols").unwrap();
-
-            let git_commit_sha_arr = git_commit_sha_col.as_string::<i32>();
-            let from_arr = from_col.as_string::<i32>();
-            let date_arr = date_col.as_string::<i32>();
-            let date_timestamp_arr = date_timestamp_col
-                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
-            let message_id_arr = message_id_col.as_string::<i32>();
-            let in_reply_to_arr = in_reply_to_col.as_string::<i32>();
-            let subject_arr = subject_col.as_string::<i32>();
-            let references_arr = references_col.as_string::<i32>();
-            let recipients_arr = recipients_col.as_string::<i32>();
-            let body_arr = body_col.as_string::<i32>();
-            let symbols_arr = symbols_col.as_string::<i32>();
-
-            for i in 0..batch.num_rows() {
-                let symbols_json = symbols_arr.value(i);
-                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
-
-                emails.push(crate::types::LoreEmailInfo {
-                    git_commit_sha: git_commit_sha_arr.value(i).to_string(),
-                    from: from_arr.value(i).to_string(),
-                    date: date_arr.value(i).to_string(),
-                    date_timestamp: Self::get_date_timestamp(date_timestamp_arr, date_arr, i),
-                    message_id: message_id_arr.value(i).to_string(),
-                    in_reply_to: if in_reply_to_arr.is_null(i) {
-                        None
-                    } else {
-                        Some(in_reply_to_arr.value(i).to_string())
-                    },
-                    subject: subject_arr.value(i).to_string(),
-                    references: if references_arr.is_null(i) {
-                        None
-                    } else {
-                        Some(references_arr.value(i).to_string())
-                    },
-                    recipients: recipients_arr.value(i).to_string(),
-                    body: body_arr.value(i).to_string(),
-                    symbols,
-                });
+                    emails.push(crate::types::LoreEmailInfo {
+                        git_commit_sha: git_commit_shas.value(i).to_string(),
+                        from: from_addrs.value(i).to_string(),
+                        date: dates.value(i).to_string(),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                        message_id: msg_ids.value(i).to_string(),
+                        in_reply_to: if in_reply_tos.is_null(i) {
+                            None
+                        } else {
+                            Some(in_reply_tos.value(i).to_string())
+                        },
+                        subject: subjects.value(i).to_string(),
+                        references: if references_list.is_null(i) {
+                            None
+                        } else {
+                            Some(references_list.value(i).to_string())
+                        },
+                        recipients: recipients_list.value(i).to_string(),
+                        body: bodies.value(i).to_string(),
+                        symbols,
+                    });
+                }
             }
         }
 

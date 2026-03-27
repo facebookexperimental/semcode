@@ -1852,20 +1852,12 @@ impl VectorSearchManager {
             let mut message_ids = HashSet::new();
 
             for batch in &results {
-                let msg_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let field_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let msg_array: &arrow::array::StringArray = super::get_column(batch, "message_id")?;
+                let field_array: &arrow::array::StringArray =
+                    super::get_column(batch, &field_name)?;
 
                 for i in 0..batch.num_rows() {
-                    let field_value = field_array.value(i);
-                    if regex.is_match(field_value) {
+                    if regex.is_match(field_array.value(i)) {
                         message_ids.insert(msg_array.value(i).to_string());
                     }
                 }
@@ -1881,88 +1873,93 @@ impl VectorSearchManager {
             Ok(message_ids)
         }
 
-        // Query from field
+        // Query from field (OR across patterns)
         if let Some(patterns) = from_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "from".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query subject field
+        // Query subject field (OR across patterns)
         if let Some(patterns) = subject_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "subject".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query body field
+        // Query body field (OR across patterns)
         if let Some(patterns) = body_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "body".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query symbols field
+        // Query symbols field (OR across patterns)
         if let Some(patterns) = symbols_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "symbols".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query recipients field
+        // Query recipients field (OR across patterns)
         if let Some(patterns) = recipients_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "recipients".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
@@ -3385,16 +3382,10 @@ impl VectorSearchManager {
             // 3. Build score map from vector results
             let mut score_map = HashMap::new();
             for batch in &vector_results {
-                let message_id_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let distance_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float32Array>()
-                    .unwrap();
+                let message_id_array: &arrow::array::StringArray =
+                    super::get_column(batch, "message_id")?;
+                let distance_array: &arrow::array::Float32Array =
+                    super::get_column(batch, "_distance")?;
 
                 for i in 0..batch.num_rows() {
                     let message_id = message_id_array.value(i).to_string();
@@ -3527,61 +3518,26 @@ impl VectorSearchManager {
                 .await?;
 
             for batch in &batches {
-                let git_commit_sha_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let from_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let date_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let git_commit_sha_array: &arrow::array::StringArray =
+                    super::get_column(batch, "git_commit_sha")?;
+                let from_array: &arrow::array::StringArray = super::get_column(batch, "from")?;
+                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
                 let date_timestamp_array = batch
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-                let message_id_array = batch
-                    .column(4)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let in_reply_to_array = batch
-                    .column(5)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let subject_array = batch
-                    .column(6)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let references_array = batch
-                    .column(7)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let recipients_array = batch
-                    .column(8)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let body_array = batch
-                    .column(9)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let symbols_array = batch
-                    .column(10)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+                let message_id_array: &arrow::array::StringArray =
+                    super::get_column(batch, "message_id")?;
+                let in_reply_to_array: &arrow::array::StringArray =
+                    super::get_column(batch, "in_reply_to")?;
+                let subject_array: &arrow::array::StringArray =
+                    super::get_column(batch, "subject")?;
+                let references_array: &arrow::array::StringArray =
+                    super::get_column(batch, "references")?;
+                let recipients_array: &arrow::array::StringArray =
+                    super::get_column(batch, "recipients")?;
+                let body_array: &arrow::array::StringArray = super::get_column(batch, "body")?;
+                let symbols_array: &arrow::array::StringArray =
+                    super::get_column(batch, "symbols")?;
 
                 for i in 0..batch.num_rows() {
                     if results.len() >= limit {
@@ -3642,8 +3598,9 @@ impl VectorSearchManager {
                     let symbols: Vec<String> =
                         serde_json::from_str(symbols_json).unwrap_or_default();
 
-                    // Get date_timestamp from the batch
-                    let date_timestamp = date_timestamp_array.value(i);
+                    let date_timestamp = date_timestamp_array
+                        .map(|arr| arr.value(i))
+                        .unwrap_or_else(|| email_datetime.timestamp());
 
                     results.push((
                         crate::types::LoreEmailInfo {

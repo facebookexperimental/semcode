@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
+use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -309,6 +310,109 @@ impl SchemaManager {
             }
         }
 
+        // Add the date_timestamp column if missing. Databases created
+        // before this column was introduced have a 10-column schema;
+        // merge_insert of 11-column batches silently fails, causing
+        // new emails to be skipped while their commit SHAs are still
+        // recorded as indexed.
+        if schema.column_with_name("date_timestamp").is_none() {
+            tracing::info!("Migrating lore table: adding 'date_timestamp' column");
+            table
+                .add_columns(
+                    lancedb::table::NewColumnTransform::SqlExpressions(vec![(
+                        "date_timestamp".into(),
+                        "CAST(0 AS BIGINT)".into(),
+                    )]),
+                    None,
+                )
+                .await?;
+
+            // Purge lore_indexed_commits so that previously-skipped
+            // emails are re-examined on the next --lore refresh.
+            self.reconcile_lore_indexed_commits().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove entries from lore_indexed_commits whose git_commit_sha
+    /// does not appear in the lore table.  This recovers from the
+    /// schema-mismatch bug where SHAs were recorded as indexed but the
+    /// corresponding emails were never stored.
+    async fn reconcile_lore_indexed_commits(&self) -> Result<()> {
+        let lore = self.connection.open_table("lore").execute().await?;
+        let idx = self
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await?;
+
+        // Collect the set of SHAs actually present in the lore table.
+        let lore_stream = lore
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "git_commit_sha".to_string()
+            ]))
+            .execute()
+            .await?;
+        let lore_batches: Vec<_> = lore_stream.try_collect().await?;
+
+        let mut lore_shas = std::collections::HashSet::new();
+        for batch in &lore_batches {
+            if let Some(col) = batch.column_by_name("git_commit_sha") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    for i in 0..arr.len() {
+                        lore_shas.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        // Collect SHAs from lore_indexed_commits.
+        let idx_stream = idx
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "git_commit_sha".to_string()
+            ]))
+            .execute()
+            .await?;
+        let idx_batches: Vec<_> = idx_stream.try_collect().await?;
+
+        let mut orphaned: Vec<String> = Vec::new();
+        for batch in &idx_batches {
+            if let Some(col) = batch.column_by_name("git_commit_sha") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    for i in 0..arr.len() {
+                        let sha = arr.value(i);
+                        if !lore_shas.contains(sha) {
+                            orphaned.push(sha.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if orphaned.is_empty() {
+            tracing::info!("reconcile_lore_indexed_commits: no orphaned entries");
+            return Ok(());
+        }
+
+        tracing::info!(
+            "reconcile_lore_indexed_commits: removing {} orphaned entries",
+            orphaned.len()
+        );
+
+        // Delete in chunks to avoid oversized SQL predicates.
+        for chunk in orphaned.chunks(500) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|s| format!("'{}'", s.replace('\'', "''")))
+                .collect();
+            let predicate = format!("git_commit_sha IN ({})", placeholders.join(", "));
+            idx.delete(&predicate).await?;
+        }
+
+        tracing::info!("reconcile_lore_indexed_commits: done");
         Ok(())
     }
 
