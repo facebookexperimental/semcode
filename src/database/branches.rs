@@ -8,7 +8,6 @@
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -103,8 +102,6 @@ impl IndexedBranchStore {
             None => remote_builder.append_null(),
         }
 
-        let schema = Self::get_schema();
-
         let batch = RecordBatch::try_from_iter(vec![
             (
                 "branch_name",
@@ -121,9 +118,7 @@ impl IndexedBranchStore {
             ("remote", Arc::new(remote_builder.finish()) as ArrayRef),
         ])?;
 
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+        table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
@@ -336,10 +331,8 @@ mod tests {
         // Create the table
         let schema = IndexedBranchStore::get_schema();
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
         connection
-            .create_table("indexed_branches", batch_iterator)
+            .create_table("indexed_branches", vec![empty_batch])
             .execute()
             .await
             .unwrap();

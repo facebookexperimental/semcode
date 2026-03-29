@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -78,17 +76,13 @@ impl ProcessedFileStore {
         }
         let git_file_sha_array = git_file_sha_builder.finish();
 
-        let schema = self.get_schema();
-
         let batch = RecordBatch::try_from_iter(vec![
             ("file", Arc::new(file_builder.finish()) as ArrayRef),
             ("git_sha", Arc::new(git_sha_array) as ArrayRef),
             ("git_file_sha", Arc::new(git_file_sha_array) as ArrayRef),
         ])?;
 
-        let batches = vec![Ok(batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
-        table.add(batch_iterator).execute().await?;
+        table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
@@ -452,13 +446,5 @@ impl ProcessedFileStore {
             git_sha,
             git_file_sha,
         }))
-    }
-
-    fn get_schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("file", DataType::Utf8, false),
-            Field::new("git_sha", DataType::Utf8, true), // Hex string instead of binary
-            Field::new("git_file_sha", DataType::Utf8, false),
-        ]))
     }
 }

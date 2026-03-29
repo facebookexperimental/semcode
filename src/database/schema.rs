@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::error::ArrowError;
-use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+use arrow::record_batch::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
 use lancedb::connection::Connection;
 use lancedb::index::{scalar::BTreeIndexBuilder, scalar::FtsIndexBuilder, Index as LanceIndex};
@@ -94,11 +93,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("functions", batch_iterator)
+            .create_table("functions", vec![empty_batch])
             .execute()
             .await?;
 
@@ -119,11 +116,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("types", batch_iterator)
+            .create_table("types", vec![empty_batch])
             .execute()
             .await?;
 
@@ -142,11 +137,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("vectors", batch_iterator)
+            .create_table("vectors", vec![empty_batch])
             .execute()
             .await?;
 
@@ -166,11 +159,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("commit_vectors", batch_iterator)
+            .create_table("commit_vectors", vec![empty_batch])
             .execute()
             .await?;
 
@@ -190,11 +181,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("lore_vectors", batch_iterator)
+            .create_table("lore_vectors", vec![empty_batch])
             .execute()
             .await?;
 
@@ -210,11 +199,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("processed_files", batch_iterator)
+            .create_table("processed_files", vec![empty_batch])
             .execute()
             .await?;
 
@@ -228,11 +215,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("symbol_filename", batch_iterator)
+            .create_table("symbol_filename", vec![empty_batch])
             .execute()
             .await?;
 
@@ -253,11 +238,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("git_commits", batch_iterator)
+            .create_table("git_commits", vec![empty_batch])
             .execute()
             .await?;
 
@@ -280,11 +263,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("lore", batch_iterator)
+            .create_table("lore", vec![empty_batch])
             .execute()
             .await?;
 
@@ -297,11 +278,9 @@ impl SchemaManager {
 
         let schema = IndexedBranchStore::get_schema();
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("indexed_branches", batch_iterator)
+            .create_table("indexed_branches", vec![empty_batch])
             .execute()
             .await?;
 
@@ -316,11 +295,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table("content", batch_iterator)
+            .create_table("content", vec![empty_batch])
             .execute()
             .await?;
 
@@ -341,11 +318,9 @@ impl SchemaManager {
 
             if !table_names.iter().any(|n| n == &table_name) {
                 let empty_batch = RecordBatch::new_empty(schema.clone());
-                let batches = vec![Ok(empty_batch)];
-                let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema.clone());
 
                 self.connection
-                    .create_table(&table_name, batch_iterator)
+                    .create_table(&table_name, vec![empty_batch])
                     .execute()
                     .await?;
 
@@ -1209,16 +1184,8 @@ impl SchemaManager {
 
         let table = self.connection.open_table(table_name).execute().await?;
 
-        // Create a RecordBatchIterator from the batches
-        if let Some(first_batch) = batches.first() {
-            let schema = first_batch.schema();
-            let batch_results: Vec<Result<RecordBatch, ArrowError>> =
-                batches.into_iter().map(Ok).collect();
-            let batch_iterator = RecordBatchIterator::new(batch_results.into_iter(), schema);
-
-            // Add all batches at once using the iterator
-            table.add(batch_iterator).execute().await?;
-        }
+        // Add all batches at once
+        table.add(batches).execute().await?;
 
         Ok(())
     }
@@ -1253,11 +1220,9 @@ impl SchemaManager {
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
-        let batches = vec![Ok(empty_batch)];
-        let batch_iterator = RecordBatchIterator::new(batches.into_iter(), schema);
 
         self.connection
-            .create_table(table_name, batch_iterator)
+            .create_table(table_name, vec![empty_batch])
             .execute()
             .await?;
 
