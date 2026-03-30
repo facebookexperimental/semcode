@@ -22,6 +22,7 @@ use crate::database::processed_files::{ProcessedFileRecord, ProcessedFileStore};
 use crate::database::vectors::VectorStore;
 use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
+use crate::workdir::WorkdirIndex;
 use std::collections::HashSet;
 
 // Optimal batch size for LanceDB operations
@@ -40,6 +41,7 @@ pub struct DatabaseManager {
     content_store: ContentStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
+    workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
 }
 
 impl DatabaseManager {
@@ -59,6 +61,7 @@ impl DatabaseManager {
             content_store: ContentStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             branch_store: IndexedBranchStore::new(connection.clone()),
+            workdir_index: std::sync::RwLock::new(None),
         })
     }
 
@@ -70,6 +73,29 @@ impl DatabaseManager {
         self.schema_manager.create_all_tables().await?;
         self.schema_manager.create_scalar_indices().await?;
         Ok(())
+    }
+
+    /// Set the working directory index for overlaying uncommitted changes on queries.
+    /// When set, all `_git_aware` methods will automatically merge results from the
+    /// working directory overlay with database results.
+    pub fn set_workdir_index(&self, workdir: WorkdirIndex) {
+        *self.workdir_index.write().unwrap() = Some(workdir);
+    }
+
+    /// Check if a workdir index is set.
+    pub fn has_workdir_index(&self) -> bool {
+        self.workdir_index.read().unwrap().is_some()
+    }
+
+    /// Clear the working directory index.
+    pub fn clear_workdir_index(&self) {
+        *self.workdir_index.write().unwrap() = None;
+    }
+
+    /// Take the working directory index out, leaving None in its place.
+    /// Used to extract the previous index for incremental rebuilds.
+    pub fn take_workdir_index(&self) -> Option<WorkdirIndex> {
+        self.workdir_index.write().unwrap().take()
     }
 
     pub async fn clear_all_data(&self) -> Result<()> {
@@ -640,6 +666,103 @@ impl DatabaseManager {
         Ok(())
     }
 
+    // --- Workdir overlay helpers ---
+
+    /// Look up a function in the workdir overlay (if set).
+    fn workdir_find_function(&self, name: &str) -> Option<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().and_then(|w| w.find_function(name).cloned())
+    }
+
+    /// Look up all functions matching a name in the workdir overlay.
+    fn workdir_find_all_functions(&self, name: &str) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_all_functions(name).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Look up a type in the workdir overlay (if set).
+    fn workdir_find_type(&self, name: &str) -> Option<TypeInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().and_then(|w| w.find_type(name).cloned())
+    }
+
+    /// Find callers in the workdir overlay.
+    fn workdir_find_callers(&self, name: &str) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_callers(name).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Find callees in the workdir overlay.
+    fn workdir_find_callees(&self, name: &str) -> Option<Vec<String>> {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().and_then(|w| w.find_callees(name))
+    }
+
+    /// Grep function bodies in the workdir overlay.
+    fn workdir_grep_functions(
+        &self,
+        pattern: &str,
+        path_pattern: Option<&str>,
+    ) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| {
+                w.grep_functions(pattern, path_pattern)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Regex search for functions in the workdir overlay.
+    fn workdir_find_functions_regex(&self, pattern: &str) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| {
+                w.find_functions_regex(pattern)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Regex search for types in the workdir overlay.
+    fn workdir_find_types_regex(&self, pattern: &str) -> Vec<TypeInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_types_regex(pattern).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Check if a file is deleted in the workdir overlay.
+    fn workdir_is_deleted(&self, file_path: &str) -> bool {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().is_some_and(|w| w.is_deleted(file_path))
+    }
+
+    /// Merge a HEAD manifest with workdir dirty/deleted state.
+    fn workdir_merged_manifest(
+        &self,
+        head_manifest: std::collections::HashMap<String, String>,
+    ) -> std::collections::HashMap<String, String> {
+        let guard = self.workdir_index.read().unwrap();
+        match guard.as_ref() {
+            Some(w) => w.merged_manifest(&head_manifest),
+            None => head_manifest,
+        }
+    }
+
     /// Find a function by name without git awareness (non-git-aware)
     ///
     /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
@@ -674,6 +797,10 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Option<FunctionInfo>> {
+        // Check workdir overlay first — if the function is in a dirty file, return it
+        if let Some(func) = self.workdir_find_function(name) {
+            return Ok(Some(func));
+        }
         let git_manifest = self.generate_git_manifest(git_sha).await?;
         if git_manifest.is_empty() {
             tracing::info!(
@@ -844,13 +971,23 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
+        // Get workdir overlay matches first
+        let workdir_matches = self.workdir_find_all_functions(name);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect();
+
         // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full function records)
         let unique_file_paths = self
             .symbol_filename_store
             .get_filenames_for_symbol(name)
             .await?;
-        if unique_file_paths.is_empty() {
+        if unique_file_paths.is_empty() && workdir_matches.is_empty() {
             return Ok(Vec::new());
+        }
+        if unique_file_paths.is_empty() {
+            return Ok(self.filter_implementations_only(workdir_matches));
         }
 
         tracing::debug!(
@@ -912,7 +1049,16 @@ impl DatabaseManager {
             return Ok(self.filter_implementations_only(all_functions));
         }
 
-        let implementations = self.filter_implementations_only(matches);
+        // Filter out DB results from dirty/deleted files, then merge with workdir results
+        let mut merged: Vec<FunctionInfo> = workdir_matches;
+        for func in matches {
+            if !workdir_files.contains(&func.file_path) && !self.workdir_is_deleted(&func.file_path)
+            {
+                merged.push(func);
+            }
+        }
+
+        let implementations = self.filter_implementations_only(merged);
         tracing::info!(
             "Git-aware lookup succeeded: found {} implementations of '{}' at commit '{}'",
             implementations.len(),
@@ -1183,6 +1329,10 @@ impl DatabaseManager {
     }
 
     pub async fn find_type_git_aware(&self, name: &str, git_sha: &str) -> Result<Option<TypeInfo>> {
+        // Check workdir overlay first
+        if let Some(ty) = self.workdir_find_type(name) {
+            return Ok(Some(ty));
+        }
         // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full type records)
         let unique_file_paths = self
             .symbol_filename_store
@@ -1460,9 +1610,25 @@ impl DatabaseManager {
         pattern: &str,
         git_sha: &str,
     ) -> Result<Vec<TypeInfo>> {
-        self.search_manager
+        let workdir_matches = self.workdir_find_types_regex(pattern);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|t| t.file_path.clone())
+            .collect();
+
+        let mut db_results = self
+            .search_manager
             .search_types_regex_git_aware(pattern, git_sha)
-            .await
+            .await?;
+
+        // Filter out DB results from dirty/deleted files, then prepend workdir matches
+        db_results.retain(|t| {
+            !workdir_files.contains(&t.file_path) && !self.workdir_is_deleted(&t.file_path)
+        });
+
+        let mut merged = workdir_matches;
+        merged.extend(db_results);
+        Ok(merged)
     }
 
     /// Search typedefs using regex patterns on the name column without git awareness (non-git-aware)
@@ -1527,9 +1693,24 @@ impl DatabaseManager {
         pattern: &str,
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
-        self.search_manager
+        let workdir_matches = self.workdir_find_functions_regex(pattern);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect();
+
+        let mut db_results = self
+            .search_manager
             .search_functions_regex_git_aware(pattern, git_sha)
-            .await
+            .await?;
+
+        db_results.retain(|f| {
+            !workdir_files.contains(&f.file_path) && !self.workdir_is_deleted(&f.file_path)
+        });
+
+        let mut merged = workdir_matches;
+        merged.extend(db_results);
+        Ok(merged)
     }
 
     // Call relationship operations
@@ -1626,12 +1807,23 @@ impl DatabaseManager {
         function_name: &str,
         git_sha: &str,
     ) -> Result<Vec<String>> {
+        // Collect callers from workdir overlay
+        let workdir_callers = self.workdir_find_callers(function_name);
+        let mut caller_names: Vec<String> =
+            workdir_callers.iter().map(|f| f.name.clone()).collect();
+
         let git_manifest = self.generate_git_manifest(git_sha).await?;
-        if git_manifest.is_empty() {
-            return Ok(Vec::new());
+        if !git_manifest.is_empty() {
+            let db_callers = self
+                .get_function_callers_with_manifest(function_name, &git_manifest)
+                .await?;
+            for name in db_callers {
+                if !caller_names.contains(&name) {
+                    caller_names.push(name);
+                }
+            }
         }
-        self.get_function_callers_with_manifest(function_name, &git_manifest)
-            .await
+        Ok(caller_names)
     }
 
     // Optimized methods for call chain analysis
@@ -1893,6 +2085,10 @@ impl DatabaseManager {
         function_name: &str,
         git_sha: &str,
     ) -> Result<Vec<String>> {
+        // Check workdir overlay first — if the function is in a dirty file, use its callees
+        if let Some(callees) = self.workdir_find_callees(function_name) {
+            return Ok(callees);
+        }
         let git_manifest = self.generate_git_manifest(git_sha).await?;
         if git_manifest.is_empty() {
             return Ok(Vec::new());
@@ -2959,11 +3155,18 @@ impl DatabaseManager {
         limit: usize,
         git_sha: &str,
     ) -> Result<(Vec<FunctionInfo>, bool)> {
+        // Get workdir overlay matches first
+        let workdir_matches = self.workdir_grep_functions(pattern, path_pattern);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect();
+
         // Step 1: Get all matching functions using the existing non-git-aware method
         let (all_matching_functions, limit_hit_pre_filter) =
             self.grep_function_bodies(pattern, path_pattern, 0).await?; // Use 0 for unlimited to get all matches first
 
-        if all_matching_functions.is_empty() {
+        if all_matching_functions.is_empty() && workdir_matches.is_empty() {
             return Ok((Vec::new(), false));
         }
 
@@ -3033,15 +3236,31 @@ impl DatabaseManager {
             }
         }
 
+        // Merge workdir results with DB results, excluding dirty/deleted files from DB
+        let mut merged = workdir_matches;
+        for func in git_filtered_functions {
+            if !workdir_files.contains(&func.file_path) && !self.workdir_is_deleted(&func.file_path)
+            {
+                merged.push(func);
+            }
+        }
+
+        let mut final_limit_hit = limit_hit || limit_hit_pre_filter;
+        if limit > 0 && merged.len() > limit {
+            merged.truncate(limit);
+            final_limit_hit = true;
+        }
+
         tracing::info!(
-            "Git-aware grep: pattern '{}' matched {} functions, filtered to {} functions at git commit {}",
+            "Git-aware grep: pattern '{}' matched {} DB functions + {} workdir, filtered to {} at git commit {}",
             pattern,
             total_matching_functions,
-            git_filtered_functions.len(),
+            workdir_files.len(),
+            merged.len(),
             git_sha
         );
 
-        Ok((git_filtered_functions, limit_hit || limit_hit_pre_filter))
+        Ok((merged, final_limit_hit))
     }
 
     /// Efficient callers function implementation following the 4-step algorithm:
@@ -3215,7 +3434,8 @@ impl DatabaseManager {
             },
         )?;
 
-        Ok(manifest)
+        // Merge with workdir overlay (adds dirty files, removes deleted files)
+        Ok(self.workdir_merged_manifest(manifest))
     }
 
     /// Fallback callers search when not in git repository
@@ -5559,147 +5779,5 @@ impl DatabaseManager {
         merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
-    }
-
-    // --- Working directory overlay methods ---
-
-    /// Find a function by name, merging results from a WorkdirIndex overlay with the database.
-    ///
-    /// For files that are dirty in the working directory, the overlay's version takes precedence.
-    /// For clean files, the database result is used. Deleted files are excluded.
-    pub async fn find_function_with_workdir(
-        &self,
-        name: &str,
-        git_sha: &str,
-        workdir: &crate::workdir::WorkdirIndex,
-    ) -> Result<Option<FunctionInfo>> {
-        // Check workdir overlay first
-        if let Some(func) = workdir.find_function(name) {
-            return Ok(Some(func.clone()));
-        }
-        // Fall back to database with merged manifest (excludes deleted files)
-        let head_manifest = self.generate_git_manifest(git_sha).await?;
-        let merged = workdir.merged_manifest(&head_manifest);
-        self.find_function_with_manifest(name, &merged).await
-    }
-
-    /// Find all functions matching a name, merging workdir overlay with database results.
-    pub async fn find_all_functions_with_workdir(
-        &self,
-        name: &str,
-        git_sha: &str,
-        workdir: &crate::workdir::WorkdirIndex,
-    ) -> Result<Vec<FunctionInfo>> {
-        let mut results: Vec<FunctionInfo> = Vec::new();
-
-        // Get workdir matches and track which files they come from
-        let workdir_matches = workdir.find_all_functions(name);
-        let workdir_files: std::collections::HashSet<&str> = workdir_matches
-            .iter()
-            .map(|f| f.file_path.as_str())
-            .collect();
-        results.extend(workdir_matches.into_iter().cloned());
-
-        // Get database matches, excluding files covered by workdir
-        let db_matches = self.find_all_functions_git_aware(name, git_sha).await?;
-        for func in db_matches {
-            if !workdir_files.contains(func.file_path.as_str())
-                && !workdir.is_deleted(&func.file_path)
-            {
-                results.push(func);
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Find a type by name, merging workdir overlay with database results.
-    pub async fn find_type_with_workdir(
-        &self,
-        name: &str,
-        git_sha: &str,
-        workdir: &crate::workdir::WorkdirIndex,
-    ) -> Result<Option<TypeInfo>> {
-        if let Some(ty) = workdir.find_type(name) {
-            return Ok(Some(ty.clone()));
-        }
-        self.find_type_git_aware(name, git_sha).await
-    }
-
-    /// Get callers of a function, merging workdir overlay with database results.
-    pub async fn get_function_callers_with_workdir(
-        &self,
-        function_name: &str,
-        git_sha: &str,
-        workdir: &crate::workdir::WorkdirIndex,
-    ) -> Result<Vec<String>> {
-        let mut callers: Vec<String> = Vec::new();
-
-        // Get callers from workdir overlay
-        let workdir_callers = workdir.find_callers(function_name);
-        callers.extend(workdir_callers.iter().map(|f| f.name.clone()));
-
-        // Get callers from database, excluding those from dirty/deleted files
-        let db_callers = self
-            .get_function_callers_git_aware(function_name, git_sha)
-            .await?;
-        for caller_name in db_callers {
-            // We can't easily check file paths from just caller names, so include all.
-            // Duplicates from workdir are acceptable since the caller just gets a list of names.
-            if !callers.contains(&caller_name) {
-                callers.push(caller_name);
-            }
-        }
-
-        Ok(callers)
-    }
-
-    /// Grep function bodies, merging workdir overlay with database results.
-    pub async fn grep_function_bodies_with_workdir(
-        &self,
-        pattern: &str,
-        path_pattern: Option<&str>,
-        limit: usize,
-        git_sha: &str,
-        workdir: &crate::workdir::WorkdirIndex,
-    ) -> Result<(Vec<FunctionInfo>, bool)> {
-        let mut results: Vec<FunctionInfo> = Vec::new();
-
-        // Get matches from workdir overlay
-        let workdir_matches = workdir.grep_functions(pattern, path_pattern);
-        let workdir_files: std::collections::HashSet<&str> = workdir_matches
-            .iter()
-            .map(|f| f.file_path.as_str())
-            .collect();
-        results.extend(workdir_matches.into_iter().cloned());
-
-        // Check if we've already hit the limit
-        if limit > 0 && results.len() >= limit {
-            results.truncate(limit);
-            return Ok((results, true));
-        }
-
-        // Get matches from database, excluding files covered by workdir
-        let remaining = if limit > 0 {
-            limit - results.len()
-        } else {
-            0 // 0 means unlimited in the DB method
-        };
-        let (db_matches, db_limit_hit) = self
-            .grep_function_bodies_git_aware(pattern, path_pattern, remaining, git_sha)
-            .await?;
-        for func in db_matches {
-            if !workdir_files.contains(func.file_path.as_str())
-                && !workdir.is_deleted(&func.file_path)
-            {
-                results.push(func);
-            }
-        }
-
-        let limit_hit = db_limit_hit || (limit > 0 && results.len() >= limit);
-        if limit > 0 && results.len() > limit {
-            results.truncate(limit);
-        }
-        Ok((results, limit_hit))
     }
 }

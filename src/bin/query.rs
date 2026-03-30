@@ -13,6 +13,33 @@ use tracing::info;
 use query_impl::commands::handle_command;
 use semcode::display::print_welcome_message_with_model;
 
+/// Rebuild the working directory index to pick up any file changes since the last query.
+/// Reuses cached analysis results for files whose mtime and size haven't changed.
+fn refresh_workdir_index(db_manager: &DatabaseManager, git_repo: &str) {
+    let repo_path = std::path::Path::new(git_repo);
+    let previous = db_manager.take_workdir_index();
+    match semcode::WorkdirIndex::build_incremental(repo_path, previous.as_ref()) {
+        Ok(workdir) => {
+            if workdir.is_empty() {
+                // No need to set — we already took it out
+            } else {
+                info!(
+                    "Working directory overlay: {} dirty, {} deleted, {} functions, {} types",
+                    workdir.dirty_file_count(),
+                    workdir.deleted_file_count(),
+                    workdir.function_count(),
+                    workdir.type_count(),
+                );
+                db_manager.set_workdir_index(workdir);
+            }
+        }
+        Err(e) => {
+            info!("Could not build working directory index: {}", e);
+            // No need to clear — we already took it out
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "semcode")]
 #[command(about = "Query the semantic code database", long_about = None)]
@@ -49,6 +76,10 @@ struct Args {
     /// Default: 1/1 (direct callers and callees only).
     #[arg(long, value_name = "UP/DOWN", requires = "diffinfo")]
     depth: Option<String>,
+
+    /// Disable working directory overlay (only query committed code)
+    #[arg(long)]
+    git_only: bool,
 }
 
 /// Check if the current commit needs indexing and perform incremental indexing if needed
@@ -421,6 +452,11 @@ async fn main() -> Result<()> {
         // Convert to Vec<&str> for handle_command
         let parts: Vec<&str> = parts_owned.iter().map(|s| s.as_str()).collect();
 
+        // Rebuild workdir index to reflect current file state
+        if !args.git_only {
+            refresh_workdir_index(&db_manager, &args.git_repo);
+        }
+
         // Execute the command
         match handle_command(
             &parts,
@@ -482,6 +518,11 @@ async fn main() -> Result<()> {
 
                 // Convert to Vec<&str> for handle_command
                 let parts: Vec<&str> = parts_owned.iter().map(|s| s.as_str()).collect();
+
+                // Rebuild workdir index to reflect current file state
+                if !args.git_only {
+                    refresh_workdir_index(&db_manager, &args.git_repo);
+                }
 
                 // Handle command and check if we should exit
                 if handle_command(

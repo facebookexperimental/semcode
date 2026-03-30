@@ -4,17 +4,40 @@
 //! This module detects files that differ from the HEAD commit (modified, new, or deleted)
 //! and analyzes them with tree-sitter to produce an in-memory overlay of functions, types,
 //! and macros. The overlay can be composed with database lookups to query uncommitted state.
+//!
+//! Incremental rebuilds use mtime + file size to skip re-analyzing files that haven't
+//! changed since the last build, making repeated queries in interactive mode fast.
 
 use anyhow::Result;
 use gix::bstr::ByteSlice;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::SystemTime;
 
 use crate::file_extensions::is_supported_for_analysis;
 use crate::hash::compute_blake3_hash;
 use crate::treesitter_analyzer::TreeSitterAnalyzer;
 use crate::types::{FunctionInfo, TypeInfo};
+
+/// Cached stat metadata + analysis results for a single dirty file.
+#[derive(Clone)]
+struct FileCacheEntry {
+    /// File modification time (seconds since epoch)
+    mtime_secs: u64,
+    /// File modification time (nanoseconds component)
+    mtime_nanos: u32,
+    /// File size in bytes
+    size: u64,
+    /// Blake3 content hash (used as git_file_hash in the manifest)
+    content_hash: String,
+    /// Extracted functions
+    functions: Vec<FunctionInfo>,
+    /// Extracted types
+    types: Vec<TypeInfo>,
+    /// Extracted macros (stored as FunctionInfo)
+    macros: Vec<FunctionInfo>,
+}
 
 /// In-memory index of functions, types, and macros extracted from uncommitted working
 /// directory changes. Built by scanning dirty files and analyzing them with tree-sitter.
@@ -29,43 +52,90 @@ pub struct WorkdirIndex {
     dirty_manifest: HashMap<String, String>,
     /// Files tracked in HEAD but deleted in the working directory
     deleted_files: HashSet<String>,
-}
-
-/// Classification of a file's working directory status
-#[derive(Debug)]
-enum DirtyStatus {
-    /// File is modified (exists in HEAD and working directory with different content)
-    Modified,
-    /// File is new (exists in working directory but not in HEAD)
-    New,
-}
-
-/// A file that differs from HEAD
-#[derive(Debug)]
-struct DirtyFile {
-    /// Relative path within the repository
-    relative_path: String,
-    /// Full absolute path on disk
-    absolute_path: std::path::PathBuf,
-    /// How this file differs from HEAD
-    _status: DirtyStatus,
+    /// Per-file cache of stat metadata + analysis results, for incremental rebuilds
+    file_cache: HashMap<String, FileCacheEntry>,
+    /// HEAD commit SHA at the time of the last build (to detect when HEAD changes)
+    head_sha: Option<String>,
 }
 
 impl WorkdirIndex {
     /// Build a WorkdirIndex by scanning the working directory for uncommitted changes.
     ///
-    /// This detects modified, new, and deleted files by comparing the working directory
-    /// against the HEAD commit tree. Files with supported extensions are analyzed with
-    /// tree-sitter and their extracted symbols are stored in memory.
+    /// Equivalent to `build_incremental(repo_path, None)`.
     pub fn build(repo_path: &Path) -> Result<Self> {
+        Self::build_incremental(repo_path, None)
+    }
+
+    /// Build a WorkdirIndex, reusing cached analysis results from a previous index
+    /// for files whose mtime and size haven't changed.
+    ///
+    /// If `previous` is `None` or HEAD has changed since the previous build, all dirty
+    /// files are re-analyzed from scratch.
+    pub fn build_incremental(repo_path: &Path, previous: Option<&WorkdirIndex>) -> Result<Self> {
+        let total_start = std::time::Instant::now();
+
+        let t = std::time::Instant::now();
         let repo = gix::discover(repo_path)?;
         let workdir = repo
             .workdir()
             .ok_or_else(|| anyhow::anyhow!("Cannot index bare repository"))?
             .to_path_buf();
+        tracing::info!("workdir: gix discover: {:?}", t.elapsed());
 
-        // Build HEAD tree manifest: relative_path -> git blob OID as hex
-        let mut head_files: HashMap<String, String> = HashMap::new();
+        // Get current HEAD SHA
+        let t = std::time::Instant::now();
+        let current_head_sha = repo.head_commit().ok().map(|c| c.id().to_string());
+        tracing::info!("workdir: head commit: {:?}", t.elapsed());
+
+        // Determine if the previous cache is valid (HEAD hasn't changed)
+        let prev_cache: Option<&HashMap<String, FileCacheEntry>> = previous.and_then(|prev| {
+            if prev.head_sha == current_head_sha {
+                Some(&prev.file_cache)
+            } else {
+                None
+            }
+        });
+        tracing::info!(
+            "workdir: cache valid: {}, cached files: {}",
+            prev_cache.is_some(),
+            prev_cache.map_or(0, |c| c.len())
+        );
+
+        // Read git index for stat-based fast path (like `git status`)
+        let t = std::time::Instant::now();
+        let git_index = repo.open_index()?;
+        let stat_options = repo.stat_options()?;
+
+        // Build index map: path -> (stat, oid) for tracked files with supported extensions
+        struct IndexEntry {
+            stat: gix::index::entry::Stat,
+            oid: gix::ObjectId,
+        }
+        let mut index_map: HashMap<String, IndexEntry> = HashMap::new();
+        for entry in git_index.entries() {
+            let path = entry.path_in(git_index.path_backing());
+            if let Ok(path_str) = std::str::from_utf8(path) {
+                if is_supported_for_analysis(path_str) {
+                    index_map.insert(
+                        path_str.to_string(),
+                        IndexEntry {
+                            stat: entry.stat,
+                            oid: entry.id,
+                        },
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            "workdir: read git index ({} tracked supported files): {:?}",
+            index_map.len(),
+            t.elapsed()
+        );
+
+        // Build HEAD tree manifest: relative_path -> git blob OID
+        // Only for supported files (used to detect staged-but-not-committed changes)
+        let t = std::time::Instant::now();
+        let mut head_oids: HashMap<String, gix::ObjectId> = HashMap::new();
         if let Ok(head_commit) = repo.head_commit() {
             if let Ok(tree) = head_commit.tree() {
                 use gix::traverse::tree::Recorder;
@@ -74,77 +144,173 @@ impl WorkdirIndex {
                     for entry in &recorder.records {
                         if entry.mode.is_blob() {
                             let path = entry.filepath.to_str_lossy();
-                            head_files.insert(path.to_string(), entry.oid.to_string());
+                            if is_supported_for_analysis(&path) {
+                                head_oids.insert(path.to_string(), entry.oid);
+                            }
                         }
                     }
                 }
             }
         }
+        tracing::info!(
+            "workdir: HEAD tree walk ({} supported files): {:?}",
+            head_oids.len(),
+            t.elapsed()
+        );
 
-        // Scan working directory for supported files
-        let mut workdir_files: HashMap<String, std::path::PathBuf> = HashMap::new();
-        Self::walk_directory(&workdir, &workdir, &mut workdir_files)?;
-
-        // Classify files
-        let mut dirty_files: Vec<DirtyFile> = Vec::new();
+        // Classify tracked files using stat-based fast path.
+        // Only iterate files in the index — no directory walk needed.
+        let mut dirty_files_to_analyze: Vec<(String, std::path::PathBuf)> = Vec::new();
         let mut deleted_files: HashSet<String> = HashSet::new();
         let mut dirty_manifest: HashMap<String, String> = HashMap::new();
+        let mut file_cache: HashMap<String, FileCacheEntry> = HashMap::new();
 
-        // Check for modified and new files
-        for (rel_path, abs_path) in &workdir_files {
-            let content = match std::fs::read_to_string(abs_path) {
-                Ok(c) => c,
-                Err(_) => continue, // Skip binary or unreadable files
-            };
-            let content_hash = compute_blake3_hash(&content);
-
-            if let Some(head_oid) = head_files.get(rel_path) {
-                // File exists in HEAD — check if content differs
-                // Read blob from HEAD and compare via blake3
-                let head_content_hash = Self::blob_blake3_hash(&repo, head_oid);
-                if head_content_hash.as_deref() != Some(content_hash.as_str()) {
-                    dirty_manifest.insert(rel_path.clone(), content_hash);
-                    dirty_files.push(DirtyFile {
-                        relative_path: rel_path.clone(),
-                        absolute_path: abs_path.clone(),
-                        _status: DirtyStatus::Modified,
-                    });
-                }
-            } else {
-                // File not in HEAD — it's new/untracked
-                dirty_manifest.insert(rel_path.clone(), content_hash);
-                dirty_files.push(DirtyFile {
-                    relative_path: rel_path.clone(),
-                    absolute_path: abs_path.clone(),
-                    _status: DirtyStatus::New,
-                });
-            }
-        }
-
-        // Check for deleted files (in HEAD but not in working directory)
-        for rel_path in head_files.keys() {
-            if !workdir_files.contains_key(rel_path) && is_supported_for_analysis(rel_path) {
-                deleted_files.insert(rel_path.clone());
-            }
-        }
-
-        // Analyze dirty files with tree-sitter
+        // Aggregated symbol maps
         let mut functions: HashMap<String, Vec<FunctionInfo>> = HashMap::new();
         let mut types: HashMap<String, Vec<TypeInfo>> = HashMap::new();
         let mut macros: HashMap<String, Vec<FunctionInfo>> = HashMap::new();
 
+        let t = std::time::Instant::now();
+        let mut stat_clean = 0usize;
+        let mut cache_hits = 0usize;
+        let mut files_read = 0usize;
+        let mut tracked_hash_dirty = 0usize;
+        let mut tracked_hash_clean = 0usize;
+
+        for (rel_path, idx_entry) in &index_map {
+            let abs_path = workdir.join(rel_path);
+
+            let gix_meta = match gix::index::fs::Metadata::from_path_no_follow(&abs_path) {
+                Ok(m) => m,
+                Err(_) => continue, // File doesn't exist on disk (deleted)
+            };
+            let meta = match std::fs::metadata(&abs_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let (mtime_secs, mtime_nanos) = mtime_from_metadata(&meta);
+            let size = meta.len();
+
+            // Fast path: check git index stat to skip clean tracked files
+            // If workdir stat matches index stat AND index OID matches HEAD OID → clean
+            let workdir_stat = gix::index::entry::Stat::from_fs(&gix_meta)?;
+            if idx_entry.stat.matches(&workdir_stat, stat_options) {
+                if let Some(head_oid) = head_oids.get(rel_path) {
+                    if idx_entry.oid == *head_oid {
+                        stat_clean += 1;
+                        continue;
+                    }
+                }
+                // Index stat matches but OID differs from HEAD → staged change, dirty
+            }
+
+            // Check if we can reuse the previous cache entry (mtime+size unchanged)
+            if let Some(cached) = prev_cache.and_then(|c| c.get(rel_path)) {
+                if cached.mtime_secs == mtime_secs
+                    && cached.mtime_nanos == mtime_nanos
+                    && cached.size == size
+                {
+                    // File unchanged since last workdir build — reuse cached results
+                    dirty_manifest.insert(rel_path.clone(), cached.content_hash.clone());
+                    insert_symbols(
+                        &cached.functions,
+                        &cached.types,
+                        &cached.macros,
+                        &mut functions,
+                        &mut types,
+                        &mut macros,
+                    );
+                    file_cache.insert(rel_path.clone(), cached.clone());
+                    cache_hits += 1;
+                    continue;
+                }
+            }
+
+            // Need to read and check this file
+            let content = match std::fs::read_to_string(&abs_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            files_read += 1;
+            let content_hash = compute_blake3_hash(&content);
+
+            // Compare content hash against HEAD OID directly
+            let is_dirty = if let Some(head_oid) = head_oids.get(rel_path) {
+                match gix::objs::compute_hash(
+                    repo.object_hash(),
+                    gix::object::Kind::Blob,
+                    content.as_bytes(),
+                ) {
+                    Ok(workdir_oid) => {
+                        if workdir_oid != *head_oid {
+                            tracked_hash_dirty += 1;
+                            true
+                        } else {
+                            tracked_hash_clean += 1;
+                            false
+                        }
+                    }
+                    Err(_) => true,
+                }
+            } else {
+                true // In index but not in HEAD (staged new file)
+            };
+
+            if is_dirty {
+                dirty_manifest.insert(rel_path.clone(), content_hash.clone());
+                dirty_files_to_analyze.push((rel_path.clone(), abs_path.clone()));
+                file_cache.insert(
+                    rel_path.clone(),
+                    FileCacheEntry {
+                        mtime_secs,
+                        mtime_nanos,
+                        size,
+                        content_hash,
+                        functions: Vec::new(),
+                        types: Vec::new(),
+                        macros: Vec::new(),
+                    },
+                );
+            }
+        }
+        tracing::info!(
+            "workdir: classify files: {:?} (stat_clean={}, cache_hits={}, files_read={}, hash_dirty={}, hash_clean={}, dirty={})",
+            t.elapsed(),
+            stat_clean,
+            cache_hits,
+            files_read,
+            tracked_hash_dirty,
+            tracked_hash_clean,
+            dirty_files_to_analyze.len()
+        );
+
+        // Check for deleted files (in HEAD but not on disk)
+        let t = std::time::Instant::now();
+        for rel_path in head_oids.keys() {
+            if !workdir.join(rel_path).exists() {
+                deleted_files.insert(rel_path.clone());
+            }
+        }
+        tracing::info!(
+            "workdir: deleted files check ({} deleted): {:?}",
+            deleted_files.len(),
+            t.elapsed()
+        );
+
+        // Analyze dirty files that weren't served from cache
+        let t = std::time::Instant::now();
         let mut analyzer = TreeSitterAnalyzer::new()?;
         let source_root = Some(workdir.as_path());
 
-        for dirty_file in &dirty_files {
-            let content = match std::fs::read_to_string(&dirty_file.absolute_path) {
+        for (rel_path, abs_path) in &dirty_files_to_analyze {
+            let content = match std::fs::read_to_string(abs_path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
             let content_hash = dirty_manifest
-                .get(&dirty_file.relative_path)
+                .get(rel_path)
                 .expect("dirty file must have a manifest entry");
-            let file_path = Path::new(&dirty_file.relative_path);
+            let file_path = Path::new(rel_path);
 
             match analyzer.analyze_source_with_metadata(
                 &content,
@@ -153,28 +319,33 @@ impl WorkdirIndex {
                 source_root,
             ) {
                 Ok((file_functions, file_types, file_macros)) => {
-                    for func in file_functions {
-                        functions
-                            .entry(func.name.to_lowercase())
-                            .or_default()
-                            .push(func);
+                    // Update the cache entry with analysis results
+                    if let Some(entry) = file_cache.get_mut(rel_path) {
+                        entry.functions = file_functions.clone();
+                        entry.types = file_types.clone();
+                        entry.macros = file_macros.clone();
                     }
-                    for ty in file_types {
-                        types.entry(ty.name.to_lowercase()).or_default().push(ty);
-                    }
-                    for mac in file_macros {
-                        macros.entry(mac.name.to_lowercase()).or_default().push(mac);
-                    }
+                    insert_symbols(
+                        &file_functions,
+                        &file_types,
+                        &file_macros,
+                        &mut functions,
+                        &mut types,
+                        &mut macros,
+                    );
                 }
                 Err(e) => {
-                    tracing::info!(
-                        "Failed to analyze dirty file {}: {}",
-                        dirty_file.relative_path,
-                        e
-                    );
+                    tracing::info!("Failed to analyze dirty file {}: {}", rel_path, e);
                 }
             }
         }
+        tracing::info!(
+            "workdir: tree-sitter analysis ({} files): {:?}",
+            dirty_files_to_analyze.len(),
+            t.elapsed()
+        );
+
+        tracing::info!("workdir: total build time: {:?}", total_start.elapsed());
 
         Ok(Self {
             functions,
@@ -182,6 +353,8 @@ impl WorkdirIndex {
             macros,
             dirty_manifest,
             deleted_files,
+            file_cache,
+            head_sha: current_head_sha,
         })
     }
 
@@ -391,55 +564,6 @@ impl WorkdirIndex {
 
     // --- Private helpers ---
 
-    /// Walk a directory recursively, collecting files with supported extensions.
-    fn walk_directory(
-        root: &Path,
-        dir: &Path,
-        files: &mut HashMap<String, std::path::PathBuf>,
-    ) -> Result<()> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(()), // Skip unreadable directories
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-
-            // Skip hidden directories and common non-source directories
-            if name_str.starts_with('.') || name_str == "target" || name_str == "node_modules" {
-                continue;
-            }
-
-            if path.is_dir() {
-                Self::walk_directory(root, &path, files)?;
-            } else if path.is_file() {
-                let rel_path = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-                if is_supported_for_analysis(&rel_path) {
-                    files.insert(rel_path, path);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Compute blake3 hash of a git blob's content by its OID.
-    fn blob_blake3_hash(repo: &gix::Repository, oid_hex: &str) -> Option<String> {
-        let oid = gix::ObjectId::from_hex(oid_hex.as_bytes()).ok()?;
-        let object = repo.find_object(oid).ok()?;
-        let content = object.data.as_bstr().to_str().ok()?;
-        Some(compute_blake3_hash(content))
-    }
-
     /// Select the best function from multiple matches (prefers .c over .h, longer body).
     fn best_function(matches: &[FunctionInfo]) -> Option<&FunctionInfo> {
         if matches.is_empty() {
@@ -459,6 +583,46 @@ impl WorkdirIndex {
     }
 }
 
+/// Extract mtime as (seconds, nanoseconds) from file metadata.
+fn mtime_from_metadata(meta: &std::fs::Metadata) -> (u64, u32) {
+    match meta.modified() {
+        Ok(mtime) => match mtime.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs(), d.subsec_nanos()),
+            Err(_) => (0, 0),
+        },
+        Err(_) => (0, 0),
+    }
+}
+
+/// Insert analysis results into the aggregated symbol maps.
+fn insert_symbols(
+    file_functions: &[FunctionInfo],
+    file_types: &[TypeInfo],
+    file_macros: &[FunctionInfo],
+    functions: &mut HashMap<String, Vec<FunctionInfo>>,
+    types: &mut HashMap<String, Vec<TypeInfo>>,
+    macros: &mut HashMap<String, Vec<FunctionInfo>>,
+) {
+    for func in file_functions {
+        functions
+            .entry(func.name.to_lowercase())
+            .or_default()
+            .push(func.clone());
+    }
+    for ty in file_types {
+        types
+            .entry(ty.name.to_lowercase())
+            .or_default()
+            .push(ty.clone());
+    }
+    for mac in file_macros {
+        macros
+            .entry(mac.name.to_lowercase())
+            .or_default()
+            .push(mac.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,7 +634,7 @@ mod tests {
         let repo_path = tmpdir.path().to_path_buf();
 
         // Initialize a git repo using gix
-        let repo = gix::init(&repo_path).unwrap();
+        let _repo = gix::init(&repo_path).unwrap();
 
         // Create a C source file
         let src_path = repo_path.join("test.c");
@@ -521,9 +685,6 @@ void hello(void);
             .env("GIT_COMMITTER_EMAIL", "test@test.com")
             .output()
             .unwrap();
-
-        // Drop and re-discover to pick up the commit
-        drop(repo);
 
         (tmpdir, repo_path)
     }
@@ -578,7 +739,7 @@ void hello(void) {
     fn test_new_file_detected() {
         let (_tmpdir, repo_path) = create_test_repo();
 
-        // Add a new file
+        // Add a new file and stage it (git add) so it appears in the index
         fs::write(
             repo_path.join("new.c"),
             r#"
@@ -588,6 +749,11 @@ int multiply(int a, int b) {
 "#,
         )
         .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "new.c"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
 
         let index = WorkdirIndex::build(&repo_path).unwrap();
         assert!(!index.is_empty());
@@ -612,7 +778,7 @@ int multiply(int a, int b) {
     fn test_merged_manifest() {
         let (_tmpdir, repo_path) = create_test_repo();
 
-        // Modify test.c and add new.c
+        // Modify test.c and stage a new file
         fs::write(
             repo_path.join("test.c"),
             "int changed(void) { return 1; }\n",
@@ -623,6 +789,11 @@ int multiply(int a, int b) {
             "int new_func(void) { return 2; }\n",
         )
         .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "new.c"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
 
         let index = WorkdirIndex::build(&repo_path).unwrap();
 
@@ -637,7 +808,7 @@ int multiply(int a, int b) {
         assert_ne!(merged.get("test.c").unwrap(), "abc123");
         // test.h should be unchanged
         assert_eq!(merged.get("test.h").unwrap(), "def456");
-        // new.c should be added
+        // new.c should be added (it's staged)
         assert!(merged.contains_key("new.c"));
     }
 
@@ -708,5 +879,43 @@ int unrelated(void) { return 3; }
         let index = WorkdirIndex::build(&repo_path).unwrap();
         let results = index.find_functions_regex("foo_.*");
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_incremental_reuses_cache() {
+        let (_tmpdir, repo_path) = create_test_repo();
+
+        // Modify test.c
+        fs::write(
+            repo_path.join("test.c"),
+            r#"
+int modified_func(void) { return 42; }
+"#,
+        )
+        .unwrap();
+
+        // First build
+        let index1 = WorkdirIndex::build(&repo_path).unwrap();
+        assert!(index1.find_function("modified_func").is_some());
+        assert_eq!(index1.dirty_file_count(), 1);
+
+        // Second build (incremental) — file hasn't changed, should reuse cache
+        let index2 = WorkdirIndex::build_incremental(&repo_path, Some(&index1)).unwrap();
+        assert!(index2.find_function("modified_func").is_some());
+        assert_eq!(index2.dirty_file_count(), 1);
+
+        // Modify the file again
+        fs::write(
+            repo_path.join("test.c"),
+            r#"
+int another_func(void) { return 99; }
+"#,
+        )
+        .unwrap();
+
+        // Third build (incremental) — file changed, should re-analyze
+        let index3 = WorkdirIndex::build_incremental(&repo_path, Some(&index2)).unwrap();
+        assert!(index3.find_function("another_func").is_some());
+        assert!(index3.find_function("modified_func").is_none());
     }
 }
