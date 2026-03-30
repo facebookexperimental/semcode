@@ -417,7 +417,6 @@ pub fn parse_email_from_commit(
     // Split headers and body
     let mut lines = email_content.lines();
     let mut in_headers = true;
-    let mut header_lines = Vec::new();
     let mut body_lines = Vec::new();
     let mut current_header: Option<(String, String)> = None;
 
@@ -431,9 +430,6 @@ pub fn parse_email_from_commit(
                 in_headers = false;
                 continue;
             }
-
-            // Store the header line as-is
-            header_lines.push(line);
 
             // Check if this is a continuation line (starts with whitespace)
             if line.starts_with(' ') || line.starts_with('\t') {
@@ -465,7 +461,6 @@ pub fn parse_email_from_commit(
     }
 
     let recipients = headers.recipients_list.join(", ");
-    let header_text = header_lines.join("\n");
     let body = body_lines.join("\n");
 
     // Extract symbols from any diffs found in the email body
@@ -480,7 +475,6 @@ pub fn parse_email_from_commit(
         subject: headers.subject,
         references: headers.references,
         recipients,
-        headers: header_text,
         body,
         symbols,
     })
@@ -968,6 +962,23 @@ pub async fn process_lore_commits_pipeline(
                         if let Err(e) = db_manager_clone.insert_lore_emails(&emails).await {
                             error!("Inserter {} failed to insert batch: {}", inserter_id, e);
                         } else {
+                            // Record processed commit SHAs so they are
+                            // not re-examined on subsequent runs.
+                            let shas: Vec<String> = emails.iter()
+                                .map(|e| e.git_commit_sha.as_str())
+                                .collect::<std::collections::HashSet<_>>()
+                                .into_iter()
+                                .map(String::from)
+                                .collect();
+                            if let Err(e) = db_manager_clone
+                                .insert_lore_indexed_commits(&shas).await
+                            {
+                                error!(
+                                    "Inserter {} failed to record indexed commits: {}",
+                                    inserter_id, e
+                                );
+                            }
+
                             let count = inserted_clone.fetch_add(batch_len, Ordering::Relaxed);
                             pb_clone.set_message(format!("Inserted {} emails", count + batch_len));
 

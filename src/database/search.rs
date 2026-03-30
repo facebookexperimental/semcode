@@ -2726,7 +2726,13 @@ impl VectorSearchManager {
             ("vector", Arc::new(vector_array) as ArrayRef),
         ])?;
 
-        commit_vectors_table.add(vec![batch]).execute().await?;
+        let mut merge_insert = commit_vectors_table.merge_insert(&["git_commit_sha"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        let schema = batch.schema();
+        let batch_reader = arrow::array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        merge_insert.execute(Box::new(batch_reader)).await?;
 
         Ok(())
     }
@@ -3087,7 +3093,13 @@ async fn insert_lore_vectors_batch_with_table(
         ("vector", Arc::new(vector_array) as ArrayRef),
     ])?;
 
-    lore_vectors_table.add(vec![batch]).execute().await?;
+    let mut merge_insert = lore_vectors_table.merge_insert(&["message_id"]);
+    merge_insert
+        .when_matched_update_all(None)
+        .when_not_matched_insert_all();
+    let schema = batch.schema();
+    let batch_reader = arrow::array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    merge_insert.execute(Box::new(batch_reader)).await?;
 
     Ok(())
 }
@@ -3596,18 +3608,13 @@ impl VectorSearchManager {
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let headers_array = batch
+                let body_array = batch
                     .column(8)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
-                let body_array = batch
-                    .column(9)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
                 let symbols_array = batch
-                    .column(10)
+                    .column(9)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
@@ -3689,7 +3696,6 @@ impl VectorSearchManager {
                                 Some(references_array.value(i).to_string())
                             },
                             recipients: recipients_array.value(i).to_string(),
-                            headers: headers_array.value(i).to_string(),
                             body: body_array.value(i).to_string(),
                             symbols,
                         },

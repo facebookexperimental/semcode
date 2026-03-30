@@ -29,16 +29,21 @@ pub fn write_email_as_mbox(email: &LoreEmailInfo, writer: &mut dyn Write) -> Res
     // Write the "From " separator line
     writeln!(writer, "From {} {}", sender, asctime_date)?;
 
-    // Write the headers (already includes the original message headers)
-    write!(writer, "{}", email.headers)?;
-
-    // Ensure there's a blank line between headers and body
-    if !email.headers.ends_with('\n') {
-        writeln!(writer)?;
+    // Reconstruct RFC 5322 headers from individual fields
+    writeln!(writer, "From: {}", email.from)?;
+    writeln!(writer, "Subject: {}", email.subject)?;
+    writeln!(writer, "Date: {}", email.date)?;
+    writeln!(writer, "Message-ID: {}", email.message_id)?;
+    if let Some(ref in_reply_to) = email.in_reply_to {
+        writeln!(writer, "In-Reply-To: {}", in_reply_to)?;
     }
-    if !email.headers.ends_with("\n\n") {
-        writeln!(writer)?;
+    if let Some(ref references) = email.references {
+        writeln!(writer, "References: {}", references)?;
     }
+    if !email.recipients.is_empty() {
+        writeln!(writer, "To: {}", email.recipients)?;
+    }
+    writeln!(writer)?;
 
     // Write the body
     write!(writer, "{}", email.body)?;

@@ -137,7 +137,6 @@ pub struct LoreEmailInfo {
     pub subject: String,             // Subject line
     pub references: Option<String>,  // Full list of References headers (nullable)
     pub recipients: String,          // Full list of To/CC recipients
-    pub headers: String,             // Email headers (everything before first blank line)
     pub body: String,                // Email body (everything after first blank line)
     pub symbols: Vec<String>,        // List of symbols referenced in the email (empty for now)
 }

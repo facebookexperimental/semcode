@@ -62,6 +62,12 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "lore") {
             self.create_lore_table().await?;
+        } else {
+            self.migrate_lore_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "lore_indexed_commits") {
+            self.create_lore_indexed_commits_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "lore_vectors") {
@@ -257,7 +263,6 @@ impl SchemaManager {
             Field::new("subject", DataType::Utf8, false),        // Subject line
             Field::new("references", DataType::Utf8, true), // Full list of references (nullable)
             Field::new("recipients", DataType::Utf8, false), // Full list of cc/to recipients
-            Field::new("headers", DataType::Utf8, false), // Email headers (everything before first blank line)
             Field::new("body", DataType::Utf8, false), // Email body (everything after first blank line)
             Field::new("symbols", DataType::Utf8, false), // JSON array of symbols referenced in email
         ]));
@@ -270,6 +275,55 @@ impl SchemaManager {
             .await?;
 
         tracing::info!("Created lore table for email archive indexing");
+        Ok(())
+    }
+
+    /// Migrate an existing lore table to the current schema.
+    async fn migrate_lore_table(&self) -> Result<()> {
+        let table = self.connection.open_table("lore").execute().await?;
+        let schema = table.schema().await?;
+
+        // Drop the "headers" column if it exists; individual header
+        // fields are stored in their own columns and reconstructed
+        // on demand for MBOX output.
+        if schema.column_with_name("headers").is_some() {
+            tracing::info!("Migrating lore table: dropping 'headers' column");
+            table.drop_columns(&["headers"]).await?;
+
+            // drop_columns() is a schema-only operation; old data
+            // fragments still carry the headers bytes on disk.
+            // Compact to rewrite fragments without the column,
+            // then prune to delete the stale files.
+            tracing::info!("Compacting lore table to reclaim space");
+            match Self::optimize_single_table(&self.connection, "lore").await? {
+                OptimizeOutcome::Optimized => {
+                    tracing::info!("Lore table migration complete");
+                }
+                OptimizeOutcome::Skipped => {
+                    tracing::info!("Lore table compaction skipped (table too small)");
+                }
+                OptimizeOutcome::PartialFailure => {
+                    tracing::warn!("Lore table compaction partially failed");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn create_lore_indexed_commits_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+
+        self.connection
+            .create_table("lore_indexed_commits", vec![empty_batch])
+            .execute()
+            .await?;
+
+        tracing::info!("Created lore_indexed_commits table");
         Ok(())
     }
 
@@ -754,33 +808,34 @@ impl SchemaManager {
             .await
         {
             Ok(_) => tracing::info!("✓ Completed {}", description),
-            Err(e) => tracing::debug!("{} may already exist: {}", description, e),
+            Err(e) => tracing::warn!("Failed to create {}: {}", description, e),
         }
     }
 
     /// Create FTS indices for lore table (must be called after data is inserted)
-    /// Only creates indices if they don't already exist
+    ///
+    /// Drops any existing FTS indices first, creates fresh ones, then
+    /// prunes so that the on-disk index directories from prior data
+    /// layouts are actually removed.
     pub async fn create_lore_fts_indices(&self) -> Result<()> {
         let table = self.connection.open_table("lore").execute().await?;
 
-        // Check if FTS indices already exist by trying to list them
+        // Drop existing FTS indices before recreating them.
+        // drop_index() removes the logical reference but leaves the
+        // old directory under _indices/ as orphaned data; a prune
+        // pass below reclaims that space.
+        use lancedb::index::IndexType;
         let indices: Vec<lancedb::index::IndexConfig> =
             (table.list_indices().await).unwrap_or_default();
-
-        // Check if FTS indices already exist (index_type must be FTS)
-        use lancedb::index::IndexType;
-        let has_fts_indices = indices.iter().any(|idx| {
-            idx.index_type == IndexType::FTS
-                && (idx.columns.contains(&"from".to_string())
-                    || idx.columns.contains(&"subject".to_string())
-                    || idx.columns.contains(&"body".to_string())
-                    || idx.columns.contains(&"recipients".to_string())
-                    || idx.columns.contains(&"symbols".to_string()))
-        });
-
-        if has_fts_indices {
-            tracing::info!("FTS indices already exist for lore table, skipping creation");
-            return Ok(());
+        let mut dropped = false;
+        for idx in &indices {
+            if idx.index_type == IndexType::FTS {
+                tracing::info!("Dropping stale FTS index: {}", idx.name);
+                if let Err(e) = table.drop_index(&idx.name).await {
+                    tracing::warn!("Failed to drop FTS index {}: {}", idx.name, e);
+                }
+                dropped = true;
+            }
         }
 
         // Create FTS indices for text search on all searchable fields in parallel
@@ -801,6 +856,28 @@ impl SchemaManager {
             "Completed creating 5 FTS indices in {:.1}s",
             elapsed.as_secs_f64()
         );
+
+        // Prune orphaned index data left behind by drop_index()
+        // and by OptimizeAction::Index in optimize_single_table(),
+        // which rebuilds all indices (including FTS) into new
+        // directories without removing the old ones.
+        if dropped {
+            tracing::info!("Pruning orphaned index data from lore table...");
+            if let Err(e) = table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(
+                        lancedb::table::Duration::try_seconds(0)
+                            .expect("valid duration"),
+                    ),
+                    delete_unverified: Some(true),
+                    error_if_tagged_old_versions: Some(false),
+                })
+                .await
+            {
+                tracing::warn!("Failed to prune lore table after FTS rebuild: {}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -860,6 +937,7 @@ impl SchemaManager {
             "git_commits".to_string(),
             "lore".to_string(),
             "indexed_branches".to_string(),
+            "lore_indexed_commits".to_string(),
         ];
 
         // Add all content shard tables
@@ -968,15 +1046,49 @@ impl SchemaManager {
         let mut success = true;
 
         // 1. Compact files
-        if let Err(e) = table
-            .optimize(OptimizeAction::Compact {
-                options: Default::default(),
-                remap_options: None,
-            })
-            .await
-        {
-            tracing::warn!("Failed to compact table {}: {}", table_name, e);
-            success = false;
+        const MAX_COMPACT_FRAGMENTS: usize = 500;
+
+        let should_compact = match table.stats().await {
+            Ok(stats)
+                if stats.fragment_stats.num_fragments
+                    > MAX_COMPACT_FRAGMENTS =>
+            {
+                tracing::warn!(
+                    "Skipping compaction for table {} \
+                     ({} fragments exceeds {} limit -- \
+                     rebuild with --clear to resolve)",
+                    table_name,
+                    stats.fragment_stats.num_fragments,
+                    MAX_COMPACT_FRAGMENTS
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read stats for table {}: {}",
+                    table_name,
+                    e
+                );
+                true
+            }
+        };
+
+        if should_compact {
+            if let Err(e) = table
+                .optimize(OptimizeAction::Compact {
+                    options: Default::default(),
+                    remap_options: None,
+                })
+                .await
+            {
+                tracing::warn!(
+                    "Failed to compact table {}: {}",
+                    table_name,
+                    e
+                );
+                success = false;
+            }
         }
 
         // 2. Prune ALL old versions
@@ -1039,6 +1151,7 @@ impl SchemaManager {
             "git_commits",
             "lore",
             "indexed_branches",
+            "lore_indexed_commits",
         ];
 
         // Add all content shard tables
@@ -1202,6 +1315,7 @@ impl SchemaManager {
             "symbol_filename" => self.create_symbol_filename_table().await,
             "git_commits" => self.create_git_commits_table().await,
             "lore" => self.create_lore_table().await,
+            "lore_indexed_commits" => self.create_lore_indexed_commits_table().await,
             "indexed_branches" => self.create_indexed_branches_table().await,
             "content" => self.create_content_table().await,
             name if name.starts_with("content_") => {

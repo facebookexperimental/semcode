@@ -84,7 +84,13 @@ impl VectorStore {
             ("vector", Arc::new(vector_array) as ArrayRef),
         ])?;
 
-        table.add(vec![batch]).execute().await?;
+        let mut merge_insert = table.merge_insert(&["content_hash"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        let schema = batch.schema();
+        let batch_reader = arrow::array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        merge_insert.execute(Box::new(batch_reader)).await?;
 
         Ok(())
     }
