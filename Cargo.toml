@@ -75,3 +75,4 @@ path = "src/bin/semcode-lsp.rs"
 
 [profile.release]
 debug = false
+frame-pointers = true
