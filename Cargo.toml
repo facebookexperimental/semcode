@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 [package]
 name = "semcode"
-version = "0.1.0"
+version = "0.1.1"
+authors = ["Chris Mason <clm@meta.com>"]
+description = "Semantic code search for C/C++ codebases"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/facebookexperimental/semcode"
 
 [dependencies]
 lancedb = "0.27"
