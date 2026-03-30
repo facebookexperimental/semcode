@@ -110,8 +110,18 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
     let stop_at = if from_spec.is_empty() {
         None
     } else {
-        let from_commit = resolve_to_commit(repo, from_spec)?;
-        Some(from_commit.id().detach())
+        match resolve_to_commit(repo, from_spec) {
+            Ok(from_commit) => Some(from_commit.id().detach()),
+            Err(e) => {
+                // Parent commit not found (shallow clone or root commit).
+                // Fall back to returning just the target commit.
+                info!(
+                    "Could not resolve '{}' ({}); falling back to single-commit indexing",
+                    from_spec, e
+                );
+                return Ok(vec![to_id.to_string()]);
+            }
+        }
     };
 
     let mut shas = Vec::new();
@@ -136,8 +146,12 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
             ));
         }
 
-        // Get the first parent to continue walking
-        let commit = repo.find_commit(current_id)?;
+        // Get the first parent to continue walking.
+        // In shallow clones, parent objects may be missing — treat as end of history.
+        let commit = match repo.find_commit(current_id) {
+            Ok(c) => c,
+            Err(_) => break,
+        };
         let parent_ids: Vec<_> = commit.parent_ids().collect();
 
         if parent_ids.is_empty() {
