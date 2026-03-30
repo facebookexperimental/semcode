@@ -2,6 +2,7 @@
 use crate::CallRelationship;
 use anyhow::Result;
 use arrow::array::{Array, StringArray};
+use arrow::record_batch::RecordBatch;
 use colored::*;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
@@ -2809,22 +2810,16 @@ impl DatabaseManager {
                 .try_collect::<Vec<_>>()
                 .await?;
 
-            // Extract function info from results
-            for batch in &function_results {
-                for i in 0..batch.num_rows() {
-                    if path_pattern.is_none() && limit > 0 && matching_functions.len() >= limit {
-                        limit_hit = true;
-                        break;
-                    }
-
-                    if let Some(func) = self
-                        .function_store
-                        .extract_function_from_batch(batch, i)
-                        .await?
-                    {
-                        matching_functions.push(func);
-                    }
+            let functions = self
+                .function_store
+                .extract_functions_from_batches(&function_results)
+                .await?;
+            for func in functions {
+                if path_pattern.is_none() && limit > 0 && matching_functions.len() >= limit {
+                    limit_hit = true;
+                    break;
                 }
+                matching_functions.push(func);
             }
         } else {
             // For larger result sets, use batched queries optimized for parallel processing
@@ -2847,10 +2842,13 @@ impl DatabaseManager {
                 chunks.len(), chunk_size, concurrent_limit,
                 std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
 
+            // Collect all function batches from every chunk, then do a single bulk
+            // content fetch across all chunks to avoid repeated table opens.
+            let mut all_function_batches: Vec<RecordBatch> = Vec::new();
+
             let mut chunk_stream = stream::iter(chunks)
                 .map(|chunk| {
                     let functions_table = &functions_table;
-                    let function_store = &self.function_store;
                     async move {
                         let hash_list: Vec<String> =
                             chunk.iter().map(|hash| format!("'{hash}'")).collect();
@@ -2866,41 +2864,27 @@ impl DatabaseManager {
                             .try_collect::<Vec<_>>()
                             .await?;
 
-                        // Extract functions from this chunk with potential parallel batch processing
-                        let mut chunk_functions = Vec::new();
-                        for batch in &function_results {
-                            // For large batches, we could add more parallelism here if needed
-                            // Currently keeping sequential to avoid over-parallelization
-                            for i in 0..batch.num_rows() {
-                                if let Some(func) =
-                                    function_store.extract_function_from_batch(batch, i).await?
-                                {
-                                    chunk_functions.push(func);
-                                }
-                            }
-                        }
-
-                        Ok::<Vec<crate::types::FunctionInfo>, anyhow::Error>(chunk_functions)
+                        Ok::<Vec<RecordBatch>, anyhow::Error>(function_results)
                     }
                 })
                 .buffer_unordered(concurrent_limit);
 
-            // Collect results from parallel chunks
             while let Some(chunk_result) = chunk_stream.next().await {
-                let chunk_functions = chunk_result?;
+                all_function_batches.extend(chunk_result?);
+            }
 
-                for func in chunk_functions {
-                    if path_pattern.is_none() && limit > 0 && matching_functions.len() >= limit {
-                        limit_hit = true;
-                        break;
-                    }
-                    matching_functions.push(func);
-                }
+            let functions = self
+                .function_store
+                .extract_functions_from_batches(&all_function_batches)
+                .await?;
 
-                // Early termination if we've hit the limit
-                if limit_hit {
+            // Collect results, applying the limit
+            for func in functions {
+                if path_pattern.is_none() && limit > 0 && matching_functions.len() >= limit {
+                    limit_hit = true;
                     break;
                 }
+                matching_functions.push(func);
             }
         }
 

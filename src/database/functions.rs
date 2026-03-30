@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::content::ContentStore;
+use crate::database::get_column;
 use crate::types::{FunctionInfo, ParameterInfo};
 
 #[derive(Debug, Clone)]
-struct FunctionMetadata {
+pub(crate) struct FunctionMetadata {
     pub name: String,
     pub file_path: String,
     pub git_file_hash: String,
@@ -310,15 +311,7 @@ impl FunctionStore {
             return Ok(Vec::new());
         }
 
-        let batch = &results[0];
-        let mut candidates = Vec::new();
-
-        // Extract all matching functions
-        for i in 0..batch.num_rows() {
-            if let Some(func) = self.extract_function_from_batch(batch, i).await? {
-                candidates.push(func);
-            }
-        }
+        let candidates = self.extract_functions_from_batches(&results).await?;
 
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -361,16 +354,7 @@ impl FunctionStore {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut all_functions = Vec::new();
-
-        for batch in &results {
-            // Extract ALL matching functions without any filtering
-            for i in 0..batch.num_rows() {
-                if let Some(func) = self.extract_function_from_batch(batch, i).await? {
-                    all_functions.push(func);
-                }
-            }
-        }
+        let all_functions = self.extract_functions_from_batches(&results).await?;
 
         Ok(all_functions)
     }
@@ -399,18 +383,10 @@ impl FunctionStore {
             .try_collect::<Vec<_>>()
             .await?;
 
-        // Search through all batches for the exact hash match
-        for batch in &results {
-            for i in 0..batch.num_rows() {
-                if let Some(func) = self.extract_function_from_batch(batch, i).await? {
-                    if func.git_file_hash == git_hash_to_match {
-                        return Ok(Some(func));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
+        let functions = self.extract_functions_from_batches(&results).await?;
+        Ok(functions
+            .into_iter()
+            .find(|f| f.git_file_hash == git_hash_to_match))
     }
 
     pub async fn get_all(&self) -> Result<Vec<FunctionInfo>> {
@@ -558,61 +534,21 @@ impl FunctionStore {
     }
 
     /// Extract function metadata from batch without content lookup
-    fn extract_function_metadata_from_batch(
+    pub(crate) fn extract_function_metadata_from_batch(
         &self,
         batch: &RecordBatch,
         row: usize,
     ) -> Result<Option<FunctionMetadata>> {
-        let name_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let file_path_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let git_file_hash_array = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let line_start_array = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let line_end_array = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let return_type_array = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let parameters_array = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let body_hash_array = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let calls_array = batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let types_array = batch
-            .column(9)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let name_array = get_column::<StringArray>(batch, "name")?;
+        let file_path_array = get_column::<StringArray>(batch, "file_path")?;
+        let git_file_hash_array = get_column::<StringArray>(batch, "git_file_hash")?;
+        let line_start_array = get_column::<arrow::array::Int64Array>(batch, "line_start")?;
+        let line_end_array = get_column::<arrow::array::Int64Array>(batch, "line_end")?;
+        let return_type_array = get_column::<StringArray>(batch, "return_type")?;
+        let parameters_array = get_column::<StringArray>(batch, "parameters")?;
+        let body_hash_array = get_column::<StringArray>(batch, "body_hash")?;
+        let calls_array = get_column::<StringArray>(batch, "calls")?;
+        let types_array = get_column::<StringArray>(batch, "types")?;
 
         let parameters: Vec<ParameterInfo> =
             serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
@@ -652,11 +588,70 @@ impl FunctionStore {
     }
 
     /// Bulk fetch content for multiple hashes
-    async fn bulk_get_content(
+    pub async fn bulk_get_content(
         &self,
         hashes: &[String],
     ) -> Result<std::collections::HashMap<String, String>> {
         self.content_store.get_content_bulk(hashes).await
+    }
+
+    /// Extract all functions from a slice of batches using bulk content lookup.
+    ///
+    /// Iterates the batches to collect metadata and unique body hashes, then
+    /// issues a single bulk content fetch before assembling the final
+    /// `FunctionInfo` values.  This avoids one `open_table` call per row.
+    pub async fn extract_functions_from_batches(
+        &self,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<FunctionInfo>> {
+        let mut all_metadata = Vec::new();
+        let mut body_hashes = std::collections::HashSet::new();
+
+        for batch in batches {
+            for i in 0..batch.num_rows() {
+                match self.extract_function_metadata_from_batch(batch, i) {
+                    Ok(Some(meta)) => {
+                        if let Some(ref h) = meta.body_hash {
+                            body_hashes.insert(h.clone());
+                        }
+                        all_metadata.push(meta);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Skipping row {i} in batch: {e}");
+                    }
+                }
+            }
+        }
+
+        let content_map = if !body_hashes.is_empty() {
+            let hash_vec: Vec<String> = body_hashes.into_iter().collect();
+            self.bulk_get_content(&hash_vec).await?
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        let mut functions = Vec::with_capacity(all_metadata.len());
+        for meta in all_metadata {
+            let body = match meta.body_hash {
+                Some(ref h) => content_map.get(h).cloned().unwrap_or_default(),
+                None => String::new(),
+            };
+            functions.push(FunctionInfo {
+                name: meta.name,
+                file_path: meta.file_path,
+                git_file_hash: meta.git_file_hash,
+                line_start: meta.line_start,
+                line_end: meta.line_end,
+                return_type: meta.return_type,
+                parameters: meta.parameters,
+                body,
+                calls: meta.calls,
+                types: meta.types,
+            });
+        }
+
+        Ok(functions)
     }
 
     /// Get functions by a list of names (batch lookup) - optimized to minimize content queries
@@ -739,131 +734,4 @@ impl FunctionStore {
         Ok(result)
     }
 
-    pub async fn extract_function_from_batch(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-    ) -> Result<Option<FunctionInfo>> {
-        let name_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let file_path_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let git_file_hash_array = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let line_start_array = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let line_end_array = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let return_type_array = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let parameters_array = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let body_hash_array = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let calls_array = batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let types_array = batch
-            .column(9)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        let parameters: Vec<ParameterInfo> =
-            serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
-
-        // Get function body from content table using hash (if not null)
-        let body = if body_hash_array.is_null(row) {
-            String::new() // Empty body for null hash
-        } else {
-            let hash_hex = body_hash_array.value(row);
-            tracing::info!(
-                "Retrieving function body for '{}' with hash: {}",
-                name_array.value(row),
-                hash_hex
-            );
-            match self.content_store.get_content(hash_hex).await? {
-                Some(content) => {
-                    tracing::info!(
-                        "Successfully retrieved content for '{}', size: {} bytes",
-                        name_array.value(row),
-                        content.len()
-                    );
-                    content
-                }
-                None => {
-                    tracing::error!(
-                        "Body content not found for function '{}' with hash: {} - this indicates a database consistency issue",
-                        name_array.value(row),
-                        hash_hex
-                    );
-                    // Check if content exists with a different lookup
-                    match self.content_store.content_exists(hash_hex).await {
-                        Ok(true) => {
-                            tracing::error!("Content exists check returned true but get_content returned None - possible race condition");
-                        }
-                        Ok(false) => {
-                            tracing::error!("Content definitely does not exist in content store");
-                        }
-                        Err(e) => {
-                            tracing::error!("Error checking content existence: {}", e);
-                        }
-                    }
-                    String::new() // Fallback to empty body if content not found
-                }
-            }
-        };
-
-        // Parse calls and types from JSON (they're nullable)
-        let calls = if calls_array.is_null(row) {
-            None
-        } else {
-            serde_json::from_str::<Vec<String>>(calls_array.value(row)).ok()
-        };
-
-        let types = if types_array.is_null(row) {
-            None
-        } else {
-            serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
-        };
-
-        Ok(Some(FunctionInfo {
-            name: name_array.value(row).to_string(),
-            file_path: file_path_array.value(row).to_string(),
-            git_file_hash: git_file_hash_array.value(row).to_string(),
-            line_start: line_start_array.value(row) as u32,
-            line_end: line_end_array.value(row) as u32,
-            return_type: return_type_array.value(row).to_string(),
-            parameters,
-            body,
-            calls,
-            types,
-        }))
-    }
 }

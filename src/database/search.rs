@@ -9,6 +9,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
 
 use crate::database::content::ContentStore;
+use crate::database::functions::FunctionStore;
 use crate::types::{FieldInfo, FunctionInfo, ParameterInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use std::collections::HashMap;
@@ -1772,15 +1773,15 @@ impl SearchManager {
 
 pub struct VectorSearchManager {
     connection: Connection,
-    content_store: ContentStore,
+    function_store: FunctionStore,
 }
 
 impl VectorSearchManager {
     pub fn new(connection: Connection) -> Self {
-        let content_store = ContentStore::new(connection.clone());
+        let function_store = FunctionStore::new(connection.clone());
         Self {
             connection,
-            content_store,
+            function_store,
         }
     }
 
@@ -2131,8 +2132,9 @@ impl VectorSearchManager {
         // Now query the functions table for these content hashes (in body_hash field)
         let functions_table = self.connection.open_table("functions").execute().await?;
 
-        // Process in chunks to avoid query size limits
-        let mut function_matches = Vec::new();
+        // Collect all record batches, then use FunctionStore to extract
+        // metadata and bulk-fetch content bodies in a single pass.
+        let mut all_batches = Vec::new();
         for chunk in content_hashes.chunks(100) {
             let hash_conditions: Vec<String> = chunk
                 .iter()
@@ -2148,34 +2150,66 @@ impl VectorSearchManager {
                 .try_collect::<Vec<_>>()
                 .await?;
 
-            for batch in &function_results {
-                // Get body_hash column to look up similarity scores
-                let body_hash_array = batch
-                    .column(7) // body_hash is column 7 in functions table
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+            all_batches.extend(function_results);
+        }
 
-                for i in 0..batch.num_rows() {
-                    if let Ok(Some(func)) = self
-                        .extract_function_from_batch(batch, i, &self.content_store)
-                        .await
-                    {
-                        // Get the similarity score for this function's body hash
-                        let similarity_score = if body_hash_array.is_null(i) {
-                            0.0 // Default score for functions without body hash
-                        } else {
-                            let body_hash = body_hash_array.value(i);
-                            score_map.get(body_hash).copied().unwrap_or(0.0)
-                        };
-
-                        function_matches.push(FunctionMatch {
-                            function: func,
-                            similarity_score,
-                        });
+        // Extract metadata to get body_hashes for score lookup, then
+        // bulk-fetch content and assemble FunctionInfo via the store.
+        let mut all_metadata = Vec::new();
+        for batch in &all_batches {
+            for i in 0..batch.num_rows() {
+                match self.function_store.extract_function_metadata_from_batch(batch, i) {
+                    Ok(Some(meta)) => {
+                        all_metadata.push(meta);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Skipping row {i} in batch: {e}");
                     }
                 }
             }
+        }
+
+        let body_hashes: Vec<String> = all_metadata
+            .iter()
+            .filter_map(|m| m.body_hash.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let content_map = if !body_hashes.is_empty() {
+            self.function_store.bulk_get_content(&body_hashes).await?
+        } else {
+            HashMap::new()
+        };
+
+        let mut function_matches = Vec::new();
+        for meta in all_metadata {
+            let similarity_score = meta
+                .body_hash
+                .as_deref()
+                .and_then(|h| score_map.get(h).copied())
+                .unwrap_or(0.0);
+            let body = meta
+                .body_hash
+                .as_ref()
+                .and_then(|h| content_map.get(h).cloned())
+                .unwrap_or_default();
+
+            function_matches.push(FunctionMatch {
+                function: FunctionInfo {
+                    name: meta.name,
+                    file_path: meta.file_path,
+                    git_file_hash: meta.git_file_hash,
+                    line_start: meta.line_start,
+                    line_end: meta.line_end,
+                    return_type: meta.return_type,
+                    parameters: meta.parameters,
+                    body,
+                    calls: meta.calls,
+                    types: meta.types,
+                },
+                similarity_score,
+            });
         }
 
         // Sort by similarity score (highest first) to show most relevant matches first
@@ -2198,84 +2232,6 @@ impl VectorSearchManager {
             .search_similar_functions_with_scores(query_vector, limit, filter)
             .await?;
         Ok(matches.into_iter().map(|m| m.function).collect())
-    }
-
-    // Helper method to extract function data from a batch - similar to the one in functions.rs
-    async fn extract_function_from_batch(
-        &self,
-        batch: &arrow::record_batch::RecordBatch,
-        row: usize,
-        content_store: &ContentStore,
-    ) -> Result<Option<FunctionInfo>> {
-        let name_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let file_path_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let git_hash_array = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-        let line_start_array = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let line_end_array = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        let return_type_array = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let parameters_array = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let body_hash_array = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        let parameters: Vec<ParameterInfo> = serde_json::from_str(parameters_array.value(row))?;
-
-        // Get function body from content table using hash (if not null)
-        let body = if body_hash_array.is_null(row) {
-            String::new()
-        } else {
-            let body_hash = body_hash_array.value(row);
-            match content_store.get_content(body_hash).await? {
-                Some(content) => content,
-                None => {
-                    tracing::warn!("Body content not found for hash: {}", body_hash);
-                    String::new() // Fallback to empty body if content not found
-                }
-            }
-        };
-
-        Ok(Some(FunctionInfo {
-            name: name_array.value(row).to_string(),
-            file_path: file_path_array.value(row).to_string(),
-            git_file_hash: git_hash_array.value(row).to_string(),
-            line_start: line_start_array.value(row) as u32,
-            line_end: line_end_array.value(row) as u32,
-            return_type: return_type_array.value(row).to_string(),
-            parameters,
-            body,
-            calls: None, // Not populated from database extraction helper
-            types: None, // Not populated from database extraction helper
-        }))
     }
 
     pub async fn search_similar_by_name(
