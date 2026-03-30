@@ -259,9 +259,9 @@ impl SchemaManager {
             Field::new("from", DataType::Utf8, false),           // From header in the email
             Field::new("date", DataType::Utf8, false),           // Date field (RFC 2822 format)
             Field::new("date_timestamp", DataType::Int64, false), // Unix timestamp for efficient date filtering
-            Field::new("message_id", DataType::Utf8, false),     // Message-ID header
-            Field::new("in_reply_to", DataType::Utf8, true),     // In-Reply-To header (nullable)
-            Field::new("subject", DataType::Utf8, false),        // Subject line
+            Field::new("message_id", DataType::Utf8, false),      // Message-ID header
+            Field::new("in_reply_to", DataType::Utf8, true),      // In-Reply-To header (nullable)
+            Field::new("subject", DataType::Utf8, false),         // Subject line
             Field::new("references", DataType::Utf8, true), // Full list of references (nullable)
             Field::new("recipients", DataType::Utf8, false), // Full list of cc/to recipients
             Field::new("body", DataType::Utf8, false), // Email body (everything after first blank line)
@@ -313,9 +313,11 @@ impl SchemaManager {
     }
 
     async fn create_lore_indexed_commits_table(&self) -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("git_commit_sha", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "git_commit_sha",
+            DataType::Utf8,
+            false,
+        )]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
 
@@ -867,8 +869,7 @@ impl SchemaManager {
             if let Err(e) = table
                 .optimize(OptimizeAction::Prune {
                     older_than: Some(
-                        lancedb::table::Duration::try_seconds(0)
-                            .expect("valid duration"),
+                        lancedb::table::Duration::try_seconds(0).expect("valid duration"),
                     ),
                     delete_unverified: Some(true),
                     error_if_tagged_old_versions: Some(false),
@@ -1050,10 +1051,7 @@ impl SchemaManager {
         const MAX_COMPACT_FRAGMENTS: usize = 500;
 
         let should_compact = match table.stats().await {
-            Ok(stats)
-                if stats.fragment_stats.num_fragments
-                    > MAX_COMPACT_FRAGMENTS =>
-            {
+            Ok(stats) if stats.fragment_stats.num_fragments > MAX_COMPACT_FRAGMENTS => {
                 tracing::warn!(
                     "Skipping compaction for table {} \
                      ({} fragments exceeds {} limit -- \
@@ -1066,11 +1064,7 @@ impl SchemaManager {
             }
             Ok(_) => true,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to read stats for table {}: {}",
-                    table_name,
-                    e
-                );
+                tracing::warn!("Failed to read stats for table {}: {}", table_name, e);
                 true
             }
         };
@@ -1083,11 +1077,7 @@ impl SchemaManager {
                 })
                 .await
             {
-                tracing::warn!(
-                    "Failed to compact table {}: {}",
-                    table_name,
-                    e
-                );
+                tracing::warn!("Failed to compact table {}: {}", table_name, e);
                 success = false;
             }
         }

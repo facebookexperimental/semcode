@@ -993,14 +993,15 @@ pub async fn process_lore_commits_pipeline(
                         } else {
                             // Record processed commit SHAs so they are
                             // not re-examined on subsequent runs.
-                            let shas: Vec<String> = emails.iter()
+                            let shas: Vec<String> = emails
+                                .iter()
                                 .map(|e| e.git_commit_sha.as_str())
                                 .collect::<std::collections::HashSet<_>>()
                                 .into_iter()
                                 .map(String::from)
                                 .collect();
-                            if let Err(e) = db_manager_clone
-                                .insert_lore_indexed_commits(&shas).await
+                            if let Err(e) =
+                                db_manager_clone.insert_lore_indexed_commits(&shas).await
                             {
                                 error!(
                                     "Inserter {} failed to record indexed commits: {}",

@@ -26,7 +26,10 @@ fn looks_like_base64(body: &str) -> bool {
             continue;
         }
         total_lines += 1;
-        if !trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+        if !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+        {
             return false;
         }
         if trimmed.len() == 76 {

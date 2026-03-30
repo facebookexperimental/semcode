@@ -661,9 +661,7 @@ async fn index_lore_archive(
 
     // Get already indexed commits from database
     println!("Checking for already-indexed commits...");
-    let existing_commits = db_manager
-        .get_indexed_lore_commits()
-        .await?;
+    let existing_commits = db_manager.get_indexed_lore_commits().await?;
 
     // Filter out already indexed commits
     let new_commits: Vec<String> = all_commit_shas

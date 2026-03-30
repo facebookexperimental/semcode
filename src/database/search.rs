@@ -2158,7 +2158,10 @@ impl VectorSearchManager {
         let mut all_metadata = Vec::new();
         for batch in &all_batches {
             for i in 0..batch.num_rows() {
-                match self.function_store.extract_function_metadata_from_batch(batch, i) {
+                match self
+                    .function_store
+                    .extract_function_metadata_from_batch(batch, i)
+                {
                     Ok(Some(meta)) => {
                         all_metadata.push(meta);
                     }
