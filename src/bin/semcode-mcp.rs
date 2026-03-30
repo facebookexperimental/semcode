@@ -2613,8 +2613,10 @@ impl McpServer {
             .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string())
     }
 
-    /// Resolve git SHA from either git_sha or branch argument
+    /// Resolve git SHA from either git_sha or branch argument.
     /// If branch is provided, resolve it to a SHA. Otherwise use git_sha or default.
+    /// When using the default HEAD SHA (no explicit git_sha or branch), refreshes
+    /// the working directory overlay so queries reflect uncommitted changes.
     fn resolve_git_sha_or_branch(
         &self,
         git_sha_arg: Option<&str>,
@@ -2623,14 +2625,43 @@ impl McpServer {
         // Branch takes precedence if provided
         if let Some(branch) = branch_arg {
             match git::resolve_branch(&self.git_repo_path, branch) {
-                Ok(sha) => return sha,
+                Ok(sha) => {
+                    // Explicit branch — disable workdir overlay
+                    self.db.clear_workdir_index();
+                    return sha;
+                }
                 Err(e) => {
                     eprintln!("Warning: Failed to resolve branch '{}': {}", branch, e);
                     // Fall through to git_sha or default
                 }
             }
         }
+
+        if git_sha_arg.is_some() {
+            // Explicit git SHA — disable workdir overlay
+            self.db.clear_workdir_index();
+        } else {
+            // Using default HEAD — refresh workdir overlay
+            self.refresh_workdir_index();
+        }
+
         self.resolve_git_sha(git_sha_arg)
+    }
+
+    /// Rebuild the working directory index to reflect current file state.
+    fn refresh_workdir_index(&self) {
+        let repo_path = std::path::Path::new(&self.git_repo_path);
+        let previous = self.db.take_workdir_index();
+        match semcode::WorkdirIndex::build_incremental(repo_path, previous.as_ref()) {
+            Ok(workdir) => {
+                if !workdir.is_empty() {
+                    self.db.set_workdir_index(workdir);
+                }
+            }
+            Err(e) => {
+                tracing::info!("Could not build working directory index: {}", e);
+            }
+        }
     }
 
     /// Check if the database appears to be empty and return a helpful message if so

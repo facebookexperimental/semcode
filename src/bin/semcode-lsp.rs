@@ -92,7 +92,32 @@ impl SemcodeLspBackend {
         }
     }
 
+    /// Rebuild the working directory index to reflect current file state.
+    async fn refresh_workdir_index(&self) {
+        let db_guard = self.database.lock().await;
+        let db = match db_guard.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
+        let repo_path_guard = self.git_repo_path.lock().await;
+        let repo_path = match repo_path_guard.as_ref() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        drop(repo_path_guard);
+
+        let path = std::path::Path::new(&repo_path);
+        let previous = db.take_workdir_index();
+        if let Ok(workdir) = semcode::WorkdirIndex::build_incremental(path, previous.as_ref()) {
+            if !workdir.is_empty() {
+                db.set_workdir_index(workdir);
+            }
+        }
+    }
+
     async fn find_function_definition(&self, identifier_name: &str) -> Option<Location> {
+        self.refresh_workdir_index().await;
+
         let db_guard = self.database.lock().await;
         let db = db_guard.as_ref()?;
 
@@ -156,6 +181,8 @@ impl SemcodeLspBackend {
     }
 
     async fn find_function_references(&self, function_name: &str) -> Vec<Location> {
+        self.refresh_workdir_index().await;
+
         let db_guard = self.database.lock().await;
         let db = match db_guard.as_ref() {
             Some(db) => db,
