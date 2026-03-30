@@ -6,6 +6,8 @@ both exact matches and semantic similarity.
 
 ## News
 
+Working directory overlay: queries now reflect uncommitted changes to tracked files automatically, no commit or re-index needed.
+
 Rust indexing is now supported.  This just uses treesitter, but all the
 semcode features are there.
 
@@ -27,6 +29,22 @@ you'll need to reindex your database.
 - **Pattern matching**
 - **MCP server** for integration with AI code tools
 - **GIT integration** for incremental scans of new commits
+
+### Working Directory Overlay
+
+All three tools (query, MCP server, LSP server) automatically detect
+uncommitted modifications to tracked files and overlay them on top of
+the indexed database. This means you can edit a file, and immediately
+query the new function definitions, callers, and types without
+committing or re-indexing.
+
+- Uses the git index for fast stat-based change detection (~500ms on a
+  93k-file kernel tree)
+- Only tracked files are checked; new files need `git add` to appear
+- Caches tree-sitter results across queries using mtime+size
+- The query tool's `--git-only` flag disables the overlay
+- The MCP server disables the overlay when an explicit `git_sha` or
+  `branch` parameter is passed
 
 While semcode provides both a query tool and an MCP server, the primary use
 case is via the MCP server.  It gives AI code tools the ability to quickly
