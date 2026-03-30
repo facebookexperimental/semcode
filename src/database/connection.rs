@@ -3914,6 +3914,28 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Parse an RFC 2822 date string into a Unix timestamp.
+    /// Returns 0 if parsing fails.
+    fn parse_date_to_timestamp(date_str: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc2822(date_str)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0)
+    }
+
+    /// Extract date_timestamp from a batch row, falling back to parsing the
+    /// date string for databases that predate the date_timestamp column.
+    fn get_date_timestamp(
+        date_timestamps: Option<&arrow::array::Int64Array>,
+        dates: &arrow::array::GenericStringArray<i32>,
+        row: usize,
+    ) -> i64 {
+        if let Some(ts) = date_timestamps {
+            ts.value(row)
+        } else {
+            Self::parse_date_to_timestamp(dates.value(row))
+        }
+    }
+
     /// Get all lore emails from the database
     pub async fn get_all_lore_emails(&self) -> Result<Vec<crate::types::LoreEmailInfo>> {
         use arrow::array::AsArray;
@@ -3943,10 +3965,7 @@ impl DatabaseManager {
                 .as_string::<i32>();
             let date_timestamps = batch
                 .column_by_name("date_timestamp")
-                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -3985,7 +4004,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
-                    date_timestamp: date_timestamps.value(i),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -4037,17 +4056,24 @@ impl DatabaseManager {
             until_timestamp
         );
 
-        // Build date filter clause for database-level filtering
-        let date_filter = match (since_timestamp, until_timestamp) {
-            (Some(since), Some(until)) => {
-                Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
-            }
-            (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
-            (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
-            (None, None) => None,
-        };
-
         let table = self.connection.open_table("lore").execute().await?;
+
+        // Only use date_timestamp filter if the column exists in the table
+        let has_date_timestamp = table.schema().await
+            .map(|s| s.field_with_name("date_timestamp").is_ok())
+            .unwrap_or(false);
+        let date_filter = if has_date_timestamp {
+            match (since_timestamp, until_timestamp) {
+                (Some(since), Some(until)) => {
+                    Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
+                }
+                (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
+                (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
+                (None, None) => None,
+            }
+        } else {
+            None
+        };
 
         // FTS uses simple tokenizer - normalize pattern by stripping special chars
         let fts_pattern = pattern
@@ -4115,10 +4141,7 @@ impl DatabaseManager {
                     .as_string::<i32>();
                 let date_timestamps = batch
                     .column_by_name("date_timestamp")
-                    .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
                 let message_ids = batch
                     .column_by_name("message_id")
                     .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4178,7 +4201,7 @@ impl DatabaseManager {
                         git_commit_sha: git_commit_shas.value(i).to_string(),
                         from: from_addrs.value(i).to_string(),
                         date: dates.value(i).to_string(),
-                        date_timestamp: date_timestamps.value(i),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                         message_id: message_ids.value(i).to_string(),
                         in_reply_to: if in_reply_tos.is_null(i) {
                             None
@@ -4518,14 +4541,24 @@ impl DatabaseManager {
             until_timestamp
         );
 
-        // Build date filter clause for database-level filtering
-        let date_filter = match (since_timestamp, until_timestamp) {
-            (Some(since), Some(until)) => {
-                Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
+        // Build date filter clause — only if the column exists in the table
+        let has_date_timestamp = {
+            let table = self.connection.open_table("lore").execute().await?;
+            table.schema().await
+                .map(|s| s.field_with_name("date_timestamp").is_ok())
+                .unwrap_or(false)
+        };
+        let date_filter = if has_date_timestamp {
+            match (since_timestamp, until_timestamp) {
+                (Some(since), Some(until)) => {
+                    Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
+                }
+                (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
+                (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
+                (None, None) => None,
             }
-            (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
-            (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
-            (None, None) => None,
+        } else {
+            None
         };
 
         // Fetch emails with date filtering at database level
@@ -4597,7 +4630,7 @@ impl DatabaseManager {
             let git_commit_sha_col = batch.column_by_name("git_commit_sha").unwrap();
             let from_col = batch.column_by_name("from").unwrap();
             let date_col = batch.column_by_name("date").unwrap();
-            let date_timestamp_col = batch.column_by_name("date_timestamp").unwrap();
+            let date_timestamp_col = batch.column_by_name("date_timestamp");
             let message_id_col = batch.column_by_name("message_id").unwrap();
             let in_reply_to_col = batch.column_by_name("in_reply_to").unwrap();
             let subject_col = batch.column_by_name("subject").unwrap();
@@ -4610,9 +4643,7 @@ impl DatabaseManager {
             let from_arr = from_col.as_string::<i32>();
             let date_arr = date_col.as_string::<i32>();
             let date_timestamp_arr = date_timestamp_col
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .unwrap();
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
             let message_id_arr = message_id_col.as_string::<i32>();
             let in_reply_to_arr = in_reply_to_col.as_string::<i32>();
             let subject_arr = subject_col.as_string::<i32>();
@@ -4629,7 +4660,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_sha_arr.value(i).to_string(),
                     from: from_arr.value(i).to_string(),
                     date: date_arr.value(i).to_string(),
-                    date_timestamp: date_timestamp_arr.value(i),
+                    date_timestamp: Self::get_date_timestamp(date_timestamp_arr, date_arr, i),
                     message_id: message_id_arr.value(i).to_string(),
                     in_reply_to: if in_reply_to_arr.is_null(i) {
                         None
@@ -4695,10 +4726,7 @@ impl DatabaseManager {
                 .as_string::<i32>();
             let date_timestamps = batch
                 .column_by_name("date_timestamp")
-                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4737,7 +4765,7 @@ impl DatabaseManager {
                 git_commit_sha: git_commit_shas.value(0).to_string(),
                 from: from_addrs.value(0).to_string(),
                 date: dates.value(0).to_string(),
-                date_timestamp: date_timestamps.value(0),
+                date_timestamp: Self::get_date_timestamp(date_timestamps, dates, 0),
                 message_id: message_ids.value(0).to_string(),
                 in_reply_to: if in_reply_tos.is_null(0) {
                     None
@@ -4812,10 +4840,7 @@ impl DatabaseManager {
                 .as_string::<i32>();
             let date_timestamps = batch
                 .column_by_name("date_timestamp")
-                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4861,7 +4886,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
-                    date_timestamp: date_timestamps.value(i),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id,
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -4907,19 +4932,24 @@ impl DatabaseManager {
         // Escape SQL string literal
         let escaped_subject = subject.replace("'", "''");
 
+        let table = self.connection.open_table("lore").execute().await?;
+        let has_date_timestamp = table.schema().await
+            .map(|s| s.field_with_name("date_timestamp").is_ok())
+            .unwrap_or(false);
+
         // Build WHERE clause with subject filter and optional date filters
         let mut where_parts = vec![format!("subject LIKE '%{}%'", escaped_subject)];
 
-        if let Some(since) = since_timestamp {
-            where_parts.push(format!("date_timestamp >= {}", since));
-        }
-        if let Some(until) = until_timestamp {
-            where_parts.push(format!("date_timestamp <= {}", until));
+        if has_date_timestamp {
+            if let Some(since) = since_timestamp {
+                where_parts.push(format!("date_timestamp >= {}", since));
+            }
+            if let Some(until) = until_timestamp {
+                where_parts.push(format!("date_timestamp <= {}", until));
+            }
         }
 
         let where_clause = where_parts.join(" AND ");
-
-        let table = self.connection.open_table("lore").execute().await?;
         let mut query = table.query().only_if(&where_clause);
 
         if limit > 0 {
@@ -4951,10 +4981,7 @@ impl DatabaseManager {
                 .as_string::<i32>();
             let date_timestamps = batch
                 .column_by_name("date_timestamp")
-                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -4993,7 +5020,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
-                    date_timestamp: date_timestamps.value(i),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -5056,10 +5083,7 @@ impl DatabaseManager {
                 .as_string::<i32>();
             let date_timestamps = batch
                 .column_by_name("date_timestamp")
-                .ok_or_else(|| anyhow::anyhow!("Missing date_timestamp column"))?
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("date_timestamp column is not Int64"))?;
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
             let message_ids = batch
                 .column_by_name("message_id")
                 .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
@@ -5098,7 +5122,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
-                    date_timestamp: date_timestamps.value(i),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
