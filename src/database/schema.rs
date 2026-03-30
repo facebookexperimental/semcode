@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub enum OptimizeOutcome {
     /// Table was successfully optimized (all operations completed)
     Optimized,
-    /// Table was skipped (too small to benefit from optimization)
+    /// Table was skipped (e.g., too few rows to benefit)
     Skipped,
     /// Optimization was attempted but one or more operations failed
     PartialFailure,
@@ -301,7 +301,7 @@ impl SchemaManager {
                     tracing::info!("Lore table migration complete");
                 }
                 OptimizeOutcome::Skipped => {
-                    tracing::info!("Lore table compaction skipped (table too small)");
+                    tracing::info!("Lore table compaction skipped (preserving FTS indices)");
                 }
                 OptimizeOutcome::PartialFailure => {
                     tracing::warn!("Lore table compaction partially failed");
@@ -1025,6 +1025,15 @@ impl SchemaManager {
         connection: &Connection,
         table_name: &str,
     ) -> Result<OptimizeOutcome> {
+        // Skip the lore table entirely: Compact, Prune, and
+        // OptimizeAction::Index each create new manifest versions
+        // that drop FTS index references, destroying full-text
+        // search until the next semcode-index --lore rebuild.
+        if table_name == "lore" {
+            tracing::info!("Skipping optimization for lore table (preserving FTS indices)");
+            return Ok(OptimizeOutcome::Skipped);
+        }
+
         // Minimum row count for optimization to be worthwhile
         const MIN_ROWS_FOR_OPTIMIZATION: usize = 1000;
 
