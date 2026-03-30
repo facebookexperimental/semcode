@@ -63,45 +63,42 @@ async fn index_current_commit_if_needed(
 
     let repo_path = PathBuf::from(git_repo);
 
-    // Quick check: if a file changed in the current commit is already indexed with
-    // its current SHA, we can skip indexing entirely (nothing new to process)
-    // Compare HEAD with HEAD~1 (parent) to find changed files
+    // Quick check: look at files changed in the current commit.
+    // If no supported files changed, or the changed files are already indexed, skip.
     match semcode::git::get_changed_files(&repo_path, "HEAD~1", "HEAD") {
         Ok(changed_files) => {
-            if !changed_files.is_empty() {
-                // Find first C/C++/Rust file that was changed (added or modified)
-                if let Some(changed_file) = changed_files.iter().find(|cf| {
+            // Find supported files that were added or modified
+            let supported_changes: Vec<_> = changed_files
+                .iter()
+                .filter(|cf| {
                     matches!(
                         cf.change_type,
                         semcode::git::ChangeType::Added | semcode::git::ChangeType::Modified
                     ) && cf.new_file_hash.is_some()
                         && semcode::file_extensions::is_supported_for_analysis(&cf.path)
-                }) {
-                    if let Some(new_hash) = &changed_file.new_file_hash {
-                        // Get already processed files from database
-                        let processed_pairs = db_manager.get_processed_file_pairs().await?;
+                })
+                .collect();
 
-                        // Check if this changed file with its new SHA is already in database
-                        if processed_pairs.contains(&(changed_file.path.clone(), new_hash.clone()))
-                        {
-                            info!(
-                                "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
-                                changed_file.path,
-                                &new_hash[..8]
-                            );
-                            return Ok(());
-                        } else {
-                            info!(
-                                "Changed file '{}' (SHA: {}) needs indexing",
-                                changed_file.path,
-                                &new_hash[..8]
-                            );
-                        }
-                    }
+            if supported_changes.is_empty() {
+                info!("No supported files changed in current commit, skipping auto-indexing");
+                return Ok(());
+            }
+
+            // Check if the first supported changed file is already indexed
+            if let Some(new_hash) = &supported_changes[0].new_file_hash {
+                if db_manager.is_file_processed(new_hash).await? {
+                    info!(
+                        "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
+                        supported_changes[0].path,
+                        &new_hash[..8]
+                    );
+                    return Ok(());
                 }
-            } else {
-                // No changes in this commit (might be initial commit or root commit)
-                info!("No changed files found in current commit, will check all files");
+                info!(
+                    "Changed file '{}' (SHA: {}) needs indexing",
+                    supported_changes[0].path,
+                    &new_hash[..8]
+                );
             }
         }
         Err(e) => {
@@ -110,11 +107,9 @@ async fn index_current_commit_if_needed(
         }
     }
 
-    // Run git range indexing using the shared library function
-    // This uses the same code path as semcode-index -s .
+    // Index the current commit
     println!("Checking for files to index...");
 
-    // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", git_sha, git_sha);
     let extensions_vec = semcode::file_extensions::supported_extensions();
 

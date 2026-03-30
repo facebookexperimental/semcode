@@ -5,7 +5,6 @@
 //! that can be called from different binaries (semcode-index, semcode, semcode-mcp, etc.)
 
 use anyhow::Result;
-use gix::revision::walk::Sorting;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,13 +85,15 @@ pub async fn check_and_optimize_if_needed(
     true
 }
 
-/// Parse git range and get all commit SHAs in the range
-/// Uses gitoxide's built-in rev-spec parsing for proper A..B semantics
+/// Parse git range and get all commit SHAs in the range.
+///
+/// Walks first-parent chain from B back to A, avoiding gix's rev_walk + with_hidden
+/// which does an O(all commits) graph painting that is catastrophically slow on large repos.
+///
+/// Supports two formats:
+/// 1. "A..B" - commits reachable from B but not from A (first-parent walk)
+/// 2. "REF" (no ..) - all commits reachable from REF via first-parent (for initial indexing)
 pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>> {
-    // Support two formats:
-    // 1. "A..B" - commits reachable from B but not from A
-    // 2. "REF" (no ..) - all commits reachable from REF (for initial indexing)
-
     let (from_spec, to_spec) = if range.contains("..") {
         let parts: Vec<&str> = range.split("..").collect();
         if parts.len() != 2 {
@@ -100,50 +101,51 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
         }
         (parts[0], parts[1])
     } else {
-        // No range separator - return all commits up to this ref
         ("", range)
     };
 
-    // Resolve the target commit
     let to_commit = resolve_to_commit(repo, to_spec)?;
     let to_id = to_commit.id().detach();
 
-    // Build the rev_walk - optionally exclude ancestors of from_spec
-    let walk = if from_spec.is_empty() {
-        // No exclusion - include all ancestors
-        repo.rev_walk([to_id])
-            .sorting(Sorting::ByCommitTime(Default::default()))
-            .all()?
+    let stop_at = if from_spec.is_empty() {
+        None
     } else {
-        // Exclude commits reachable from from_spec
         let from_commit = resolve_to_commit(repo, from_spec)?;
-        let from_id = from_commit.id().detach();
-        repo.rev_walk([to_id])
-            .with_hidden([from_id])
-            .sorting(Sorting::ByCommitTime(Default::default()))
-            .all()?
+        Some(from_commit.id().detach())
     };
 
     let mut shas = Vec::new();
-    let mut commit_count = 0;
-    const MAX_COMMITS: usize = 10000000; // Safety limit
+    let mut current_id = to_id;
+    const MAX_COMMITS: usize = 10000000;
 
-    // Iterate commits in the set "reachable from B but not from A"
-    for info in walk {
-        let info = info?;
-        commit_count += 1;
+    loop {
+        // Stop if we've reached the exclusion boundary
+        if let Some(ref stop) = stop_at {
+            if current_id == *stop {
+                break;
+            }
+        }
 
-        // Safety check to prevent runaway processing
-        if commit_count > MAX_COMMITS {
+        shas.push(current_id.to_string());
+
+        if shas.len() > MAX_COMMITS {
             return Err(anyhow::anyhow!(
-                "Commit range {} is too large (>{} commits). This may indicate a problem with the repository.",
-                range, MAX_COMMITS
+                "Commit range {} is too large (>{} commits)",
+                range,
+                MAX_COMMITS
             ));
         }
 
-        let commit_id = info.id();
-        let commit_sha = commit_id.to_string();
-        shas.push(commit_sha);
+        // Get the first parent to continue walking
+        let commit = repo.find_commit(current_id)?;
+        let parent_ids: Vec<_> = commit.parent_ids().collect();
+
+        if parent_ids.is_empty() {
+            // Root commit, no more parents
+            break;
+        }
+
+        current_id = parent_ids[0].detach();
     }
 
     // Reverse to get chronological order (oldest first)
