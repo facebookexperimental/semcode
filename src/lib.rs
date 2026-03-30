@@ -14,6 +14,7 @@ pub mod text_utils;
 mod treesitter_analyzer;
 mod types;
 mod vectorizer;
+pub mod workdir;
 
 // Query functionality modules
 pub mod callchain;
@@ -36,6 +37,7 @@ pub use types::{
     LoreEmailInfo, ParameterInfo, TypeInfo, TypedefInfo,
 };
 pub use vectorizer::CodeVectorizer;
+pub use workdir::WorkdirIndex;
 
 // Re-export database types
 pub use database::calls::CallRelationship;

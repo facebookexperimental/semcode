@@ -3775,8 +3775,7 @@ impl DatabaseManager {
         // have persisted some rows before the error.  Because the
         // upsert key is message_id, re-inserting those rows is
         // idempotent.
-        if let Err(e) =
-            Self::merge_insert_lore_chunk(&table, emails, &dedup_indices, &schema).await
+        if let Err(e) = Self::merge_insert_lore_chunk(&table, emails, &dedup_indices, &schema).await
         {
             tracing::warn!(
                 "insert_lore_emails: full batch of {} failed ({}), \
@@ -3794,8 +3793,7 @@ impl DatabaseManager {
             const MAX_CHUNK: usize = 128;
 
             for chunk in dedup_indices.chunks(MAX_CHUNK) {
-                if let Err(e) =
-                    Self::merge_insert_lore_chunk(&table, emails, chunk, &schema).await
+                if let Err(e) = Self::merge_insert_lore_chunk(&table, emails, chunk, &schema).await
                 {
                     tracing::warn!(
                         "insert_lore_emails: chunk of {} failed ({}), \
@@ -3805,10 +3803,7 @@ impl DatabaseManager {
                     );
                     for &idx in chunk {
                         if let Err(e2) =
-                            Self::merge_insert_lore_chunk(
-                                &table, emails, &[idx], &schema,
-                            )
-                            .await
+                            Self::merge_insert_lore_chunk(&table, emails, &[idx], &schema).await
                         {
                             tracing::warn!(
                                 "insert_lore_emails: skipping \
@@ -3885,10 +3880,7 @@ impl DatabaseManager {
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
         let batches = vec![Ok(batch)];
         let batch_iterator =
-            arrow::record_batch::RecordBatchIterator::new(
-                batches.into_iter(),
-                schema.clone(),
-            );
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema.clone());
 
         let mut merge_insert = table.merge_insert(&["message_id"]);
         merge_insert
@@ -4043,14 +4035,17 @@ impl DatabaseManager {
         let table = self.connection.open_table("lore").execute().await?;
 
         // Only use date_timestamp filter if the column exists in the table
-        let has_date_timestamp = table.schema().await
+        let has_date_timestamp = table
+            .schema()
+            .await
             .map(|s| s.field_with_name("date_timestamp").is_ok())
             .unwrap_or(false);
         let date_filter = if has_date_timestamp {
             match (since_timestamp, until_timestamp) {
-                (Some(since), Some(until)) => {
-                    Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
-                }
+                (Some(since), Some(until)) => Some(format!(
+                    "date_timestamp >= {} AND date_timestamp <= {}",
+                    since, until
+                )),
                 (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
                 (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
                 (None, None) => None,
@@ -4081,19 +4076,14 @@ impl DatabaseManager {
             let fts_query =
                 FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
 
-            let mut query_builder = table
-                .query()
-                .full_text_search(fts_query);
+            let mut query_builder = table.query().full_text_search(fts_query);
 
             // Apply date filter at database level so limit applies to date-filtered results
             if let Some(ref filter) = date_filter {
                 query_builder = query_builder.only_if(filter);
             }
 
-            let stream = query_builder
-                .limit(fts_limit)
-                .execute()
-                .await?;
+            let stream = query_builder.limit(fts_limit).execute().await?;
             let batches: Vec<_> = stream.try_collect().await?;
 
             let fts_count: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -4528,15 +4518,18 @@ impl DatabaseManager {
         // Build date filter clause — only if the column exists in the table
         let has_date_timestamp = {
             let table = self.connection.open_table("lore").execute().await?;
-            table.schema().await
+            table
+                .schema()
+                .await
                 .map(|s| s.field_with_name("date_timestamp").is_ok())
                 .unwrap_or(false)
         };
         let date_filter = if has_date_timestamp {
             match (since_timestamp, until_timestamp) {
-                (Some(since), Some(until)) => {
-                    Some(format!("date_timestamp >= {} AND date_timestamp <= {}", since, until))
-                }
+                (Some(since), Some(until)) => Some(format!(
+                    "date_timestamp >= {} AND date_timestamp <= {}",
+                    since, until
+                )),
                 (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
                 (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
                 (None, None) => None,
@@ -4870,7 +4863,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
-                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id,
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -4917,7 +4910,9 @@ impl DatabaseManager {
         let escaped_subject = subject.replace("'", "''");
 
         let table = self.connection.open_table("lore").execute().await?;
-        let has_date_timestamp = table.schema().await
+        let has_date_timestamp = table
+            .schema()
+            .await
             .map(|s| s.field_with_name("date_timestamp").is_ok())
             .unwrap_or(false);
 
@@ -5004,7 +4999,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
-                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -5106,7 +5101,7 @@ impl DatabaseManager {
                     git_commit_sha: git_commit_shas.value(i).to_string(),
                     from: from_addrs.value(i).to_string(),
                     date: dates.value(i).to_string(),
-                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id: message_ids.value(i).to_string(),
                     in_reply_to: if in_reply_tos.is_null(i) {
                         None
@@ -5491,7 +5486,12 @@ impl DatabaseManager {
     /// lore_indexed_commits table. The table contains only short
     /// SHA strings, so reading it entirely into memory is cheap.
     pub async fn get_indexed_lore_commits(&self) -> Result<HashSet<String>> {
-        let table = match self.connection.open_table("lore_indexed_commits").execute().await {
+        let table = match self
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to open lore_indexed_commits table: {}", e);
@@ -5502,7 +5502,7 @@ impl DatabaseManager {
         let stream = table
             .query()
             .select(lancedb::query::Select::Columns(vec![
-                "git_commit_sha".to_string(),
+                "git_commit_sha".to_string()
             ]))
             .execute()
             .await?;
@@ -5534,13 +5534,13 @@ impl DatabaseManager {
             return Ok(());
         }
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("git_commit_sha", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "git_commit_sha",
+            DataType::Utf8,
+            false,
+        )]));
 
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(commit_shas.to_vec())),
-        ];
+        let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(commit_shas.to_vec()))];
 
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
         let batches = vec![Ok(batch)];
@@ -5559,5 +5559,147 @@ impl DatabaseManager {
         merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
+    }
+
+    // --- Working directory overlay methods ---
+
+    /// Find a function by name, merging results from a WorkdirIndex overlay with the database.
+    ///
+    /// For files that are dirty in the working directory, the overlay's version takes precedence.
+    /// For clean files, the database result is used. Deleted files are excluded.
+    pub async fn find_function_with_workdir(
+        &self,
+        name: &str,
+        git_sha: &str,
+        workdir: &crate::workdir::WorkdirIndex,
+    ) -> Result<Option<FunctionInfo>> {
+        // Check workdir overlay first
+        if let Some(func) = workdir.find_function(name) {
+            return Ok(Some(func.clone()));
+        }
+        // Fall back to database with merged manifest (excludes deleted files)
+        let head_manifest = self.generate_git_manifest(git_sha).await?;
+        let merged = workdir.merged_manifest(&head_manifest);
+        self.find_function_with_manifest(name, &merged).await
+    }
+
+    /// Find all functions matching a name, merging workdir overlay with database results.
+    pub async fn find_all_functions_with_workdir(
+        &self,
+        name: &str,
+        git_sha: &str,
+        workdir: &crate::workdir::WorkdirIndex,
+    ) -> Result<Vec<FunctionInfo>> {
+        let mut results: Vec<FunctionInfo> = Vec::new();
+
+        // Get workdir matches and track which files they come from
+        let workdir_matches = workdir.find_all_functions(name);
+        let workdir_files: std::collections::HashSet<&str> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.as_str())
+            .collect();
+        results.extend(workdir_matches.into_iter().cloned());
+
+        // Get database matches, excluding files covered by workdir
+        let db_matches = self.find_all_functions_git_aware(name, git_sha).await?;
+        for func in db_matches {
+            if !workdir_files.contains(func.file_path.as_str())
+                && !workdir.is_deleted(&func.file_path)
+            {
+                results.push(func);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Find a type by name, merging workdir overlay with database results.
+    pub async fn find_type_with_workdir(
+        &self,
+        name: &str,
+        git_sha: &str,
+        workdir: &crate::workdir::WorkdirIndex,
+    ) -> Result<Option<TypeInfo>> {
+        if let Some(ty) = workdir.find_type(name) {
+            return Ok(Some(ty.clone()));
+        }
+        self.find_type_git_aware(name, git_sha).await
+    }
+
+    /// Get callers of a function, merging workdir overlay with database results.
+    pub async fn get_function_callers_with_workdir(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+        workdir: &crate::workdir::WorkdirIndex,
+    ) -> Result<Vec<String>> {
+        let mut callers: Vec<String> = Vec::new();
+
+        // Get callers from workdir overlay
+        let workdir_callers = workdir.find_callers(function_name);
+        callers.extend(workdir_callers.iter().map(|f| f.name.clone()));
+
+        // Get callers from database, excluding those from dirty/deleted files
+        let db_callers = self
+            .get_function_callers_git_aware(function_name, git_sha)
+            .await?;
+        for caller_name in db_callers {
+            // We can't easily check file paths from just caller names, so include all.
+            // Duplicates from workdir are acceptable since the caller just gets a list of names.
+            if !callers.contains(&caller_name) {
+                callers.push(caller_name);
+            }
+        }
+
+        Ok(callers)
+    }
+
+    /// Grep function bodies, merging workdir overlay with database results.
+    pub async fn grep_function_bodies_with_workdir(
+        &self,
+        pattern: &str,
+        path_pattern: Option<&str>,
+        limit: usize,
+        git_sha: &str,
+        workdir: &crate::workdir::WorkdirIndex,
+    ) -> Result<(Vec<FunctionInfo>, bool)> {
+        let mut results: Vec<FunctionInfo> = Vec::new();
+
+        // Get matches from workdir overlay
+        let workdir_matches = workdir.grep_functions(pattern, path_pattern);
+        let workdir_files: std::collections::HashSet<&str> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.as_str())
+            .collect();
+        results.extend(workdir_matches.into_iter().cloned());
+
+        // Check if we've already hit the limit
+        if limit > 0 && results.len() >= limit {
+            results.truncate(limit);
+            return Ok((results, true));
+        }
+
+        // Get matches from database, excluding files covered by workdir
+        let remaining = if limit > 0 {
+            limit - results.len()
+        } else {
+            0 // 0 means unlimited in the DB method
+        };
+        let (db_matches, db_limit_hit) = self
+            .grep_function_bodies_git_aware(pattern, path_pattern, remaining, git_sha)
+            .await?;
+        for func in db_matches {
+            if !workdir_files.contains(func.file_path.as_str())
+                && !workdir.is_deleted(&func.file_path)
+            {
+                results.push(func);
+            }
+        }
+
+        let limit_hit = db_limit_hit || (limit > 0 && results.len() >= limit);
+        if limit > 0 && results.len() > limit {
+            results.truncate(limit);
+        }
+        Ok((results, limit_hit))
     }
 }
