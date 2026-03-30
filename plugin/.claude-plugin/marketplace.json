@@ -7,16 +7,13 @@
   "plugins": [
     {
       "name": "semcode",
+      "source": "./semcode",
       "version": "1.0.0",
       "description": "Semantic code search for C/C++ codebases with git-aware lookups, call graph analysis, and vector search",
       "author": {
         "name": "Semcode"
       },
-      "homepage": "https://github.com/masoncl/semcode",
-      "source": "./plugin/semcode",
-      "mcpServers": [
-        "./mcp/semcode.json"
-      ]
+      "keywords": ["c", "cpp", "code-search", "semantic-search", "call-graph", "git-integration"]
     }
   ]
 }

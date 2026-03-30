@@ -45,7 +45,7 @@ echo
 
 # Step 1: Add marketplace
 echo "Step 1: Adding marketplace to Claude..."
-if claude plugin marketplace add "$PLUGIN_DIR/marketplace.json"; then
+if claude plugin marketplace add "$PLUGIN_DIR"; then
     echo "✓ Marketplace added successfully"
 else
     echo "⚠ Warning: Marketplace may already be added (this is OK)"
@@ -98,40 +98,33 @@ case $choice in
 esac
 
 # Update MCP configuration if database path is provided
+MCP_CONFIG="$SCRIPT_DIR/.mcp.json"
 if [ -n "$DB_PATH" ]; then
-    MCP_CONFIG="$SCRIPT_DIR/mcp/semcode.json"
     echo
     echo "Updating MCP configuration at: $MCP_CONFIG"
 
     # Create new config with database path
     cat > "$MCP_CONFIG" << EOF
 {
-  "mcpServers": {
-    "semcode": {
-      "type": "stdio",
-      "command": "$MCP_BINARY",
-      "args": ["--database", "$DB_PATH"],
-      "env": {}
-    }
+  "semcode": {
+    "command": "$MCP_BINARY",
+    "args": ["--database", "$DB_PATH"],
+    "env": {}
   }
 }
 EOF
     echo "✓ Configuration updated"
 else
     # No database path specified, create config without --database arg
-    MCP_CONFIG="$SCRIPT_DIR/mcp/semcode.json"
     echo
     echo "Creating MCP configuration without database path: $MCP_CONFIG"
 
     cat > "$MCP_CONFIG" << EOF
 {
-  "mcpServers": {
-    "semcode": {
-      "type": "stdio",
-      "command": "$MCP_BINARY",
-      "args": [],
-      "env": {}
-    }
+  "semcode": {
+    "command": "$MCP_BINARY",
+    "args": [],
+    "env": {}
   }
 }
 EOF
@@ -223,7 +216,7 @@ echo "For usage examples and tool reference, see:"
 echo "  $SCRIPT_DIR/../../docs/semcode-mcp.md"
 echo
 echo "To reconfigure the database path, edit:"
-echo "  $SCRIPT_DIR/mcp/semcode.json"
+echo "  $SCRIPT_DIR/.mcp.json"
 echo
 echo "To pre-approve tools for additional directories:"
 echo "  $SCRIPT_DIR/approve-tools.sh /path/to/directory"

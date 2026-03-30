@@ -22,7 +22,7 @@ semcode-index --source .
 
 # 4. Install plugin
 cd /path/to/semcode
-claude plugin marketplace add $(pwd)/plugin/marketplace.json
+claude plugin marketplace add $(pwd)/plugin
 claude plugin install semcode@semcode-local
 
 # 5. Restart Claude and verify
@@ -33,14 +33,17 @@ claude plugin install semcode@semcode-local
 
 ```
 plugin/
-├── README.md           # This file
-├── marketplace.json    # Plugin marketplace manifest
-└── semcode/           # Plugin implementation
-    ├── README.md      # Full installation and usage guide
+├── .claude-plugin/
+│   └── marketplace.json  # Plugin marketplace manifest
+├── README.md             # This file
+└── semcode/              # Plugin implementation
+    ├── .claude-plugin/
+    │   └── plugin.json   # Plugin manifest
+    ├── .mcp.json         # MCP server configuration
+    ├── README.md         # Full installation and usage guide
     ├── TOOL_APPROVAL.md
     ├── approve-tools.sh
-    ├── install.sh
-    └── mcp/          # MCP server configuration
+    └── install.sh
 ```
 
 ## Documentation

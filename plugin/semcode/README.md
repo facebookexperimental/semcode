@@ -33,7 +33,7 @@ This creates a `.semcode.db` directory in your codebase.
 ```bash
 # Add the marketplace
 cd /path/to/semcode
-claude plugin marketplace add $(pwd)/plugin/marketplace.json
+claude plugin marketplace add $(pwd)/plugin
 
 # Install the plugin
 claude plugin install semcode@semcode-local
@@ -62,17 +62,14 @@ claude    # Uses /path/to/another-project/.semcode.db
 
 ### Optional: Fixed Database Path
 
-To always use the same database, edit `plugin/semcode/mcp/semcode.json`:
+To always use the same database, edit `plugin/semcode/.mcp.json`:
 
 ```json
 {
-  "mcpServers": {
-    "semcode": {
-      "type": "stdio",
-      "command": "semcode-mcp",
-      "args": ["--database", "/absolute/path/to/your/codebase"],
-      "env": {}
-    }
+  "semcode": {
+    "command": "semcode-mcp",
+    "args": ["--database", "/absolute/path/to/your/codebase"],
+    "env": {}
   }
 }
 ```

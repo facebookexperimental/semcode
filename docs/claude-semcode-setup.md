@@ -33,7 +33,7 @@ Bigger ranges take longer, so it's better to just index what you need.
 
 ## Configuring MCP for Claude
 
-claude plugins are the preferred way to configure things, but you can also
+Claude Code plugins are the preferred way to configure things, but you can also
 setup a json file with details about the MCP server.  The documentation below
 describes both.
 
@@ -65,7 +65,7 @@ For detailed information about tool approval methods and troubleshooting, see [.
 
 ### Configuring Claude via the --mcp-config command line option
 
-If claude plugins aren't right for your configuration, passing the mcp config
+If Claude Code plugins aren't right for your configuration, passing the mcp config
 on the command line is also possible.
 
 ```
