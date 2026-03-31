@@ -3933,13 +3933,19 @@ impl DatabaseManager {
         Ok(())
     }
 
-    /// Insert lore emails into the database
-    pub async fn insert_lore_emails(&self, emails: &[crate::types::LoreEmailInfo]) -> Result<()> {
+    /// Insert lore emails into the database, returning the indices of
+    /// any emails that could not be stored.  Callers must not record
+    /// commit SHAs for failed indices in the lore_indexed_commits
+    /// table, otherwise those emails are permanently lost.
+    pub async fn insert_lore_emails(
+        &self,
+        emails: &[crate::types::LoreEmailInfo],
+    ) -> Result<Vec<usize>> {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
         if emails.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         tracing::info!(
@@ -3982,6 +3988,8 @@ impl DatabaseManager {
         }
 
         let table = self.connection.open_table("lore").execute().await?;
+
+        let mut failed_indices: Vec<usize> = Vec::new();
 
         // Try inserting the full batch first -- a single merge_insert
         // is far cheaper than many small ones because each call is a
@@ -4031,15 +4039,24 @@ impl DatabaseManager {
                                 emails[idx].message_id,
                                 e2
                             );
+                            failed_indices.push(idx);
                         }
                     }
                 }
             }
         }
 
+        if !failed_indices.is_empty() {
+            tracing::warn!(
+                "insert_lore_emails: {} of {} emails failed to insert",
+                failed_indices.len(),
+                dedup_indices.len()
+            );
+        }
+
         tracing::info!("insert_lore_emails: Batch insertion complete");
 
-        Ok(())
+        Ok(failed_indices)
     }
 
     /// Build a [`RecordBatch`] from the given email indices and
