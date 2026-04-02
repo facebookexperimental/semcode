@@ -4367,18 +4367,42 @@ impl DatabaseManager {
         let mut first_iteration = true;
 
         loop {
-            let fts_query =
-                FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and use a plain table
+            // scan so the regex post-filter still runs.
+            let batches: Vec<_> = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field
+                );
+                let mut query_builder = table.query();
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
 
-            let mut query_builder = table.query().full_text_search(fts_query);
+                let mut query_builder = table.query().full_text_search(fts_query);
 
-            // Apply date filter at database level so limit applies to date-filtered results
-            if let Some(ref filter) = date_filter {
-                query_builder = query_builder.only_if(filter);
-            }
+                // Apply date filter at database level so limit applies to date-filtered results
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
 
-            let stream = query_builder.limit(fts_limit).execute().await?;
-            let batches: Vec<_> = stream.try_collect().await?;
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            };
 
             let fts_count: usize = batches.iter().map(|b| b.num_rows()).sum();
             tracing::info!(
@@ -4576,26 +4600,50 @@ impl DatabaseManager {
                 fts_pattern
             );
 
-            let fts_query =
-                FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
-            let mut query = lore_table.query().full_text_search(fts_query).select(
-                lancedb::query::Select::Columns(vec![
-                    "message_id".to_string(),
-                    "_score".to_string(),
-                    field_name.clone(),
-                ]),
-            );
-
-            // Apply limit - use large limit if search_limit is 0 (unlimited)
-            // FTS has a default limit of 10, so we must explicitly set a large limit
             let effective_limit = if search_limit > 0 {
                 search_limit
             } else {
                 100000
             };
-            query = query.limit(effective_limit);
 
-            let results = query.execute().await?.try_collect::<Vec<_>>().await?;
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and fall back to a plain
+            // table scan so the regex post-filter still runs.
+            let results = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field_name
+                );
+                lore_table
+                    .query()
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
+                lore_table
+                    .query()
+                    .full_text_search(fts_query)
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        "_score".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            };
 
             // Step 2: Post-filter with regex in memory
             let fts_result_count: usize = results.iter().map(|b| b.num_rows()).sum();
