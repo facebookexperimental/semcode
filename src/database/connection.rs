@@ -509,9 +509,19 @@ impl DatabaseManager {
         self.schema_manager.drop_and_recreate_tables().await
     }
 
-    /// Create FTS indices for lore table (must be called after data is inserted)
+    /// Drop and rebuild all FTS indices for the lore table from scratch.
     pub async fn create_lore_fts_indices(&self) -> Result<()> {
         self.schema_manager.create_lore_fts_indices().await
+    }
+
+    /// Create FTS indices only if they do not already exist.
+    pub async fn ensure_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.ensure_lore_fts_indices().await
+    }
+
+    /// Merge newly-inserted rows into existing lore FTS indices.
+    pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.optimize_lore_fts_indices().await
     }
 
     /// Get lore table information including row count and indices
@@ -4021,8 +4031,7 @@ impl DatabaseManager {
         // with "subject contained null values".  Plain append avoids
         // the merge codepath entirely.  Duplicates are prevented by
         // the filter_existing_lore_ids check above.
-        if let Err(e) = Self::add_lore_chunk(&table, emails, &new_indices, &schema).await
-        {
+        if let Err(e) = Self::add_lore_chunk(&table, emails, &new_indices, &schema).await {
             tracing::warn!(
                 "insert_lore_emails: full batch of {} failed ({}), \
                  falling back to chunked insertion",
@@ -4033,8 +4042,7 @@ impl DatabaseManager {
             const MAX_CHUNK: usize = 128;
 
             for chunk in new_indices.chunks(MAX_CHUNK) {
-                if let Err(e) = Self::add_lore_chunk(&table, emails, chunk, &schema).await
-                {
+                if let Err(e) = Self::add_lore_chunk(&table, emails, chunk, &schema).await {
                     tracing::warn!(
                         "insert_lore_emails: chunk of {} failed ({}), \
                          retrying individually",
@@ -4042,8 +4050,7 @@ impl DatabaseManager {
                         e
                     );
                     for &idx in chunk {
-                        if let Err(e2) =
-                            Self::add_lore_chunk(&table, emails, &[idx], &schema).await
+                        if let Err(e2) = Self::add_lore_chunk(&table, emails, &[idx], &schema).await
                         {
                             tracing::warn!(
                                 "insert_lore_emails: skipping \
@@ -4085,9 +4092,7 @@ impl DatabaseManager {
         // the SQL literal.
         let id_list: Vec<String> = indices
             .iter()
-            .map(|&i| {
-                format!("'{}'", emails[i].message_id.replace('\'', "''"))
-            })
+            .map(|&i| format!("'{}'", emails[i].message_id.replace('\'', "''")))
             .collect();
 
         let predicate = format!("message_id IN ({})", id_list.join(", "));
@@ -4095,7 +4100,7 @@ impl DatabaseManager {
         let stream = table
             .query()
             .select(lancedb::query::Select::Columns(vec![
-                "message_id".to_string(),
+                "message_id".to_string()
             ]))
             .only_if(&predicate)
             .execute()
