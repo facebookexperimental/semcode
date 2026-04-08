@@ -970,42 +970,57 @@ pub async fn process_lore_commits_pipeline(
 
                 match batch {
                     Ok(emails) => {
-                        let batch_len = emails.len();
-
                         // Insert batch into database
-                        if let Err(e) = db_manager_clone.insert_lore_emails(&emails).await {
-                            error!("Inserter {} failed to insert batch: {}", inserter_id, e);
-                        } else {
-                            // Record processed commit SHAs so they are
-                            // not re-examined on subsequent runs.
-                            let shas: Vec<String> = emails
-                                .iter()
-                                .map(|e| e.git_commit_sha.as_str())
-                                .collect::<std::collections::HashSet<_>>()
-                                .into_iter()
-                                .map(String::from)
-                                .collect();
-                            if let Err(e) =
-                                db_manager_clone.insert_lore_indexed_commits(&shas).await
-                            {
-                                error!(
-                                    "Inserter {} failed to record indexed commits: {}",
-                                    inserter_id, e
-                                );
+                        match db_manager_clone.insert_lore_emails(&emails).await {
+                            Err(e) => {
+                                error!("Inserter {} failed to insert batch: {}", inserter_id, e);
                             }
+                            Ok(failed_indices) => {
+                                let failed_set: std::collections::HashSet<usize> =
+                                    failed_indices.into_iter().collect();
+                                let success_count = emails.len() - failed_set.len();
 
-                            let count = inserted_clone.fetch_add(batch_len, Ordering::Relaxed);
-                            pb_clone.set_message(format!("Inserted {} emails", count + batch_len));
+                                // Record commit SHAs only for emails that
+                                // were actually stored, so that failed
+                                // emails are retried on the next run.
+                                let shas: Vec<String> = emails
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| !failed_set.contains(i))
+                                    .map(|(_, e)| e.git_commit_sha.as_str())
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .into_iter()
+                                    .map(String::from)
+                                    .collect();
+                                if !shas.is_empty() {
+                                    if let Err(e) =
+                                        db_manager_clone.insert_lore_indexed_commits(&shas).await
+                                    {
+                                        error!(
+                                            "Inserter {} failed to record indexed commits: {}",
+                                            inserter_id, e
+                                        );
+                                    }
+                                }
 
-                            // Track successful batch insertions and check for periodic optimization
-                            let total_batches = batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                            check_and_optimize_if_needed(
-                                &db_manager_clone,
-                                inserter_id,
-                                total_batches,
-                                &optimization_check_timer,
-                            )
-                            .await;
+                                let count =
+                                    inserted_clone.fetch_add(success_count, Ordering::Relaxed);
+                                pb_clone.set_message(format!(
+                                    "Inserted {} emails",
+                                    count + success_count
+                                ));
+
+                                // Track successful batch insertions and check for periodic optimization
+                                let total_batches =
+                                    batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                check_and_optimize_if_needed(
+                                    &db_manager_clone,
+                                    inserter_id,
+                                    total_batches,
+                                    &optimization_check_timer,
+                                )
+                                .await;
+                            }
                         }
                     }
                     Err(_) => {

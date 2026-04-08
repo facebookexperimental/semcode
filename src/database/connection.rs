@@ -3933,13 +3933,19 @@ impl DatabaseManager {
         Ok(())
     }
 
-    /// Insert lore emails into the database
-    pub async fn insert_lore_emails(&self, emails: &[crate::types::LoreEmailInfo]) -> Result<()> {
+    /// Insert lore emails into the database, returning the indices of
+    /// any emails that could not be stored.  Callers must not record
+    /// commit SHAs for failed indices in the lore_indexed_commits
+    /// table, otherwise those emails are permanently lost.
+    pub async fn insert_lore_emails(
+        &self,
+        emails: &[crate::types::LoreEmailInfo],
+    ) -> Result<Vec<usize>> {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
         if emails.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         tracing::info!(
@@ -3961,10 +3967,10 @@ impl DatabaseManager {
             Field::new("symbols", DataType::Utf8, false),
         ]));
 
-        // Deduplicate by message_id within the batch. A lore archive
-        // can contain the same email in multiple git commits, and
-        // LanceDB merge_insert requires each target row to be matched
-        // by at most one source row. Keep the last occurrence.
+        // Deduplicate by message_id within the batch.  A lore
+        // archive can contain the same email in multiple git commits;
+        // appending duplicates would create redundant rows.  Keep the
+        // last occurrence.
         let mut seen = std::collections::HashMap::with_capacity(emails.len());
         for (i, email) in emails.iter().enumerate() {
             seen.insert(&email.message_id, i);
@@ -3983,37 +3989,51 @@ impl DatabaseManager {
 
         let table = self.connection.open_table("lore").execute().await?;
 
-        // Try inserting the full batch first -- a single merge_insert
-        // is far cheaper than many small ones because each call is a
-        // full read-modify-write cycle in LanceDB.  Fall back to
-        // chunked insertion only when the batch exhausts DataFusion's
-        // memory pool (the RepartitionExec OOM described in the
-        // comment below).
-        //
-        // Retrying the full set of indices on failure is safe:
-        // merge_insert is not transactional, so a failed call may
-        // have persisted some rows before the error.  Because the
-        // upsert key is message_id, re-inserting those rows is
-        // idempotent.
-        if let Err(e) = Self::merge_insert_lore_chunk(&table, emails, &dedup_indices, &schema).await
+        let mut failed_indices: Vec<usize> = Vec::new();
+
+        // Filter out emails whose message_id already exists in the
+        // table.  Normally every email here is new because
+        // index_lore_archive skips already-indexed commits, but a
+        // partial failure on a previous run can leave rows in the
+        // table whose commit SHA was never recorded in
+        // lore_indexed_commits.  Filtering avoids duplicates without
+        // relying on merge_insert, which hits a spurious null-column
+        // error in lance-file 3.0.1.
+        let new_indices = Self::filter_existing_lore_ids(&table, emails, &dedup_indices).await?;
+
+        if new_indices.len() < dedup_indices.len() {
+            tracing::info!(
+                "insert_lore_emails: {} of {} already in table, inserting {}",
+                dedup_indices.len() - new_indices.len(),
+                dedup_indices.len(),
+                new_indices.len(),
+            );
+        }
+
+        if new_indices.is_empty() {
+            tracing::info!("insert_lore_emails: no new emails to insert");
+            return Ok(failed_indices);
+        }
+
+        // Use table.add() instead of merge_insert.  merge_insert in
+        // lance-file 3.0.1 introduces spurious nulls during its
+        // internal join/write phase, causing every insert to fail
+        // with "subject contained null values".  Plain append avoids
+        // the merge codepath entirely.  Duplicates are prevented by
+        // the filter_existing_lore_ids check above.
+        if let Err(e) = Self::add_lore_chunk(&table, emails, &new_indices, &schema).await
         {
             tracing::warn!(
                 "insert_lore_emails: full batch of {} failed ({}), \
                  falling back to chunked insertion",
-                dedup_indices.len(),
+                new_indices.len(),
                 e
             );
 
-            // Lore emails carry full bodies, so each row is large
-            // compared to code-analysis records.  LanceDB
-            // merge_insert uses DataFusion's RepartitionExec, whose
-            // memory pool can be exhausted by a single oversized
-            // RecordBatch.  Insert in sub-batches to bound peak
-            // memory per operation.
             const MAX_CHUNK: usize = 128;
 
-            for chunk in dedup_indices.chunks(MAX_CHUNK) {
-                if let Err(e) = Self::merge_insert_lore_chunk(&table, emails, chunk, &schema).await
+            for chunk in new_indices.chunks(MAX_CHUNK) {
+                if let Err(e) = Self::add_lore_chunk(&table, emails, chunk, &schema).await
                 {
                     tracing::warn!(
                         "insert_lore_emails: chunk of {} failed ({}), \
@@ -4023,7 +4043,7 @@ impl DatabaseManager {
                     );
                     for &idx in chunk {
                         if let Err(e2) =
-                            Self::merge_insert_lore_chunk(&table, emails, &[idx], &schema).await
+                            Self::add_lore_chunk(&table, emails, &[idx], &schema).await
                         {
                             tracing::warn!(
                                 "insert_lore_emails: skipping \
@@ -4031,20 +4051,82 @@ impl DatabaseManager {
                                 emails[idx].message_id,
                                 e2
                             );
+                            failed_indices.push(idx);
                         }
                     }
                 }
             }
         }
 
+        if !failed_indices.is_empty() {
+            tracing::warn!(
+                "insert_lore_emails: {} of {} emails failed to insert",
+                failed_indices.len(),
+                new_indices.len()
+            );
+        }
+
         tracing::info!("insert_lore_emails: Batch insertion complete");
 
-        Ok(())
+        Ok(failed_indices)
+    }
+
+    /// Return the subset of `indices` whose message_id does not
+    /// already exist in the lore table.
+    async fn filter_existing_lore_ids(
+        table: &lancedb::Table,
+        emails: &[crate::types::LoreEmailInfo],
+        indices: &[usize],
+    ) -> Result<Vec<usize>> {
+        use futures::TryStreamExt as _;
+
+        // Build an IN-list predicate.  message_ids are already
+        // validated to be non-empty, but escape single quotes for
+        // the SQL literal.
+        let id_list: Vec<String> = indices
+            .iter()
+            .map(|&i| {
+                format!("'{}'", emails[i].message_id.replace('\'', "''"))
+            })
+            .collect();
+
+        let predicate = format!("message_id IN ({})", id_list.join(", "));
+
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "message_id".to_string(),
+            ]))
+            .only_if(&predicate)
+            .execute()
+            .await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut existing = std::collections::HashSet::new();
+        for batch in &batches {
+            if let Some(col) = batch.column_by_name("message_id") {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("message_id column must be StringArray");
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        existing.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(indices
+            .iter()
+            .copied()
+            .filter(|&i| !existing.contains(&emails[i].message_id))
+            .collect())
     }
 
     /// Build a [`RecordBatch`] from the given email indices and
-    /// merge-insert it into the lore table.
-    async fn merge_insert_lore_chunk(
+    /// append it to the lore table.
+    async fn add_lore_chunk(
         table: &lancedb::Table,
         emails: &[crate::types::LoreEmailInfo],
         indices: &[usize],
@@ -4098,15 +4180,7 @@ impl DatabaseManager {
         ];
 
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let batches = vec![Ok(batch)];
-        let batch_iterator =
-            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema.clone());
-
-        let mut merge_insert = table.merge_insert(&["message_id"]);
-        merge_insert
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
-        merge_insert.execute(Box::new(batch_iterator)).await?;
+        table.add(vec![batch]).execute().await?;
         Ok(())
     }
 
@@ -4293,18 +4367,42 @@ impl DatabaseManager {
         let mut first_iteration = true;
 
         loop {
-            let fts_query =
-                FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and use a plain table
+            // scan so the regex post-filter still runs.
+            let batches: Vec<_> = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field
+                );
+                let mut query_builder = table.query();
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
 
-            let mut query_builder = table.query().full_text_search(fts_query);
+                let mut query_builder = table.query().full_text_search(fts_query);
 
-            // Apply date filter at database level so limit applies to date-filtered results
-            if let Some(ref filter) = date_filter {
-                query_builder = query_builder.only_if(filter);
-            }
+                // Apply date filter at database level so limit applies to date-filtered results
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
 
-            let stream = query_builder.limit(fts_limit).execute().await?;
-            let batches: Vec<_> = stream.try_collect().await?;
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            };
 
             let fts_count: usize = batches.iter().map(|b| b.num_rows()).sum();
             tracing::info!(
@@ -4502,26 +4600,50 @@ impl DatabaseManager {
                 fts_pattern
             );
 
-            let fts_query =
-                FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
-            let mut query = lore_table.query().full_text_search(fts_query).select(
-                lancedb::query::Select::Columns(vec![
-                    "message_id".to_string(),
-                    "_score".to_string(),
-                    field_name.clone(),
-                ]),
-            );
-
-            // Apply limit - use large limit if search_limit is 0 (unlimited)
-            // FTS has a default limit of 10, so we must explicitly set a large limit
             let effective_limit = if search_limit > 0 {
                 search_limit
             } else {
                 100000
             };
-            query = query.limit(effective_limit);
 
-            let results = query.execute().await?.try_collect::<Vec<_>>().await?;
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and fall back to a plain
+            // table scan so the regex post-filter still runs.
+            let results = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field_name
+                );
+                lore_table
+                    .query()
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
+                lore_table
+                    .query()
+                    .full_text_search(fts_query)
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        "_score".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            };
 
             // Step 2: Post-filter with regex in memory
             let fts_result_count: usize = results.iter().map(|b| b.num_rows()).sum();
