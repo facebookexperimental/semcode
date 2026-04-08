@@ -5,6 +5,7 @@
 //! that can be called from different binaries (semcode-index, semcode, semcode-mcp, etc.)
 
 use anyhow::Result;
+use gix::revision::walk::Sorting;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,12 +88,11 @@ pub async fn check_and_optimize_if_needed(
 
 /// Parse git range and get all commit SHAs in the range.
 ///
-/// Walks first-parent chain from B back to A, avoiding gix's rev_walk + with_hidden
-/// which does an O(all commits) graph painting that is catastrophically slow on large repos.
+/// List commit SHAs in a range using gitoxide's rev_walk.
 ///
 /// Supports two formats:
-/// 1. "A..B" - commits reachable from B but not from A (first-parent walk)
-/// 2. "REF" (no ..) - all commits reachable from REF via first-parent (for initial indexing)
+/// 1. "A..B" - commits reachable from B but not from A
+/// 2. "REF" (no ..) - all commits reachable from REF (for initial indexing)
 pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<String>> {
     let (from_spec, to_spec) = if range.contains("..") {
         let parts: Vec<&str> = range.split("..").collect();
@@ -107,14 +107,20 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
     let to_commit = resolve_to_commit(repo, to_spec)?;
     let to_id = to_commit.id().detach();
 
-    let stop_at = if from_spec.is_empty() {
-        None
+    let walk = if from_spec.is_empty() {
+        repo.rev_walk([to_id])
+            .sorting(Sorting::ByCommitTime(Default::default()))
+            .all()?
     } else {
         match resolve_to_commit(repo, from_spec) {
-            Ok(from_commit) => Some(from_commit.id().detach()),
+            Ok(from_commit) => {
+                let from_id = from_commit.id().detach();
+                repo.rev_walk([to_id])
+                    .with_hidden([from_id])
+                    .sorting(Sorting::ByCommitTime(Default::default()))
+                    .all()?
+            }
             Err(e) => {
-                // Parent commit not found (shallow clone or root commit).
-                // Fall back to returning just the target commit.
                 info!(
                     "Could not resolve '{}' ({}); falling back to single-commit indexing",
                     from_spec, e
@@ -125,18 +131,10 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
     };
 
     let mut shas = Vec::new();
-    let mut current_id = to_id;
     const MAX_COMMITS: usize = 10000000;
 
-    loop {
-        // Stop if we've reached the exclusion boundary
-        if let Some(ref stop) = stop_at {
-            if current_id == *stop {
-                break;
-            }
-        }
-
-        shas.push(current_id.to_string());
+    for info in walk {
+        let info = info?;
 
         if shas.len() > MAX_COMMITS {
             return Err(anyhow::anyhow!(
@@ -146,20 +144,7 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
             ));
         }
 
-        // Get the first parent to continue walking.
-        // In shallow clones, parent objects may be missing — treat as end of history.
-        let commit = match repo.find_commit(current_id) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        let parent_ids: Vec<_> = commit.parent_ids().collect();
-
-        if parent_ids.is_empty() {
-            // Root commit, no more parents
-            break;
-        }
-
-        current_id = parent_ids[0].detach();
+        shas.push(info.id().to_string());
     }
 
     // Reverse to get chronological order (oldest first)
