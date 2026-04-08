@@ -1121,3 +1121,151 @@ pub async fn index_git_commits(
 
     Ok(commit_count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: run a git command in a directory, panic on failure.
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .expect("git command failed to execute");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Build a repo with merge topology and a tag on the side branch:
+    ///
+    ///   A -- B -- M -- D   (main)
+    ///         \      /
+    ///          C ---       (tagged "v1")
+    ///
+    /// Returns (tempdir, repo, sha_a, sha_b, sha_c, sha_m, sha_d).
+    fn create_merge_repo() -> (
+        tempfile::TempDir,
+        gix::Repository,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let p = tmpdir.path();
+
+        git(p, &["init", "-b", "main"]);
+
+        // Commit A
+        std::fs::write(p.join("a.txt"), "a").unwrap();
+        git(p, &["add", "a.txt"]);
+        git(p, &["commit", "-m", "A"]);
+        let sha_a = git(p, &["rev-parse", "HEAD"]);
+
+        // Commit B
+        std::fs::write(p.join("b.txt"), "b").unwrap();
+        git(p, &["add", "b.txt"]);
+        git(p, &["commit", "-m", "B"]);
+        let sha_b = git(p, &["rev-parse", "HEAD"]);
+
+        // Side branch with commit C, tagged "v1"
+        git(p, &["checkout", "-b", "side"]);
+        std::fs::write(p.join("c.txt"), "c").unwrap();
+        git(p, &["add", "c.txt"]);
+        git(p, &["commit", "-m", "C"]);
+        let sha_c = git(p, &["rev-parse", "HEAD"]);
+        git(p, &["tag", "v1"]);
+
+        // Back to main, merge side → creates merge commit M
+        git(p, &["checkout", "main"]);
+        git(p, &["merge", "side", "--no-ff", "-m", "M"]);
+        let sha_m = git(p, &["rev-parse", "HEAD"]);
+
+        // Commit D on top
+        std::fs::write(p.join("d.txt"), "d").unwrap();
+        git(p, &["add", "d.txt"]);
+        git(p, &["commit", "-m", "D"]);
+        let sha_d = git(p, &["rev-parse", "HEAD"]);
+
+        let repo = gix::open(p).unwrap();
+        (tmpdir, repo, sha_a, sha_b, sha_c, sha_m, sha_d)
+    }
+
+    /// Regression test: a tag on a side branch (not on the first-parent
+    /// chain) must still correctly bound the range.  A first-parent-only
+    /// walk would miss it and traverse the entire history.
+    #[test]
+    fn test_list_shas_tag_on_side_branch() {
+        let (_tmp, repo, _sha_a, _sha_b, _sha_c, sha_m, sha_d) = create_merge_repo();
+
+        let shas = list_shas_in_range(&repo, "v1..HEAD").unwrap();
+
+        // v1 points at C (on the side branch).  The range v1..HEAD
+        // should include M and D only — NOT A, B, or C.
+        assert!(
+            shas.contains(&sha_m),
+            "merge commit M should be in v1..HEAD"
+        );
+        assert!(shas.contains(&sha_d), "commit D should be in v1..HEAD");
+        assert_eq!(
+            shas.len(),
+            2,
+            "v1..HEAD should contain exactly 2 commits (M, D), got {}: {:?}",
+            shas.len(),
+            shas
+        );
+    }
+
+    /// Range where the start IS on the first-parent chain works too.
+    #[test]
+    fn test_list_shas_first_parent_boundary() {
+        let (_tmp, repo, sha_a, sha_b, sha_c, sha_m, sha_d) = create_merge_repo();
+
+        let shas = list_shas_in_range(&repo, &format!("{sha_a}..HEAD")).unwrap();
+
+        // A..HEAD should include B, C, M, D (everything after A).
+        let expected: std::collections::HashSet<&str> = [
+            sha_b.as_str(),
+            sha_c.as_str(),
+            sha_m.as_str(),
+            sha_d.as_str(),
+        ]
+        .into_iter()
+        .collect();
+        let got: std::collections::HashSet<&str> = shas.iter().map(|s| s.as_str()).collect();
+
+        assert_eq!(expected, got, "A..HEAD should be {{B, C, M, D}}");
+    }
+
+    /// No range separator — returns all reachable commits.
+    #[test]
+    fn test_list_shas_no_range() {
+        let (_tmp, repo, sha_a, sha_b, sha_c, sha_m, sha_d) = create_merge_repo();
+
+        let shas = list_shas_in_range(&repo, "HEAD").unwrap();
+
+        let expected: std::collections::HashSet<&str> = [
+            sha_a.as_str(),
+            sha_b.as_str(),
+            sha_c.as_str(),
+            sha_m.as_str(),
+            sha_d.as_str(),
+        ]
+        .into_iter()
+        .collect();
+        let got: std::collections::HashSet<&str> = shas.iter().map(|s| s.as_str()).collect();
+
+        assert_eq!(expected, got, "HEAD (no range) should return all 5 commits");
+    }
+}
