@@ -4,10 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tower_lsp::jsonrpc::Result as LspResult;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, LspService, Server};
-use url::Url;
+use tower_lsp_server::jsonrpc::Result as LspResult;
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 use semcode::{database_utils, DatabaseManager};
 
@@ -33,7 +32,7 @@ impl SemcodeLspBackend {
         }
     }
 
-    async fn ensure_database_connection(&self, workspace_uri: Option<&Url>) -> Result<()> {
+    async fn ensure_database_connection(&self, workspace_uri: Option<&Uri>) -> Result<()> {
         let mut db = self.database.lock().await;
         if db.is_some() {
             return Ok(());
@@ -64,7 +63,7 @@ impl SemcodeLspBackend {
             // Use workspace directory (process_database_path will add .semcode.db)
             let workspace_path = uri
                 .to_file_path()
-                .map_err(|_| anyhow::anyhow!("Failed to convert workspace URI to file path"))?;
+                .ok_or_else(|| anyhow::anyhow!("Failed to convert workspace URI to file path"))?;
             let workspace_str = workspace_path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("Invalid workspace path"))?
@@ -175,7 +174,7 @@ impl SemcodeLspBackend {
         drop(repo_path_guard);
 
         // Convert absolute file path to URI
-        let file_uri = Url::from_file_path(&absolute_path).ok()?;
+        let file_uri = Uri::from_file_path(&absolute_path)?;
 
         // Create position (LSP uses 0-based line numbers)
         let position = Position {
@@ -269,7 +268,7 @@ impl SemcodeLspBackend {
             drop(repo_path_guard);
 
             // Convert to URI
-            if let Ok(file_uri) = Url::from_file_path(&absolute_path) {
+            if let Some(file_uri) = Uri::from_file_path(&absolute_path) {
                 let position = Position {
                     line: line_start.saturating_sub(1),
                     character: 0,
@@ -334,12 +333,18 @@ impl SemcodeLspBackend {
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for SemcodeLspBackend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
-        // Try to establish database connection
+        // Try to establish database connection using workspace folders (preferred) or root_uri (legacy)
+        let workspace_uri = params
+            .workspace_folders
+            .as_ref()
+            .and_then(|folders| folders.first())
+            .map(|f| &f.uri);
+        #[allow(deprecated)]
+        let workspace_uri = workspace_uri.or(params.root_uri.as_ref());
         let _ = self
-            .ensure_database_connection(params.root_uri.as_ref())
+            .ensure_database_connection(workspace_uri)
             .await;
 
         Ok(InitializeResult {
@@ -347,6 +352,7 @@ impl LanguageServer for SemcodeLspBackend {
                 name: "semcode-lsp".to_string(),
                 version: Some("0.1.0".to_string()),
             }),
+            offset_encoding: None,
             capabilities: ServerCapabilities {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
@@ -372,7 +378,11 @@ impl LanguageServer for SemcodeLspBackend {
         let position = &params.text_document_position_params.position;
 
         // Get the document text to extract the function name
-        let document_text = match std::fs::read_to_string(uri.path()) {
+        let file_path = match uri.to_file_path() {
+            Some(p) => p.into_owned(),
+            None => return Ok(None),
+        };
+        let document_text = match std::fs::read_to_string(&file_path) {
             Ok(text) => text,
             Err(_) => return Ok(None),
         };
@@ -397,7 +407,11 @@ impl LanguageServer for SemcodeLspBackend {
         let position = &params.text_document_position.position;
 
         // Get the document text to extract the function name
-        let document_text = match std::fs::read_to_string(uri.path()) {
+        let file_path = match uri.to_file_path() {
+            Some(p) => p.into_owned(),
+            None => return Ok(None),
+        };
+        let document_text = match std::fs::read_to_string(&file_path) {
             Ok(text) => text,
             Err(_) => return Ok(None),
         };
