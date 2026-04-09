@@ -1787,6 +1787,7 @@ impl VectorSearchManager {
 
     /// Helper to query lore by fields and return intersection of message_ids
     /// Optimized for large result sets with capacity pre-allocation
+    #[allow(clippy::too_many_arguments)]
     async fn query_lore_fields_intersection(
         &self,
         from_patterns: Option<&[String]>,
@@ -1795,18 +1796,35 @@ impl VectorSearchManager {
         symbols_patterns: Option<&[String]>,
         recipients_patterns: Option<&[String]>,
         search_limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
     ) -> Result<std::collections::HashSet<String>> {
         use std::collections::HashSet;
 
         let lore_table = self.connection.open_table("lore").execute().await?;
         let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
 
-        // Helper function to query a field using substring matching and collect message_ids efficiently
+        // Parse date filters into DateTime for temporal comparison
+        // in query_field_impl (RFC 2822 string comparison is not
+        // meaningful for date ordering).
+        let since_dt = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_dt = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        // Helper function to query a field using FTS with regex and
+        // date post-filtering.  Selects the "date" column alongside
+        // the searched field so temporal filtering happens on the
+        // already-fetched FTS candidates without extra lookups.
         async fn query_field_impl(
             lore_table: &lancedb::Table,
             field_name: String,
             pattern: String,
             search_limit: usize,
+            since: Option<chrono::DateTime<chrono::Utc>>,
+            until: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<HashSet<String>> {
             let start = std::time::Instant::now();
 
@@ -1826,11 +1844,12 @@ impl VectorSearchManager {
 
             let fts_query =
                 FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
-            let mut query = lore_table.query().full_text_search(fts_query).select(
+            let query = lore_table.query().full_text_search(fts_query).select(
                 lancedb::query::Select::Columns(vec![
                     "message_id".to_string(),
                     "_score".to_string(),
                     field_name.clone(),
+                    "date".to_string(),
                 ]),
             );
 
@@ -1841,38 +1860,56 @@ impl VectorSearchManager {
             } else {
                 100000
             };
-            query = query.limit(effective_limit);
+            let query = query.limit(effective_limit);
 
             let results = query.execute().await?.try_collect::<Vec<_>>().await?;
 
-            // Step 2: Post-filter results with regex in memory (small result set)
+            // Post-filter with regex and date range in memory
             let regex = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()?;
+            let has_date_filter = since.is_some() || until.is_some();
             let mut message_ids = HashSet::new();
+            let mut bad_dates: usize = 0;
 
             for batch in &results {
-                let msg_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let field_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let msg_array: &arrow::array::StringArray = super::get_column(batch, "message_id")?;
+                let field_array: &arrow::array::StringArray =
+                    super::get_column(batch, &field_name)?;
+                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
 
                 for i in 0..batch.num_rows() {
-                    let field_value = field_array.value(i);
-                    if regex.is_match(field_value) {
-                        message_ids.insert(msg_array.value(i).to_string());
+                    if !regex.is_match(field_array.value(i)) {
+                        continue;
                     }
+                    if has_date_filter {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_array.value(i)) {
+                            let dt_utc = dt.with_timezone(&chrono::Utc);
+                            if since.is_some_and(|s| dt_utc < s) {
+                                continue;
+                            }
+                            if until.is_some_and(|u| dt_utc > u) {
+                                continue;
+                            }
+                        } else {
+                            bad_dates += 1;
+                            continue;
+                        }
+                    }
+                    message_ids.insert(msg_array.value(i).to_string());
                 }
             }
 
+            if bad_dates > 0 {
+                tracing::warn!(
+                    "Skipped {} candidates with unparseable dates for field '{}'",
+                    bad_dates,
+                    field_name
+                );
+            }
+
             tracing::info!(
-                "vlore filter completed: FTS returned {} candidates, regex filtered to {} in {:?}",
+                "vlore filter completed: FTS returned {} candidates, regex+date filtered to {} in {:?}",
                 results.iter().map(|b| b.num_rows()).sum::<usize>(),
                 message_ids.len(),
                 start.elapsed()
@@ -1881,88 +1918,103 @@ impl VectorSearchManager {
             Ok(message_ids)
         }
 
-        // Query from field
+        // Query from field (OR across patterns)
         if let Some(patterns) = from_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "from".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
+                        since_dt,
+                        until_dt,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query subject field
+        // Query subject field (OR across patterns)
         if let Some(patterns) = subject_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "subject".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
+                        since_dt,
+                        until_dt,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query body field
+        // Query body field (OR across patterns)
         if let Some(patterns) = body_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "body".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
+                        since_dt,
+                        until_dt,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query symbols field
+        // Query symbols field (OR across patterns)
         if let Some(patterns) = symbols_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "symbols".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
+                        since_dt,
+                        until_dt,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
-        // Query recipients field
+        // Query recipients field (OR across patterns)
         if let Some(patterns) = recipients_patterns {
             if !patterns.is_empty() {
-                // FTS: join patterns with spaces for multi-keyword search
-                let combined_pattern = patterns.join(" ");
-                field_result_sets.push(
-                    query_field_impl(
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
                         &lore_table,
                         "recipients".to_string(),
-                        combined_pattern,
+                        pattern.clone(),
                         search_limit,
+                        since_dt,
+                        until_dt,
                     )
-                    .await?,
-                );
+                    .await?;
+                    field_union.extend(results);
+                }
+                field_result_sets.push(field_union);
             }
         }
 
@@ -3232,7 +3284,7 @@ impl VectorSearchManager {
         );
 
         // Separate field filters from date filters
-        // Field filters affect which emails to search (FTS/regex), date filters affect final results
+        // Field filters select emails via FTS/regex; date filters narrow candidates during FTS post-filtering
         let has_field_filters = filters.from_patterns.is_some()
             || filters.subject_patterns.is_some()
             || filters.body_patterns.is_some()
@@ -3242,39 +3294,13 @@ impl VectorSearchManager {
         let lore_vectors_table = self.connection.open_table("lore_vectors").execute().await?;
         let lore_table = self.connection.open_table("lore").execute().await?;
 
-        // Build date filter clause if needed
-        let date_filter = match (filters.since_date, filters.until_date) {
-            (Some(since), Some(until)) => {
-                let escaped_since = since.replace("'", "''");
-                let escaped_until = until.replace("'", "''");
-                Some(format!(
-                    "date >= '{}' AND date <= '{}'",
-                    escaped_since, escaped_until
-                ))
-            }
-            (Some(since), None) => {
-                let escaped_since = since.replace("'", "''");
-                Some(format!("date >= '{}'", escaped_since))
-            }
-            (None, Some(until)) => {
-                let escaped_until = until.replace("'", "''");
-                Some(format!("date <= '{}'", escaped_until))
-            }
-            (None, None) => None,
-        };
-
-        if let Some(ref filter) = date_filter {
-            tracing::info!(
-                "vlore: Date filter will be applied during email fetch: {}",
-                filter
-            );
-        }
+        let has_date_filter = filters.since_date.is_some() || filters.until_date.is_some();
 
         // No field filters (but may have date filter): simple vector search
         if !has_field_filters {
             // Note: LanceDB vector search on lore_vectors table doesn't have date column
             // We must fetch more candidates and filter in fetch_emails_by_ids
-            let fetch_multiplier = if date_filter.is_some() {
+            let fetch_multiplier = if has_date_filter {
                 50 // Significantly increase to ensure we get enough results after date filtering
             } else {
                 2
@@ -3352,6 +3378,8 @@ impl VectorSearchManager {
                     filters.symbols_patterns,
                     filters.recipients_patterns,
                     search_limit,
+                    filters.since_date,
+                    filters.until_date,
                 )
                 .await?;
 
@@ -3385,16 +3413,10 @@ impl VectorSearchManager {
             // 3. Build score map from vector results
             let mut score_map = HashMap::new();
             for batch in &vector_results {
-                let message_id_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let distance_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float32Array>()
-                    .unwrap();
+                let message_id_array: &arrow::array::StringArray =
+                    super::get_column(batch, "message_id")?;
+                let distance_array: &arrow::array::Float32Array =
+                    super::get_column(batch, "_distance")?;
 
                 for i in 0..batch.num_rows() {
                     let message_id = message_id_array.value(i).to_string();
@@ -3431,7 +3453,9 @@ impl VectorSearchManager {
                 continue; // Try larger search if no intersection found
             }
 
-            // 5. Fetch full email data for intersection (only what we need, up to limit)
+            // 5. Fetch full email data for intersection (up to limit).
+            // Date filtering was already applied in the FTS phase,
+            // so no date re-filtering is needed here.
             let ids_to_fetch: Vec<String> = intersection_ids
                 .iter()
                 .take(limit)
@@ -3444,8 +3468,8 @@ impl VectorSearchManager {
                     &score_map,
                     lore_table.clone(),
                     limit,
-                    filters.since_date,
-                    filters.until_date,
+                    None,
+                    None,
                 )
                 .await?;
 
@@ -3527,61 +3551,26 @@ impl VectorSearchManager {
                 .await?;
 
             for batch in &batches {
-                let git_commit_sha_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let from_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let date_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let git_commit_sha_array: &arrow::array::StringArray =
+                    super::get_column(batch, "git_commit_sha")?;
+                let from_array: &arrow::array::StringArray = super::get_column(batch, "from")?;
+                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
                 let date_timestamp_array = batch
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-                let message_id_array = batch
-                    .column(4)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let in_reply_to_array = batch
-                    .column(5)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let subject_array = batch
-                    .column(6)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let references_array = batch
-                    .column(7)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let recipients_array = batch
-                    .column(8)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let body_array = batch
-                    .column(9)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let symbols_array = batch
-                    .column(10)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+                let message_id_array: &arrow::array::StringArray =
+                    super::get_column(batch, "message_id")?;
+                let in_reply_to_array: &arrow::array::StringArray =
+                    super::get_column(batch, "in_reply_to")?;
+                let subject_array: &arrow::array::StringArray =
+                    super::get_column(batch, "subject")?;
+                let references_array: &arrow::array::StringArray =
+                    super::get_column(batch, "references")?;
+                let recipients_array: &arrow::array::StringArray =
+                    super::get_column(batch, "recipients")?;
+                let body_array: &arrow::array::StringArray = super::get_column(batch, "body")?;
+                let symbols_array: &arrow::array::StringArray =
+                    super::get_column(batch, "symbols")?;
 
                 for i in 0..batch.num_rows() {
                     if results.len() >= limit {
@@ -3642,8 +3631,9 @@ impl VectorSearchManager {
                     let symbols: Vec<String> =
                         serde_json::from_str(symbols_json).unwrap_or_default();
 
-                    // Get date_timestamp from the batch
-                    let date_timestamp = date_timestamp_array.value(i);
+                    let date_timestamp = date_timestamp_array
+                        .map(|arr| arr.value(i))
+                        .unwrap_or_else(|| email_datetime.timestamp());
 
                     results.push((
                         crate::types::LoreEmailInfo {

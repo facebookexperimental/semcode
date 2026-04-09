@@ -1080,8 +1080,6 @@ async fn main() -> Result<()> {
                 total_emails_all_archives
             );
 
-            // Optimize before creating FTS indices so that compaction
-            // does not orphan the index data that was just built.
             if total_new_emails > 0 {
                 match db_manager.check_optimization_health().await {
                     Ok((needs_optimization, message)) => {
@@ -1100,10 +1098,18 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                println!("\nCreating FTS indices for lore table...");
-                match db_manager.create_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices created successfully"),
-                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
+                // Create FTS indices on first run; merge new rows on
+                // subsequent runs.  LanceDB's native FTS engine serves
+                // unindexed rows via brute-force fallback, so queries
+                // remain correct before optimize completes.
+                println!("\nUpdating FTS indices for lore table...");
+                match db_manager.ensure_lore_fts_indices().await {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
+                }
+                match db_manager.optimize_lore_fts_indices().await {
+                    Ok(_) => println!("FTS indices updated successfully"),
+                    Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }
 
@@ -1248,8 +1254,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Optimize before creating FTS indices so that compaction
-            // does not orphan the index data that was just built.
             if total_new_emails > 0 {
                 match db_manager.check_optimization_health().await {
                     Ok((needs_optimization, message)) => {
@@ -1268,10 +1272,14 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                println!("\nCreating FTS indices for lore table...");
-                match db_manager.create_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices created successfully"),
-                    Err(e) => eprintln!("Warning: Failed to create FTS indices: {}", e),
+                println!("\nUpdating FTS indices for lore table...");
+                match db_manager.ensure_lore_fts_indices().await {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
+                }
+                match db_manager.optimize_lore_fts_indices().await {
+                    Ok(_) => println!("FTS indices updated successfully"),
+                    Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
+use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -309,6 +310,109 @@ impl SchemaManager {
             }
         }
 
+        // Add the date_timestamp column if missing. Databases created
+        // before this column was introduced have a 10-column schema;
+        // merge_insert of 11-column batches silently fails, causing
+        // new emails to be skipped while their commit SHAs are still
+        // recorded as indexed.
+        if schema.column_with_name("date_timestamp").is_none() {
+            tracing::info!("Migrating lore table: adding 'date_timestamp' column");
+            table
+                .add_columns(
+                    lancedb::table::NewColumnTransform::SqlExpressions(vec![(
+                        "date_timestamp".into(),
+                        "CAST(0 AS BIGINT)".into(),
+                    )]),
+                    None,
+                )
+                .await?;
+
+            // Purge lore_indexed_commits so that previously-skipped
+            // emails are re-examined on the next --lore refresh.
+            self.reconcile_lore_indexed_commits().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove entries from lore_indexed_commits whose git_commit_sha
+    /// does not appear in the lore table.  This recovers from the
+    /// schema-mismatch bug where SHAs were recorded as indexed but the
+    /// corresponding emails were never stored.
+    async fn reconcile_lore_indexed_commits(&self) -> Result<()> {
+        let lore = self.connection.open_table("lore").execute().await?;
+        let idx = self
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await?;
+
+        // Collect the set of SHAs actually present in the lore table.
+        let lore_stream = lore
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "git_commit_sha".to_string()
+            ]))
+            .execute()
+            .await?;
+        let lore_batches: Vec<_> = lore_stream.try_collect().await?;
+
+        let mut lore_shas = std::collections::HashSet::new();
+        for batch in &lore_batches {
+            if let Some(col) = batch.column_by_name("git_commit_sha") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    for i in 0..arr.len() {
+                        lore_shas.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        // Collect SHAs from lore_indexed_commits.
+        let idx_stream = idx
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "git_commit_sha".to_string()
+            ]))
+            .execute()
+            .await?;
+        let idx_batches: Vec<_> = idx_stream.try_collect().await?;
+
+        let mut orphaned: Vec<String> = Vec::new();
+        for batch in &idx_batches {
+            if let Some(col) = batch.column_by_name("git_commit_sha") {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    for i in 0..arr.len() {
+                        let sha = arr.value(i);
+                        if !lore_shas.contains(sha) {
+                            orphaned.push(sha.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if orphaned.is_empty() {
+            tracing::info!("reconcile_lore_indexed_commits: no orphaned entries");
+            return Ok(());
+        }
+
+        tracing::info!(
+            "reconcile_lore_indexed_commits: removing {} orphaned entries",
+            orphaned.len()
+        );
+
+        // Delete in chunks to avoid oversized SQL predicates.
+        for chunk in orphaned.chunks(500) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|s| format!("'{}'", s.replace('\'', "''")))
+                .collect();
+            let predicate = format!("git_commit_sha IN ({})", placeholders.join(", "));
+            idx.delete(&predicate).await?;
+        }
+
+        tracing::info!("reconcile_lore_indexed_commits: done");
         Ok(())
     }
 
@@ -788,38 +892,11 @@ impl SchemaManager {
         }
     }
 
-    async fn try_create_fts_index(
-        &self,
-        table: &lancedb::table::Table,
-        columns: &[&str],
-        description: &str,
-    ) {
-        // Configure FTS index optimized for source code and technical docs
-        let fts_config = FtsIndexBuilder::default()
-            .with_position(false) // Enable phrase queries for exact code snippets
-            .base_tokenizer("simple".to_string())
-            .lower_case(true) // Case-insensitive search for better matching
-            .stem(false) // No stemming (run != running in code)
-            .remove_stop_words(false) // Keep all tokens (if, for, while are keywords)
-            .ascii_folding(true) // Preserve exact characters
-            .max_token_length(Some(100)); // Allow long identifiers/symbols
-
-        tracing::info!("Starting {}", description);
-        match table
-            .create_index(columns, LanceIndex::FTS(fts_config))
-            .execute()
-            .await
-        {
-            Ok(_) => tracing::info!("✓ Completed {}", description),
-            Err(e) => tracing::warn!("Failed to create {}: {}", description, e),
-        }
-    }
-
-    /// Create FTS indices for lore table (must be called after data is inserted)
+    /// Drop and rebuild all FTS indices for the lore table from scratch.
     ///
-    /// Drops any existing FTS indices first, creates fresh ones, then
-    /// prunes so that the on-disk index directories from prior data
-    /// layouts are actually removed.
+    /// Intended for schema migrations and --clear rebuilds where the
+    /// table structure has changed.  Normal incremental indexing should
+    /// use ensure_lore_fts_indices() + optimize_lore_fts_indices().
     pub async fn create_lore_fts_indices(&self) -> Result<()> {
         let table = self.connection.open_table("lore").execute().await?;
 
@@ -841,29 +918,9 @@ impl SchemaManager {
             }
         }
 
-        // Create FTS indices for text search on all searchable fields in parallel
-        let start_time = std::time::Instant::now();
-        tracing::info!("Creating 5 FTS indices for lore table in parallel (from, subject, body, recipients, symbols)...");
+        Self::create_all_fts_indices(&table).await?;
 
-        // Create all 5 indices concurrently for faster indexing
-        tokio::join!(
-            self.try_create_fts_index(&table, &["from"], "FTS index on lore.from"),
-            self.try_create_fts_index(&table, &["subject"], "FTS index on lore.subject"),
-            self.try_create_fts_index(&table, &["body"], "FTS index on lore.body"),
-            self.try_create_fts_index(&table, &["recipients"], "FTS index on lore.recipients"),
-            self.try_create_fts_index(&table, &["symbols"], "FTS index on lore.symbols"),
-        );
-
-        let elapsed = start_time.elapsed();
-        tracing::info!(
-            "Completed creating 5 FTS indices in {:.1}s",
-            elapsed.as_secs_f64()
-        );
-
-        // Prune orphaned index data left behind by drop_index()
-        // and by OptimizeAction::Index in optimize_single_table(),
-        // which rebuilds all indices (including FTS) into new
-        // directories without removing the old ones.
+        // Prune orphaned index data left behind by drop_index().
         if dropped {
             tracing::info!("Pruning orphaned index data from lore table...");
             if let Err(e) = table
@@ -881,6 +938,121 @@ impl SchemaManager {
         }
 
         Ok(())
+    }
+
+    /// Create FTS indices only if they do not already exist.
+    ///
+    /// After the first full build, subsequent indexing runs call this
+    /// to ensure the indices are present, then optimize_lore_fts_indices()
+    /// to merge newly-inserted rows into the existing indices.
+    pub async fn ensure_lore_fts_indices(&self) -> Result<()> {
+        use lancedb::index::IndexType;
+        let table = self.connection.open_table("lore").execute().await?;
+        let indices: Vec<lancedb::index::IndexConfig> =
+            (table.list_indices().await).unwrap_or_default();
+
+        let fts_count = indices
+            .iter()
+            .filter(|idx| idx.index_type == IndexType::FTS)
+            .count();
+
+        // All 5 FTS indices present — nothing to do.
+        if fts_count >= 5 {
+            tracing::info!(
+                "Lore FTS indices already present ({} indices), skipping creation",
+                fts_count
+            );
+            return Ok(());
+        }
+
+        if fts_count > 0 {
+            tracing::info!(
+                "Only {} of 5 FTS indices present, rebuilding all",
+                fts_count
+            );
+            // Drop the partial set so create_index does not collide.
+            for idx in &indices {
+                if idx.index_type == IndexType::FTS {
+                    let _ = table.drop_index(&idx.name).await;
+                }
+            }
+        } else {
+            tracing::info!("No FTS indices found, creating initial set");
+        }
+
+        Self::create_all_fts_indices(&table).await
+    }
+
+    /// Merge newly-inserted rows into existing lore FTS indices.
+    ///
+    /// LanceDB's native FTS engine serves unindexed rows via a
+    /// brute-force fallback at query time, so queries remain correct
+    /// even before this call.  Running optimize merges those rows
+    /// into the inverted index structure, eliminating the scan cost.
+    pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+        let table = self.connection.open_table("lore").execute().await?;
+        let start_time = std::time::Instant::now();
+
+        tracing::info!("Optimizing lore FTS indices (incremental merge)...");
+        table
+            .optimize(OptimizeAction::Index(Default::default()))
+            .await?;
+
+        let elapsed = start_time.elapsed();
+        tracing::info!(
+            "Lore FTS index optimization completed in {:.1}s",
+            elapsed.as_secs_f64()
+        );
+        Ok(())
+    }
+
+    /// Shared helper: create all 5 FTS indices on an already-opened table.
+    async fn create_all_fts_indices(table: &lancedb::table::Table) -> Result<()> {
+        let start_time = std::time::Instant::now();
+        tracing::info!(
+            "Creating 5 FTS indices for lore table (from, subject, body, recipients, symbols)..."
+        );
+
+        tokio::join!(
+            Self::create_one_fts_index(table, &["from"], "FTS index on lore.from"),
+            Self::create_one_fts_index(table, &["subject"], "FTS index on lore.subject"),
+            Self::create_one_fts_index(table, &["body"], "FTS index on lore.body"),
+            Self::create_one_fts_index(table, &["recipients"], "FTS index on lore.recipients"),
+            Self::create_one_fts_index(table, &["symbols"], "FTS index on lore.symbols"),
+        );
+
+        let elapsed = start_time.elapsed();
+        tracing::info!(
+            "Completed creating 5 FTS indices in {:.1}s",
+            elapsed.as_secs_f64()
+        );
+        Ok(())
+    }
+
+    /// Create a single FTS index on the given columns.
+    async fn create_one_fts_index(
+        table: &lancedb::table::Table,
+        columns: &[&str],
+        description: &str,
+    ) {
+        let fts_config = FtsIndexBuilder::default()
+            .with_position(false)
+            .base_tokenizer("simple".to_string())
+            .lower_case(true)
+            .stem(false)
+            .remove_stop_words(false)
+            .ascii_folding(true)
+            .max_token_length(Some(100));
+
+        tracing::info!("Starting {}", description);
+        match table
+            .create_index(columns, LanceIndex::FTS(fts_config))
+            .execute()
+            .await
+        {
+            Ok(_) => tracing::info!("Completed {}", description),
+            Err(e) => tracing::warn!("Failed to create {}: {}", description, e),
+        }
     }
 
     pub async fn rebuild_indices(&self) -> Result<()> {
@@ -1025,15 +1197,6 @@ impl SchemaManager {
         connection: &Connection,
         table_name: &str,
     ) -> Result<OptimizeOutcome> {
-        // Skip the lore table entirely: Compact, Prune, and
-        // OptimizeAction::Index each create new manifest versions
-        // that drop FTS index references, destroying full-text
-        // search until the next semcode-index --lore rebuild.
-        if table_name == "lore" {
-            tracing::info!("Skipping optimization for lore table (preserving FTS indices)");
-            return Ok(OptimizeOutcome::Skipped);
-        }
-
         // Minimum row count for optimization to be worthwhile
         const MIN_ROWS_FOR_OPTIMIZATION: usize = 1000;
 
