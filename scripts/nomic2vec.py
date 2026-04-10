@@ -493,6 +493,17 @@ def main():
                 # Allow setting but always return self
                 pass
 
+        # NomicBertEmbedding doesn't implement {get,set}_input_embeddings, but
+        # it is required for distill_from_model. See:
+        # https://huggingface.co/nomic-ai/nomic-bert-2048/discussions/22
+        import types
+        def get_input_embeddings(self):
+            return self.embeddings.word_embeddings
+        def set_input_embeddings(self, value):
+            self.embeddings.word_embeddings = value
+        model.get_input_embeddings = types.MethodType(get_input_embeddings, model)
+        model.set_input_embeddings = types.MethodType(set_input_embeddings, model)
+
         try:
             # Get full stack trace to see where the error is coming from
             import traceback
