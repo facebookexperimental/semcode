@@ -1217,6 +1217,43 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Compact only the tables modified by lore indexing.
+    ///
+    /// The full `compact_and_cleanup` method processes every table in
+    /// the database, including code-index tables and content shards
+    /// that a lore run never touches.  On memory-constrained systems
+    /// the combined working set of those compactions triggers the OOM
+    /// killer.  This method limits work to the two lore tables and
+    /// processes them sequentially to keep peak memory low.
+    pub async fn compact_lore_tables(&self) -> Result<()> {
+        tracing::info!("Running compaction for lore tables...");
+
+        let table_names = self.connection.table_names().execute().await?;
+        let lore_tables = ["lore", "lore_indexed_commits"];
+
+        for name in &lore_tables {
+            if !table_names.iter().any(|n| n == name) {
+                continue;
+            }
+            match Self::optimize_single_table(&self.connection, name).await {
+                Ok(OptimizeOutcome::Optimized) => {
+                    tracing::info!("Compacted table {}", name);
+                }
+                Ok(OptimizeOutcome::Skipped) => {
+                    tracing::info!("Skipped table {} (too small)", name);
+                }
+                Ok(OptimizeOutcome::PartialFailure) => {
+                    tracing::warn!("Partial failure compacting table {}", name);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to compact table {}: {}", name, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Optimize a single table - runs compact, prune, and index operations
     ///
     /// Tables with fewer than 1000 rows are skipped since the overhead of

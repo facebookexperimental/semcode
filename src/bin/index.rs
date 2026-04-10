@@ -1081,21 +1081,15 @@ async fn main() -> Result<()> {
             );
 
             if total_new_emails > 0 {
-                match db_manager.check_optimization_health().await {
-                    Ok((needs_optimization, message)) => {
-                        if needs_optimization {
-                            println!("\n{}", message);
-                            match db_manager.optimize_database().await {
-                                Ok(_) => println!("Database optimization completed successfully"),
-                                Err(e) => error!("Failed to optimize database: {}", e),
-                            }
-                        } else {
-                            println!("\n{}", message);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to check database health: {}", e);
-                    }
+                // Compact only lore tables.  The full optimize_database()
+                // method processes every table in the database including
+                // code-index tables and content shards that a lore run
+                // never touches.  On memory-constrained systems the
+                // combined working set triggers the OOM killer.
+                println!("\nCompacting lore tables...");
+                match db_manager.compact_lore_tables().await {
+                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
                 // Create FTS indices on first run; merge new rows on
@@ -1255,21 +1249,10 @@ async fn main() -> Result<()> {
             }
 
             if total_new_emails > 0 {
-                match db_manager.check_optimization_health().await {
-                    Ok((needs_optimization, message)) => {
-                        if needs_optimization {
-                            println!("\n{}", message);
-                            match db_manager.optimize_database().await {
-                                Ok(_) => println!("Database optimization completed successfully"),
-                                Err(e) => error!("Failed to optimize database: {}", e),
-                            }
-                        } else {
-                            println!("\n{}", message);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to check database health: {}", e);
-                    }
+                println!("\nCompacting lore tables...");
+                match db_manager.compact_lore_tables().await {
+                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
                 println!("\nUpdating FTS indices for lore table...");
