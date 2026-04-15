@@ -49,7 +49,7 @@ struct Args {
     database: Option<String>,
 
     /// Path to the git repository for git-aware queries
-    #[arg(long, default_value = ".")]
+    #[arg(long, env = "SEMCODE_GIT_REPO", default_value = ".")]
     git_repo: String,
 
     /// Path to local model directory (for semantic search)
@@ -80,6 +80,50 @@ struct Args {
     /// Disable working directory overlay (only query committed code)
     #[arg(long)]
     git_only: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::env;
+
+    #[test]
+    fn test_git_repo_env_var() {
+        let key = "SEMCODE_GIT_REPO";
+        let value = "/tmp/test_repo";
+        env::set_var(key, value);
+
+        // No arguments provided, should use env var
+        let args = Args::try_parse_from(&["query"]).unwrap();
+        assert_eq!(args.git_repo, value);
+
+        env::remove_var(key);
+    }
+
+    #[test]
+    fn test_git_repo_priority() {
+        let key = "SEMCODE_GIT_REPO";
+        let env_value = "/tmp/env_repo";
+        let arg_value = "/tmp/arg_repo";
+        env::set_var(key, env_value);
+
+        // Argument should take priority over env var
+        let args = Args::try_parse_from(&["query", "--git-repo", arg_value]).unwrap();
+        assert_eq!(args.git_repo, arg_value);
+
+        env::remove_var(key);
+    }
+
+    #[test]
+    fn test_git_repo_default() {
+        let key = "SEMCODE_GIT_REPO";
+        env::remove_var(key);
+
+        // No arguments and no env var, should use default
+        let args = Args::try_parse_from(&["query"]).unwrap();
+        assert_eq!(args.git_repo, ".");
+    }
 }
 
 /// Check if the current commit needs indexing and perform incremental indexing if needed
