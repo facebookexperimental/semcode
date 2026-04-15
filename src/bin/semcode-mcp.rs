@@ -1814,7 +1814,7 @@ struct Args {
     database: Option<String>,
 
     /// Path to the git repository for git-aware queries
-    #[arg(long, default_value = ".")]
+    #[arg(long, env = "SEMCODE_GIT_REPO", default_value = ".")]
     git_repo: String,
 
     /// Path to custom model directory (defaults to ~/.cache/semcode/models/)
@@ -5680,6 +5680,45 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::env;
+
+    #[test]
+    fn test_git_repo_env_var() {
+        let key = "SEMCODE_GIT_REPO";
+        let value = "/tmp/test_repo_mcp";
+        env::set_var(key, value);
+
+        // No arguments provided, should use env var
+        let args = Args::try_parse_from(&["semcode-mcp"]).unwrap();
+        assert_eq!(args.git_repo, value);
+
+        env::remove_var(key);
+    }
+
+    #[test]
+    fn test_git_repo_priority() {
+        let key = "SEMCODE_GIT_REPO";
+        let env_value = "/tmp/env_repo_mcp";
+        let arg_value = "/tmp/arg_repo_mcp";
+        env::set_var(key, env_value);
+
+        // Argument should take priority over env var
+        let args = Args::try_parse_from(&["semcode-mcp", "--git-repo", arg_value]).unwrap();
+        assert_eq!(args.git_repo, arg_value);
+
+        env::remove_var(key);
+    }
+
+    #[test]
+    fn test_git_repo_default() {
+        let key = "SEMCODE_GIT_REPO";
+        env::remove_var(key);
+
+        // No arguments and no env var, should use default
+        let args = Args::try_parse_from(&["semcode-mcp"]).unwrap();
+        assert_eq!(args.git_repo, ".");
+    }
 
     #[test]
     fn test_indexing_state_new() {
