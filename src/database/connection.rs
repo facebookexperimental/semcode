@@ -504,6 +504,10 @@ impl DatabaseManager {
         self.schema_manager.compact_and_cleanup().await
     }
 
+    pub async fn compact_lore_tables(&self) -> Result<()> {
+        self.schema_manager.compact_lore_tables().await
+    }
+
     /// Drop and recreate all tables for maximum space savings
     pub async fn drop_and_recreate_tables(&self) -> Result<()> {
         self.schema_manager.drop_and_recreate_tables().await

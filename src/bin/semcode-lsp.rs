@@ -343,9 +343,7 @@ impl LanguageServer for SemcodeLspBackend {
             .map(|f| &f.uri);
         #[allow(deprecated)]
         let workspace_uri = workspace_uri.or(params.root_uri.as_ref());
-        let _ = self
-            .ensure_database_connection(workspace_uri)
-            .await;
+        let _ = self.ensure_database_connection(workspace_uri).await;
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {

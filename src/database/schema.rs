@@ -990,6 +990,34 @@ impl SchemaManager {
     /// even before this call.  Running optimize merges those rows
     /// into the inverted index structure, eliminating the scan cost.
     pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+        // Guard against running on a table with a large _indices/
+        // backlog.  lance/index/append.rs opens every delta fragment
+        // for a column before merging any, so peak memory scales
+        // linearly with the number of fragments per column.  On
+        // memory-constrained systems a backlog in the thousands
+        // drives semcode-index into swap and gets it OOM-killed.
+        // Query correctness is preserved regardless: unindexed rows
+        // still fall back to a brute-force scan.
+        const MAX_LORE_INDEX_FRAGMENTS: usize = 100;
+        let uri = self.connection.uri();
+        let indices_dir = std::path::Path::new(uri)
+            .join("lore.lance")
+            .join("_indices");
+        if let Ok(rd) = std::fs::read_dir(&indices_dir) {
+            let count = rd.count();
+            if count > MAX_LORE_INDEX_FRAGMENTS {
+                tracing::warn!(
+                    "Skipping lore FTS index optimization: \
+                     {} _indices/ fragments exceeds {} threshold. \
+                     Queries remain correct via brute-force fallback. \
+                     Rebuild the lore table on a larger host to recover.",
+                    count,
+                    MAX_LORE_INDEX_FRAGMENTS
+                );
+                return Ok(());
+            }
+        }
+
         let table = self.connection.open_table("lore").execute().await?;
         let start_time = std::time::Instant::now();
 
@@ -1189,6 +1217,43 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Compact only the tables modified by lore indexing.
+    ///
+    /// The full `compact_and_cleanup` method processes every table in
+    /// the database, including code-index tables and content shards
+    /// that a lore run never touches.  On memory-constrained systems
+    /// the combined working set of those compactions triggers the OOM
+    /// killer.  This method limits work to the two lore tables and
+    /// processes them sequentially to keep peak memory low.
+    pub async fn compact_lore_tables(&self) -> Result<()> {
+        tracing::info!("Running compaction for lore tables...");
+
+        let table_names = self.connection.table_names().execute().await?;
+        let lore_tables = ["lore", "lore_indexed_commits"];
+
+        for name in &lore_tables {
+            if !table_names.iter().any(|n| n == name) {
+                continue;
+            }
+            match Self::optimize_single_table(&self.connection, name).await {
+                Ok(OptimizeOutcome::Optimized) => {
+                    tracing::info!("Compacted table {}", name);
+                }
+                Ok(OptimizeOutcome::Skipped) => {
+                    tracing::info!("Skipped table {} (too small)", name);
+                }
+                Ok(OptimizeOutcome::PartialFailure) => {
+                    tracing::warn!("Partial failure compacting table {}", name);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to compact table {}: {}", name, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Optimize a single table - runs compact, prune, and index operations
     ///
     /// Tables with fewer than 1000 rows are skipped since the overhead of
@@ -1197,6 +1262,24 @@ impl SchemaManager {
         connection: &Connection,
         table_name: &str,
     ) -> Result<OptimizeOutcome> {
+        // The lore table is indexed incrementally via
+        // ensure_lore_fts_indices() + optimize_lore_fts_indices().
+        // Running the generic optimize path here does no useful work
+        // that those helpers have not already done, and for large
+        // lore archives its Compact phase walks every delta index
+        // fragment under _indices/, holding per-fragment state until
+        // the operation completes.  On memory-constrained systems the
+        // resident set grows into swap and the OOM killer terminates
+        // semcode-index before compaction finishes, leaving fresh
+        // delta fragments behind each time.  Skip the table entirely.
+        if table_name == "lore" {
+            tracing::info!(
+                "Skipping generic optimization for lore table \
+                 (handled by optimize_lore_fts_indices)"
+            );
+            return Ok(OptimizeOutcome::Skipped);
+        }
+
         // Minimum row count for optimization to be worthwhile
         const MIN_ROWS_FOR_OPTIMIZATION: usize = 1000;
 
