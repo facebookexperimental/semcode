@@ -49,7 +49,7 @@ tower = "0.5"
 tokio-tungstenite = "0.29"
 anstream = "1.0"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
 owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
-gix = { version = "0.81", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl-openssl"] }
+gix = { version = "0.83", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl-openssl"] }
 model2vec-rs = "0.1.4"
 tower-lsp-server = "0.23"  # Language Server Protocol framework for LSP server
 similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for commit diffs
