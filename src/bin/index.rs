@@ -4,6 +4,7 @@ use clap::Parser;
 use colored::Colorize;
 use semcode::indexer::{
     list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline,
+    process_mbox_messages_pipeline,
 };
 use semcode::{measure, process_database_path, CodeVectorizer, DatabaseManager};
 // Temporary call relationships are now embedded in function JSON columns
@@ -103,6 +104,20 @@ struct Args {
     /// Without arguments, refreshes all previously indexed archives
     #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 0..)]
     lore: Option<Vec<String>>,
+
+    /// Download and index pipermail mbox archives into <db_dir>/pipermail/<host>/<list>
+    /// Accepts comma-separated archive base URLs
+    /// (e.g., --pipermail https://lists.denx.de/pipermail/u-boot/)
+    /// Without arguments, refreshes all previously downloaded archives
+    #[arg(long, value_name = "URL", value_delimiter = ',', num_args = 0..)]
+    pipermail: Option<Vec<String>>,
+
+    /// Only download and index pipermail archives from this date onwards
+    /// (month granularity). Accepts 'YYYY-MM-DD' or relative dates like
+    /// '1 year ago'. The cutoff is recorded per archive and refreshes
+    /// keep honouring it unless an earlier date is given explicitly.
+    #[arg(long, value_name = "DATE", requires = "pipermail")]
+    pipermail_since: Option<String>,
 
     // ==================== Multi-Branch Indexing ====================
     /// Index a specific branch (can be specified multiple times)
@@ -712,6 +727,106 @@ async fn index_lore_archive(
     })
 }
 
+/// Shared settings and insertion counters for a pipermail indexing run
+struct PipermailRun {
+    batch_size: usize,
+    since: Option<(u32, u32)>,
+    batches_inserted: Arc<std::sync::atomic::AtomicUsize>,
+    optimization_check_timer: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+/// Download new monthly mbox files for a pipermail archive and index any
+/// messages not yet in the database. `existing` carries the set of already
+/// indexed message ids and is updated as messages are queued for insertion.
+async fn process_pipermail_archive(
+    base_url: &str,
+    db_path: &str,
+    db_manager: &Arc<DatabaseManager>,
+    run: &PipermailRun,
+    existing: &mut HashSet<String>,
+) -> Result<LoreIndexResult> {
+    use semcode::pipermail;
+
+    let base_url = pipermail::normalize_base_url(base_url);
+    let archive_dir = pipermail::archive_storage_dir(db_path, &base_url)?;
+    std::fs::create_dir_all(&archive_dir)?;
+    pipermail::save_archive_url(&archive_dir, &base_url)?;
+
+    // An explicit cutoff is recorded for later refreshes; without one,
+    // fall back to the cutoff recorded by a previous run.
+    let since = match run.since {
+        Some(s) => {
+            pipermail::save_archive_since(&archive_dir, s)?;
+            Some(s)
+        }
+        None => pipermail::load_archive_since(&archive_dir),
+    };
+
+    println!("Fetching archive index from {}...", base_url);
+    let index_html = {
+        let url = base_url.clone();
+        tokio::task::spawn_blocking(move || pipermail::fetch_index_page(&url)).await??
+    };
+    let remote_files = pipermail::discover_archive_files(&index_html);
+    if remote_files.is_empty() {
+        return Err(anyhow::anyhow!("No monthly archives found at {}", base_url));
+    }
+
+    let to_download = pipermail::files_to_download(&remote_files, &archive_dir, since)?;
+    println!(
+        "{} monthly archives on server, {} to download",
+        remote_files.len(),
+        to_download.len()
+    );
+    for file in to_download {
+        let url = format!("{}{}", base_url, file.file_name);
+        let dest = archive_dir.join(&file.file_name);
+        println!("  Downloading {}", file.file_name);
+        tokio::task::spawn_blocking(move || pipermail::download_file(&url, &dest)).await??;
+    }
+
+    let mut new_emails = 0usize;
+    let mut total_emails = 0usize;
+    for (file, path) in pipermail::list_local_mbox_files(&archive_dir)? {
+        if since.is_some_and(|s| file.key() < s) {
+            continue;
+        }
+        let content = pipermail::read_mbox_file(&path)?;
+        let messages = pipermail::split_mbox(&content);
+        total_emails += messages.len();
+
+        let mut new_messages = Vec::new();
+        for message in messages {
+            let id = semcode::hash::compute_blake3_hash(&message);
+            if existing.insert(id.clone()) {
+                new_messages.push((id, message));
+            }
+        }
+        if new_messages.is_empty() {
+            continue;
+        }
+
+        println!(
+            "  {}: indexing {} new messages",
+            file.file_name,
+            new_messages.len()
+        );
+        new_emails += process_mbox_messages_pipeline(
+            new_messages,
+            db_manager.clone(),
+            run.batch_size,
+            run.batches_inserted.clone(),
+            run.optimization_check_timer.clone(),
+        )
+        .await?;
+    }
+
+    Ok(LoreIndexResult {
+        new_emails,
+        total_emails,
+    })
+}
+
 // ==================== Branch Indexing Support ====================
 
 /// Collect branches to index from the various branch-related CLI flags
@@ -1306,6 +1421,137 @@ async fn main() -> Result<()> {
 
             return Ok(());
         }
+    }
+
+    // Handle --pipermail option if provided
+    if let Some(pipermail_args) = &args.pipermail {
+        // If --pipermail has arguments, download and index the specified archives
+        // If --pipermail has no arguments, refresh all previously downloaded archives
+        let base_urls: Vec<String> = if !pipermail_args.is_empty() {
+            pipermail_args.clone()
+        } else {
+            let saved = semcode::pipermail::discover_saved_archives(&database_path)?;
+            if saved.is_empty() {
+                println!("No pipermail archives have been downloaded yet.");
+                println!();
+                println!("To index pipermail mailing list archives, specify archive base URLs:");
+                println!("  semcode-index --pipermail <URL>[,<URL>...]");
+                println!();
+                println!("Example:");
+                println!("  semcode-index --pipermail https://lists.denx.de/pipermail/u-boot/");
+                return Ok(());
+            }
+            println!("Found {} pipermail archive(s) to refresh:", saved.len());
+            for (_, url) in &saved {
+                println!("  - {}", url);
+            }
+            saved.into_iter().map(|(_, url)| url).collect()
+        };
+
+        info!(
+            "Pipermail archive processing requested for {} archives",
+            base_urls.len()
+        );
+
+        let since = match args.pipermail_since.as_deref() {
+            Some(date_str) => {
+                let (year, month) = semcode::pipermail::since_month(date_str)?;
+                println!("Limiting archives to {}-{:02} onwards", year, month);
+                Some((year, month))
+            }
+            None => None,
+        };
+
+        let db_manager =
+            DatabaseManager::new(&database_path, args.source.to_string_lossy().to_string()).await?;
+        db_manager.create_tables().await?;
+        let db_manager = Arc::new(db_manager);
+
+        let start_time = std::time::Instant::now();
+        let run = PipermailRun {
+            batch_size: 1024,
+            since,
+            batches_inserted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            optimization_check_timer: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        };
+
+        println!("Checking for already-indexed messages...");
+        let mut existing = db_manager.get_indexed_lore_commits().await?;
+
+        let mut total_new_emails = 0usize;
+        let mut total_emails_all_archives = 0usize;
+        let mut failed_archives: Vec<(String, String)> = Vec::new();
+
+        for base_url in &base_urls {
+            println!("\n=== Processing pipermail archive: {} ===", base_url);
+            match process_pipermail_archive(
+                base_url,
+                &database_path,
+                &db_manager,
+                &run,
+                &mut existing,
+            )
+            .await
+            {
+                Ok(result) => {
+                    println!(
+                        "Indexed {} new emails from {} (total in archive: {})",
+                        result.new_emails, base_url, result.total_emails
+                    );
+                    total_new_emails += result.new_emails;
+                    total_emails_all_archives += result.total_emails;
+                }
+                Err(e) => {
+                    eprintln!("Error processing {}: {:#}", base_url, e);
+                    failed_archives.push((base_url.clone(), e.to_string()));
+                }
+            }
+        }
+
+        let total_time = start_time.elapsed();
+
+        println!("\n=== Pipermail Email Indexing Complete ===");
+        println!("Total time: {:.1}s", total_time.as_secs_f64());
+        println!(
+            "Archives processed: {}/{}",
+            base_urls.len() - failed_archives.len(),
+            base_urls.len()
+        );
+        println!("New emails indexed: {}", total_new_emails);
+        println!(
+            "Total emails across archives: {}",
+            total_emails_all_archives
+        );
+
+        if !failed_archives.is_empty() {
+            eprintln!("\nFailed archives:");
+            for (name, err) in &failed_archives {
+                eprintln!("  {}: {}", name, err);
+            }
+        }
+
+        if total_new_emails > 0 {
+            println!("\nCompacting lore tables...");
+            match db_manager.compact_lore_tables().await {
+                Ok(_) => println!("Lore table compaction completed successfully"),
+                Err(e) => error!("Failed to compact lore tables: {}", e),
+            }
+
+            println!("\nUpdating FTS indices for lore table...");
+            match db_manager.ensure_lore_fts_indices().await {
+                Ok(_) => {}
+                Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
+            }
+            match db_manager.optimize_lore_fts_indices().await {
+                Ok(_) => println!("FTS indices updated successfully"),
+                Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
+            }
+        }
+
+        println!("\nTo query this database, run:");
+        println!("  semcode --database {}", database_path);
+
+        return Ok(());
     }
 
     // Validate mutually exclusive options
