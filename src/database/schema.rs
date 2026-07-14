@@ -61,14 +61,16 @@ impl SchemaManager {
             self.create_commit_vectors_table().await?;
         }
 
+        // Must exist before migrate_lore_table(), which reconciles
+        // against it when adding the date_timestamp column.
+        if !table_names.iter().any(|n| n == "lore_indexed_commits") {
+            self.create_lore_indexed_commits_table().await?;
+        }
+
         if !table_names.iter().any(|n| n == "lore") {
             self.create_lore_table().await?;
         } else {
             self.migrate_lore_table().await?;
-        }
-
-        if !table_names.iter().any(|n| n == "lore_indexed_commits") {
-            self.create_lore_indexed_commits_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "lore_vectors") {
@@ -1652,5 +1654,57 @@ impl SchemaManager {
 
         tracing::info!("Drop and recreate complete for table {}", table_name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Databases created before lore_indexed_commits existed have a lore
+    /// table without the date_timestamp column. create_all_tables() must
+    /// create lore_indexed_commits before migrating the lore table, since
+    /// the migration reconciles against it.
+    #[tokio::test]
+    async fn test_create_all_tables_migrates_old_lore_schema() {
+        let tmpdir = TempDir::new().unwrap();
+        let connection = lancedb::connect(tmpdir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+
+        let old_schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+            Field::new("from", DataType::Utf8, false),
+            Field::new("date", DataType::Utf8, false),
+            Field::new("message_id", DataType::Utf8, false),
+            Field::new("in_reply_to", DataType::Utf8, true),
+            Field::new("subject", DataType::Utf8, false),
+            Field::new("references", DataType::Utf8, true),
+            Field::new("recipients", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("symbols", DataType::Utf8, false),
+        ]));
+        let empty_batch = RecordBatch::new_empty(old_schema.clone());
+        connection
+            .create_table("lore", vec![empty_batch])
+            .execute()
+            .await
+            .unwrap();
+
+        let manager = SchemaManager::new(connection.clone());
+        manager.create_all_tables().await.unwrap();
+
+        let tables = connection.table_names().execute().await.unwrap();
+        assert!(tables.iter().any(|n| n == "lore_indexed_commits"));
+
+        let lore = connection.open_table("lore").execute().await.unwrap();
+        assert!(lore
+            .schema()
+            .await
+            .unwrap()
+            .column_with_name("date_timestamp")
+            .is_some());
     }
 }
