@@ -9,6 +9,7 @@ pub mod git_range;
 pub mod hash;
 pub mod indexer;
 pub mod perf_monitor;
+pub mod rust_analyzer;
 pub mod symbol_walkback;
 pub mod text_utils;
 mod treesitter_analyzer;

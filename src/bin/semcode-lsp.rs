@@ -89,6 +89,9 @@ impl SemcodeLspBackend {
 
         match DatabaseManager::new(&processed_path, git_repo_path.clone()).await {
             Ok(database_manager) => {
+                if let Err(e) = database_manager.attach_rust_analyzer().await {
+                    tracing::warn!("Failed to attach rust-analyzer: {}", e);
+                }
                 *db = Some(database_manager);
 
                 // Get the current git SHA for git-aware lookups
@@ -119,7 +122,8 @@ impl SemcodeLspBackend {
 
         let path = std::path::Path::new(&repo_path);
         let previous = db.take_workdir_index();
-        if let Ok(workdir) = semcode::WorkdirIndex::build_incremental(path, previous.as_ref()) {
+        if let Ok(workdir) = semcode::WorkdirIndex::build_incremental(path, previous.as_ref()).await
+        {
             if !workdir.is_empty() {
                 db.set_workdir_index(workdir);
             }

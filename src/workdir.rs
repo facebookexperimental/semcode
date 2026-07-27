@@ -61,9 +61,9 @@ pub struct WorkdirIndex {
 impl WorkdirIndex {
     /// Build a WorkdirIndex by scanning the working directory for uncommitted changes.
     ///
-    /// Equivalent to `build_incremental(repo_path, None)`.
-    pub fn build(repo_path: &Path) -> Result<Self> {
-        Self::build_incremental(repo_path, None)
+    /// Equivalent to `build_incremental(repo_path, None, None)`.
+    pub async fn build(repo_path: &Path) -> Result<Self> {
+        Self::build_incremental(repo_path, None).await
     }
 
     /// Build a WorkdirIndex, reusing cached analysis results from a previous index
@@ -71,7 +71,10 @@ impl WorkdirIndex {
     ///
     /// If `previous` is `None` or HEAD has changed since the previous build, all dirty
     /// files are re-analyzed from scratch.
-    pub fn build_incremental(repo_path: &Path, previous: Option<&WorkdirIndex>) -> Result<Self> {
+    pub async fn build_incremental(
+        repo_path: &Path,
+        previous: Option<&WorkdirIndex>,
+    ) -> Result<Self> {
         let total_start = std::time::Instant::now();
 
         let t = std::time::Instant::now();
@@ -689,17 +692,17 @@ void hello(void);
         (tmpdir, repo_path)
     }
 
-    #[test]
-    fn test_clean_repo_produces_empty_index() {
+    #[tokio::test]
+    async fn test_clean_repo_produces_empty_index() {
         let (_tmpdir, repo_path) = create_test_repo();
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
         assert!(index.is_empty());
         assert_eq!(index.function_count(), 0);
         assert_eq!(index.type_count(), 0);
     }
 
-    #[test]
-    fn test_modified_file_detected() {
+    #[tokio::test]
+    async fn test_modified_file_detected() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         // Modify test.c
@@ -723,7 +726,7 @@ void hello(void) {
         )
         .unwrap();
 
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
         assert!(!index.is_empty());
         assert!(index.is_dirty("test.c"));
         assert!(!index.is_dirty("test.h"));
@@ -735,8 +738,8 @@ void hello(void) {
         assert!(index.find_function("add").is_some());
     }
 
-    #[test]
-    fn test_new_file_detected() {
+    #[tokio::test]
+    async fn test_new_file_detected() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         // Add a new file and stage it (git add) so it appears in the index
@@ -755,27 +758,27 @@ int multiply(int a, int b) {
             .output()
             .unwrap();
 
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
         assert!(!index.is_empty());
         assert!(index.is_dirty("new.c"));
         assert!(index.find_function("multiply").is_some());
     }
 
-    #[test]
-    fn test_deleted_file_detected() {
+    #[tokio::test]
+    async fn test_deleted_file_detected() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         // Delete test.c
         fs::remove_file(repo_path.join("test.c")).unwrap();
 
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
         assert!(!index.is_empty());
         assert!(index.is_deleted("test.c"));
         assert!(!index.is_dirty("test.c"));
     }
 
-    #[test]
-    fn test_merged_manifest() {
+    #[tokio::test]
+    async fn test_merged_manifest() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         // Modify test.c and stage a new file
@@ -795,25 +798,25 @@ int multiply(int a, int b) {
             .output()
             .unwrap();
 
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
 
         // Create a fake HEAD manifest
         let mut head_manifest = HashMap::new();
-        head_manifest.insert("test.c".to_string(), "abc123".to_string());
-        head_manifest.insert("test.h".to_string(), "def456".to_string());
+        head_manifest.insert("test.c".to_string(), "old_hash1".to_string());
+        head_manifest.insert("test.h".to_string(), "old_hash2".to_string());
 
         let merged = index.merged_manifest(&head_manifest);
 
-        // test.c should have the dirty hash, not the HEAD hash
-        assert_ne!(merged.get("test.c").unwrap(), "abc123");
         // test.h should be unchanged
-        assert_eq!(merged.get("test.h").unwrap(), "def456");
-        // new.c should be added (it's staged)
+        assert_eq!(merged.get("test.h").unwrap(), "old_hash2");
+        // test.c should be updated
+        assert_ne!(merged.get("test.c").unwrap(), "old_hash1");
+        // new.c should be added
         assert!(merged.contains_key("new.c"));
     }
 
-    #[test]
-    fn test_find_callers_in_overlay() {
+    #[tokio::test]
+    async fn test_find_callers_in_overlay() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         fs::write(
@@ -830,14 +833,14 @@ int compute(int x) {
         )
         .unwrap();
 
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
         let callers = index.find_callers("add");
         assert!(!callers.is_empty());
         assert!(callers.iter().any(|f| f.name == "compute"));
     }
 
-    #[test]
-    fn test_grep_functions() {
+    #[tokio::test]
+    async fn test_grep_functions() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         fs::write(
@@ -854,7 +857,7 @@ int other(void) {
         )
         .unwrap();
 
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
         let results = index.grep_functions("42", None);
         assert!(!results.is_empty());
         assert!(results.iter().any(|f| f.name == "special_value"));
@@ -862,8 +865,8 @@ int other(void) {
         assert!(!results.iter().any(|f| f.name == "other"));
     }
 
-    #[test]
-    fn test_regex_search() {
+    #[tokio::test]
+    async fn test_regex_search() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         fs::write(
@@ -876,13 +879,13 @@ int unrelated(void) { return 3; }
         )
         .unwrap();
 
-        let index = WorkdirIndex::build(&repo_path).unwrap();
+        let index = WorkdirIndex::build(&repo_path).await.unwrap();
         let results = index.find_functions_regex("foo_.*");
         assert_eq!(results.len(), 2);
     }
 
-    #[test]
-    fn test_incremental_reuses_cache() {
+    #[tokio::test]
+    async fn test_incremental_reuses_cache() {
         let (_tmpdir, repo_path) = create_test_repo();
 
         // Modify test.c
@@ -895,12 +898,14 @@ int modified_func(void) { return 42; }
         .unwrap();
 
         // First build
-        let index1 = WorkdirIndex::build(&repo_path).unwrap();
+        let index1 = WorkdirIndex::build(&repo_path).await.unwrap();
         assert!(index1.find_function("modified_func").is_some());
         assert_eq!(index1.dirty_file_count(), 1);
 
         // Second build (incremental) — file hasn't changed, should reuse cache
-        let index2 = WorkdirIndex::build_incremental(&repo_path, Some(&index1)).unwrap();
+        let index2 = WorkdirIndex::build_incremental(&repo_path, Some(&index1))
+            .await
+            .unwrap();
         assert!(index2.find_function("modified_func").is_some());
         assert_eq!(index2.dirty_file_count(), 1);
 
@@ -914,7 +919,9 @@ int another_func(void) { return 99; }
         .unwrap();
 
         // Third build (incremental) — file changed, should re-analyze
-        let index3 = WorkdirIndex::build_incremental(&repo_path, Some(&index2)).unwrap();
+        let index3 = WorkdirIndex::build_incremental(&repo_path, Some(&index2))
+            .await
+            .unwrap();
         assert!(index3.find_function("another_func").is_some());
         assert!(index3.find_function("modified_func").is_none());
     }

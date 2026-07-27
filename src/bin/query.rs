@@ -15,10 +15,10 @@ use semcode::display::print_welcome_message_with_model;
 
 /// Rebuild the working directory index to pick up any file changes since the last query.
 /// Reuses cached analysis results for files whose mtime and size haven't changed.
-fn refresh_workdir_index(db_manager: &DatabaseManager, git_repo: &str) {
+async fn refresh_workdir_index(db_manager: &DatabaseManager, git_repo: &str) {
     let repo_path = std::path::Path::new(git_repo);
     let previous = db_manager.take_workdir_index();
-    match semcode::WorkdirIndex::build_incremental(repo_path, previous.as_ref()) {
+    match semcode::WorkdirIndex::build_incremental(repo_path, previous.as_ref()).await {
         Ok(workdir) => {
             if workdir.is_empty() {
                 // No need to set — we already took it out
@@ -235,7 +235,14 @@ async fn main() -> Result<()> {
     info!("Connecting to database: {}", database_path);
 
     // Connect to database
-    let db_manager = Arc::new(DatabaseManager::new(&database_path, args.git_repo.clone()).await?);
+    let db_manager = DatabaseManager::new(&database_path, args.git_repo.clone()).await?;
+
+    // Attach rust-analyzer if applicable
+    if let Err(e) = db_manager.attach_rust_analyzer().await {
+        tracing::warn!("Failed to attach rust-analyzer: {}", e);
+    }
+
+    let db_manager = Arc::new(db_manager);
 
     // Ensure tables exist
     db_manager.create_tables().await?;
@@ -454,7 +461,7 @@ async fn main() -> Result<()> {
 
         // Rebuild workdir index to reflect current file state
         if !args.git_only {
-            refresh_workdir_index(&db_manager, &args.git_repo);
+            refresh_workdir_index(&db_manager, &args.git_repo).await;
         }
 
         // Execute the command
@@ -521,7 +528,7 @@ async fn main() -> Result<()> {
 
                 // Rebuild workdir index to reflect current file state
                 if !args.git_only {
-                    refresh_workdir_index(&db_manager, &args.git_repo);
+                    refresh_workdir_index(&db_manager, &args.git_repo).await;
                 }
 
                 // Handle command and check if we should exit

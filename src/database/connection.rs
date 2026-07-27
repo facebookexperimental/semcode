@@ -42,6 +42,7 @@ pub struct DatabaseManager {
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
+    rust_analyzer: std::sync::RwLock<Option<std::sync::Arc<crate::rust_analyzer::RustAnalyzer>>>,
 }
 
 impl DatabaseManager {
@@ -62,7 +63,28 @@ impl DatabaseManager {
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
+            rust_analyzer: std::sync::RwLock::new(None),
         })
+    }
+
+    pub async fn attach_rust_analyzer(&self) -> Result<()> {
+        if std::path::Path::new(&self.git_repo_path)
+            .join("Cargo.toml")
+            .exists()
+        {
+            let lsp = crate::rust_analyzer::RustAnalyzer::start(std::path::Path::new(
+                &self.git_repo_path,
+            ))
+            .await?;
+            if let Ok(mut w) = self.rust_analyzer.write() {
+                *w = Some(std::sync::Arc::new(lsp));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rust_analyzer(&self) -> Option<std::sync::Arc<crate::rust_analyzer::RustAnalyzer>> {
+        self.rust_analyzer.read().ok()?.clone()
     }
 
     pub async fn list_tables(&self) -> Result<Vec<String>> {
