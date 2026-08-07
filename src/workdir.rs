@@ -713,11 +713,17 @@ void hello(void);
         std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(&repo_path)
+            // Do not inherit developer's git configuration.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .unwrap();
         std::process::Command::new("git")
             .args(["commit", "-m", "initial"])
             .current_dir(&repo_path)
+            // Do not inherit developer's git configuration.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "test")
@@ -791,6 +797,9 @@ int multiply(int a, int b) {
         std::process::Command::new("git")
             .args(["add", "new.c"])
             .current_dir(&repo_path)
+            // Do not inherit developer's git configuration.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .unwrap();
 
@@ -831,6 +840,9 @@ int multiply(int a, int b) {
         std::process::Command::new("git")
             .args(["add", "new.c"])
             .current_dir(&repo_path)
+            // Do not inherit developer's git configuration.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .unwrap();
 

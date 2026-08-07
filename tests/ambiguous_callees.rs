@@ -10,6 +10,9 @@ fn git_run(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(repo)
+        // Do not inherit developer's git configuration.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "Semcode Test")
         .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
         .env("GIT_COMMITTER_NAME", "Semcode Test")
