@@ -2974,6 +2974,7 @@ checksum = "daf02e6f5c8f07a069c9ea5245f40d9b14856ada4086091dc99941b49002b4fa"
 dependencies = [
  "clru",
  "gix-chunk",
+ "gix-diff",
  "gix-error",
  "gix-features",
  "gix-hash",
@@ -2981,6 +2982,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "gix-tempfile",
+ "gix-traverse",
  "memmap2",
  "parking_lot",
  "smallvec",
@@ -6258,6 +6260,7 @@ dependencies = [
  "flate2",
  "futures",
  "gix",
+ "gix-pack",
  "hex",
  "indicatif 0.18.6",
  "lancedb",
