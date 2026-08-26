@@ -1280,9 +1280,13 @@ impl TreeSitterAnalyzer {
                 continue;
             };
 
+            // The innermost enclosing scope, not the first one found: a body
+            // tree-sitter cannot close spans every function below it, and its
+            // declarations would otherwise stand in for the real one's.
             let scope = scopes
                 .iter()
-                .find(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
+                .filter(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
+                .min_by_key(|(start, end, _)| end - start)
                 .map(|(_, _, declared)| declared);
             let declared_type = |name: &str| -> Option<String> {
                 match scope
@@ -2275,6 +2279,24 @@ impl TreeSitterAnalyzer {
         Some((name.to_string(), node.start_byte(), node.end_byte()))
     }
 
+    /// The name of the innermost function whose extent encloses a byte offset,
+    /// or `None` when no function does.
+    ///
+    /// Innermost, rather than the first whose range covers it: a body the
+    /// parser cannot close runs to the end of the file, and `net/core/dev.c`
+    /// has one — the `#define` inside `netdev_cmd_to_name`'s switch leaves its
+    /// node spanning the 11,000 lines below it. Attributing in file order gave
+    /// that name to every dispatch site in the rest of the file, so a caller
+    /// query for anything reached through `packet_type::func` answered with a
+    /// function that only stringifies notifier commands.
+    fn innermost_function(spans: &[(usize, usize, String)], byte_start: usize) -> Option<&str> {
+        spans
+            .iter()
+            .filter(|(start, end, _)| byte_start >= *start && byte_start < *end)
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(_, _, name)| name.as_str())
+    }
+
     /// Extract functions with pre-computed call data (avoids per-function tree traversals)
     fn extract_functions_with_calls(
         &self,
@@ -2283,8 +2305,10 @@ impl TreeSitterAnalyzer {
     ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
-        let mut covered_sites: std::collections::HashSet<usize> = Default::default();
-        let mut covered_registrations: std::collections::HashSet<usize> = Default::default();
+        // Where every function the query matched begins and ends. Sites and
+        // registrations are attributed once the whole file is known, so that
+        // the innermost enclosing function claims each one.
+        let mut function_spans: Vec<(usize, usize, String)> = Vec::new();
         let mut pointer_call_sites: Vec<RawDispatchSite> = Vec::new();
         let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
@@ -2471,39 +2495,8 @@ impl TreeSitterAnalyzer {
                     (Vec::new(), Vec::new())
                 };
 
-                for raw in extraction
-                    .member_sites
-                    .iter()
-                    .chain(pointer_call_sites.iter())
-                    .filter(|site| {
-                        site.byte_start >= function_start_byte
-                            && site.byte_start < function_end_byte
-                    })
-                {
-                    // The function query yields several captures per function,
-                    // so a site can be reached more than once; a site is one
-                    // row regardless.
-                    if !covered_sites.insert(raw.byte_start) {
-                        continue;
-                    }
-                    dispatch_sites.push(raw.attribute(
-                        &name,
-                        &self.make_relative_path(ctx.file_path, ctx.source_root),
-                        ctx.git_hash,
-                    ));
-                }
-
-                for raw in extraction.registrations.iter().filter(|reg| {
-                    reg.byte_start >= function_start_byte && reg.byte_start < function_end_byte
-                }) {
-                    if !covered_registrations.insert(raw.byte_start) {
-                        continue;
-                    }
-                    registrations.push(raw.attribute(
-                        &name,
-                        &self.make_relative_path(ctx.file_path, ctx.source_root),
-                        ctx.git_hash,
-                    ));
+                if function_end_byte > function_start_byte {
+                    function_spans.push((function_start_byte, function_end_byte, name.clone()));
                 }
 
                 let func = FunctionInfo {
@@ -2539,31 +2532,36 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        // Most ops tables sit at file scope and belong to no function.
-        for raw in extraction
-            .registrations
-            .iter()
-            .filter(|reg| !covered_registrations.contains(&reg.byte_start))
-        {
-            registrations.push(raw.attribute(
-                "",
-                &self.make_relative_path(ctx.file_path, ctx.source_root),
-                ctx.git_hash,
-            ));
+        // Attribute each one now that every function's extent is known. An
+        // empty name means no function encloses it: most ops tables sit at file
+        // scope, and Python module level and class bodies run code there too.
+        //
+        // The function query yields several captures per function, so a site
+        // can be reached more than once; a site is one row regardless.
+        let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
+
+        let mut seen_registrations: std::collections::HashSet<usize> = Default::default();
+        for raw in extraction.registrations.iter() {
+            if !seen_registrations.insert(raw.byte_start) {
+                continue;
+            }
+            let enclosing =
+                Self::innermost_function(&function_spans, raw.byte_start).unwrap_or_default();
+            registrations.push(raw.attribute(enclosing, &relative_path, ctx.git_hash));
         }
 
-        // Python module level and class bodies, C++ and Rust static
-        // initializers: a dispatch that belongs to no function still happened.
+        let mut seen_sites: std::collections::HashSet<usize> = Default::default();
         for raw in extraction
             .member_sites
             .iter()
-            .filter(|site| !covered_sites.contains(&site.byte_start))
+            .chain(pointer_call_sites.iter())
         {
-            dispatch_sites.push(raw.attribute(
-                "",
-                &self.make_relative_path(ctx.file_path, ctx.source_root),
-                ctx.git_hash,
-            ));
+            if !seen_sites.insert(raw.byte_start) {
+                continue;
+            }
+            let enclosing =
+                Self::innermost_function(&function_spans, raw.byte_start).unwrap_or_default();
+            dispatch_sites.push(raw.attribute(enclosing, &relative_path, ctx.git_hash));
         }
 
         Ok((functions, dispatch_sites, registrations))
@@ -5971,6 +5969,42 @@ mod tests {
             kinds,
             vec![DispatchKind::MemberArrow, DispatchKind::MemberDot]
         );
+    }
+
+    #[test]
+    fn a_site_belongs_to_the_innermost_function_that_encloses_it() {
+        // The spans net/core/dev.c produces. The `#define` inside
+        // netdev_cmd_to_name's switch leaves tree-sitter unable to close the
+        // body, so its extent runs from line 1860 to the end of the file and
+        // covers every function below. Claiming sites in file order gave that
+        // name to every dispatch site in the rest of dev.c, so `callers` for
+        // anything reached through packet_type::func answered with a function
+        // that only stringifies notifier commands.
+        let spans = vec![
+            (100, 10_000, "netdev_cmd_to_name".to_string()),
+            (500, 600, "deliver_skb".to_string()),
+            (700, 800, "dev_queue_xmit_nit".to_string()),
+        ];
+
+        assert_eq!(
+            TreeSitterAnalyzer::innermost_function(&spans, 550),
+            Some("deliver_skb")
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::innermost_function(&spans, 750),
+            Some("dev_queue_xmit_nit")
+        );
+
+        // The wide one still answers where nothing narrower encloses the site.
+        assert_eq!(
+            TreeSitterAnalyzer::innermost_function(&spans, 200),
+            Some("netdev_cmd_to_name")
+        );
+
+        // Nothing when no function encloses it: a file-scope ops table, or a
+        // Python module-level call.
+        assert_eq!(TreeSitterAnalyzer::innermost_function(&spans, 20), None);
+        assert_eq!(TreeSitterAnalyzer::innermost_function(&spans, 20_000), None);
     }
 
     #[test]
