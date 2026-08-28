@@ -257,7 +257,7 @@ async fn show_callchain_with_limits(
         )
         .await?
     } else {
-        0
+        semcode::callchain::PointerReach::default()
     };
 
     // Show callers with depth and limit control
@@ -435,11 +435,14 @@ async fn show_callchain_with_limits(
     println!("Total direct callers: {}", callers.len());
     println!("Total direct callees: {}", callees.len());
 
-    if reached_through_pointer > 0 {
-        println!("Dispatching sites that reach it: {reached_through_pointer}");
+    if reached_through_pointer.shown > 0 {
+        println!(
+            "Dispatching sites that reach it: {}",
+            reached_through_pointer.shown
+        );
     }
 
-    if callers.is_empty() && callees.is_empty() && reached_through_pointer == 0 {
+    if callers.is_empty() && callees.is_empty() && reached_through_pointer.is_empty() {
         println!(
             "{} This function is isolated (no callers or callees)",
             "Info:".yellow()

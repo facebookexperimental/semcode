@@ -124,6 +124,33 @@ fn write_fixture(repo: &Path) {
     )
     .unwrap();
 
+    // Installed in a member, and the only call through that member is on a
+    // receiver nothing declares. There is no typed site to show, so the
+    // question is what a section says when it has candidates and no answers.
+    std::fs::write(
+        repo.join("quirk.h"),
+        "struct quirk_ops { void (*fixup)(void); };\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        repo.join("quirk_install.c"),
+        "#include \"quirk.h\"\n\
+         void quirk_impl(void) { }\n\
+         static struct quirk_ops quirk_table = { .fixup = quirk_impl };\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        repo.join("quirk_call.c"),
+        "#include \"quirk.h\"\n\
+         void apply_quirk(void)\n\
+         {\n\
+         \tunknown_table->fixup();\n\
+         }\n",
+    )
+    .unwrap();
+
     // The registration: a compound literal assigned to a member, inside a
     // function, which is how net/ipv4/af_inet.c writes it.
     std::fs::write(
@@ -421,7 +448,7 @@ async fn a_callback_reached_only_through_a_pointer_has_a_chain_above_it() {
     let (db, git_sha) = index_fixture(dir.path()).await;
 
     let mut rendered = Vec::new();
-    let shown = semcode::callchain::write_indirect_reverse_chain(
+    let reach = semcode::callchain::write_indirect_reverse_chain(
         &db,
         "super_cache_scan",
         &git_sha,
@@ -433,7 +460,7 @@ async fn a_callback_reached_only_through_a_pointer_has_a_chain_above_it() {
     .unwrap();
     let text = String::from_utf8(rendered).unwrap();
 
-    assert!(shown >= 1, "no dispatching site shown: {text}");
+    assert!(reach.shown >= 1, "no dispatching site shown: {text}");
     assert!(
         text.contains("do_shrink_slab"),
         "the dispatch is missing: {text}"
@@ -452,7 +479,7 @@ async fn a_function_with_ordinary_callers_gets_no_pointer_chain() {
     let (db, git_sha) = index_fixture(dir.path()).await;
 
     let mut rendered = Vec::new();
-    let shown = semcode::callchain::write_indirect_reverse_chain(
+    let reach = semcode::callchain::write_indirect_reverse_chain(
         &db,
         "do_shrink_slab",
         &git_sha,
@@ -463,10 +490,95 @@ async fn a_function_with_ordinary_callers_gets_no_pointer_chain() {
     .await
     .unwrap();
 
-    assert_eq!(shown, 0);
+    assert!(reach.is_empty(), "{reach:?}");
     assert!(
         rendered.is_empty(),
         "{}",
         String::from_utf8_lossy(&rendered)
+    );
+}
+
+#[tokio::test]
+async fn a_member_name_match_does_not_crowd_out_a_typed_one() {
+    // The section never applied the confidence filter the other commands do,
+    // and the rows are ordered by the dispatching function's name. Any weak
+    // row sorting early took a place from a real answer: can_rcv is installed
+    // in packet_type::func, and the fifteen rows shown were bcache work items
+    // and amdgpu register macros dispatching through some other ::func, with
+    // every site that receives a CAN frame past the end of the list.
+    //
+    // Here `deliver_untyped` calls `proto_table->handler` on a receiver
+    // nothing declares, and sorts ahead of the macro that names tcp_v4_rcv
+    // outright.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_fixture(dir.path()).await;
+
+    let mut rendered = Vec::new();
+    let reach = semcode::callchain::write_indirect_reverse_chain(
+        &db,
+        "tcp_v4_rcv",
+        &git_sha,
+        2,
+        3,
+        &mut rendered,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(rendered).unwrap();
+
+    assert_eq!(reach.shown, 3, "{text}");
+    for dispatching in [
+        "deliver_chained",
+        "deliver_plain",
+        "ip_protocol_deliver_rcu",
+    ] {
+        assert!(text.contains(dispatching), "{dispatching} missing: {text}");
+    }
+    assert!(
+        !text.contains("deliver_untyped"),
+        "a member-name match took a row: {text}"
+    );
+
+    // Dropped from the list, not from the answer.
+    assert!(reach.noted >= 1, "{reach:?}");
+    assert!(
+        text.contains("go through a member of the same name"),
+        "the weaker matches were dropped silently: {text}"
+    );
+}
+
+#[tokio::test]
+async fn weak_evidence_alone_still_gets_a_heading() {
+    // quirk_impl is installed in quirk_ops::fixup, and the one call through
+    // `fixup` is on a receiver nothing declares. Nothing can be shown with a
+    // chain above it, and saying nothing at all would claim the index knows of
+    // no way in when it knows of one it cannot stand behind.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_fixture(dir.path()).await;
+
+    let mut rendered = Vec::new();
+    let reach = semcode::callchain::write_indirect_reverse_chain(
+        &db,
+        "quirk_impl",
+        &git_sha,
+        2,
+        10,
+        &mut rendered,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(rendered).unwrap();
+
+    assert_eq!(reach.shown, 0, "{text}");
+    assert_eq!(reach.noted, 1, "{text}");
+    assert!(!reach.is_empty(), "{reach:?}");
+    assert!(text.contains("Reverse Chain"), "{text}");
+    assert!(
+        text.contains("1 call sites go through a member of the same name"),
+        "the count claims something was listed above it: {text}"
+    );
+    assert!(
+        !text.contains("apply_quirk"),
+        "a member-name match was shown as an answer: {text}"
     );
 }

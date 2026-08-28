@@ -428,18 +428,34 @@ fn show_indirect_callers(
         }
     }
 
-    if !by_name_only.is_empty() {
-        let further = if confident.is_empty() { "" } else { "further " };
-        let note = format!(
-            "\n{} {} {}call sites go through a member of the same name, \
-             but nothing says their receiver has the type the function was \
-             installed in.",
-            "Note:".yellow(),
-            by_name_only.len(),
-            further
-        );
-        writeln!(writer, "{note}")?;
+    write_member_name_note(by_name_only.len(), !confident.is_empty(), writer)?;
+
+    Ok(())
+}
+
+/// The sites that match on the member name alone, as a count.
+///
+/// Both sections that report indirect callers report these the same way and in
+/// the same words: a reader comparing `callers` with the pointer chain has no
+/// way to tell a difference in wording from a difference in the answer.
+///
+/// `listed_above` says whether anything was printed above the note, which is
+/// what makes "further" true or a lie.
+fn write_member_name_note(count: usize, listed_above: bool, writer: &mut dyn Write) -> Result<()> {
+    if count == 0 {
+        return Ok(());
     }
+
+    let further = if listed_above { "further " } else { "" };
+    let note = format!(
+        "\n{} {} {}call sites go through a member of the same name, \
+         but nothing says their receiver has the type the function was \
+         installed in.",
+        "Note:".yellow(),
+        count,
+        further
+    );
+    writeln!(writer, "{note}")?;
 
     Ok(())
 }
@@ -646,18 +662,6 @@ pub async fn show_callees_to_writer(
     Ok(())
 }
 
-/// The sites that reach a function through a pointer, and the chain above each.
-///
-/// A function only ever called through a pointer has no direct callers, so a
-/// reverse chain built from calls alone renders it as a root: `callers
-/// super_cache_scan` named three sites while `callchain super_cache_scan`
-/// reported none, from the same index. The dispatching function is where the
-/// chain continues upward, and is walked like any other caller.
-///
-/// A site outside any function — a store into a table at file scope — has
-/// nothing above it and is named without a chain.
-///
-/// Returns the number of dispatching sites shown.
 /// One caller above a dispatching site, and the callers above it.
 ///
 /// Kept separate from the tree printer used for a direct chain, which marks an
@@ -692,6 +696,38 @@ fn write_caller_above(
     Ok(())
 }
 
+/// What the pointer section said: dispatching sites shown with a chain above
+/// them, and sites named only by a count.
+///
+/// The two are separate because they answer different questions above this: a
+/// section that said nothing at all means the function is reached by name or
+/// not at all, while one that reported a count means the index has candidates
+/// it cannot stand behind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PointerReach {
+    /// Dispatching sites printed with the chain above them.
+    pub shown: usize,
+    /// Sites reported as a count, because only the member name matched.
+    pub noted: usize,
+}
+
+impl PointerReach {
+    /// Whether the section said anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.shown == 0 && self.noted == 0
+    }
+}
+
+/// The sites that reach a function through a pointer, and the chain above each.
+///
+/// A function only ever called through a pointer has no direct callers, so a
+/// reverse chain built from calls alone renders it as a root: `callers
+/// super_cache_scan` named three sites while `callchain super_cache_scan`
+/// reported none, from the same index. The dispatching function is where the
+/// chain continues upward, and is walked like any other caller.
+///
+/// A site outside any function — a store into a table at file scope — has
+/// nothing above it and is named without a chain.
 pub async fn write_indirect_reverse_chain(
     db: &DatabaseManager,
     name: &str,
@@ -699,18 +735,32 @@ pub async fn write_indirect_reverse_chain(
     depth: usize,
     limit: usize,
     writer: &mut dyn Write,
-) -> Result<usize> {
+) -> Result<PointerReach> {
     let indirect = db.find_indirect_callers(name, git_sha).await?;
     if indirect.is_empty() {
-        return Ok(0);
+        return Ok(PointerReach::default());
     }
+
+    // Only a site whose receiver has the type the function was installed in is
+    // an answer here, the same split `callers` reports. A member-name match
+    // reaches every call through a member of that name anywhere in the tree:
+    // can_rcv sits in packet_type::func, and `func` is also work_struct's, so
+    // the chains above these sites were bcache work items and amdgpu register
+    // macros — sorted, by name, ahead of the three sites that receive CAN
+    // frames, which left the default output with no correct row in it.
+    //
+    // Walking a chain is what the section costs, so this is also why it costs
+    // what it does: one walk per site shown, and every false one was paid for.
+    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
+        .iter()
+        .partition(|caller| caller.evidence.is_type_matched());
 
     // One entry per dispatching function: a function dispatching through the
     // same member twice is one way in, not two.
     let mut order: Vec<String> = Vec::new();
     let mut sites: HashMap<String, Vec<&crate::database::resolution::IndirectCaller>> =
         HashMap::new();
-    for caller in &indirect {
+    for caller in confident.iter().copied() {
         let key = if caller.caller_name.is_empty() {
             format!("{}:{}", caller.site_file, caller.site_line)
         } else {
@@ -798,7 +848,12 @@ pub async fn write_indirect_reverse_chain(
         )?;
     }
 
-    Ok(shown)
+    write_member_name_note(by_name_only.len(), shown > 0, writer)?;
+
+    Ok(PointerReach {
+        shown,
+        noted: by_name_only.len(),
+    })
 }
 
 pub async fn show_callchain_to_writer(
@@ -861,7 +916,7 @@ pub async fn show_callchain_to_writer(
                 print_callchain_tree_to_writer(&forward_chain, 0, writer)?;
             }
 
-            if callers.is_empty() && callees.is_empty() && dispatched == 0 {
+            if callers.is_empty() && callees.is_empty() && dispatched.is_empty() {
                 let info_msg = format!(
                     "\n{} This function is isolated (no callers or callees)",
                     "Info:".yellow()
