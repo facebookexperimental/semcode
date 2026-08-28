@@ -7,6 +7,7 @@ pub mod content;
 pub mod dispatch_sites;
 mod functions;
 pub mod globals;
+mod lore_date;
 pub mod object_macros;
 pub mod processed_files;
 pub mod registrations;

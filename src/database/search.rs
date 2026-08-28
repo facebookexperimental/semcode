@@ -10,6 +10,7 @@ use lancedb::DistanceType;
 
 use crate::database::content::ContentStore;
 use crate::database::functions::FunctionStore;
+use crate::database::lore_date::LoreDateFilter;
 use crate::types::{FieldInfo, FunctionInfo, ParameterInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use std::collections::HashMap;
@@ -1774,6 +1775,9 @@ impl SearchManager {
 pub struct VectorSearchManager {
     connection: Connection,
     function_store: FunctionStore,
+    /// Whether the lore table carries the date_timestamp column,
+    /// probed from the schema once per process.
+    lore_has_date_timestamp: std::sync::OnceLock<bool>,
 }
 
 impl VectorSearchManager {
@@ -1782,7 +1786,26 @@ impl VectorSearchManager {
         Self {
             connection,
             function_store,
+            lore_has_date_timestamp: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Whether the lore table carries the date_timestamp column.
+    /// Databases created before the column existed lack it until an
+    /// indexing run migrates them.  Probe the schema once: a
+    /// migration by this process's own indexing pass leaves a stale
+    /// false behind, which only forgoes predicate pushdown --
+    /// matches() still filters correctly.
+    async fn lore_has_date_timestamp(&self, table: &lancedb::Table) -> bool {
+        if let Some(has) = self.lore_has_date_timestamp.get() {
+            return *has;
+        }
+        let has = table
+            .schema()
+            .await
+            .map(|s| s.field_with_name("date_timestamp").is_ok())
+            .unwrap_or(false);
+        *self.lore_has_date_timestamp.get_or_init(|| has)
     }
 
     /// Helper to query lore by fields and return intersection of message_ids
@@ -1804,27 +1827,30 @@ impl VectorSearchManager {
         let lore_table = self.connection.open_table("lore").execute().await?;
         let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
 
-        // Parse date filters into DateTime for temporal comparison
-        // in query_field_impl (RFC 2822 string comparison is not
-        // meaningful for date ordering).
-        let since_dt = since_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        let until_dt = until_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+        // Push the date range into the query as a date_timestamp
+        // predicate so it bounds the candidate set before the FTS
+        // limit applies.  FTS orders by relevance, not date, so a
+        // post-filter over a capped candidate set silently drops
+        // matches whenever the pattern matches more rows than the
+        // cap.  Rows the predicate cannot settle -- unknown
+        // timestamps, or a table without the column -- fall back to
+        // matches() on the RFC 2822 date string.
+        let date_filter = LoreDateFilter::new(
+            self.lore_has_date_timestamp(&lore_table).await,
+            since_date,
+            until_date,
+        );
 
-        // Helper function to query a field using FTS with regex and
-        // date post-filtering.  Selects the "date" column alongside
-        // the searched field so temporal filtering happens on the
-        // already-fetched FTS candidates without extra lookups.
+        // Helper function to query a field using FTS with regex
+        // post-filtering.  The date range arrives as date_filter:
+        // its predicate bounds the query, and matches() settles the
+        // rows the predicate could not.
         async fn query_field_impl(
             lore_table: &lancedb::Table,
             field_name: String,
             pattern: String,
             search_limit: usize,
-            since: Option<chrono::DateTime<chrono::Utc>>,
-            until: Option<chrono::DateTime<chrono::Utc>>,
+            date_filter: &LoreDateFilter,
         ) -> Result<HashSet<String>> {
             let start = std::time::Instant::now();
 
@@ -1842,16 +1868,22 @@ impl VectorSearchManager {
                 .collect::<Vec<_>>()
                 .join(" ");
 
+            let mut columns = vec![
+                "message_id".to_string(),
+                "_score".to_string(),
+                field_name.clone(),
+            ];
+            columns.extend(date_filter.extra_columns());
+
             let fts_query =
                 FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
-            let query = lore_table.query().full_text_search(fts_query).select(
-                lancedb::query::Select::Columns(vec![
-                    "message_id".to_string(),
-                    "_score".to_string(),
-                    field_name.clone(),
-                    "date".to_string(),
-                ]),
-            );
+            let mut query = lore_table
+                .query()
+                .full_text_search(fts_query)
+                .select(lancedb::query::Select::Columns(columns));
+            if let Some(filter) = date_filter.predicate() {
+                query = query.only_if(filter);
+            }
 
             // Apply limit - use large limit if search_limit is 0 (unlimited)
             // FTS has a default limit of 10, so we must explicitly set a large limit
@@ -1868,7 +1900,6 @@ impl VectorSearchManager {
             let regex = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()?;
-            let has_date_filter = since.is_some() || until.is_some();
             let mut message_ids = HashSet::new();
             let mut bad_dates: usize = 0;
 
@@ -1876,23 +1907,25 @@ impl VectorSearchManager {
                 let msg_array: &arrow::array::StringArray = super::get_column(batch, "message_id")?;
                 let field_array: &arrow::array::StringArray =
                     super::get_column(batch, &field_name)?;
-                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
+                let date_array: Option<&arrow::array::StringArray> = if date_filter.is_active() {
+                    Some(super::get_column(batch, "date")?)
+                } else {
+                    None
+                };
+                let ts_array = batch
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
 
                 for i in 0..batch.num_rows() {
                     if !regex.is_match(field_array.value(i)) {
                         continue;
                     }
-                    if has_date_filter {
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_array.value(i)) {
-                            let dt_utc = dt.with_timezone(&chrono::Utc);
-                            if since.is_some_and(|s| dt_utc < s) {
-                                continue;
-                            }
-                            if until.is_some_and(|u| dt_utc > u) {
-                                continue;
-                            }
-                        } else {
-                            bad_dates += 1;
+                    if let Some(dates) = date_array {
+                        if !date_filter.matches(
+                            ts_array.map(|a| a.value(i)),
+                            dates.value(i),
+                            &mut bad_dates,
+                        ) {
                             continue;
                         }
                     }
@@ -1928,8 +1961,7 @@ impl VectorSearchManager {
                         "from".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -1948,8 +1980,7 @@ impl VectorSearchManager {
                         "subject".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -1968,8 +1999,7 @@ impl VectorSearchManager {
                         "body".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -1988,8 +2018,7 @@ impl VectorSearchManager {
                         "symbols".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -2008,8 +2037,7 @@ impl VectorSearchManager {
                         "recipients".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);

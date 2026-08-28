@@ -14,6 +14,7 @@ use lancedb::query::QueryBase;
 
 use crate::database::branches::IndexedBranchStore;
 use crate::database::functions::FunctionStore;
+use crate::database::lore_date::LoreDateFilter;
 use crate::database::schema::SchemaManager;
 use crate::database::search::{SearchManager, VectorSearchManager};
 use crate::database::symbol_filename::SymbolFilenameStore;
@@ -167,6 +168,9 @@ pub struct DatabaseManager {
     manifest_cache: std::sync::RwLock<Option<(String, GitManifest)>>,
     /// Identifiers that are compiler attributes, read once per process.
     attribute_names: std::sync::OnceLock<Arc<HashSet<String>>>,
+    /// Whether the lore table carries the date_timestamp column,
+    /// probed from the schema once per process.
+    lore_has_date_timestamp: std::sync::OnceLock<bool>,
     /// Hashes of working-copy files a query has already looked at, memoised
     /// on (size, mtime) so a name asked about twice reads its file once.
     /// This is what a query stats instead of the working tree.
@@ -231,6 +235,7 @@ impl DatabaseManager {
             workdir_index: std::sync::RwLock::new(None),
             manifest_cache: std::sync::RwLock::new(None),
             attribute_names: std::sync::OnceLock::new(),
+            lore_has_date_timestamp: std::sync::OnceLock::new(),
             working_copy: WorkingCopyHashes::new(),
             git_only: AtomicBool::new(false),
             workdir_command_generation: AtomicU64::new(0),
@@ -6487,6 +6492,24 @@ impl DatabaseManager {
         Ok(emails)
     }
 
+    /// Whether the lore table carries the date_timestamp column.
+    /// Databases created before the column existed lack it until an
+    /// indexing run migrates them.  Probe the schema once: a
+    /// migration by this process's own indexing pass leaves a stale
+    /// false behind, which only forgoes predicate pushdown --
+    /// matches() still filters correctly.
+    async fn lore_has_date_timestamp(&self, table: &lancedb::Table) -> bool {
+        if let Some(has) = self.lore_has_date_timestamp.get() {
+            return *has;
+        }
+        let has = table
+            .schema()
+            .await
+            .map(|s| s.field_with_name("date_timestamp").is_ok())
+            .unwrap_or(false);
+        *self.lore_has_date_timestamp.get_or_init(|| has)
+    }
+
     /// Search lore emails using Full Text Search with regex post-filtering
     pub async fn search_lore_emails(
         &self,
@@ -6499,43 +6522,20 @@ impl DatabaseManager {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
 
-        // Parse filter dates to Unix timestamps for database-level filtering
-        let since_timestamp = since_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
-        let until_timestamp = until_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
-
         tracing::info!(
-            "lore search: field='{}' pattern='{}' since_timestamp={:?} until_timestamp={:?}",
+            "lore search: field='{}' pattern='{}' since_date={:?} until_date={:?}",
             field,
             pattern,
-            since_timestamp,
-            until_timestamp
+            since_date,
+            until_date
         );
 
         let table = self.connection.open_table("lore").execute().await?;
-
-        // Only use date_timestamp filter if the column exists in the table
-        let has_date_timestamp = table
-            .schema()
-            .await
-            .map(|s| s.field_with_name("date_timestamp").is_ok())
-            .unwrap_or(false);
-        let date_filter = if has_date_timestamp {
-            match (since_timestamp, until_timestamp) {
-                (Some(since), Some(until)) => Some(format!(
-                    "date_timestamp >= {} AND date_timestamp <= {}",
-                    since, until
-                )),
-                (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
-                (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
-                (None, None) => None,
-            }
-        } else {
-            None
-        };
+        let date_filter = LoreDateFilter::new(
+            self.lore_has_date_timestamp(&table).await,
+            since_date,
+            until_date,
+        );
 
         // FTS uses simple tokenizer - normalize pattern by stripping special chars
         let fts_pattern = pattern
@@ -6548,6 +6548,7 @@ impl DatabaseManager {
             .case_insensitive(true)
             .build()?;
         let mut emails = Vec::new();
+        let mut bad_dates: usize;
         let target_limit = if limit > 0 { limit } else { 10000 };
 
         // Incremental search: start with reasonable limit, expand until matches stop increasing
@@ -6565,7 +6566,7 @@ impl DatabaseManager {
                     field
                 );
                 let mut query_builder = table.query();
-                if let Some(ref filter) = date_filter {
+                if let Some(filter) = date_filter.predicate() {
                     query_builder = query_builder.only_if(filter);
                 }
                 query_builder
@@ -6581,7 +6582,7 @@ impl DatabaseManager {
                 let mut query_builder = table.query().full_text_search(fts_query);
 
                 // Apply date filter at database level so limit applies to date-filtered results
-                if let Some(ref filter) = date_filter {
+                if let Some(filter) = date_filter.predicate() {
                     query_builder = query_builder.only_if(filter);
                 }
 
@@ -6603,6 +6604,7 @@ impl DatabaseManager {
 
             // Step 2: Post-filter with regex and build email objects
             emails.clear(); // Reset for this iteration
+            bad_dates = 0;
 
             for batch in batches {
                 let num_rows = batch.num_rows();
@@ -6665,6 +6667,15 @@ impl DatabaseManager {
 
                     // Apply regex filter (case-insensitive for better matching)
                     if !regex.is_match(field_value) {
+                        continue;
+                    }
+
+                    // Settle rows the date predicate could not
+                    if !date_filter.matches(
+                        date_timestamps.map(|a| a.value(i)),
+                        dates.value(i),
+                        &mut bad_dates,
+                    ) {
                         continue;
                     }
 
@@ -6750,6 +6761,14 @@ impl DatabaseManager {
             fts_limit *= 5; // Exponential expansion
         }
 
+        if bad_dates > 0 {
+            tracing::warn!(
+                "Skipped {} candidates with unparseable dates for field '{}'",
+                bad_dates,
+                field
+            );
+        }
+
         Ok(emails)
     }
 
@@ -6771,27 +6790,30 @@ impl DatabaseManager {
         let lore_table = self.connection.open_table("lore").execute().await?;
         let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
 
-        // Parse date filters into DateTime for temporal comparison
-        // in query_field_impl (RFC 2822 string comparison is not
-        // meaningful for date ordering).
-        let since_dt = since_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        let until_dt = until_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+        // Push the date range into the query as a date_timestamp
+        // predicate so it bounds the candidate set before the FTS
+        // limit applies.  FTS orders by relevance, not date, so a
+        // post-filter over a capped candidate set silently drops
+        // matches whenever the pattern matches more rows than the
+        // cap.  Rows the predicate cannot settle -- unknown
+        // timestamps, or a table without the column -- fall back to
+        // matches() on the RFC 2822 date string.
+        let date_filter = LoreDateFilter::new(
+            self.lore_has_date_timestamp(&lore_table).await,
+            since_date,
+            until_date,
+        );
 
-        // Helper function to query a field using FTS with regex and
-        // date post-filtering.  Selects the "date" column alongside
-        // the searched field so temporal filtering happens on the
-        // already-fetched FTS candidates without extra lookups.
+        // Helper function to query a field using FTS with regex
+        // post-filtering.  The date range arrives as date_filter:
+        // its predicate bounds the query, and matches() settles the
+        // rows the predicate could not.
         async fn query_field_impl(
             lore_table: &lancedb::Table,
             field_name: String,
             pattern: String,
             search_limit: usize,
-            since: Option<chrono::DateTime<chrono::Utc>>,
-            until: Option<chrono::DateTime<chrono::Utc>>,
+            date_filter: &LoreDateFilter,
         ) -> Result<HashSet<String>> {
             // FTS uses simple tokenizer - normalize pattern by stripping special chars
             let fts_pattern = pattern
@@ -6813,6 +6835,12 @@ impl DatabaseManager {
                 100000
             };
 
+            let mut columns = vec!["message_id".to_string(), field_name.clone()];
+            if !fts_pattern.is_empty() {
+                columns.push("_score".to_string());
+            }
+            columns.extend(date_filter.extra_columns());
+
             // When the FTS pattern is empty (e.g. regex ".*" has no
             // alphanumeric tokens), skip FTS and fall back to a plain
             // table scan so the regex post-filter still runs.
@@ -6821,13 +6849,13 @@ impl DatabaseManager {
                     "FTS pattern empty for field '{}', falling back to table scan",
                     field_name
                 );
-                lore_table
+                let mut query_builder = lore_table
                     .query()
-                    .select(lancedb::query::Select::Columns(vec![
-                        "message_id".to_string(),
-                        field_name.clone(),
-                        "date".to_string(),
-                    ]))
+                    .select(lancedb::query::Select::Columns(columns));
+                if let Some(filter) = date_filter.predicate() {
+                    query_builder = query_builder.only_if(filter);
+                }
+                query_builder
                     .limit(effective_limit)
                     .execute()
                     .await?
@@ -6836,15 +6864,14 @@ impl DatabaseManager {
             } else {
                 let fts_query =
                     FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
-                lore_table
+                let mut query_builder = lore_table
                     .query()
                     .full_text_search(fts_query)
-                    .select(lancedb::query::Select::Columns(vec![
-                        "message_id".to_string(),
-                        "_score".to_string(),
-                        field_name.clone(),
-                        "date".to_string(),
-                    ]))
+                    .select(lancedb::query::Select::Columns(columns));
+                if let Some(filter) = date_filter.predicate() {
+                    query_builder = query_builder.only_if(filter);
+                }
+                query_builder
                     .limit(effective_limit)
                     .execute()
                     .await?
@@ -6863,7 +6890,6 @@ impl DatabaseManager {
             let regex = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()?;
-            let has_date_filter = since.is_some() || until.is_some();
             let mut message_ids = HashSet::new();
             let mut bad_dates: usize = 0;
 
@@ -6871,23 +6897,25 @@ impl DatabaseManager {
                 let msg_array: &arrow::array::StringArray = super::get_column(batch, "message_id")?;
                 let field_array: &arrow::array::StringArray =
                     super::get_column(batch, &field_name)?;
-                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
+                let date_array: Option<&arrow::array::StringArray> = if date_filter.is_active() {
+                    Some(super::get_column(batch, "date")?)
+                } else {
+                    None
+                };
+                let ts_array = batch
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
 
                 for i in 0..batch.num_rows() {
                     if !regex.is_match(field_array.value(i)) {
                         continue;
                     }
-                    if has_date_filter {
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_array.value(i)) {
-                            let dt_utc = dt.with_timezone(&chrono::Utc);
-                            if since.is_some_and(|s| dt_utc < s) {
-                                continue;
-                            }
-                            if until.is_some_and(|u| dt_utc > u) {
-                                continue;
-                            }
-                        } else {
-                            bad_dates += 1;
+                    if let Some(dates) = date_array {
+                        if !date_filter.matches(
+                            ts_array.map(|a| a.value(i)),
+                            dates.value(i),
+                            &mut bad_dates,
+                        ) {
                             continue;
                         }
                     }
@@ -6922,8 +6950,7 @@ impl DatabaseManager {
                         "from".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -6943,8 +6970,7 @@ impl DatabaseManager {
                         "subject".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -6964,8 +6990,7 @@ impl DatabaseManager {
                         "body".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -6985,8 +7010,7 @@ impl DatabaseManager {
                         "recipients".to_string(),
                         pattern.clone(),
                         search_limit,
-                        since_dt,
-                        until_dt,
+                        &date_filter,
                     )
                     .await?;
                     field_union.extend(results);
@@ -7061,9 +7085,10 @@ impl DatabaseManager {
         let body_patterns = field_map.get("body").map(|v| v.as_slice());
         let recipients_patterns = field_map.get("recipients").map(|v| v.as_slice());
 
-        // Use helper to get intersection of message_ids.
-        // Date range is pushed into FTS queries so the candidate set
-        // is already bounded before intersection and fetching.
+        // Use helper to get intersection of message_ids.  The date
+        // range is pushed into each field query as a date_timestamp
+        // predicate so the FTS candidate limit applies after date
+        // filtering, not before.
         let intersection = self
             .query_lore_by_fields_intersection(
                 from_patterns,
@@ -7451,34 +7476,20 @@ impl DatabaseManager {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
 
-        // Parse filter dates to Unix timestamps for database-level filtering
-        let since_timestamp = since_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
-        let until_timestamp = until_date
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|dt| dt.timestamp());
-
         // Escape SQL string literal
         let escaped_subject = subject.replace("'", "''");
 
         let table = self.connection.open_table("lore").execute().await?;
-        let has_date_timestamp = table
-            .schema()
-            .await
-            .map(|s| s.field_with_name("date_timestamp").is_ok())
-            .unwrap_or(false);
+        let date_filter = LoreDateFilter::new(
+            self.lore_has_date_timestamp(&table).await,
+            since_date,
+            until_date,
+        );
 
         // Build WHERE clause with subject filter and optional date filters
         let mut where_parts = vec![format!("subject LIKE '%{}%'", escaped_subject)];
-
-        if has_date_timestamp {
-            if let Some(since) = since_timestamp {
-                where_parts.push(format!("date_timestamp >= {}", since));
-            }
-            if let Some(until) = until_timestamp {
-                where_parts.push(format!("date_timestamp <= {}", until));
-            }
+        if let Some(filter) = date_filter.predicate() {
+            where_parts.push(filter.to_string());
         }
 
         let where_clause = where_parts.join(" AND ");
@@ -7492,6 +7503,7 @@ impl DatabaseManager {
         let batches: Vec<_> = stream.try_collect().await?;
 
         let mut emails = Vec::new();
+        let mut bad_dates: usize = 0;
 
         for batch in batches {
             if batch.num_rows() == 0 {
@@ -7544,6 +7556,15 @@ impl DatabaseManager {
                 .as_string::<i32>();
 
             for i in 0..batch.num_rows() {
+                // Settle rows the date predicate could not
+                if !date_filter.matches(
+                    date_timestamps.map(|a| a.value(i)),
+                    dates.value(i),
+                    &mut bad_dates,
+                ) {
+                    continue;
+                }
+
                 // Parse JSON symbols array
                 let symbols_json = symbols_list.value(i);
                 let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
@@ -7572,6 +7593,13 @@ impl DatabaseManager {
 
                 emails.push(email);
             }
+        }
+
+        if bad_dates > 0 {
+            tracing::warn!(
+                "Skipped {} subject-match emails with unparseable dates",
+                bad_dates
+            );
         }
 
         Ok(emails)
