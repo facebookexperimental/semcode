@@ -421,6 +421,13 @@ pub fn parse_email_from_commit(
     let blob = object.try_into_blob()?;
     let email_content = String::from_utf8_lossy(blob.data.as_slice()).to_string();
 
+    parse_email_content(&email_content, commit_sha)
+}
+
+/// Parse a raw email message (headers and body) into a LoreEmailInfo.
+/// The id becomes the git_commit_sha field: the containing commit SHA for
+/// public-inbox archives, or a content hash for mbox-sourced messages.
+pub fn parse_email_content(email_content: &str, id: &str) -> Result<crate::LoreEmailInfo> {
     // Parse email headers
     let mut headers = EmailHeaders::new();
 
@@ -480,7 +487,7 @@ pub fn parse_email_from_commit(
     let date_timestamp = parse_rfc2822_to_timestamp(&headers.date);
 
     Ok(crate::LoreEmailInfo {
-        git_commit_sha: commit_sha.to_string(),
+        git_commit_sha: id.to_string(),
         from: headers.from,
         date: headers.date,
         date_timestamp,
@@ -1056,6 +1063,55 @@ pub async fn process_lore_commits_pipeline(
     progress_thread.join().unwrap();
 
     Ok(())
+}
+
+/// Parse raw mbox messages in parallel and insert them into the lore tables.
+/// `messages` holds (id, raw email) pairs where id is a stable content hash
+/// used as the lore git_commit_sha. Returns the number of emails stored.
+pub async fn process_mbox_messages_pipeline(
+    messages: Vec<(String, String)>,
+    db_manager: Arc<DatabaseManager>,
+    batch_size: usize,
+    batches_inserted: Arc<AtomicUsize>,
+    optimization_check_timer: Arc<std::sync::Mutex<std::time::Instant>>,
+) -> Result<usize> {
+    use rayon::prelude::*;
+
+    let emails: Vec<crate::LoreEmailInfo> = messages
+        .par_iter()
+        .filter_map(|(id, content)| match parse_email_content(content, id) {
+            Ok(email) => Some(email),
+            Err(e) => {
+                warn!("Failed to parse mbox message {}: {}", id, e);
+                None
+            }
+        })
+        .collect();
+
+    let mut inserted = 0usize;
+    for chunk in emails.chunks(batch_size) {
+        let failed_indices = db_manager.insert_lore_emails(chunk).await?;
+        let failed_set: HashSet<usize> = failed_indices.into_iter().collect();
+
+        // Record ids only for emails that were actually stored, so that
+        // failed emails are retried on the next run.
+        let ids: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !failed_set.contains(i))
+            .map(|(_, e)| e.git_commit_sha.clone())
+            .collect();
+        inserted += ids.len();
+        if !ids.is_empty() {
+            db_manager.insert_lore_indexed_commits(&ids).await?;
+        }
+
+        let total_batches = batches_inserted.fetch_add(1, Ordering::Relaxed) + 1;
+        check_and_optimize_if_needed(&db_manager, 0, total_batches, &optimization_check_timer)
+            .await;
+    }
+
+    Ok(inserted)
 }
 
 /// Index commits in a git range

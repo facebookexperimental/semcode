@@ -104,6 +104,50 @@ When called without arguments, `--lore` discovers all git repositories under
 not yet in the database. Use this for a simple one-command workflow to keep
 lore archives up to date.
 
+### Indexing Pipermail Archives
+
+Projects that publish their mailing list archives with pipermail (Mailman 2)
+instead of public-inbox/lore can be indexed with `--pipermail`, passing the
+base URL of the archive index page:
+
+```bash
+# Index a pipermail archive (e.g., the U-Boot mailing list)
+semcode-index --pipermail https://lists.denx.de/pipermail/u-boot/
+
+# Index multiple archives at once
+semcode-index --pipermail https://lists.denx.de/pipermail/u-boot/,https://lists.denx.de/pipermail/eldk/
+
+# Refresh all previously downloaded pipermail archives
+semcode-index --pipermail
+```
+
+To avoid downloading decades of history, limit how far back the archives go
+with `--pipermail-since` (month granularity):
+
+```bash
+# Only index emails from the previous year onwards
+semcode-index --pipermail https://lists.denx.de/pipermail/u-boot/ --pipermail-since "1 year ago"
+
+# Absolute dates work too
+semcode-index --pipermail https://lists.denx.de/pipermail/u-boot/ --pipermail-since 2025-01-01
+```
+
+The cutoff is recorded in the archive directory (`archive.since`) and
+persists across refreshes: `semcode-index --pipermail` keeps honouring it.
+Archives downloaded without a cutoff never reach further back than their
+oldest already-downloaded month. To extend an archive further into the
+past later, pass an earlier `--pipermail-since` explicitly.
+
+The monthly mbox files (`YYYY-Month.txt.gz`) linked from the index page are
+downloaded to `<db_dir>/pipermail/<host>/<list>/` and split into individual
+messages, which are stored in the same lore tables as public-inbox archives.
+All `lore`, `dig`, and `vlore` commands work on them identically.
+
+Since there is no backing git repository, each message is identified by a
+content hash instead of a commit SHA. Refreshing re-downloads only months
+that are missing locally plus the newest month (which keeps growing until
+the next month starts); already-indexed messages are skipped.
+
 ### Optional: Generate Vector Embeddings for Semantic Search
 
 To enable semantic search with the `vlore` command:

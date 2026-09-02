@@ -17,7 +17,9 @@ with tree-sitter, including 0.16 type builtins (`@Int`, `@Struct`,
 packed union backing integers.
 
 Now with lore indexing!  semcode-index --lore lkml,netdev (or any list names) will
-pull down the latest git archive from those lists.  See [the lore documentation](docs/lore.md)
+pull down the latest git archive from those lists.  Projects using pipermail
+archives instead can use semcode-index --pipermail <archive url>.  See
+[the lore documentation](docs/lore.md)
 for more details.  This is a database schema change, so you'll need to reindex.
 
 Recent commits introduced indexes for git commit history, as well as
