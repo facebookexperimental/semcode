@@ -22,6 +22,7 @@ pub mod worktree;
 pub mod callchain;
 pub mod diffdump;
 pub mod display;
+pub mod lore_repack;
 pub mod lore_writers;
 pub mod pages;
 pub mod search;

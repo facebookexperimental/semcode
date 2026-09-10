@@ -104,6 +104,10 @@ struct Args {
     #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 0..)]
     lore: Option<Vec<String>>,
 
+    /// Leave the lore archive git repositories unpacked after fetching
+    #[arg(long)]
+    no_lore_repack: bool,
+
     // ==================== Multi-Branch Indexing ====================
     /// Index a specific branch (can be specified multiple times)
     /// Example: --branch main --branch develop
@@ -366,6 +370,7 @@ async fn clone_lore_repository(lore_url: &str, db_path: &str) -> Result<PathBuf>
 
         let fetch_outcome =
             connection.receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+        release_fetched_pack(&fetch_outcome.status);
 
         // The receive() method in gix automatically calls refs::update() internally,
         // so references should already be updated. Let's report what happened.
@@ -583,6 +588,7 @@ async fn fetch_lore_archive(repo_path: PathBuf) -> Result<gix::Repository> {
 
         let fetch_outcome =
             connection.receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+        release_fetched_pack(&fetch_outcome.status);
 
         match &fetch_outcome.status {
             gix::remote::fetch::Status::NoPackReceived { update_refs, .. } => {
@@ -606,6 +612,64 @@ async fn fetch_lore_archive(repo_path: PathBuf) -> Result<gix::Repository> {
     .await??;
 
     Ok(repo)
+}
+
+/// Release the pack a fetch wrote.
+///
+/// gix holds a fetched pack with a `.keep` file until the refs that
+/// bind it are updated, and leaves the file in place when no ref
+/// changed. A pack held that way is left out of every rollup, so drop
+/// the hold here.
+fn release_fetched_pack(status: &gix::remote::fetch::Status) {
+    let gix::remote::fetch::Status::Change {
+        write_pack_bundle, ..
+    } = status
+    else {
+        return;
+    };
+    if let Some(keep) = &write_pack_bundle.keep_path {
+        match std::fs::remove_file(keep) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Failed to remove {}: {}", keep.display(), e),
+        }
+    }
+}
+
+/// Packs a lore archive accumulates before a rollup earns its cost.
+const LORE_REPACK_THRESHOLD: usize = 20;
+
+/// Consolidate the packs a lore archive has accumulated.
+///
+/// Runs after indexing rather than straight after the fetch so that a
+/// rollup of a large archive does not hold up the emails the caller
+/// came for, and only when indexing succeeded, so that it does not
+/// delay the report of a failure either. A failure of the rollup is
+/// reported and the run carries on, since an archive that keeps its
+/// packs stays correct and only searches more slowly.
+async fn repack_lore_archive(
+    args: &Args,
+    archive_path: PathBuf,
+    display_name: &str,
+    indexed: &Result<LoreIndexResult>,
+) {
+    if args.no_lore_repack || indexed.is_err() {
+        return;
+    }
+    let outcome = tokio::task::spawn_blocking(move || {
+        semcode::lore_repack::repack_if_needed(&archive_path, LORE_REPACK_THRESHOLD)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(Some(stats))) => println!(
+            "[{}] Repacked {} of {} packs, {} objects",
+            display_name, stats.packs_rolled_up, stats.packs_before, stats.objects_written
+        ),
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => eprintln!("Warning: failed to repack {}: {:#}", display_name, e),
+        Err(e) => eprintln!("Warning: the repack of {} did not run: {}", display_name, e),
+    }
 }
 
 /// Result of indexing a single lore archive
@@ -947,6 +1011,14 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // The first termination signal raises gix's interrupt flag, which
+    // its fetch, clone, and pack writing poll and stop on; the second
+    // aborts the process. A rollup stopped this way releases the .keep
+    // on the pack it wrote, which a kill would leave holding that pack
+    // out of every later rollup.
+    // SAFETY: the handler touches only atomics.
+    unsafe { gix::interrupt::init_handler(1, || {}) }?;
+
     // Enable performance monitoring if --perf flag is set
     if args.perf {
         semcode::perf_monitor::enable_performance_monitoring();
@@ -1066,7 +1138,7 @@ async fn main() -> Result<()> {
                 };
 
                 // Index the archive using the shared function
-                match index_lore_archive(
+                let index_result = index_lore_archive(
                     lore_repo,
                     &clone_path,
                     lore_url,
@@ -1075,8 +1147,11 @@ async fn main() -> Result<()> {
                     num_workers,
                     args.db_threads,
                 )
-                .await
-                {
+                .await;
+
+                repack_lore_archive(&args, clone_path, lore_url, &index_result).await;
+
+                match index_result {
                     Ok(result) => {
                         total_new_emails += result.new_emails;
                         total_emails_all_archives += result.total_emails;
@@ -1210,7 +1285,7 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                match index_lore_archive(
+                let index_result = index_lore_archive(
                     lore_repo,
                     &archive_path,
                     &display_name,
@@ -1219,8 +1294,11 @@ async fn main() -> Result<()> {
                     num_workers,
                     db_threads,
                 )
-                .await
-                {
+                .await;
+
+                repack_lore_archive(&args, archive_path, &display_name, &index_result).await;
+
+                match index_result {
                     Ok(result) => results.push(Ok((display_name, result))),
                     Err(e) => results.push(Err((display_name, e))),
                 }

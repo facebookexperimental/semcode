@@ -51,6 +51,10 @@ tokio-tungstenite = "0.29"
 anstream = "1.0"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
 owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
 gix = { version = "0.83", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl-openssl"] }
+# gix pulls gix-pack with default features off, which leaves out the
+# "generate" feature that gates pack writing.  Repacking the lore
+# archives needs it.
+gix-pack = { version = "0.70", default-features = false, features = ["generate", "streaming-input"] }
 model2vec-rs = "0.1.4"
 tower-lsp-server = "0.23"  # Language Server Protocol framework for LSP server
 similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for commit diffs
