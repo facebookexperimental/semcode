@@ -277,10 +277,17 @@ pub async fn show_callers_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Search for function - macros are now stored as functions
-    let func_opt = db.find_function_git_aware(name, git_sha).await?;
+    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
 
-    match func_opt {
-        Some(func) => {
+    match chosen_opt {
+        Some(chosen) => {
+            // Callers are found by name, and a name can belong to several
+            // functions. Listing them under one definition's heading says the
+            // callers of the others belong to it.
+            if let Some(note) = chosen.ambiguity_note() {
+                writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
+            }
+            let func = chosen.function;
             // Always use git-aware callers query
             let callers = db.get_function_callers_git_aware(name, git_sha).await?;
             let indirect = db.find_indirect_callers(name, git_sha).await?;
@@ -1102,10 +1109,17 @@ pub async fn show_callchain_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Use provided git SHA
-    let func_opt = db.find_function_git_aware(name, git_sha).await?;
+    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
 
-    match func_opt {
-        Some(func) => {
+    match chosen_opt {
+        Some(chosen) => {
+            // A chain is read as one path, so it starts at one definition. It
+            // said which file that was and not that there had been a choice,
+            // which reads as the tree having one.
+            if let Some(note) = chosen.ambiguity_note() {
+                writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
+            }
+            let func = chosen.function;
             let header = format!("{}", "=== Function Call Chain ===".bold().green());
             writeln!(writer, "{header}")?;
 

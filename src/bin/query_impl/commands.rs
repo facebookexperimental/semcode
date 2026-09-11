@@ -201,10 +201,12 @@ async fn show_callchain_with_limits(
     );
 
     // First, check if function exists using git-aware query
-    let func_opt = db.find_function_git_aware(function_name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(function_name, git_sha)
+        .await?;
 
-    let func = match func_opt {
-        Some(f) => f,
+    let chosen = match chosen_opt {
+        Some(chosen) => chosen,
         None => {
             println!(
                 "{} Function '{}' not found in database at git SHA {}",
@@ -215,6 +217,12 @@ async fn show_callchain_with_limits(
             return Ok(());
         }
     };
+    // One chain, so one definition. Say so rather than presenting the choice
+    // as the tree's only answer.
+    if let Some(note) = chosen.ambiguity_note() {
+        println!("{} {}", "Ambiguous:".bold().yellow(), note);
+    }
+    let func = chosen.function;
 
     println!("{}", "=== Function Information ===".bold().green());
     println!(
