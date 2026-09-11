@@ -252,6 +252,72 @@ async fn the_listing_shows_each_definition_its_own_calls() {
 }
 
 #[tokio::test]
+async fn the_types_belong_to_the_definition_that_was_named() {
+    // Third part of one answer, third place it was ranked: the types beside a
+    // function were picked by a copy of the older ladder, so a report could
+    // name one definition, list a second one's callees and a third one's
+    // types. Nothing said they were about different functions.
+    // Each definition has to name a DIFFERENT type, or the two answers are
+    // both empty and the test passes whichever definition it read. The first
+    // version of this test did exactly that.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::create_dir_all(repo.join("arch/x86/tools")).unwrap();
+    std::fs::create_dir_all(repo.join("include/linux")).unwrap();
+    std::fs::write(
+        repo.join("include/linux/printk.h"),
+        "struct kdev { int id; };\n\
+         static inline int report(struct kdev *dev)\n{\n\treturn dev->id;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("arch/x86/tools/decoder_test.c"),
+        "struct host_ctx { int fd; };\n\
+         int report(struct host_ctx *ctx)\n{\n\treturn ctx->fd;\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "two definitions, two types"]);
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["c".to_string(), "h".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+    let manifest = db.git_manifest_cached(&sha).await.unwrap();
+
+    let chosen = db
+        .find_function_git_aware_reporting("report", &sha)
+        .await
+        .unwrap()
+        .unwrap();
+    let types = db
+        .get_function_types_with_manifest("report", &manifest)
+        .await
+        .unwrap();
+
+    assert_eq!(chosen.function.file_path, "include/linux/printk.h");
+    assert!(
+        types.iter().any(|t| t == "kdev" || t == "struct kdev"),
+        "named include/linux/printk.h and reported types {types:?}"
+    );
+    assert!(
+        !types.iter().any(|t| t.contains("host_ctx")),
+        "types came from the host tool's definition: {types:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_use_of_the_name_is_not_an_answer_about_it() {
     // Some rows are neither a definition nor a declaration. In Linux,
     // arch/x86/xen/suspend_hvm.c:22 is `BUG_ON(xen_set_upcall_vector(cpu));`

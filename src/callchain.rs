@@ -823,6 +823,11 @@ pub async fn show_callees_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Search for function - macros are now stored as functions
+    // The silent resolver is what this wants: where the name has more than one
+    // definition the answer below is every definition and this returns before
+    // reaching anything that names a single file, so nothing here picks one on
+    // a reader's behalf. Moving that early return above this line would change
+    // that.
     let func_opt = db.find_function_git_aware(name, git_sha).await?;
 
     match func_opt {

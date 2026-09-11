@@ -2463,16 +2463,19 @@ impl DatabaseManager {
             return Ok(Vec::new());
         }
 
-        // Select best match (prefer implementation over declaration)
-        let best_match = matches
-            .into_iter()
-            .max_by_key(|(file_path, line_start, line_end, _)| {
-                let line_count = line_end.saturating_sub(*line_start);
-                let is_header = file_path.ends_with(".h");
-                (if is_header { 0 } else { 1 }, line_count)
-            });
-
-        match best_match {
+        // The definition the rest of the answer is about, looked up by where it
+        // was read. Ranking here as well is what let a chain name one
+        // definition and list another's callees; the types beside them were
+        // ranked by this copy of the older ladder and could disagree with both.
+        let Some(chosen) = self
+            .find_function_with_manifest_reporting(name, git_manifest)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        match matches.into_iter().find(|(file_path, line_start, _, _)| {
+            *file_path == chosen.function.file_path && *line_start == chosen.function.line_start
+        }) {
             Some((_, _, _, Some(types))) => Ok(types),
             _ => Ok(Vec::new()),
         }
