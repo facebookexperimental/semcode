@@ -266,6 +266,21 @@ fn when_it_runs(level: &str) -> &'static str {
         .unwrap_or("runs at boot")
 }
 
+/// What to add to a name's file and line where the tree defines the name more
+/// than once.
+///
+/// One row of a list is the wrong place for the full note: a caller list runs
+/// to thousands of rows and `callers pr_warn` names 4,065 of them. Measured on
+/// this tree, 2 of 20 rows of one such list have an ambiguous name, so the
+/// count is worth carrying and the paths are not. The reader who wants them
+/// asks about that name.
+fn definition_marker(chosen: &crate::types::ChosenDefinition) -> String {
+    match chosen.others.len() {
+        0 => String::new(),
+        others => format!(" [1 of {} definitions]", others + 1),
+    }
+}
+
 pub async fn show_callers_to_writer(
     db: &DatabaseManager,
     name: &str,
@@ -420,15 +435,21 @@ pub async fn show_callers_to_writer(
                     // Only perform extra lookups in verbose mode
                     if verbose {
                         // Get more info about the caller
-                        if let Ok(Some(caller_func)) =
-                            db.find_function_git_aware(caller, git_sha).await
+                        if let Ok(Some(chosen)) =
+                            db.find_function_git_aware_reporting(caller, git_sha).await
                         {
+                            // The file and line of a name with several
+                            // definitions is one of them, and a row of a list
+                            // has no other way to say so.
+                            let marker = definition_marker(&chosen);
+                            let caller_func = chosen.function;
                             let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
+                                "     {} ({}:{}) [file SHA: {}]{}",
                                 caller_func.return_type.bright_black(),
                                 caller_func.file_path.bright_black(),
                                 caller_func.line_start,
-                                caller_func.git_file_hash.bright_black()
+                                caller_func.git_file_hash.bright_black(),
+                                marker.yellow()
                             );
                             writeln!(writer, "{info}")?;
                         }
@@ -941,15 +962,18 @@ pub async fn show_callees_to_writer(
                     // Only perform extra lookups in verbose mode
                     if verbose {
                         // Get more info about the callee
-                        if let Ok(Some(callee_func)) =
-                            db.find_function_git_aware(callee, git_sha).await
+                        if let Ok(Some(chosen)) =
+                            db.find_function_git_aware_reporting(callee, git_sha).await
                         {
+                            let marker = definition_marker(&chosen);
+                            let callee_func = chosen.function;
                             let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
+                                "     {} ({}:{}) [file SHA: {}]{}",
                                 callee_func.return_type.bright_black(),
                                 callee_func.file_path.bright_black(),
                                 callee_func.line_start,
-                                callee_func.git_file_hash.bright_black()
+                                callee_func.git_file_hash.bright_black(),
+                                marker.yellow()
                             );
                             writeln!(writer, "{info}")?;
                         }
