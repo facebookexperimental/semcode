@@ -279,10 +279,18 @@ async fn mcp_show_callers(
 
     // Find function or macro - both are stored in the functions table
     // Macros are distinguished by having an empty return_type
-    let entity_opt = db.find_function_git_aware(function_name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(function_name, git_sha)
+        .await?;
 
-    match entity_opt {
-        Some(entity) => {
+    match chosen_opt {
+        Some(chosen) => {
+            // Callers are found by name, and a name can belong to several
+            // functions. An agent reading this has no other way to learn that.
+            if let Some(note) = chosen.ambiguity_note() {
+                writeln!(buffer, "Ambiguous: {note}")?;
+            }
+            let entity = chosen.function;
             let is_macro = entity.return_type.is_empty();
             let entity_type = if is_macro { "macro" } else { "function" };
 
@@ -444,20 +452,25 @@ async fn mcp_show_calls(
 
     // Find function or macro - both are stored in the functions table
     // Macros are distinguished by having an empty return_type
-    let entity_opt = db.find_function_git_aware(function_name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(function_name, git_sha)
+        .await?;
 
-    match entity_opt {
-        Some(entity) => {
+    match chosen_opt {
+        Some(chosen) => {
+            if let Some(note) = chosen.ambiguity_note() {
+                writeln!(buffer, "Ambiguous: {note}")?;
+            }
+            let entity = chosen.function;
             let is_macro = entity.return_type.is_empty();
             let entity_type = if is_macro { "Macro" } else { "Function" };
 
-            // Get callees - for macros, use the calls field; for functions, use db lookup
-            let calls = if is_macro {
-                entity.calls.clone().unwrap_or_default()
-            } else {
-                db.get_function_callees_git_aware(function_name, git_sha)
-                    .await?
-            };
+            // The callees of the definition named above. Reading them off the
+            // row for macros took them from whichever definition the resolver
+            // returned, which is the same silent choice one step earlier.
+            let calls = db
+                .get_function_callees_git_aware(function_name, git_sha)
+                .await?;
 
             if calls.is_empty() {
                 writeln!(
@@ -1708,12 +1721,11 @@ async fn mcp_show_callchain_with_limits(
     // by temporarily redirecting stdout to capture the output
 
     // First, check if function exists
-    let func_exists = db
-        .find_function_git_aware(function_name, git_sha)
-        .await?
-        .is_some();
+    let chosen_opt = db
+        .find_function_git_aware_reporting(function_name, git_sha)
+        .await?;
 
-    if !func_exists {
+    if chosen_opt.is_none() {
         writeln!(
             buffer,
             "Error: Function '{function_name}' not found in database at git SHA {git_sha}"
@@ -1733,8 +1745,13 @@ async fn mcp_show_callchain_with_limits(
     // Use a simplified but functional approach that mimics the efficient implementation
     // This calls the underlying database method directly but captures output
 
-    // Get the function info first
-    if let Some(func) = db.find_function_git_aware(function_name, git_sha).await? {
+    // Get the function info first. One chain starts at one definition, so the
+    // chain says which one rather than reading as the tree having one.
+    if let Some(chosen) = chosen_opt {
+        if let Some(note) = chosen.ambiguity_note() {
+            writeln!(buffer, "Ambiguous: {note}")?;
+        }
+        let func = chosen.function;
         writeln!(buffer, "\n=== Function Information ===")?;
         writeln!(
             buffer,

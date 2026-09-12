@@ -129,71 +129,99 @@ impl SemcodeLspBackend {
         }
     }
 
-    async fn find_function_definition(&self, identifier_name: &str) -> Option<Location> {
+    /// Every place the identifier is defined, in the order a listing reports.
+    ///
+    /// One location where a name has several definitions is a guess, and the
+    /// protocol has nowhere to say so -- but it does take a list, and an editor
+    /// offers a list to the reader. `pr_warn` has nine definitions in Linux and
+    /// this used to jump to whichever one a heuristic preferred.
+    async fn find_function_definitions(&self, identifier_name: &str) -> Vec<Location> {
         if self.index_is_stale().await {
-            return None;
+            return Vec::new();
         }
 
         let db_guard = self.database.lock().await;
-        let db = db_guard.as_ref()?;
+        let Some(db) = db_guard.as_ref() else {
+            return Vec::new();
+        };
 
         // Try git-aware lookup first if we have a git SHA
         let git_sha_guard = self.git_sha.lock().await;
-        let (func_result, macro_result, type_result, typedef_result) =
-            if let Some(git_sha) = git_sha_guard.as_ref() {
-                // Use git-aware lookup to find function, macro, type, and typedef at current commit
-                let func = db.find_function_git_aware(identifier_name, git_sha).await;
-                let mac = db.find_function_git_aware(identifier_name, git_sha).await;
-                let typ = db.find_type_git_aware(identifier_name, git_sha).await;
-                let typedef = db.find_typedef_git_aware(identifier_name, git_sha).await;
-                (func, mac, typ, typedef)
-            } else {
-                // Fall back to non-git-aware lookup
-                let func = db.find_function(identifier_name).await;
-                let mac = db.find_function(identifier_name).await;
-                let typ = db.find_type(identifier_name).await;
-                let typedef = db.find_typedef(identifier_name).await;
-                (func, mac, typ, typedef)
-            };
+        // Functions and macros live in one table, so one lookup answers for
+        // both; asking twice was the same question twice.
+        let (functions, type_result, typedef_result) = if let Some(git_sha) = git_sha_guard.as_ref()
+        {
+            let mut functions = db
+                .find_all_functions_git_aware(identifier_name, git_sha)
+                .await
+                .unwrap_or_default();
+            // The best guess leads. A client that offers a picker offers all of
+            // them either way; one that jumps to the first entry without asking
+            // should land on the definition the other commands answer about,
+            // not on whichever file sorts first.
+            if let Ok(Some(chosen)) = db
+                .find_function_git_aware_reporting(identifier_name, git_sha)
+                .await
+            {
+                functions.sort_by_key(|func| {
+                    func.file_path != chosen.function.file_path
+                        || func.line_start != chosen.function.line_start
+                });
+            }
+            let typ = db.find_type_git_aware(identifier_name, git_sha).await;
+            let typedef = db.find_typedef_git_aware(identifier_name, git_sha).await;
+            (functions, typ, typedef)
+        } else {
+            // Fall back to non-git-aware lookup
+            let functions = db
+                .find_all_functions(identifier_name)
+                .await
+                .unwrap_or_default();
+            let typ = db.find_type(identifier_name).await;
+            let typedef = db.find_typedef(identifier_name).await;
+            (functions, typ, typedef)
+        };
         drop(git_sha_guard);
 
         // Prioritize: function > macro > type > typedef
-        let (file_path, line_start) = match (func_result, macro_result, type_result, typedef_result)
-        {
-            (Ok(Some(func)), _, _, _) => (func.file_path, func.line_start),
-            (_, Ok(Some(mac)), _, _) => (mac.file_path, mac.line_start),
-            (_, _, Ok(Some(typ)), _) => (typ.file_path, typ.line_start),
-            (_, _, _, Ok(Some(typedef))) => (typedef.file_path, typedef.line_start),
-            _ => return None,
+        let places: Vec<(String, u32)> = match (&functions, type_result, typedef_result) {
+            (functions, _, _) if !functions.is_empty() => functions
+                .iter()
+                .map(|func| (func.file_path.clone(), func.line_start))
+                .collect(),
+            (_, Ok(Some(typ)), _) => vec![(typ.file_path, typ.line_start)],
+            (_, _, Ok(Some(typedef))) => vec![(typedef.file_path, typedef.line_start)],
+            _ => return Vec::new(),
         };
 
-        // Convert relative file path to absolute path using git repo path
+        // Convert relative file paths to absolute paths using git repo path
         let repo_path_guard = self.git_repo_path.lock().await;
-        let absolute_path = if let Some(repo_path) = repo_path_guard.as_ref() {
-            // Join repo path with relative file path from database
-            std::path::Path::new(repo_path).join(&file_path)
-        } else {
-            // Fallback to relative path (shouldn't happen if database connected)
-            std::path::PathBuf::from(&file_path)
-        };
+        let repo_path = repo_path_guard.clone();
         drop(repo_path_guard);
 
-        // Convert absolute file path to URI
-        let file_uri = Uri::from_file_path(&absolute_path)?;
-
-        // Create position (LSP uses 0-based line numbers)
-        let position = Position {
-            line: line_start.saturating_sub(1),
-            character: 0,
-        };
-
-        Some(Location {
-            uri: file_uri,
-            range: Range {
-                start: position,
-                end: position,
-            },
-        })
+        places
+            .into_iter()
+            .filter_map(|(file_path, line_start)| {
+                let absolute_path = match &repo_path {
+                    Some(repo_path) => std::path::Path::new(repo_path).join(&file_path),
+                    // Fallback to relative path (shouldn't happen if database connected)
+                    None => std::path::PathBuf::from(&file_path),
+                };
+                let file_uri = Uri::from_file_path(&absolute_path)?;
+                // Create position (LSP uses 0-based line numbers)
+                let position = Position {
+                    line: line_start.saturating_sub(1),
+                    character: 0,
+                };
+                Some(Location {
+                    uri: file_uri,
+                    range: Range {
+                        start: position,
+                        end: position,
+                    },
+                })
+            })
+            .collect()
     }
 
     async fn find_function_references(&self, function_name: &str) -> Vec<Location> {
@@ -395,11 +423,14 @@ impl LanguageServer for SemcodeLspBackend {
             None => return Ok(None),
         };
 
-        // Find the function definition in the database
-        if let Some(location) = self.find_function_definition(&function_name).await {
-            Ok(Some(GotoDefinitionResponse::Scalar(location)))
-        } else {
-            Ok(None)
+        // Find the definitions in the database. Several is the honest answer
+        // where the tree defines the name several times; the editor offers the
+        // list rather than this picking one.
+        let mut locations = self.find_function_definitions(&function_name).await;
+        match locations.len() {
+            0 => Ok(None),
+            1 => Ok(Some(GotoDefinitionResponse::Scalar(locations.remove(0)))),
+            _ => Ok(Some(GotoDefinitionResponse::Array(locations))),
         }
     }
 
