@@ -3,7 +3,7 @@ use anyhow::Result;
 use clap::Parser;
 use semcode::{
     git, lore_writers::decode_email_body, pages::PageCache, process_database_path,
-    search::is_function_definition, search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
+    row_defines_the_function, search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
 };
 use serde_json::{json, Value};
 use std::io::Write;
@@ -47,7 +47,7 @@ async fn mcp_query_function_or_macro(
     // Filter to only keep actual definitions (not declarations or call sites)
     let definitions: Vec<_> = all_matches
         .into_iter()
-        .filter(is_function_definition)
+        .filter(|func| row_defines_the_function(&func.return_type, &func.body))
         .collect();
 
     let result = if definitions.is_empty() {

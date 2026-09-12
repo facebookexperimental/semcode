@@ -2681,13 +2681,7 @@ impl DatabaseManager {
     fn filter_implementations_only(&self, functions: Vec<FunctionInfo>) -> Vec<FunctionInfo> {
         functions
             .into_iter()
-            .filter(|func| {
-                // Macros (empty return_type) are always implementations
-                if func.return_type.is_empty() {
-                    return true;
-                }
-                !func.body.is_empty() && !crate::types::text_is_prototype(&func.body)
-            })
+            .filter(|func| crate::types::row_defines_the_function(&func.return_type, &func.body))
             .collect()
     }
 
@@ -2755,8 +2749,8 @@ impl DatabaseManager {
             //    under the name it calls. It is a .c file in the tree being
             //    audited, so every rung below this one ranked it first, and a
             //    question about BUG_ON was answered from a use of it.
-            let a_defines = !crate::types::text_is_prototype(&a.body);
-            let b_defines = !crate::types::text_is_prototype(&b.body);
+            let a_defines = crate::types::row_defines_the_function(&a.return_type, &a.body);
+            let b_defines = crate::types::row_defines_the_function(&b.return_type, &b.body);
             if a_defines != b_defines {
                 return b_defines.cmp(&a_defines);
             }
@@ -2826,7 +2820,9 @@ impl DatabaseManager {
         let mut matches = matches.into_iter();
         let function = matches.next().unwrap();
         let others = matches
-            .filter(|candidate| !crate::types::text_is_prototype(&candidate.body))
+            .filter(|candidate| {
+                crate::types::row_defines_the_function(&candidate.return_type, &candidate.body)
+            })
             .map(|candidate| crate::types::DefinitionSite {
                 file_path: candidate.file_path,
                 line_start: candidate.line_start,
@@ -4103,7 +4099,10 @@ impl DatabaseManager {
                         line_start: function.line_start,
                         line_end: function.line_end,
                         callees: function.calls.clone().unwrap_or_default(),
-                        is_definition: !crate::types::text_is_prototype(&function.body),
+                        is_definition: crate::types::row_defines_the_function(
+                            &function.return_type,
+                            &function.body,
+                        ),
                     })
                     .collect()
             })
@@ -5787,6 +5786,13 @@ impl DatabaseManager {
                 line_start,
                 line_end,
                 callees: calls.unwrap_or_default(),
+                // The one place that cannot use `row_defines_the_function`:
+                // this reads the stored text by content hash and has no return
+                // type beside it. The two agree wherever both can answer -- a
+                // macro's text starts with `#`, which is not a prototype
+                // either way -- and the counts are checked against each other
+                // on the tree, so a divergence here would show up as two
+                // commands reporting different numbers.
                 is_definition: !text.is_empty() && !crate::types::text_is_prototype(&text),
             });
         }

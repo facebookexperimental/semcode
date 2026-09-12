@@ -184,6 +184,24 @@ pub fn path_language(file_path: &str) -> &str {
     }
 }
 
+/// Whether a row defines the function it names, rather than declaring it.
+///
+/// The one test for the question, so that two commands cannot answer it two
+/// ways. Three of them used to: a body-length threshold listed five of the six
+/// definitions of `kfree`, and requiring braces in a header dropped every macro
+/// defined in one, so `container_of` was listed eleven times where the same
+/// tree reported twelve. A macro is a definition however it is written.
+pub fn row_defines_the_function(return_type: &str, body: &str) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    // A macro has no return type, and is a definition however it is written.
+    if return_type.is_empty() {
+        return true;
+    }
+    !text_is_prototype(body)
+}
+
 /// Whether stored text declares a function without defining it.
 ///
 /// The row's own text is the only thing that separates the two: a prototype

@@ -661,3 +661,32 @@ fn a_path_component_names_another_program_where_a_prefix_does_not() {
     assert!(!path_is_other_program("drivers/tty/toolsomething.c"));
     assert!(!path_is_other_program("mm/mytools.c"));
 }
+
+#[tokio::test]
+async fn the_three_commands_count_the_same_definitions() {
+    // The note tells the reader to run `func` to see the definitions it set
+    // aside, so the two have to agree about how many there are. They did not:
+    // three predicates answered "does this row define the function" three
+    // ways, and `kfree` was reported six times and listed five.
+    let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
+
+    let chosen = db
+        .find_function_git_aware_reporting("report", &sha)
+        .await
+        .unwrap()
+        .unwrap();
+    let listed = db
+        .find_all_functions_git_aware("report", &sha)
+        .await
+        .unwrap();
+    let by_callee_query = db
+        .get_function_callees_by_definition_git_aware("report", &sha)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|definition| definition.is_definition)
+        .count();
+
+    assert_eq!(chosen.others.len() + 1, listed.len(), "note vs listing");
+    assert_eq!(listed.len(), by_callee_query, "listing vs callee query");
+}

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+use crate::types::row_defines_the_function;
 use crate::{CodeVectorizer, DatabaseManager};
 use anstream::stdout;
 use anyhow::Result;
@@ -1225,27 +1226,6 @@ pub async fn query_function_or_macro_to_writer_verbose(
     query_function_or_macro_to_writer_with_options(db, name, git_sha, writer, verbose).await
 }
 
-/// Check if a function is actually a definition (has implementation) vs just a declaration
-///
-/// The row's own text decides, the same test a callee query and the definition
-/// chooser use. Requiring braces in a header decided it before, which dropped
-/// every macro defined in one: `container_of` was listed 11 times where a
-/// callee query and the ambiguity note both counted 12. Three commands then
-/// disagreed about how many definitions a name has, and the note sends the
-/// reader here to see them.
-pub fn is_function_definition(func: &crate::FunctionInfo) -> bool {
-    if func.body.is_empty() {
-        return false; // Empty body is definitely a declaration
-    }
-
-    // Macros have empty return_type and are always definitions (never just declarations)
-    if func.return_type.is_empty() {
-        return true;
-    }
-
-    !crate::types::text_is_prototype(&func.body)
-}
-
 async fn query_function_or_macro_to_writer_with_options(
     db: &DatabaseManager,
     name: &str,
@@ -1268,7 +1248,7 @@ async fn query_function_or_macro_to_writer_with_options(
             // Found functions only - filter out declarations and display only definitions
             let definitions: Vec<_> = func_results
                 .iter()
-                .filter(|func| is_function_definition(func))
+                .filter(|func| row_defines_the_function(&func.return_type, &func.body))
                 .collect();
 
             if definitions.len() > 1 {
@@ -1399,7 +1379,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     // Filter out declarations and show only definitions
                     let regex_definitions: Vec<_> = regex_functions
                         .iter()
-                        .filter(|func| is_function_definition(func))
+                        .filter(|func| row_defines_the_function(&func.return_type, &func.body))
                         .collect();
                     for func in &regex_definitions {
                         display_function_to_writer_with_options(func, writer, true)?;
