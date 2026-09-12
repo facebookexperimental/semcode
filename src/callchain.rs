@@ -266,6 +266,21 @@ fn when_it_runs(level: &str) -> &'static str {
         .unwrap_or("runs at boot")
 }
 
+/// What to add to a name's file and line where the tree defines the name more
+/// than once.
+///
+/// One row of a list is the wrong place for the full note: a caller list runs
+/// to thousands of rows and `callers pr_warn` names 4,065 of them. Measured on
+/// this tree, 2 of 20 rows of one such list have an ambiguous name, so the
+/// count is worth carrying and the paths are not. The reader who wants them
+/// asks about that name.
+fn definition_marker(chosen: &crate::types::ChosenDefinition) -> String {
+    match chosen.others.len() {
+        0 => String::new(),
+        others => format!(" [1 of {} definitions]", others + 1),
+    }
+}
+
 pub async fn show_callers_to_writer(
     db: &DatabaseManager,
     name: &str,
@@ -277,10 +292,17 @@ pub async fn show_callers_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Search for function - macros are now stored as functions
-    let func_opt = db.find_function_git_aware(name, git_sha).await?;
+    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
 
-    match func_opt {
-        Some(func) => {
+    match chosen_opt {
+        Some(chosen) => {
+            // Callers are found by name, and a name can belong to several
+            // functions. Listing them under one definition's heading says the
+            // callers of the others belong to it.
+            if let Some(note) = chosen.ambiguity_note() {
+                writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
+            }
+            let func = chosen.function;
             // Always use git-aware callers query
             let callers = db.get_function_callers_git_aware(name, git_sha).await?;
             let indirect = db.find_indirect_callers(name, git_sha).await?;
@@ -413,15 +435,21 @@ pub async fn show_callers_to_writer(
                     // Only perform extra lookups in verbose mode
                     if verbose {
                         // Get more info about the caller
-                        if let Ok(Some(caller_func)) =
-                            db.find_function_git_aware(caller, git_sha).await
+                        if let Ok(Some(chosen)) =
+                            db.find_function_git_aware_reporting(caller, git_sha).await
                         {
+                            // The file and line of a name with several
+                            // definitions is one of them, and a row of a list
+                            // has no other way to say so.
+                            let marker = definition_marker(&chosen);
+                            let caller_func = chosen.function;
                             let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
+                                "     {} ({}:{}) [file SHA: {}]{}",
                                 caller_func.return_type.bright_black(),
                                 caller_func.file_path.bright_black(),
                                 caller_func.line_start,
-                                caller_func.git_file_hash.bright_black()
+                                caller_func.git_file_hash.bright_black(),
+                                marker.yellow()
                             );
                             writeln!(writer, "{info}")?;
                         }
@@ -684,7 +712,7 @@ pub async fn show_registrations_to_writer(
 
             // Where that call puts it, and by what route: the slot is a
             // claim about the registrar, not about this call site.
-            let handover = db
+            let handovers = db
                 .follow_handed_parameter(&argument.callee, argument.argument_index, git_sha)
                 .await?;
 
@@ -694,45 +722,66 @@ pub async fn show_registrations_to_writer(
             // rcu_head::func, so the inode is the subject. `request_irq(...,
             // handler, ..., netdev->name, ...)` also passes a member, and the
             // handler has nothing to do with it.
-            if let (
-                Some(subject_type),
-                Some(subject_member),
-                Some(Handover::StoredIn { container_type, .. }),
-            ) = (&argument.subject_type, &argument.subject_member, &handover)
+            if let (Some(subject_type), Some(subject_member)) =
+                (&argument.subject_type, &argument.subject_member)
             {
-                let holds = db
-                    .member_aggregate_git_aware(subject_type, subject_member, git_sha)
-                    .await?;
-                if holds.as_deref() == Some(container_type.as_str()) {
-                    writeln!(
-                        writer,
-                        "     attached to {}::{}",
-                        subject_type.cyan(),
-                        subject_member.cyan(),
-                    )?;
+                for (handover, _) in &handovers {
+                    let Handover::StoredIn { container_type, .. } = handover else {
+                        continue;
+                    };
+                    let holds = db
+                        .member_aggregate_git_aware(subject_type, subject_member, git_sha)
+                        .await?;
+                    if holds.as_deref() == Some(container_type.as_str()) {
+                        writeln!(
+                            writer,
+                            "     attached to {}::{}",
+                            subject_type.cyan(),
+                            subject_member.cyan(),
+                        )?;
+                        break;
+                    }
                 }
             }
 
-            match handover {
-                Some(Handover::StoredIn {
-                    path,
-                    container_type,
-                    member,
-                }) => writeln!(
+            // Definitions that disagree about where the parameter goes are two
+            // claims about two configurations, and reporting one of them reads
+            // as the tree having one answer.
+            if handovers.len() > 1 {
+                writeln!(
                     writer,
-                    "     installs it in {}::{}, {} through {}",
-                    container_type.cyan(),
-                    member.cyan(),
-                    "called later".yellow(),
-                    path.join(" -> ").bright_black(),
-                )?,
-                Some(Handover::Invoked { path }) => writeln!(
-                    writer,
-                    "     calls it {} through {}",
-                    "before returning".yellow(),
-                    path.join(" -> ").bright_black(),
-                )?,
-                None => {}
+                    "     {} the definitions of {} disagree about where it goes:",
+                    "Ambiguous:".bold().yellow(),
+                    argument.callee.cyan(),
+                )?;
+            }
+            for (handover, agreeing) in &handovers {
+                let agreement = match agreeing {
+                    0 | 1 => String::new(),
+                    count => format!(" ({count} definitions agree)"),
+                };
+                match handover {
+                    Handover::StoredIn {
+                        path,
+                        container_type,
+                        member,
+                    } => writeln!(
+                        writer,
+                        "     installs it in {}::{}, {} through {}{}",
+                        container_type.cyan(),
+                        member.cyan(),
+                        "called later".yellow(),
+                        path.join(" -> ").bright_black(),
+                        agreement.bright_black(),
+                    )?,
+                    Handover::Invoked { path } => writeln!(
+                        writer,
+                        "     calls it {} through {}{}",
+                        "before returning".yellow(),
+                        path.join(" -> ").bright_black(),
+                        agreement.bright_black(),
+                    )?,
+                }
             }
         }
     }
@@ -816,6 +865,11 @@ pub async fn show_callees_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Search for function - macros are now stored as functions
+    // The silent resolver is what this wants: where the name has more than one
+    // definition the answer below is every definition and this returns before
+    // reaching anything that names a single file, so nothing here picks one on
+    // a reader's behalf. Moving that early return above this line would change
+    // that.
     let func_opt = db.find_function_git_aware(name, git_sha).await?;
 
     match func_opt {
@@ -908,15 +962,18 @@ pub async fn show_callees_to_writer(
                     // Only perform extra lookups in verbose mode
                     if verbose {
                         // Get more info about the callee
-                        if let Ok(Some(callee_func)) =
-                            db.find_function_git_aware(callee, git_sha).await
+                        if let Ok(Some(chosen)) =
+                            db.find_function_git_aware_reporting(callee, git_sha).await
                         {
+                            let marker = definition_marker(&chosen);
+                            let callee_func = chosen.function;
                             let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]",
+                                "     {} ({}:{}) [file SHA: {}]{}",
                                 callee_func.return_type.bright_black(),
                                 callee_func.file_path.bright_black(),
                                 callee_func.line_start,
-                                callee_func.git_file_hash.bright_black()
+                                callee_func.git_file_hash.bright_black(),
+                                marker.yellow()
                             );
                             writeln!(writer, "{info}")?;
                         }
@@ -1102,10 +1159,17 @@ pub async fn show_callchain_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Use provided git SHA
-    let func_opt = db.find_function_git_aware(name, git_sha).await?;
+    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
 
-    match func_opt {
-        Some(func) => {
+    match chosen_opt {
+        Some(chosen) => {
+            // A chain is read as one path, so it starts at one definition. It
+            // said which file that was and not that there had been a choice,
+            // which reads as the tree having one.
+            if let Some(note) = chosen.ambiguity_note() {
+                writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
+            }
+            let func = chosen.function;
             let header = format!("{}", "=== Function Call Chain ===".bold().green());
             writeln!(writer, "{header}")?;
 

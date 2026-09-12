@@ -392,10 +392,14 @@ async fn a_function_handed_to_a_call_is_recorded() {
     );
 
     // Both hops stay visible: a two-hop claim that reads like a one-hop fact
-    // is worse than no answer.
+    // is worse than no answer. Each hop names the file and line its body was
+    // read from, because a name can have several definitions and a route
+    // through one of them is only checkable if it says which.
     assert!(
-        output.contains("request_irq(handler) -> request_threaded_irq(handler)"),
-        "the route was not reported:\n{output}"
+        output.contains(
+            "request_irq(handler) at irq.c:8 -> request_threaded_irq(handler) at irq.c:2"
+        ),
+        "the route was not reported with the definitions it was read from:\n{output}"
     );
 
     // Installing is not calling: the handler runs when an interrupt arrives,

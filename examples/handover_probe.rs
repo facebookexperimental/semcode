@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
     let mut unresolved: Vec<String> = Vec::new();
     let mut resolved = 0usize;
     let mut resolved_sites = 0usize;
+    let mut disagreeing = 0usize;
     let mut sites = 0usize;
     let mut examples = Vec::new();
     for ((callee, index), count) in ranked.iter().take(sample) {
@@ -58,21 +59,30 @@ async fn main() -> Result<()> {
         }
         function_valued += 1;
 
-        if let Some(handover) = db.follow_handed_parameter(callee, *index, &git_sha).await? {
+        // Every definition of the name is walked now, so a name can produce
+        // more than one claim. Two claims about one handover is a finding in
+        // its own right, so they are counted apart from the agreeing ones.
+        let handovers = db.follow_handed_parameter(callee, *index, &git_sha).await?;
+        if !handovers.is_empty() {
             resolved += 1;
             resolved_sites += count;
+            if handovers.len() > 1 {
+                disagreeing += 1;
+            }
             if examples.len() < 10 {
+                let (handover, agreeing) = &handovers[0];
                 examples.push(match handover {
                     semcode::Handover::StoredIn {
                         path,
                         container_type,
                         member,
                     } => format!(
-                        "{callee}[{index}] -> {container_type}::{member} via {}",
-                        path.join(" -> ")
+                        "{callee}[{index}] -> {container_type}::{member} via {} ({agreeing} agree, {} claims)",
+                        path.join(" -> "),
+                        handovers.len()
                     ),
                     semcode::Handover::Invoked { path } => {
-                        format!("{callee}[{index}] -> called, via {}", path.join(" -> "))
+                        format!("{callee}[{index}] -> called, via {} ({agreeing} agree)", path.join(" -> "))
                     }
                 });
             }
@@ -86,6 +96,7 @@ async fn main() -> Result<()> {
     println!("of the {sample} busiest positions ({sites} call sites):");
     println!("  take a function at that position: {function_valued}");
     println!("  reach a member: {resolved} positions, {resolved_sites} sites");
+    println!("  positions whose definitions disagree about where it goes: {disagreeing}");
     for example in examples {
         println!("    {example}");
     }

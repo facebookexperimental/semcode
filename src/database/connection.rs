@@ -23,7 +23,7 @@ use crate::database::content::{ContentInfo, ContentStore};
 use crate::database::processed_files::{ProcessedFileRecord, ProcessedFileStore};
 use crate::database::vectors::VectorStore;
 use crate::treesitter_analyzer::TreeSitterAnalyzer;
-use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
+use crate::types::{ChosenDefinition, FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
 use crate::worktree::{WorkingCopy, WorkingCopyHashes};
@@ -1389,13 +1389,23 @@ impl DatabaseManager {
             .await
     }
 
-    /// Where a call puts the function it is handed.
+    /// Where a call puts the function it is handed, per definition of the name.
     ///
     /// `request_irq(irq, nic_intr, ...)` installs nothing by itself: the
     /// wrapper hands its parameter to `request_threaded_irq`, which stores it
     /// in `irqaction::handler`. Follow that until a body stores the parameter
     /// in a member, and report the path taken, because a two-hop claim that
     /// reads like a one-hop fact is worse than no answer.
+    ///
+    /// Every definition of a name on the way is walked, and each hop carries
+    /// the file and line its body was read from. One definition was walked
+    /// before, chosen by a heuristic: `call_rcu` has three, and the claim
+    /// `rcu_head::func` was read out of kernel/rcu/tree.c with nothing said
+    /// about kernel/rcu/tiny.c, which reaches the same member by storing the
+    /// parameter itself instead of handing it to `__call_rcu_common`. Which one
+    /// a caller reaches is a configuration question this does not answer, so
+    /// where definitions agree the claim is reported once and where they
+    /// disagree both are returned rather than one of them.
     ///
     /// Bounded: a wrapper chain that has not reached a member within a few
     /// hops is not one, and a cycle must not spin.
@@ -1404,80 +1414,161 @@ impl DatabaseManager {
         callee: &str,
         argument_index: u32,
         git_sha: &str,
-    ) -> Result<Option<crate::types::Handover>> {
+    ) -> Result<Vec<(crate::types::Handover, usize)>> {
         const MAX_HOPS: usize = 4;
+        // Two budgets, because they bound two different things. MAX_BRANCHES
+        // bounds how many wrapper branches are followed, which is what stops a
+        // body handing its parameter to a dozen calls from turning into a
+        // search. MAX_DEFINITIONS bounds how many bodies are read, which is
+        // what stops a name with seventeen definitions from being expensive.
+        // Sharing one counter let the second eat the first: seventeen
+        // definitions of one hop exhausted the branch budget, and a claim two
+        // hops further on -- or a disagreement, the thing this reports --
+        // silently stopped being found.
         const MAX_BRANCHES: usize = 32;
+        const MAX_DEFINITIONS: usize = 256;
 
         let mut seen = std::collections::HashSet::new();
+        let mut expanded: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
         // Breadth first: a body often hands the same parameter to more than
         // one call, an error path among them, and the first is not the one
         // that registers.
         let mut queue = std::collections::VecDeque::new();
         queue.push_back((callee.to_string(), argument_index, Vec::<String>::new()));
-        let mut visited = 0usize;
+        let mut branches = 0usize;
+        let mut definitions_read = 0usize;
+        let mut claims: Vec<crate::types::Handover> = Vec::new();
 
         while let Some((current, index, path)) = queue.pop_front() {
-            if path.len() >= MAX_HOPS || visited >= MAX_BRANCHES {
-                continue;
-            }
-            visited += 1;
-            if !seen.insert((current.clone(), index)) {
-                continue;
-            }
-            let Some(function) = self.find_function_git_aware(&current, git_sha).await? else {
-                continue;
-            };
-            let Some(parameter) = function.parameters.get(index as usize) else {
-                continue;
-            };
-            if parameter.name.is_empty() {
-                continue;
-            }
-            // An integer handed into an integer member is not a function
-            // being installed, and following it reports `nla_put_u32`
-            // installing something in `nlattr::nla_type`.
-            if path.is_empty()
-                && !self
-                    .type_is_function_pointer(&parameter.type_name, git_sha)
-                    .await?
+            if path.len() >= MAX_HOPS
+                || branches >= MAX_BRANCHES
+                || definitions_read >= MAX_DEFINITIONS
             {
-                return Ok(None);
+                continue;
             }
-
-            let mut path = path.clone();
-            path.push(format!("{current}({})", parameter.name));
-
-            let fates = crate::TreeSitterAnalyzer::parameter_fate(&function.body, &parameter.name);
-            for fate in &fates {
-                match fate {
-                    crate::ParameterFate::StoredIn {
-                        container_type,
-                        member,
-                    } if !container_type.is_empty() => {
-                        return Ok(Some(crate::types::Handover::StoredIn {
-                            path,
-                            container_type: container_type.clone(),
-                            member: member.clone(),
-                        }));
-                    }
-                    crate::ParameterFate::Invoked => {
-                        return Ok(Some(crate::types::Handover::Invoked { path }));
-                    }
-                    _ => {}
+            branches += 1;
+            // A name and a parameter index are expanded once. Forty
+            // definitions of one wrapper enqueue the same next call forty
+            // times, and this stops each of those forty pops from reading the
+            // row for every definition of it again: 1,300 database lookups for
+            // one claim, sixteen seconds of them. The per-definition check
+            // below is still needed, for a name reached by two routes.
+            if !expanded.insert((current.clone(), index)) {
+                continue;
+            }
+            // Every definition of the name, not the one a heuristic prefers.
+            // A definition keyed by its own file and line, so two definitions
+            // of one name are two branches and not one.
+            //
+            // A missing name answers with no definitions rather than an error,
+            // so `?` here reports a database failure and does not abandon the
+            // walk for a hop the index has never seen.
+            for function in self.find_all_functions_git_aware(&current, git_sha).await? {
+                if definitions_read >= MAX_DEFINITIONS {
+                    break;
                 }
-            }
-            for fate in &fates {
-                if let crate::ParameterFate::HandedOn {
-                    callee,
-                    argument_index,
-                } = fate
+                definitions_read += 1;
+                if !seen.insert((
+                    current.clone(),
+                    index,
+                    function.file_path.clone(),
+                    function.line_start,
+                )) {
+                    continue;
+                }
+                let Some(parameter) = function.parameters.get(index as usize) else {
+                    continue;
+                };
+                if parameter.name.is_empty() {
+                    continue;
+                }
+                // An integer handed into an integer member is not a function
+                // being installed, and following it reports `nla_put_u32`
+                // installing something in `nlattr::nla_type`. One definition
+                // taking an integer there does not settle it for the rest, so
+                // this drops the branch rather than the whole answer.
+                if path.is_empty()
+                    && !self
+                        .type_is_function_pointer(&parameter.type_name, git_sha)
+                        .await?
                 {
-                    queue.push_back((callee.clone(), *argument_index, path.clone()));
+                    continue;
+                }
+
+                let mut path = path.clone();
+                // The file and line make the claim checkable. Without them a
+                // reader cannot tell which of three definitions of `call_rcu`
+                // the route was read from.
+                path.push(format!(
+                    "{current}({}) at {}:{}",
+                    parameter.name, function.file_path, function.line_start
+                ));
+
+                let fates =
+                    crate::TreeSitterAnalyzer::parameter_fate(&function.body, &parameter.name);
+                let mut settled = false;
+                for fate in &fates {
+                    match fate {
+                        crate::ParameterFate::StoredIn {
+                            container_type,
+                            member,
+                        } if !container_type.is_empty() => {
+                            claims.push(crate::types::Handover::StoredIn {
+                                path: path.clone(),
+                                container_type: container_type.clone(),
+                                member: member.clone(),
+                            });
+                            settled = true;
+                            break;
+                        }
+                        crate::ParameterFate::Invoked => {
+                            claims.push(crate::types::Handover::Invoked { path: path.clone() });
+                            settled = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if settled {
+                    continue;
+                }
+                for fate in &fates {
+                    if let crate::ParameterFate::HandedOn {
+                        callee,
+                        argument_index,
+                    } = fate
+                    {
+                        queue.push_back((callee.clone(), *argument_index, path.clone()));
+                    }
                 }
             }
         }
 
-        Ok(None)
+        // Two definitions reaching the same member by different routes are one
+        // claim, and the shortest route is the one printed. That can be a route
+        // through a definition few builds use -- `call_rcu` is reached in one
+        // hop through kernel/rcu/tiny.c and in two through kernel/rcu/tree.c,
+        // and tiny.c is printed -- so the route names its file and the count
+        // says how many definitions agreed. Which one a build uses is a
+        // configuration this does not know. Two definitions that reach
+        // different members are two claims, which is the thing a single answer
+        // used to hide.
+        claims.sort_by_key(|claim| claim.path().len());
+        let mut distinct: Vec<(crate::types::Handover, usize)> = Vec::new();
+        for claim in claims {
+            match distinct
+                .iter_mut()
+                .find(|(kept, _)| kept.same_conclusion_as(&claim))
+            {
+                // How many routes reached it is worth saying: a conclusion two
+                // definitions agree on is stronger than one read out of a
+                // single body, and only one of the routes gets printed.
+                Some((_, agreeing)) => *agreeing += 1,
+                None => distinct.push((claim, 1)),
+            }
+        }
+        Ok(distinct)
     }
 
     /// Everything installed in one member of one type.
@@ -2266,12 +2357,49 @@ impl DatabaseManager {
         self.find_function_with_manifest(name, &git_manifest).await
     }
 
+    /// Find a function by name, and say which other definitions were set aside.
+    ///
+    /// For a command that must answer about one definition. `callers` and
+    /// `callchain` start from a single function and cannot report every
+    /// definition the way a callee query does, so they report the choice.
+    pub async fn find_function_git_aware_reporting(
+        &self,
+        name: &str,
+        git_sha: &str,
+    ) -> Result<Option<ChosenDefinition>> {
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
+        if git_manifest.is_empty() {
+            let why = self.why_nothing_resolved(git_sha);
+            return Ok(self
+                .function_not_at_revision(name, git_sha, why)
+                .await?
+                .map(|function| ChosenDefinition {
+                    function,
+                    others: Vec::new(),
+                }));
+        }
+        self.find_function_with_manifest_reporting(name, &git_manifest)
+            .await
+    }
+
     /// Find a function by name using a pre-generated git manifest (fast - no manifest regeneration)
     pub async fn find_function_with_manifest(
         &self,
         name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Option<FunctionInfo>> {
+        Ok(self
+            .find_function_with_manifest_reporting(name, git_manifest)
+            .await?
+            .map(|chosen| chosen.function))
+    }
+
+    /// The body of `find_function_with_manifest`, keeping the alternatives.
+    pub async fn find_function_with_manifest_reporting(
+        &self,
+        name: &str,
+        git_manifest: &crate::database::resolution::RevisionPaths,
+    ) -> Result<Option<ChosenDefinition>> {
         let revision = match git_manifest.revision() {
             "" => "the revision asked about",
             sha => sha,
@@ -2286,9 +2414,10 @@ impl DatabaseManager {
             // No row has ever named this function: the on-miss path is the
             // only one that can still find it, in an edit the index has
             // never seen.
-            return self
+            return Ok(self
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
-                .await;
+                .await?
+                .map(ChosenDefinition::only));
         }
 
         // Step 2: Use manifest to get hashes for candidate files (fast HashMap lookups)
@@ -2300,9 +2429,10 @@ impl DatabaseManager {
         }
 
         if resolved_hashes.is_empty() {
-            return self
+            return Ok(self
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
-                .await;
+                .await?
+                .map(ChosenDefinition::only));
         }
 
         // Step 3: stat (and, on a mismatch, hash) each candidate against the
@@ -2328,13 +2458,13 @@ impl DatabaseManager {
 
         // Step 4: Pick the best result (prefer implementation over declaration)
         if matches.is_empty() {
-            return self
+            return Ok(self
                 .function_not_at_revision(name, revision, Absent::ContentNotIndexed)
-                .await;
+                .await?
+                .map(ChosenDefinition::only));
         }
 
-        let best_match = self.select_best_function_match(matches);
-        Ok(Some(best_match))
+        Ok(Some(self.choose_definition(matches)))
     }
 
     /// Get just the types field for a function using pre-generated manifest (very fast - no body fetching)
@@ -2424,16 +2554,19 @@ impl DatabaseManager {
             return Ok(Vec::new());
         }
 
-        // Select best match (prefer implementation over declaration)
-        let best_match = matches
-            .into_iter()
-            .max_by_key(|(file_path, line_start, line_end, _)| {
-                let line_count = line_end.saturating_sub(*line_start);
-                let is_header = file_path.ends_with(".h");
-                (if is_header { 0 } else { 1 }, line_count)
-            });
-
-        match best_match {
+        // The definition the rest of the answer is about, looked up by where it
+        // was read. Ranking here as well is what let a chain name one
+        // definition and list another's callees; the types beside them were
+        // ranked by this copy of the older ladder and could disagree with both.
+        let Some(chosen) = self
+            .find_function_with_manifest_reporting(name, git_manifest)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        match matches.into_iter().find(|(file_path, line_start, _, _)| {
+            *file_path == chosen.function.file_path && *line_start == chosen.function.line_start
+        }) {
             Some((_, _, _, Some(types))) => Ok(types),
             _ => Ok(Vec::new()),
         }
@@ -2464,10 +2597,22 @@ impl DatabaseManager {
             name
         );
 
-        // Step 2: Resolve file paths to git hashes at target commit
-        let resolved_hashes = self
-            .resolve_git_file_hashes(&unique_file_paths, git_sha)
-            .await?;
+        // Step 2: Resolve file paths to git hashes at target commit, through
+        // the cached manifest. Resolving them against the repository on every
+        // call cost one git tree walk per lookup: following a handover through
+        // a name with forty definitions did forty of them and took fourteen
+        // seconds, where the manifest is read once. It is also what
+        // `find_function_with_manifest` already resolves against, so the two
+        // paths now agree about which blob a path has at a revision.
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
+        let resolved_hashes: Vec<(String, String)> = unique_file_paths
+            .iter()
+            .filter_map(|file_path| {
+                git_manifest
+                    .hash_of(file_path)
+                    .map(|hash| (file_path.clone(), hash.to_string()))
+            })
+            .collect();
         if resolved_hashes.is_empty() {
             return self
                 .functions_not_at_revision(name, git_sha, self.why_nothing_resolved(git_sha))
@@ -2505,7 +2650,16 @@ impl DatabaseManager {
                 .await;
         }
 
-        let implementations = self.filter_implementations_only(matches);
+        let mut implementations = self.filter_implementations_only(matches);
+        // A stable order, so two runs and two readers see the same list. The
+        // candidate files are resolved through a hash map, so without this the
+        // nine definitions of `pr_warn` came back in a different order each
+        // run, which reads as the tree having changed.
+        implementations.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.line_start.cmp(&b.line_start))
+        });
         tracing::info!(
             "Git-aware lookup succeeded: found {} implementations of '{}' at commit '{}'",
             implementations.len(),
@@ -2516,42 +2670,117 @@ impl DatabaseManager {
     }
 
     /// Filter out declarations, keeping only function implementations
+    ///
+    /// The row's own text decides, the same test a callee query uses. A body
+    /// length threshold decided it before -- "more than 50 bytes" -- and
+    /// dropped short definitions that are not declarations at all: of six
+    /// definitions of `kfree` in Linux, a callee query reported six and this
+    /// listed five. Two commands in one answer then disagreed about how many
+    /// definitions a name has, which is the thing the reader was being asked
+    /// to go and check.
     fn filter_implementations_only(&self, functions: Vec<FunctionInfo>) -> Vec<FunctionInfo> {
         functions
             .into_iter()
-            .filter(|func| {
-                // Macros (empty return_type) are always implementations
-                if func.return_type.is_empty() {
-                    return true;
-                }
-
-                // Filter criteria: exclude likely declarations
-                let span = func.line_end.saturating_sub(func.line_start);
-                let has_substantial_body = func.body.len() > 50; // More than just a declaration
-                let is_likely_declaration = span <= 1 && func.body.trim().ends_with(';');
-
-                // Keep functions that have substantial bodies and are not declarations
-                has_substantial_body && !is_likely_declaration
-            })
+            .filter(|func| crate::types::row_defines_the_function(&func.return_type, &func.body))
             .collect()
     }
 
     /// Select the best function match, prioritizing definitions over declarations
-    fn select_best_function_match(&self, mut matches: Vec<FunctionInfo>) -> FunctionInfo {
+    fn select_best_function_match(&self, matches: Vec<FunctionInfo>) -> FunctionInfo {
+        self.choose_definition(matches).function
+    }
+
+    /// The definition to answer about, and every other definition of the name.
+    ///
+    /// The choice is a heuristic and stays one -- which definition a call site
+    /// reaches depends on the file it is written in and on the configuration
+    /// the tree is built with, and the index knows neither. What changes is
+    /// that the alternatives come back with it, so a caller can say a choice
+    /// was made instead of presenting it as the answer.
+    ///
+    /// A prototype is not an alternative: nearly every exported function has
+    /// one, and counting it would call almost every name ambiguous. The row's
+    /// own text decides, the same test a callee query uses.
+    fn choose_definition(&self, mut matches: Vec<FunctionInfo>) -> ChosenDefinition {
         if matches.len() == 1 {
-            return matches.into_iter().next().unwrap();
+            return ChosenDefinition::only(matches.into_iter().next().unwrap());
         }
+
+        // The language most definitions of this name are written in. Two
+        // languages that give one name to two things are not one ambiguous
+        // name, and `Device::pr_warn` in rust/kernel/device.rs is stored under
+        // the bare name, so it competes with the C macro that 4,065 functions
+        // call. Ranking the minority language last answers the question the
+        // tree is mostly written in; where a name is defined in one language
+        // this decides nothing.
+        let mut by_language: HashMap<&str, usize> = HashMap::new();
+        for candidate in &matches {
+            *by_language
+                .entry(crate::types::path_language(&candidate.file_path))
+                .or_default() += 1;
+        }
+        // A strict majority or nothing: more than half the definitions, not
+        // merely more than any other language. Two definitions in two
+        // languages have no majority, and picking the alphabetically later one
+        // would decide a C tree's answer by the spelling of an extension. The
+        // rung is a stand-in for an extraction defect -- a Rust method stored
+        // under its bare name -- so it fires where the tree is nearly
+        // unanimous and stays out of the way otherwise.
+        let highest = by_language.values().copied().max().unwrap_or_default();
+        let unique_top = by_language
+            .values()
+            .filter(|count| **count == highest)
+            .count()
+            == 1;
+        let majority_language = match unique_top && highest * 2 > matches.len() {
+            true => by_language
+                .iter()
+                .find(|(_, count)| **count == highest)
+                .map(|(language, _)| language.to_string())
+                .unwrap_or_default(),
+            false => String::new(),
+        };
 
         // Prioritize by multiple criteria
         matches.sort_by(|a, b| {
-            // 1. Prefer .c files over .h files
+            // 1. Prefer a row that defines the name. Some rows are neither a
+            //    definition nor a declaration: arch/x86/xen/suspend_hvm.c:22
+            //    is `BUG_ON(xen_set_upcall_vector(cpu));`, a call site stored
+            //    under the name it calls. It is a .c file in the tree being
+            //    audited, so every rung below this one ranked it first, and a
+            //    question about BUG_ON was answered from a use of it.
+            let a_defines = crate::types::row_defines_the_function(&a.return_type, &a.body);
+            let b_defines = crate::types::row_defines_the_function(&b.return_type, &b.body);
+            if a_defines != b_defines {
+                return b_defines.cmp(&a_defines);
+            }
+
+            // 2. Prefer the program being audited over another program that
+            //    shares the tree. Without this, `pr_warn` answers from
+            //    arch/x86/tools/insn_decoder_test.c -- a .c file, so rung 2
+            //    ranks it above include/linux/printk.h, and a kernel question
+            //    gets a host tool's answer.
+            let a_other = crate::types::path_is_other_program(&a.file_path);
+            let b_other = crate::types::path_is_other_program(&b.file_path);
+            if a_other != b_other {
+                return a_other.cmp(&b_other);
+            }
+
+            // 3. Prefer the language most definitions of the name are in.
+            let a_majority = crate::types::path_language(&a.file_path) == majority_language;
+            let b_majority = crate::types::path_language(&b.file_path) == majority_language;
+            if a_majority != b_majority {
+                return b_majority.cmp(&a_majority);
+            }
+
+            // 4. Prefer .c files over .h files
             let a_is_source = a.file_path.ends_with(".c");
             let b_is_source = b.file_path.ends_with(".c");
             if a_is_source != b_is_source {
                 return b_is_source.cmp(&a_is_source);
             }
 
-            // 2. Prefer functions with bodies (implementations)
+            // 5. Prefer functions with bodies (implementations)
             let a_span = a.line_end.saturating_sub(a.line_start);
             let b_span = b.line_end.saturating_sub(b.line_start);
             let a_has_body = a_span > 0 && a.body.len() > 50;
@@ -2560,15 +2789,25 @@ impl DatabaseManager {
                 return b_has_body.cmp(&a_has_body);
             }
 
-            // 3. Prefer functions with parameters
+            // 6. Prefer functions with parameters
             let a_has_params = !a.parameters.is_empty();
             let b_has_params = !b.parameters.is_empty();
             if a_has_params != b_has_params {
                 return b_has_params.cmp(&a_has_params);
             }
 
-            // 4. Prefer longer bodies (more implementation detail)
-            b.body.len().cmp(&a.body.len())
+            // 7. Prefer longer bodies (more implementation detail)
+            let by_body = b.body.len().cmp(&a.body.len());
+            if by_body != std::cmp::Ordering::Equal {
+                return by_body;
+            }
+
+            // 8. A tie decided by nothing is still decided the same way twice:
+            //    the file order a lookup returns is not stable, and two runs
+            //    answering differently reads as the tree having changed.
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.line_start.cmp(&b.line_start))
         });
 
         tracing::debug!(
@@ -2578,7 +2817,18 @@ impl DatabaseManager {
             matches[0].file_path
         );
 
-        matches.into_iter().next().unwrap()
+        let mut matches = matches.into_iter();
+        let function = matches.next().unwrap();
+        let others = matches
+            .filter(|candidate| {
+                crate::types::row_defines_the_function(&candidate.return_type, &candidate.body)
+            })
+            .map(|candidate| crate::types::DefinitionSite {
+                file_path: candidate.file_path,
+                line_start: candidate.line_start,
+            })
+            .collect();
+        ChosenDefinition { function, others }
     }
 
     /// Find all functions by name without git awareness (non-git-aware)
@@ -3849,7 +4099,10 @@ impl DatabaseManager {
                         line_start: function.line_start,
                         line_end: function.line_end,
                         callees: function.calls.clone().unwrap_or_default(),
-                        is_definition: !crate::types::text_is_prototype(&function.body),
+                        is_definition: crate::types::row_defines_the_function(
+                            &function.return_type,
+                            &function.body,
+                        ),
                     })
                     .collect()
             })
@@ -5533,6 +5786,13 @@ impl DatabaseManager {
                 line_start,
                 line_end,
                 callees: calls.unwrap_or_default(),
+                // The one place that cannot use `row_defines_the_function`:
+                // this reads the stored text by content hash and has no return
+                // type beside it. The two agree wherever both can answer -- a
+                // macro's text starts with `#`, which is not a prototype
+                // either way -- and the counts are checked against each other
+                // on the tree, so a divergence here would show up as two
+                // commands reporting different numbers.
                 is_definition: !text.is_empty() && !crate::types::text_is_prototype(&text),
             });
         }
@@ -5545,13 +5805,20 @@ impl DatabaseManager {
         Ok(definitions)
     }
 
-    /// The callees of the definition this revision most likely means: an
-    /// implementation over a declaration, and the longest body among equals.
+    /// The callees of the definition this revision most likely means.
     ///
     /// A single answer is what a call chain needs -- walking every definition of
     /// every name multiplies a chain by the ambiguity at each step. Where the
     /// choice is shown to a reader rather than walked,
     /// `get_function_callees_by_definition` reports all of them instead.
+    ///
+    /// Which definition that is comes from `choose_definition`, the same place
+    /// the header line above a chain comes from, and the row is then looked up
+    /// by where it was read. Ranking here as well is what made a chain
+    /// contradict itself: this function preferred a long `.c` body and the
+    /// header preferred the program being audited, so `callchain pr_warn` named
+    /// include/linux/printk.h:563 and then listed the callees of
+    /// arch/x86/tools/insn_decoder_test.c:48.
     pub async fn get_function_callees_with_manifest(
         &self,
         function_name: &str,
@@ -5560,12 +5827,17 @@ impl DatabaseManager {
         let definitions = self
             .get_function_callees_by_definition(function_name, git_manifest)
             .await?;
+        let chosen = self
+            .find_function_with_manifest_reporting(function_name, git_manifest)
+            .await?;
+        let Some(chosen) = chosen else {
+            return Ok(Vec::new());
+        };
         Ok(definitions
             .into_iter()
-            .max_by_key(|definition| {
-                let line_count = definition.line_end.saturating_sub(definition.line_start);
-                let is_header = definition.file_path.ends_with(".h");
-                (if is_header { 0 } else { 1 }, line_count)
+            .find(|definition| {
+                definition.file_path == chosen.function.file_path
+                    && definition.line_start == chosen.function.line_start
             })
             .map(|definition| definition.callees)
             .unwrap_or_default())

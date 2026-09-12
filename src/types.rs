@@ -69,6 +69,139 @@ pub struct CalleeDefinition {
     pub is_definition: bool,
 }
 
+/// Where one definition of a name was read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefinitionSite {
+    pub file_path: String,
+    pub line_start: u32,
+}
+
+/// The definition a command that must give one answer is about, beside the
+/// definitions of the same name it set aside.
+///
+/// A command that walks a chain or lists callers needs one starting point, so
+/// it cannot report every definition the way a callee query does. Carrying the
+/// others with the choice lets it name them, which is the difference between
+/// picking one and hiding that there was a choice.
+#[derive(Debug, Clone)]
+pub struct ChosenDefinition {
+    pub function: FunctionInfo,
+    pub others: Vec<DefinitionSite>,
+}
+
+impl ChosenDefinition {
+    /// The only definition of the name, so there was no choice to report.
+    pub fn only(function: FunctionInfo) -> Self {
+        ChosenDefinition {
+            function,
+            others: Vec::new(),
+        }
+    }
+
+    /// What to tell a reader before an answer about one of several definitions.
+    ///
+    /// `None` where the name has one definition: a note on every answer would
+    /// be noise, and noise is skipped rather than read.
+    pub fn ambiguity_note(&self) -> Option<String> {
+        if self.others.is_empty() {
+            return None;
+        }
+        let mut sites: Vec<String> = self
+            .others
+            .iter()
+            .map(|site| format!("{}:{}", site.file_path, site.line_start))
+            .collect();
+        sites.sort();
+        // A name with a hundred definitions would otherwise print a hundred
+        // paths, and a note too long to read is not read. The count is the
+        // part that cannot be cut: it says an answer was chosen.
+        const SHOWN: usize = 8;
+        let listed = if sites.len() > SHOWN {
+            format!(
+                "{}, and {} more ('func {}' lists them all)",
+                sites[..SHOWN].join(", "),
+                sites.len() - SHOWN,
+                self.function.name
+            )
+        } else {
+            sites.join(", ")
+        };
+        Some(format!(
+            "'{}' is defined {} times in this revision. This answer is about \
+             {}:{}; the others are {}. Which one a call site reaches depends on \
+             the file it is written in and on the configuration the tree is \
+             built with, and neither is recorded here.",
+            self.function.name,
+            self.others.len() + 1,
+            self.function.file_path,
+            self.function.line_start,
+            listed
+        ))
+    }
+}
+
+/// Whether a path holds a program other than the one an audit is about.
+///
+/// A source tree can build more than one program. Linux builds host tools from
+/// every directory named `tools` -- the top-level one and `arch/x86/tools`,
+/// `arch/arm64/tools`, `drivers/comedi/drivers/ni_routing/tools` and nine more
+/// -- example code from `samples`, and prose from `Documentation`. Those
+/// programs define names the kernel also defines: of nine definitions of
+/// `pr_warn`, eight are outside the kernel image.
+///
+/// A path component, not a prefix: the definition that made this necessary is
+/// `arch/x86/tools/insn_decoder_test.c`, which no prefix of `tools/` matches.
+/// Every directory named `tools` in that tree holds a host program, so the
+/// component is the signal.
+///
+/// This orders a choice between definitions. It never drops one: a name defined
+/// only under `tools` still answers, and the choice is reported either way, so
+/// a tie-break that goes the wrong way is visible rather than silent.
+///
+/// `scripts` and `usr` are deliberately absent, though they read as though they
+/// belong: both hold code that ends up in the built image. `scripts/module-common.c`
+/// is compiled into every `.ko` (`scripts/Makefile.modfinal:28`) and
+/// `usr/initramfs_data.S` is linked in, so the directory name does not imply
+/// another program there the way it does for `tools`.
+pub fn path_is_other_program(file_path: &str) -> bool {
+    const OTHER_PROGRAMS: [&str; 3] = ["tools", "samples", "Documentation"];
+    file_path
+        .split('/')
+        .any(|component| OTHER_PROGRAMS.contains(&component))
+}
+
+/// The language a path's extension names, for grouping definitions of one name.
+///
+/// Coarse on purpose: the question is only whether two definitions of a name
+/// are written in the same language, not which dialect. An unrecognised
+/// extension is its own group rather than being folded into one of these, so a
+/// file type nobody has thought about does not silently join C.
+pub fn path_language(file_path: &str) -> &str {
+    match file_path.rsplit_once('.') {
+        Some((_, "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "inc")) => "c",
+        Some((_, extension)) => extension,
+        None => "",
+    }
+}
+
+/// Whether a row defines the function it names, rather than declaring it.
+///
+/// The one test for the question, so that two commands cannot answer it two
+/// ways. Three of them used to: a body-length threshold listed five of the six
+/// definitions of `kfree`, and requiring braces in a header dropped every macro
+/// defined in one, so `container_of` was listed eleven times where the same
+/// tree reported twelve. A macro is a definition however it is written.
+pub fn row_defines_the_function(return_type: &str, body: &str) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    // A macro has no return type, and is a definition however it is written.
+    if return_type.is_empty() {
+        return true;
+    }
+    !text_is_prototype(body)
+}
+
 /// Whether stored text declares a function without defining it.
 ///
 /// The row's own text is the only thing that separates the two: a prototype
@@ -385,6 +518,40 @@ pub enum Handover {
     },
     /// Called by the callee, so the handover is itself a call edge.
     Invoked { path: Vec<String> },
+}
+
+impl Handover {
+    pub fn path(&self) -> &[String] {
+        match self {
+            Handover::StoredIn { path, .. } => path,
+            Handover::Invoked { path } => path,
+        }
+    }
+
+    /// Whether two routes end in the same place.
+    ///
+    /// `call_rcu` has three definitions and two of them reach
+    /// `rcu_head::func`, one storing the parameter itself and one handing it to
+    /// `__call_rcu_common`. That is one fact about where a callback goes,
+    /// reported twice; the route differs and the conclusion does not.
+    pub fn same_conclusion_as(&self, other: &Handover) -> bool {
+        match (self, other) {
+            (
+                Handover::StoredIn {
+                    container_type,
+                    member,
+                    ..
+                },
+                Handover::StoredIn {
+                    container_type: other_type,
+                    member: other_member,
+                    ..
+                },
+            ) => container_type == other_type && member == other_member,
+            (Handover::Invoked { .. }, Handover::Invoked { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Handover {

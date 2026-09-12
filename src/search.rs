@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+use crate::types::row_defines_the_function;
 use crate::{CodeVectorizer, DatabaseManager};
 use anstream::stdout;
 use anyhow::Result;
@@ -1225,39 +1226,6 @@ pub async fn query_function_or_macro_to_writer_verbose(
     query_function_or_macro_to_writer_with_options(db, name, git_sha, writer, verbose).await
 }
 
-/// Check if a function is actually a definition (has implementation) vs just a declaration
-pub fn is_function_definition(func: &crate::FunctionInfo) -> bool {
-    if func.body.is_empty() {
-        return false; // Empty body is definitely a declaration
-    }
-
-    // Macros have empty return_type and are always definitions (never just declarations)
-    if func.return_type.is_empty() {
-        return true;
-    }
-
-    let body = func.body.trim();
-
-    // If body ends with just a semicolon, it's a declaration
-    if body.ends_with(';') && !body.contains('{') {
-        return false;
-    }
-
-    // If it contains braces, it's likely a definition
-    if body.contains('{') && body.contains('}') {
-        return true;
-    }
-
-    // Header files typically contain declarations
-    if func.file_path.ends_with(".h") || func.file_path.ends_with(".hpp") {
-        // In header files, be more strict - require braces for definitions
-        return body.contains('{') && body.contains('}');
-    }
-
-    // For .c/.cpp files, if it's not just a semicolon-terminated line, assume it's a definition
-    !body.ends_with(';')
-}
-
 async fn query_function_or_macro_to_writer_with_options(
     db: &DatabaseManager,
     name: &str,
@@ -1280,7 +1248,7 @@ async fn query_function_or_macro_to_writer_with_options(
             // Found functions only - filter out declarations and display only definitions
             let definitions: Vec<_> = func_results
                 .iter()
-                .filter(|func| is_function_definition(func))
+                .filter(|func| row_defines_the_function(&func.return_type, &func.body))
                 .collect();
 
             if definitions.len() > 1 {
@@ -1294,6 +1262,22 @@ async fn query_function_or_macro_to_writer_with_options(
                 )?;
             }
 
+            // What each definition calls, keyed by where it was read. Asking
+            // by name once per definition returns whichever one a heuristic
+            // prefers, every time, so nine definitions of `pr_warn` were each
+            // shown the callees of arch/x86/tools/insn_decoder_test.c.
+            let per_definition: std::collections::HashMap<(String, u32), Vec<String>> = db
+                .get_function_callees_by_definition_git_aware(name, git_sha)
+                .await?
+                .into_iter()
+                .map(|definition| {
+                    (
+                        (definition.file_path, definition.line_start),
+                        definition.callees,
+                    )
+                })
+                .collect();
+
             // Display each function definition with its outgoing calls
             for (i, func) in definitions.iter().enumerate() {
                 if definitions.len() > 1 {
@@ -1306,10 +1290,13 @@ async fn query_function_or_macro_to_writer_with_options(
                     )?;
                 }
                 display_function_to_writer_with_options(func, writer, true)?;
-                // Get and display calls (outgoing) for each function definition
-                let calls = db
-                    .get_function_callees_git_aware(&func.name, git_sha)
-                    .await?;
+                // The callees of this definition, not of the name. A row the
+                // callee query did not return answers with nothing rather than
+                // with another definition's calls.
+                let calls = per_definition
+                    .get(&(func.file_path.clone(), func.line_start))
+                    .cloned()
+                    .unwrap_or_default();
                 display_call_relationships_with_options(
                     &func.name,
                     &calls,
@@ -1392,7 +1379,7 @@ async fn query_function_or_macro_to_writer_with_options(
                     // Filter out declarations and show only definitions
                     let regex_definitions: Vec<_> = regex_functions
                         .iter()
-                        .filter(|func| is_function_definition(func))
+                        .filter(|func| row_defines_the_function(&func.return_type, &func.body))
                         .collect();
                     for func in &regex_definitions {
                         display_function_to_writer_with_options(func, writer, true)?;

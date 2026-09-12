@@ -201,10 +201,12 @@ async fn show_callchain_with_limits(
     );
 
     // First, check if function exists using git-aware query
-    let func_opt = db.find_function_git_aware(function_name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(function_name, git_sha)
+        .await?;
 
-    let func = match func_opt {
-        Some(f) => f,
+    let chosen = match chosen_opt {
+        Some(chosen) => chosen,
         None => {
             println!(
                 "{} Function '{}' not found in database at git SHA {}",
@@ -215,6 +217,12 @@ async fn show_callchain_with_limits(
             return Ok(());
         }
     };
+    // One chain, so one definition. Say so rather than presenting the choice
+    // as the tree's only answer.
+    if let Some(note) = chosen.ambiguity_note() {
+        println!("{} {}", "Ambiguous:".bold().yellow(), note);
+    }
+    let func = chosen.function;
 
     println!("{}", "=== Function Information ===".bold().green());
     println!(
@@ -278,12 +286,20 @@ async fn show_callchain_with_limits(
             println!("{}. {}", (i + 1).to_string().yellow(), caller.cyan());
 
             // Show caller details if available
-            if let Ok(Some(caller_func)) = db.find_function_git_aware(caller, git_sha).await {
+            if let Ok(Some(chosen)) = db.find_function_git_aware_reporting(caller, git_sha).await {
+                // One of several definitions, where the name has several. A
+                // row of a list has no other room to say so.
+                let marker = match chosen.others.len() {
+                    0 => String::new(),
+                    others => format!(" [1 of {} definitions]", others + 1),
+                };
+                let caller_func = chosen.function;
                 println!(
-                    "   └─ {} ({}:{})",
+                    "   └─ {} ({}:{}){}",
                     caller_func.return_type.bright_black(),
                     caller_func.file_path.bright_black(),
-                    caller_func.line_start.to_string().bright_black()
+                    caller_func.line_start.to_string().bright_black(),
+                    marker.yellow()
                 );
             }
 
@@ -339,12 +355,18 @@ async fn show_callchain_with_limits(
             println!("{}. {}", (i + 1).to_string().yellow(), callee.cyan());
 
             // Show callee details if available
-            if let Ok(Some(callee_func)) = db.find_function_git_aware(callee, git_sha).await {
+            if let Ok(Some(chosen)) = db.find_function_git_aware_reporting(callee, git_sha).await {
+                let marker = match chosen.others.len() {
+                    0 => String::new(),
+                    others => format!(" [1 of {} definitions]", others + 1),
+                };
+                let callee_func = chosen.function;
                 println!(
-                    "   └─ {} ({}:{})",
+                    "   └─ {} ({}:{}){}",
                     callee_func.return_type.bright_black(),
                     callee_func.file_path.bright_black(),
-                    callee_func.line_start.to_string().bright_black()
+                    callee_func.line_start.to_string().bright_black(),
+                    marker.yellow()
                 );
             }
 
