@@ -503,6 +503,40 @@ pub enum Handover {
 }
 
 impl Handover {
+    pub fn path(&self) -> &[String] {
+        match self {
+            Handover::StoredIn { path, .. } => path,
+            Handover::Invoked { path } => path,
+        }
+    }
+
+    /// Whether two routes end in the same place.
+    ///
+    /// `call_rcu` has three definitions and two of them reach
+    /// `rcu_head::func`, one storing the parameter itself and one handing it to
+    /// `__call_rcu_common`. That is one fact about where a callback goes,
+    /// reported twice; the route differs and the conclusion does not.
+    pub fn same_conclusion_as(&self, other: &Handover) -> bool {
+        match (self, other) {
+            (
+                Handover::StoredIn {
+                    container_type,
+                    member,
+                    ..
+                },
+                Handover::StoredIn {
+                    container_type: other_type,
+                    member: other_member,
+                    ..
+                },
+            ) => container_type == other_type && member == other_member,
+            (Handover::Invoked { .. }, Handover::Invoked { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Handover {
     /// Whether the call happens after the handover returns.
     ///
     /// Storing a function in a member defers it by construction: whoever

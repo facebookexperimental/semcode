@@ -1389,13 +1389,23 @@ impl DatabaseManager {
             .await
     }
 
-    /// Where a call puts the function it is handed.
+    /// Where a call puts the function it is handed, per definition of the name.
     ///
     /// `request_irq(irq, nic_intr, ...)` installs nothing by itself: the
     /// wrapper hands its parameter to `request_threaded_irq`, which stores it
     /// in `irqaction::handler`. Follow that until a body stores the parameter
     /// in a member, and report the path taken, because a two-hop claim that
     /// reads like a one-hop fact is worse than no answer.
+    ///
+    /// Every definition of a name on the way is walked, and each hop carries
+    /// the file and line its body was read from. One definition was walked
+    /// before, chosen by a heuristic: `call_rcu` has three, and the claim
+    /// `rcu_head::func` was read out of kernel/rcu/tree.c with nothing said
+    /// about kernel/rcu/tiny.c, which reaches the same member by storing the
+    /// parameter itself instead of handing it to `__call_rcu_common`. Which one
+    /// a caller reaches is a configuration question this does not answer, so
+    /// where definitions agree the claim is reported once and where they
+    /// disagree both are returned rather than one of them.
     ///
     /// Bounded: a wrapper chain that has not reached a member within a few
     /// hops is not one, and a cycle must not spin.
@@ -1404,80 +1414,161 @@ impl DatabaseManager {
         callee: &str,
         argument_index: u32,
         git_sha: &str,
-    ) -> Result<Option<crate::types::Handover>> {
+    ) -> Result<Vec<(crate::types::Handover, usize)>> {
         const MAX_HOPS: usize = 4;
+        // Two budgets, because they bound two different things. MAX_BRANCHES
+        // bounds how many wrapper branches are followed, which is what stops a
+        // body handing its parameter to a dozen calls from turning into a
+        // search. MAX_DEFINITIONS bounds how many bodies are read, which is
+        // what stops a name with seventeen definitions from being expensive.
+        // Sharing one counter let the second eat the first: seventeen
+        // definitions of one hop exhausted the branch budget, and a claim two
+        // hops further on -- or a disagreement, the thing this reports --
+        // silently stopped being found.
         const MAX_BRANCHES: usize = 32;
+        const MAX_DEFINITIONS: usize = 256;
 
         let mut seen = std::collections::HashSet::new();
+        let mut expanded: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
         // Breadth first: a body often hands the same parameter to more than
         // one call, an error path among them, and the first is not the one
         // that registers.
         let mut queue = std::collections::VecDeque::new();
         queue.push_back((callee.to_string(), argument_index, Vec::<String>::new()));
-        let mut visited = 0usize;
+        let mut branches = 0usize;
+        let mut definitions_read = 0usize;
+        let mut claims: Vec<crate::types::Handover> = Vec::new();
 
         while let Some((current, index, path)) = queue.pop_front() {
-            if path.len() >= MAX_HOPS || visited >= MAX_BRANCHES {
-                continue;
-            }
-            visited += 1;
-            if !seen.insert((current.clone(), index)) {
-                continue;
-            }
-            let Some(function) = self.find_function_git_aware(&current, git_sha).await? else {
-                continue;
-            };
-            let Some(parameter) = function.parameters.get(index as usize) else {
-                continue;
-            };
-            if parameter.name.is_empty() {
-                continue;
-            }
-            // An integer handed into an integer member is not a function
-            // being installed, and following it reports `nla_put_u32`
-            // installing something in `nlattr::nla_type`.
-            if path.is_empty()
-                && !self
-                    .type_is_function_pointer(&parameter.type_name, git_sha)
-                    .await?
+            if path.len() >= MAX_HOPS
+                || branches >= MAX_BRANCHES
+                || definitions_read >= MAX_DEFINITIONS
             {
-                return Ok(None);
+                continue;
             }
-
-            let mut path = path.clone();
-            path.push(format!("{current}({})", parameter.name));
-
-            let fates = crate::TreeSitterAnalyzer::parameter_fate(&function.body, &parameter.name);
-            for fate in &fates {
-                match fate {
-                    crate::ParameterFate::StoredIn {
-                        container_type,
-                        member,
-                    } if !container_type.is_empty() => {
-                        return Ok(Some(crate::types::Handover::StoredIn {
-                            path,
-                            container_type: container_type.clone(),
-                            member: member.clone(),
-                        }));
-                    }
-                    crate::ParameterFate::Invoked => {
-                        return Ok(Some(crate::types::Handover::Invoked { path }));
-                    }
-                    _ => {}
+            branches += 1;
+            // A name and a parameter index are expanded once. Forty
+            // definitions of one wrapper enqueue the same next call forty
+            // times, and this stops each of those forty pops from reading the
+            // row for every definition of it again: 1,300 database lookups for
+            // one claim, sixteen seconds of them. The per-definition check
+            // below is still needed, for a name reached by two routes.
+            if !expanded.insert((current.clone(), index)) {
+                continue;
+            }
+            // Every definition of the name, not the one a heuristic prefers.
+            // A definition keyed by its own file and line, so two definitions
+            // of one name are two branches and not one.
+            //
+            // A missing name answers with no definitions rather than an error,
+            // so `?` here reports a database failure and does not abandon the
+            // walk for a hop the index has never seen.
+            for function in self.find_all_functions_git_aware(&current, git_sha).await? {
+                if definitions_read >= MAX_DEFINITIONS {
+                    break;
                 }
-            }
-            for fate in &fates {
-                if let crate::ParameterFate::HandedOn {
-                    callee,
-                    argument_index,
-                } = fate
+                definitions_read += 1;
+                if !seen.insert((
+                    current.clone(),
+                    index,
+                    function.file_path.clone(),
+                    function.line_start,
+                )) {
+                    continue;
+                }
+                let Some(parameter) = function.parameters.get(index as usize) else {
+                    continue;
+                };
+                if parameter.name.is_empty() {
+                    continue;
+                }
+                // An integer handed into an integer member is not a function
+                // being installed, and following it reports `nla_put_u32`
+                // installing something in `nlattr::nla_type`. One definition
+                // taking an integer there does not settle it for the rest, so
+                // this drops the branch rather than the whole answer.
+                if path.is_empty()
+                    && !self
+                        .type_is_function_pointer(&parameter.type_name, git_sha)
+                        .await?
                 {
-                    queue.push_back((callee.clone(), *argument_index, path.clone()));
+                    continue;
+                }
+
+                let mut path = path.clone();
+                // The file and line make the claim checkable. Without them a
+                // reader cannot tell which of three definitions of `call_rcu`
+                // the route was read from.
+                path.push(format!(
+                    "{current}({}) at {}:{}",
+                    parameter.name, function.file_path, function.line_start
+                ));
+
+                let fates =
+                    crate::TreeSitterAnalyzer::parameter_fate(&function.body, &parameter.name);
+                let mut settled = false;
+                for fate in &fates {
+                    match fate {
+                        crate::ParameterFate::StoredIn {
+                            container_type,
+                            member,
+                        } if !container_type.is_empty() => {
+                            claims.push(crate::types::Handover::StoredIn {
+                                path: path.clone(),
+                                container_type: container_type.clone(),
+                                member: member.clone(),
+                            });
+                            settled = true;
+                            break;
+                        }
+                        crate::ParameterFate::Invoked => {
+                            claims.push(crate::types::Handover::Invoked { path: path.clone() });
+                            settled = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if settled {
+                    continue;
+                }
+                for fate in &fates {
+                    if let crate::ParameterFate::HandedOn {
+                        callee,
+                        argument_index,
+                    } = fate
+                    {
+                        queue.push_back((callee.clone(), *argument_index, path.clone()));
+                    }
                 }
             }
         }
 
-        Ok(None)
+        // Two definitions reaching the same member by different routes are one
+        // claim, and the shortest route is the one printed. That can be a route
+        // through a definition few builds use -- `call_rcu` is reached in one
+        // hop through kernel/rcu/tiny.c and in two through kernel/rcu/tree.c,
+        // and tiny.c is printed -- so the route names its file and the count
+        // says how many definitions agreed. Which one a build uses is a
+        // configuration this does not know. Two definitions that reach
+        // different members are two claims, which is the thing a single answer
+        // used to hide.
+        claims.sort_by_key(|claim| claim.path().len());
+        let mut distinct: Vec<(crate::types::Handover, usize)> = Vec::new();
+        for claim in claims {
+            match distinct
+                .iter_mut()
+                .find(|(kept, _)| kept.same_conclusion_as(&claim))
+            {
+                // How many routes reached it is worth saying: a conclusion two
+                // definitions agree on is stronger than one read out of a
+                // single body, and only one of the routes gets printed.
+                Some((_, agreeing)) => *agreeing += 1,
+                None => distinct.push((claim, 1)),
+            }
+        }
+        Ok(distinct)
     }
 
     /// Everything installed in one member of one type.
@@ -2506,10 +2597,22 @@ impl DatabaseManager {
             name
         );
 
-        // Step 2: Resolve file paths to git hashes at target commit
-        let resolved_hashes = self
-            .resolve_git_file_hashes(&unique_file_paths, git_sha)
-            .await?;
+        // Step 2: Resolve file paths to git hashes at target commit, through
+        // the cached manifest. Resolving them against the repository on every
+        // call cost one git tree walk per lookup: following a handover through
+        // a name with forty definitions did forty of them and took fourteen
+        // seconds, where the manifest is read once. It is also what
+        // `find_function_with_manifest` already resolves against, so the two
+        // paths now agree about which blob a path has at a revision.
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
+        let resolved_hashes: Vec<(String, String)> = unique_file_paths
+            .iter()
+            .filter_map(|file_path| {
+                git_manifest
+                    .hash_of(file_path)
+                    .map(|hash| (file_path.clone(), hash.to_string()))
+            })
+            .collect();
         if resolved_hashes.is_empty() {
             return self
                 .functions_not_at_revision(name, git_sha, self.why_nothing_resolved(git_sha))

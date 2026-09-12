@@ -691,7 +691,7 @@ pub async fn show_registrations_to_writer(
 
             // Where that call puts it, and by what route: the slot is a
             // claim about the registrar, not about this call site.
-            let handover = db
+            let handovers = db
                 .follow_handed_parameter(&argument.callee, argument.argument_index, git_sha)
                 .await?;
 
@@ -701,45 +701,66 @@ pub async fn show_registrations_to_writer(
             // rcu_head::func, so the inode is the subject. `request_irq(...,
             // handler, ..., netdev->name, ...)` also passes a member, and the
             // handler has nothing to do with it.
-            if let (
-                Some(subject_type),
-                Some(subject_member),
-                Some(Handover::StoredIn { container_type, .. }),
-            ) = (&argument.subject_type, &argument.subject_member, &handover)
+            if let (Some(subject_type), Some(subject_member)) =
+                (&argument.subject_type, &argument.subject_member)
             {
-                let holds = db
-                    .member_aggregate_git_aware(subject_type, subject_member, git_sha)
-                    .await?;
-                if holds.as_deref() == Some(container_type.as_str()) {
-                    writeln!(
-                        writer,
-                        "     attached to {}::{}",
-                        subject_type.cyan(),
-                        subject_member.cyan(),
-                    )?;
+                for (handover, _) in &handovers {
+                    let Handover::StoredIn { container_type, .. } = handover else {
+                        continue;
+                    };
+                    let holds = db
+                        .member_aggregate_git_aware(subject_type, subject_member, git_sha)
+                        .await?;
+                    if holds.as_deref() == Some(container_type.as_str()) {
+                        writeln!(
+                            writer,
+                            "     attached to {}::{}",
+                            subject_type.cyan(),
+                            subject_member.cyan(),
+                        )?;
+                        break;
+                    }
                 }
             }
 
-            match handover {
-                Some(Handover::StoredIn {
-                    path,
-                    container_type,
-                    member,
-                }) => writeln!(
+            // Definitions that disagree about where the parameter goes are two
+            // claims about two configurations, and reporting one of them reads
+            // as the tree having one answer.
+            if handovers.len() > 1 {
+                writeln!(
                     writer,
-                    "     installs it in {}::{}, {} through {}",
-                    container_type.cyan(),
-                    member.cyan(),
-                    "called later".yellow(),
-                    path.join(" -> ").bright_black(),
-                )?,
-                Some(Handover::Invoked { path }) => writeln!(
-                    writer,
-                    "     calls it {} through {}",
-                    "before returning".yellow(),
-                    path.join(" -> ").bright_black(),
-                )?,
-                None => {}
+                    "     {} the definitions of {} disagree about where it goes:",
+                    "Ambiguous:".bold().yellow(),
+                    argument.callee.cyan(),
+                )?;
+            }
+            for (handover, agreeing) in &handovers {
+                let agreement = match agreeing {
+                    0 | 1 => String::new(),
+                    count => format!(" ({count} definitions agree)"),
+                };
+                match handover {
+                    Handover::StoredIn {
+                        path,
+                        container_type,
+                        member,
+                    } => writeln!(
+                        writer,
+                        "     installs it in {}::{}, {} through {}{}",
+                        container_type.cyan(),
+                        member.cyan(),
+                        "called later".yellow(),
+                        path.join(" -> ").bright_black(),
+                        agreement.bright_black(),
+                    )?,
+                    Handover::Invoked { path } => writeln!(
+                        writer,
+                        "     calls it {} through {}{}",
+                        "before returning".yellow(),
+                        path.join(" -> ").bright_black(),
+                        agreement.bright_black(),
+                    )?,
+                }
             }
         }
     }

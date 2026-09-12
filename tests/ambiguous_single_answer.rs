@@ -436,6 +436,197 @@ async fn two_languages_one_definition_each_is_not_a_majority() {
     assert!(note.contains("defined 2 times"), "{note}");
 }
 
+/// A tree where one registrar name has two definitions, as `call_rcu` does.
+async fn tree_with_two_registrars(
+    second_member: &str,
+) -> (tempfile::TempDir, Arc<DatabaseManager>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::create_dir_all(repo.join("kernel/rcu")).unwrap();
+    std::fs::write(
+        repo.join("head.h"),
+        "struct cb_head { void (*func)(struct cb_head *); struct cb_head *next; };\n\
+         struct other_head { void (*other)(struct other_head *); };\n",
+    )
+    .unwrap();
+    // One definition stores the parameter itself.
+    std::fs::write(
+        repo.join("kernel/rcu/tiny.c"),
+        "#include \"head.h\"\nvoid queue_cb(struct cb_head *head, void (*func)(struct cb_head *))\n{\n\thead->func = func;\n}\n",
+    )
+    .unwrap();
+    // The other hands it on, and the wrapper it hands it to stores it -- in
+    // the same member, or in a different one, depending on the caller.
+    std::fs::write(
+        repo.join("kernel/rcu/tree.c"),
+        format!(
+            "#include \"head.h\"\n\
+             static void common_queue(struct cb_head *head, void (*func)(struct cb_head *))\n{{\n\thead->{second_member} = func;\n}}\n\n\
+             void queue_cb(struct cb_head *head, void (*func)(struct cb_head *))\n{{\n\tcommon_queue(head, func);\n}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("user.c"),
+        "#include \"head.h\"\n\
+         static void my_callback(struct cb_head *h)\n{\n\t(void)h;\n}\n\n\
+         void start(struct cb_head *head)\n{\n\tqueue_cb(head, my_callback);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "two registrars"]);
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["c".to_string(), "h".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+    (dir, db, sha)
+}
+
+#[tokio::test]
+async fn agreeing_definitions_of_a_registrar_are_one_claim() {
+    // `call_rcu` has three definitions in Linux; two reach `rcu_head::func`,
+    // one storing the parameter and one handing it to `__call_rcu_common`.
+    // Walking a single silently-chosen definition reported one route as the
+    // fact. Same member, two routes, so it is one claim -- and that two
+    // definitions agree is worth saying, because it holds whichever is built.
+    let (_dir, db, sha) = tree_with_two_registrars("func").await;
+
+    let claims = db
+        .follow_handed_parameter("queue_cb", 1, &sha)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1, "{claims:?}");
+    let (claim, agreeing) = &claims[0];
+    assert_eq!(*agreeing, 2, "{claims:?}");
+    match claim {
+        semcode::Handover::StoredIn {
+            container_type,
+            member,
+            path,
+        } => {
+            assert_eq!(member, "func", "{claim:?}");
+            assert!(container_type.contains("cb_head"), "{claim:?}");
+            // The route names the file it was read from, or the reader cannot
+            // tell which of the two definitions produced it.
+            assert!(
+                path.iter().any(|hop| hop.contains("kernel/rcu/")),
+                "{path:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn definitions_that_disagree_are_both_reported() {
+    // The case a single answer hid: two definitions of one registrar putting
+    // the callback in different members. Picking either one states a fact
+    // about a configuration the reader did not choose.
+    let (_dir, db, sha) = tree_with_two_registrars("next").await;
+
+    let claims = db
+        .follow_handed_parameter("queue_cb", 1, &sha)
+        .await
+        .unwrap();
+    let mut members: Vec<String> = claims
+        .iter()
+        .filter_map(|(claim, _)| match claim {
+            semcode::Handover::StoredIn { member, .. } => Some(member.clone()),
+            _ => None,
+        })
+        .collect();
+    members.sort();
+    assert_eq!(
+        members,
+        vec!["func".to_string(), "next".to_string()],
+        "{claims:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hop_with_many_definitions_does_not_starve_the_rest_of_the_walk() {
+    // Walking every definition of every name shared one budget with following
+    // wrapper branches, so a hop with many definitions spent the whole budget
+    // and the claim two hops further on stopped being found -- silently, and
+    // the disagreement this reports would have gone with it.
+    //
+    // `noisy` here has 40 definitions, more than the 32 branches the walk will
+    // follow. The claim is three hops past it.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("head.h"),
+        "struct cb_head { void (*func)(struct cb_head *); };\n",
+    )
+    .unwrap();
+    // The intermediate, defined many times over, each definition handing the
+    // parameter on to the same next wrapper.
+    std::fs::create_dir_all(repo.join("drivers")).unwrap();
+    for i in 0..40 {
+        std::fs::write(
+            repo.join(format!("drivers/d{i}.c")),
+            "#include \"head.h\"\nstatic void deep_store(struct cb_head *, void (*)(struct cb_head *));\n\
+             static void noisy(struct cb_head *head, void (*func)(struct cb_head *))\n{\n\tdeep_store(head, func);\n}\n",
+        )
+        .unwrap();
+    }
+    // The last hop, which actually stores it.
+    std::fs::write(
+        repo.join("store.c"),
+        "#include \"head.h\"\nvoid deep_store(struct cb_head *head, void (*func)(struct cb_head *))\n{\n\thead->func = func;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("entry.c"),
+        "#include \"head.h\"\n\
+         static void noisy(struct cb_head *, void (*)(struct cb_head *));\n\
+         void register_cb(struct cb_head *head, void (*func)(struct cb_head *))\n{\n\tnoisy(head, func);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "a noisy intermediate"]);
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["c".to_string(), "h".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+
+    let claims = db
+        .follow_handed_parameter("register_cb", 1, &sha)
+        .await
+        .unwrap();
+    assert!(
+        claims.iter().any(|(claim, _)| matches!(
+            claim,
+            semcode::Handover::StoredIn { member, .. } if member == "func"
+        )),
+        "the claim past the noisy hop was not found: {claims:?}"
+    );
+}
+
 fn strip_colour(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
