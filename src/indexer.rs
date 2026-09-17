@@ -1146,6 +1146,9 @@ mod tests {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(repo)
+            // Do not inherit developer's git configuration.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "test")
