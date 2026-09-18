@@ -5690,6 +5690,22 @@ async fn mcp_vcommit_similar_commits(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+/// Build the `notifications/message` payload for a background progress line.
+///
+/// The parameters of that notification carry the logged text in `data`; there is
+/// no `message` parameter, so a client that validates what it receives drops a
+/// notification built with that name.
+fn progress_notification(message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {
+            "level": "info",
+            "data": message
+        }
+    })
+}
+
 /// Background task to index the current commit if needed (non-blocking)
 async fn index_current_commit_background(
     db_manager: Arc<DatabaseManager>,
@@ -5705,14 +5721,7 @@ async fn index_current_commit_background(
         tokio::spawn(async move {
             let guard = tx.lock().await;
             if let Some(sender) = guard.as_ref() {
-                let notification = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/message",
-                    "params": {
-                        "level": "info",
-                        "message": message
-                    }
-                });
+                let notification = progress_notification(&message);
                 let _ = sender.send(serde_json::to_string(&notification).unwrap_or_default());
             }
         });
@@ -6133,6 +6142,18 @@ mod tests {
         assert!(state.git_sha.is_none());
         assert!(state.started_at.is_none());
         assert!(state.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_progress_notification_carries_data() {
+        let notification = progress_notification("Semcode: Indexing complete");
+
+        assert_eq!(notification["method"], "notifications/message");
+        assert_eq!(notification["params"]["level"], "info");
+        assert_eq!(notification["params"]["data"], "Semcode: Indexing complete");
+        // `message` is not one of the notification's parameters: building the
+        // payload with it leaves the required `data` unset.
+        assert!(notification["params"].get("message").is_none());
     }
 
     #[test]
