@@ -142,32 +142,26 @@ impl ChosenDefinition {
 
 /// Whether a path holds a program other than the one an audit is about.
 ///
-/// A source tree can build more than one program. Linux builds host tools from
-/// every directory named `tools` -- the top-level one and `arch/x86/tools`,
-/// `arch/arm64/tools`, `drivers/comedi/drivers/ni_routing/tools` and nine more
-/// -- example code from `samples`, and prose from `Documentation`. Those
+/// A source tree can build more than one program. Linux builds host tools
+/// from every directory named `tools` -- the top-level one and
+/// `arch/x86/tools` and eleven more -- example code from `samples`, prose
+/// from `Documentation`, and a proc-macro crate from `rust/macros`. Those
 /// programs define names the kernel also defines: of nine definitions of
 /// `pr_warn`, eight are outside the kernel image.
 ///
-/// A path component, not a prefix: the definition that made this necessary is
-/// `arch/x86/tools/insn_decoder_test.c`, which no prefix of `tools/` matches.
-/// Every directory named `tools` in that tree holds a host program, so the
-/// component is the signal.
+/// This orders a choice between definitions. It never drops one: a name
+/// defined only under `tools` still answers, and the choice is reported
+/// either way.
 ///
-/// This orders a choice between definitions. It never drops one: a name defined
-/// only under `tools` still answers, and the choice is reported either way, so
-/// a tie-break that goes the wrong way is visible rather than silent.
-///
-/// `scripts` and `usr` are deliberately absent, though they read as though they
-/// belong: both hold code that ends up in the built image. `scripts/module-common.c`
-/// is compiled into every `.ko` (`scripts/Makefile.modfinal:28`) and
-/// `usr/initramfs_data.S` is linked in, so the directory name does not imply
-/// another program there the way it does for `tools`.
+/// The taxonomy lives in [`crate::domain`], which reads the same paths for
+/// the resolution filter. Two answers to this question in one binary is how
+/// a host tool becomes the preferred definition for a caller in its
+/// directory, so there is one: this asks whether the program is the kernel.
+/// That module also holds what a component test could not: `samples/` is
+/// half kernel modules and half userspace programs, and
+/// `scripts/dtc/libfdt` is compiled into the kernel by `lib/fdt_ro.c`.
 pub fn path_is_other_program(file_path: &str) -> bool {
-    const OTHER_PROGRAMS: [&str; 3] = ["tools", "samples", "Documentation"];
-    file_path
-        .split('/')
-        .any(|component| OTHER_PROGRAMS.contains(&component))
+    crate::domain::path_is_other_program(file_path)
 }
 
 /// The language a path's extension names, for grouping definitions of one name.
