@@ -280,8 +280,9 @@ async fn mcp_show_callers(
     // Find function or macro - both are stored in the functions table
     // Macros are distinguished by having an empty return_type
     let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha)
-        .await?;
+        .find_function_git_aware_reporting(function_name, git_sha, semcode::domain::Context::Any)
+        .await?
+        .chosen();
 
     match chosen_opt {
         Some(chosen) => {
@@ -453,8 +454,9 @@ async fn mcp_show_calls(
     // Find function or macro - both are stored in the functions table
     // Macros are distinguished by having an empty return_type
     let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha)
-        .await?;
+        .find_function_git_aware_reporting(function_name, git_sha, semcode::domain::Context::Any)
+        .await?
+        .chosen();
 
     match chosen_opt {
         Some(chosen) => {
@@ -1722,8 +1724,9 @@ async fn mcp_show_callchain_with_limits(
 
     // First, check if function exists
     let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha)
-        .await?;
+        .find_function_git_aware_reporting(function_name, git_sha, semcode::domain::Context::Any)
+        .await?
+        .chosen();
 
     if chosen_opt.is_none() {
         writeln!(

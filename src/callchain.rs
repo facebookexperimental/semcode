@@ -292,7 +292,10 @@ pub async fn show_callers_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Search for function - macros are now stored as functions
-    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(name, git_sha, crate::domain::Context::Any)
+        .await?
+        .chosen();
 
     match chosen_opt {
         Some(chosen) => {
@@ -435,8 +438,14 @@ pub async fn show_callers_to_writer(
                     // Only perform extra lookups in verbose mode
                     if verbose {
                         // Get more info about the caller
-                        if let Ok(Some(chosen)) =
-                            db.find_function_git_aware_reporting(caller, git_sha).await
+                        if let Ok(Some(chosen)) = db
+                            .find_function_git_aware_reporting(
+                                caller,
+                                git_sha,
+                                crate::domain::Context::Any,
+                            )
+                            .await
+                            .map(|resolution| resolution.chosen())
                         {
                             // The file and line of a name with several
                             // definitions is one of them, and a row of a list
@@ -962,8 +971,14 @@ pub async fn show_callees_to_writer(
                     // Only perform extra lookups in verbose mode
                     if verbose {
                         // Get more info about the callee
-                        if let Ok(Some(chosen)) =
-                            db.find_function_git_aware_reporting(callee, git_sha).await
+                        if let Ok(Some(chosen)) = db
+                            .find_function_git_aware_reporting(
+                                callee,
+                                git_sha,
+                                crate::domain::Context::Any,
+                            )
+                            .await
+                            .map(|resolution| resolution.chosen())
                         {
                             let marker = definition_marker(&chosen);
                             let callee_func = chosen.function;
@@ -1159,7 +1174,10 @@ pub async fn show_callchain_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Use provided git SHA
-    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(name, git_sha, crate::domain::Context::Any)
+        .await?
+        .chosen();
 
     match chosen_opt {
         Some(chosen) => {

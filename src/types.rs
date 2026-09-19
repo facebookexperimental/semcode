@@ -82,6 +82,43 @@ pub struct DefinitionSite {
 /// A command that walks a chain or lists callers needs one starting point, so
 /// it cannot report every definition the way a callee query does. Carrying the
 /// others with the choice lets it name them, which is the difference between
+/// What a name resolved to, within whatever constrained the search.
+///
+/// Three outcomes, not two. A name with no definition at this revision and a
+/// name whose every definition belongs to another architecture or another
+/// program are both "no answer", but only the second one knows where the
+/// other side is, and saying so is the difference between a dead end and a
+/// breadcrumb.
+///
+/// `NoneAdmitted` arises only where a search is constrained: an
+/// unconstrained one admits everything it finds.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    Chosen(ChosenDefinition),
+    /// No definition of the name at this revision.
+    NotFound,
+    /// Definitions exist, and the constraint admits none of them.
+    NoneAdmitted {
+        candidates: Vec<DefinitionSite>,
+    },
+}
+
+impl Resolution {
+    /// The answer, where there is one. For a caller with nothing to say
+    /// about the other two outcomes.
+    pub fn chosen(self) -> Option<ChosenDefinition> {
+        match self {
+            Resolution::Chosen(chosen) => Some(chosen),
+            _ => None,
+        }
+    }
+
+    /// The chosen function, where there is one.
+    pub fn function(self) -> Option<FunctionInfo> {
+        self.chosen().map(|chosen| chosen.function)
+    }
+}
+
 /// picking one and hiding that there was a choice.
 #[derive(Debug, Clone)]
 pub struct ChosenDefinition {

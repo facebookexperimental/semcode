@@ -202,8 +202,9 @@ async fn show_callchain_with_limits(
 
     // First, check if function exists using git-aware query
     let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha)
-        .await?;
+        .find_function_git_aware_reporting(function_name, git_sha, semcode::domain::Context::Any)
+        .await?
+        .chosen();
 
     let chosen = match chosen_opt {
         Some(chosen) => chosen,
@@ -286,7 +287,11 @@ async fn show_callchain_with_limits(
             println!("{}. {}", (i + 1).to_string().yellow(), caller.cyan());
 
             // Show caller details if available
-            if let Ok(Some(chosen)) = db.find_function_git_aware_reporting(caller, git_sha).await {
+            if let Ok(Some(chosen)) = db
+                .find_function_git_aware_reporting(caller, git_sha, semcode::domain::Context::Any)
+                .await
+                .map(|resolution| resolution.chosen())
+            {
                 // One of several definitions, where the name has several. A
                 // row of a list has no other room to say so.
                 let marker = match chosen.others.len() {
@@ -355,7 +360,11 @@ async fn show_callchain_with_limits(
             println!("{}. {}", (i + 1).to_string().yellow(), callee.cyan());
 
             // Show callee details if available
-            if let Ok(Some(chosen)) = db.find_function_git_aware_reporting(callee, git_sha).await {
+            if let Ok(Some(chosen)) = db
+                .find_function_git_aware_reporting(callee, git_sha, semcode::domain::Context::Any)
+                .await
+                .map(|resolution| resolution.chosen())
+            {
                 let marker = match chosen.others.len() {
                     0 => String::new(),
                     others => format!(" [1 of {} definitions]", others + 1),

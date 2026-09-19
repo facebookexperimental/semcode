@@ -43,7 +43,7 @@ pub use types::{
     path_is_other_program, path_language, row_defines_the_function, ArgumentFunction,
     ChosenDefinition, DefinitionSite, DispatchKind, DispatchSite, FieldInfo, FunctionInfo,
     GitCommitInfo, GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry, LoreEmailInfo,
-    ParameterInfo, Registration, RegistrationKind, TypeInfo, TypedefInfo,
+    ParameterInfo, Registration, RegistrationKind, Resolution, TypeInfo, TypedefInfo,
 };
 pub use vectorizer::CodeVectorizer;
 pub use workdir::WorkdirIndex;
