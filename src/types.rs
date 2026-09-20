@@ -143,6 +143,9 @@ impl ChosenDefinition {
         if self.others.is_empty() {
             return None;
         }
+        if let Some(note) = self.one_definition_per_architecture() {
+            return Some(note);
+        }
         let mut sites: Vec<String> = self
             .others
             .iter()
@@ -173,6 +176,55 @@ impl ChosenDefinition {
             self.function.file_path,
             self.function.line_start,
             listed
+        ))
+    }
+
+    /// The note for a name that is defined once per architecture.
+    ///
+    /// `None` unless every definition belongs to an architecture and at
+    /// least two architectures are involved, because that is the case where
+    /// the general note is both true and useless: it says the answer depends
+    /// on the configuration without saying that the reader can decide it.
+    ///
+    /// A name with a generic definition beside the architecture-specific
+    /// ones is not this case. Generic is what a build without its own
+    /// definition reaches, so there is a sensible answer to give.
+    fn one_definition_per_architecture(&self) -> Option<String> {
+        let sites: Vec<(&str, u32)> =
+            std::iter::once((self.function.file_path.as_str(), self.function.line_start))
+                .chain(
+                    self.others
+                        .iter()
+                        .map(|site| (site.file_path.as_str(), site.line_start)),
+                )
+                .collect();
+
+        let mut arches: Vec<&str> = Vec::new();
+        for (path, _) in &sites {
+            let domain = crate::domain::domain_of(path);
+            let arch = domain.arch?;
+            if domain.program != crate::domain::Program::Kernel {
+                return None;
+            }
+            if !arches.contains(&arch) {
+                arches.push(arch);
+            }
+        }
+        if arches.len() < 2 {
+            return None;
+        }
+        arches.sort_unstable();
+
+        let chosen_arch = crate::domain::domain_of(&self.function.file_path).arch?;
+        Some(format!(
+            "'{}' has one definition per architecture: {}. This answer is \
+             about {}, at {}:{}. Ask another with '--arch <arch>'; no build \
+             has more than one.",
+            self.function.name,
+            arches.join(", "),
+            chosen_arch,
+            self.function.file_path,
+            self.function.line_start,
         ))
     }
 }
@@ -817,4 +869,89 @@ impl Drop for GitFileEntry {
 pub struct GitFileManifestEntry {
     pub relative_path: std::path::PathBuf,
     pub object_id: gix::ObjectId,
+}
+
+#[cfg(test)]
+mod ambiguity_note_tests {
+    use super::*;
+
+    fn definition(name: &str, path: &str, line: u32) -> FunctionInfo {
+        FunctionInfo {
+            name: name.to_string(),
+            file_path: path.to_string(),
+            git_file_hash: String::new(),
+            line_start: line,
+            line_end: line,
+            return_type: "void".to_string(),
+            parameters: Vec::new(),
+            body: String::new(),
+            calls: None,
+            types: None,
+        }
+    }
+
+    fn site(path: &str, line: u32) -> DefinitionSite {
+        DefinitionSite {
+            file_path: path.to_string(),
+            line_start: line,
+        }
+    }
+
+    #[test]
+    fn one_definition_is_no_note() {
+        let chosen = ChosenDefinition::only(definition("f", "mm/memory.c", 1));
+        assert!(chosen.ambiguity_note().is_none());
+    }
+
+    #[test]
+    fn one_per_architecture_says_so_and_says_how_to_ask() {
+        let chosen = ChosenDefinition {
+            function: definition("__flush_tlb_all", "arch/sparc/mm/init_64.c", 2758),
+            others: vec![
+                site("arch/x86/mm/tlb.c", 1663),
+                site("arch/arm/include/asm/tlbflush.h", 343),
+            ],
+        };
+        let note = chosen.ambiguity_note().unwrap();
+        assert!(note.contains("one definition per architecture"), "{note}");
+        assert!(note.contains("arm, sparc, x86"), "{note}");
+        assert!(note.contains("--arch"), "{note}");
+        // The general note's prose about configuration is the thing this
+        // replaces: it is true and it tells the reader nothing to do.
+        assert!(!note.contains("depends on"), "{note}");
+    }
+
+    #[test]
+    fn a_generic_definition_beside_them_is_a_different_case() {
+        // Generic is what a build without its own definition reaches, so
+        // there is a sensible answer and no choice to push back.
+        let chosen = ChosenDefinition {
+            function: definition("handle_mm_fault", "mm/memory.c", 6841),
+            others: vec![site("arch/x86/mm/fault.c", 100)],
+        };
+        let note = chosen.ambiguity_note().unwrap();
+        assert!(!note.contains("one definition per architecture"), "{note}");
+    }
+
+    #[test]
+    fn two_definitions_in_one_architecture_are_not_one_per_architecture() {
+        // sparc has setup_32 and setup_64, and neither --arch nor anything
+        // else in the index tells them apart.
+        let chosen = ChosenDefinition {
+            function: definition("setup_arch", "arch/sparc/kernel/setup_32.c", 283),
+            others: vec![site("arch/sparc/kernel/setup_64.c", 622)],
+        };
+        let note = chosen.ambiguity_note().unwrap();
+        assert!(!note.contains("one definition per architecture"), "{note}");
+    }
+
+    #[test]
+    fn a_definition_in_another_program_is_not_an_architecture_choice() {
+        let chosen = ChosenDefinition {
+            function: definition("report", "arch/x86/kernel/setup.c", 10),
+            others: vec![site("tools/perf/builtin-stat.c", 20)],
+        };
+        let note = chosen.ambiguity_note().unwrap();
+        assert!(!note.contains("one definition per architecture"), "{note}");
+    }
 }
