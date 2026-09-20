@@ -347,12 +347,31 @@ pub async fn show_callers_to_writer(
     verbose: bool,
     git_sha: &str,
 ) -> Result<()> {
+    show_callers_to_writer_in(
+        db,
+        name,
+        writer,
+        verbose,
+        git_sha,
+        crate::domain::Context::Any,
+    )
+    .await
+}
+
+pub async fn show_callers_to_writer_in(
+    db: &DatabaseManager,
+    name: &str,
+    writer: &mut dyn Write,
+    verbose: bool,
+    git_sha: &str,
+    pin: crate::domain::Context,
+) -> Result<()> {
     let search_msg = format!("Finding all functions that call: {}", name.cyan());
     writeln!(writer, "{search_msg}")?;
 
     // Search for function - macros are now stored as functions
     let chosen_opt = db
-        .find_function_git_aware_reporting(name, git_sha, crate::domain::Context::Any)
+        .find_function_git_aware_reporting(name, git_sha, pin)
         .await?
         .chosen();
 
@@ -1491,7 +1510,22 @@ pub async fn show_callers(
     verbose: bool,
     git_sha: &str,
 ) -> Result<()> {
-    show_callers_to_writer(db, name, &mut stdout(), verbose, git_sha).await
+    show_callers_in(db, name, verbose, git_sha, crate::domain::Context::Any).await
+}
+
+/// `callers`, asked from a named build.
+///
+/// A pin decides which definition the question is about before the chooser
+/// gets a say, which is the difference between "callers of the x86
+/// definition" and "callers of whichever definition sorted first".
+pub async fn show_callers_in(
+    db: &DatabaseManager,
+    name: &str,
+    verbose: bool,
+    git_sha: &str,
+    pin: crate::domain::Context,
+) -> Result<()> {
+    show_callers_to_writer_in(db, name, &mut stdout(), verbose, git_sha, pin).await
 }
 
 /// Wrapper function for show_callees with verbose option

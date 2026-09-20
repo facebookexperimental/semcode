@@ -276,6 +276,22 @@ pub fn domain_of(path: &str) -> Domain {
     Domain { program, arch }
 }
 
+/// The kernel build for a named architecture, if this is one.
+///
+/// What a reader's `--arch x86` means. A name this module does not know is
+/// refused rather than ignored, because a typo that silently answers about
+/// every architecture is the failure the constraint exists to prevent.
+pub fn kernel_arch(name: &str) -> Option<Domain> {
+    ARCHITECTURES
+        .iter()
+        .copied()
+        .find(|arch| *arch == name)
+        .map(|arch| Domain {
+            program: Program::Kernel,
+            arch: Some(arch),
+        })
+}
+
 /// Whether a path belongs to a program other than the kernel image.
 ///
 /// The question `choose_definition` has asked since it had to stop ranking
@@ -521,6 +537,39 @@ mod tests {
             coexistence(domain_of("lib/rbtree.c"), domain_of("tools/lib/rbtree.c")),
             Coexistence::DifferentBuilds
         );
+    }
+
+    #[test]
+    fn a_pin_names_an_architecture_or_is_refused() {
+        assert_eq!(
+            kernel_arch("x86"),
+            Some(Domain {
+                program: Program::Kernel,
+                arch: Some("x86")
+            })
+        );
+        assert_eq!(kernel_arch("arm64").and_then(|d| d.arch), Some("arm64"));
+        // A typo, a target triple, and a directory that is not an
+        // architecture all have to be refused rather than silently widening
+        // the question back to everything.
+        assert_eq!(kernel_arch("x86_64"), None);
+        assert_eq!(kernel_arch("X86"), None);
+        assert_eq!(kernel_arch("Kconfig"), None);
+        assert_eq!(kernel_arch(""), None);
+    }
+
+    #[test]
+    fn a_pin_and_a_path_agree_about_what_an_architecture_is() {
+        // The pin and the reader of a path must not disagree, or `--arch um`
+        // would mean something different from a definition under arch/um.
+        for arch in ARCHITECTURES {
+            let from_path = domain_of(&format!("arch/{arch}/kernel/setup.c"));
+            assert_eq!(
+                kernel_arch(arch),
+                Some(from_path),
+                "pin and path disagree about {arch}"
+            );
+        }
     }
 
     #[test]
