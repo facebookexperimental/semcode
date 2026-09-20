@@ -171,3 +171,59 @@ async fn a_name_that_does_not_exist_is_not_found_rather_than_unadmitted() {
         "an absent name has no candidates to name, got {resolution:?}"
     );
 }
+
+#[tokio::test]
+async fn a_caller_list_is_about_the_definition_not_the_name() {
+    let (dir, db, sha) = tree_with_one_definition_per_arch().await;
+    let repo = dir.path();
+
+    // Two callers of the same name, one per architecture, plus a generic
+    // one. Listing all three under either definition says the other
+    // architecture's caller calls this definition, which it does not.
+    std::fs::create_dir_all(repo.join("arch/x86/mm")).unwrap();
+    std::fs::create_dir_all(repo.join("arch/sparc/mm")).unwrap();
+    std::fs::write(
+        repo.join("arch/x86/mm/fault.c"),
+        "int x86_fault(unsigned long pte)\n{\n\treturn page_present(pte);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("arch/sparc/mm/fault.c"),
+        "int sparc_fault(unsigned long pte)\n{\n\treturn page_present(pte);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "one caller per arch"]);
+    let sha2 = git::get_git_sha(repo).unwrap().unwrap();
+    let extensions = ["c".to_string(), "h".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha2, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+    let _ = sha;
+
+    let unconstrained = db
+        .get_function_callers_in("page_present", &sha2, Context::Any)
+        .await
+        .unwrap();
+    assert!(unconstrained.contains(&"x86_fault".to_string()));
+    assert!(unconstrained.contains(&"sparc_fault".to_string()));
+    assert!(unconstrained.contains(&"handle_fault".to_string()));
+
+    let from_x86 = db
+        .get_function_callers_in(
+            "page_present",
+            &sha2,
+            Context::In(domain_of("arch/x86/include/asm/pgtable.h")),
+        )
+        .await
+        .unwrap();
+    assert!(from_x86.contains(&"x86_fault".to_string()));
+    // Generic code calls whichever definition the build selects, so it is a
+    // caller of this one.
+    assert!(from_x86.contains(&"handle_fault".to_string()));
+    // The sparc caller is not.
+    assert!(
+        !from_x86.contains(&"sparc_fault".to_string()),
+        "sparc_fault calls sparc's definition, not x86's: {from_x86:?}"
+    );
+}

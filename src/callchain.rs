@@ -274,6 +274,37 @@ fn when_it_runs(level: &str) -> &'static str {
 /// this tree, 2 of 20 rows of one such list have an ambiguous name, so the
 /// count is worth carrying and the paths are not. The reader who wants them
 /// asks about that name.
+/// What to say about a name whose definitions all belong to another build.
+///
+/// "Not found" would be a lie: the name is defined, just not anywhere this
+/// caller can reach. Naming where the other side lives is the whole
+/// difference between a dead end and a breadcrumb.
+fn elsewhere_note(
+    candidates: &[crate::types::DefinitionSite],
+    context: crate::domain::Context,
+) -> String {
+    let here = match context {
+        crate::domain::Context::In(domain) => domain.arch.unwrap_or("this build"),
+        crate::domain::Context::Any => "this build",
+    };
+    let mut sites: Vec<String> = candidates
+        .iter()
+        .map(|site| format!("{}:{}", site.file_path, site.line_start))
+        .collect();
+    sites.sort();
+    const SHOWN: usize = 3;
+    let listed = if sites.len() > SHOWN {
+        format!(
+            "{}, and {} more",
+            sites[..SHOWN].join(", "),
+            sites.len() - SHOWN
+        )
+    } else {
+        sites.join(", ")
+    };
+    format!("no definition in {here}; defined at {listed}")
+}
+
 fn definition_marker(chosen: &crate::types::ChosenDefinition) -> String {
     match chosen.others.len() {
         0 => String::new(),
@@ -306,8 +337,13 @@ pub async fn show_callers_to_writer(
                 writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
             }
             let func = chosen.function;
-            // Always use git-aware callers query
-            let callers = db.get_function_callers_git_aware(name, git_sha).await?;
+            let subject_context =
+                crate::domain::Context::In(crate::domain::domain_of(&func.file_path));
+            // Callers of THIS definition, not of the name: a caller in
+            // another architecture calls the definition in its own.
+            let callers = db
+                .get_function_callers_in(name, git_sha, subject_context)
+                .await?;
             let indirect = db.find_indirect_callers(name, git_sha).await?;
             // Nothing in the source calls an initcall: the pointer sits in a
             // section that do_initcalls() walks at boot. Saying only that
@@ -426,9 +462,16 @@ pub async fn show_callers_to_writer(
 
                 writeln!(
                     writer,
-                    "{} functions directly call '{}':",
+                    "{} functions directly call '{}'{}:",
                     callers.len(),
-                    name
+                    name,
+                    match subject_context {
+                        crate::domain::Context::In(domain) => domain
+                            .arch
+                            .map(|arch| format!(" from {arch}"))
+                            .unwrap_or_default(),
+                        crate::domain::Context::Any => String::new(),
+                    }
                 )?;
 
                 for (i, caller) in callers.iter().enumerate() {
@@ -437,30 +480,38 @@ pub async fn show_callers_to_writer(
 
                     // Only perform extra lookups in verbose mode
                     if verbose {
-                        // Get more info about the caller
-                        if let Ok(Some(chosen)) = db
-                            .find_function_git_aware_reporting(
-                                caller,
-                                git_sha,
-                                crate::domain::Context::Any,
-                            )
+                        // Resolved within the subject's own build: a caller of
+                        // an x86 function is x86 or generic code, and a sparc
+                        // definition of that name is a different function that
+                        // happens to share a spelling.
+                        match db
+                            .find_function_git_aware_reporting(caller, git_sha, subject_context)
                             .await
-                            .map(|resolution| resolution.chosen())
                         {
-                            // The file and line of a name with several
-                            // definitions is one of them, and a row of a list
-                            // has no other way to say so.
-                            let marker = definition_marker(&chosen);
-                            let caller_func = chosen.function;
-                            let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]{}",
-                                caller_func.return_type.bright_black(),
-                                caller_func.file_path.bright_black(),
-                                caller_func.line_start,
-                                caller_func.git_file_hash.bright_black(),
-                                marker.yellow()
-                            );
-                            writeln!(writer, "{info}")?;
+                            Ok(crate::types::Resolution::NoneAdmitted { candidates }) => {
+                                writeln!(
+                                    writer,
+                                    "     {}",
+                                    elsewhere_note(&candidates, subject_context).bright_black()
+                                )?;
+                            }
+                            Ok(crate::types::Resolution::Chosen(chosen)) => {
+                                // The file and line of a name with several
+                                // definitions is one of them, and a row of a list
+                                // has no other way to say so.
+                                let marker = definition_marker(&chosen);
+                                let caller_func = chosen.function;
+                                let info = format!(
+                                    "     {} ({}:{}) [file SHA: {}]{}",
+                                    caller_func.return_type.bright_black(),
+                                    caller_func.file_path.bright_black(),
+                                    caller_func.line_start,
+                                    caller_func.git_file_hash.bright_black(),
+                                    marker.yellow()
+                                );
+                                writeln!(writer, "{info}")?;
+                            }
+                            _ => {}
                         }
                     }
                 }

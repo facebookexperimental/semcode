@@ -3808,18 +3808,42 @@ impl DatabaseManager {
         function_name: &str,
         git_sha: &str,
     ) -> Result<Vec<String>> {
+        self.get_function_callers_in(function_name, git_sha, crate::domain::Context::Any)
+            .await
+    }
+
+    /// Callers of a name that belong to a build the subject can be called
+    /// from.
+    ///
+    /// A caller list is built from every row whose `calls` names the target,
+    /// across the whole tree. Under `Context::Any` that is what comes back,
+    /// as before. Given a context, a caller in another architecture or
+    /// another program is dropped: it calls a different function that
+    /// happens to share the spelling, and listing it under this definition
+    /// says otherwise.
+    pub async fn get_function_callers_in(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+        context: crate::domain::Context,
+    ) -> Result<Vec<String>> {
+        let admits = |file_path: &str| context.admits(crate::domain::domain_of(file_path));
+
         // Collect callers from workdir overlay
         let workdir_callers = self.workdir_find_callers(function_name, git_sha);
-        let mut caller_names: Vec<String> =
-            workdir_callers.iter().map(|f| f.name.clone()).collect();
+        let mut caller_names: Vec<String> = workdir_callers
+            .iter()
+            .filter(|func| admits(&func.file_path))
+            .map(|func| func.name.clone())
+            .collect();
 
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         if !git_manifest.is_empty() {
             let db_callers = self
                 .get_function_callers_with_manifest(function_name, &git_manifest)
                 .await?;
-            for name in db_callers {
-                if !caller_names.contains(&name) {
+            for (name, file_path) in db_callers {
+                if admits(&file_path) && !caller_names.contains(&name) {
                     caller_names.push(name);
                 }
             }
@@ -4042,6 +4066,9 @@ impl DatabaseManager {
                     let callers = if let Some(manifest) = &git_manifest {
                         self.get_function_callers_with_manifest(&func_name, manifest)
                             .await?
+                            .into_iter()
+                            .map(|(name, _file_path)| name)
+                            .collect()
                     } else {
                         self.get_function_callers(&func_name).await?
                     };
@@ -5984,11 +6011,15 @@ impl DatabaseManager {
     }
 
     /// Get function callers using pre-generated manifest (fast)
+    /// Callers of a name, with the file each was found in.
+    ///
+    /// The file is what says which build a caller belongs to, and a caller
+    /// in another build is not a caller of this definition.
     pub async fn get_function_callers_with_manifest(
         &self,
         function_name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(String, String)>> {
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
         let table = self.connection.open_table("functions").execute().await?;
@@ -6049,7 +6080,7 @@ impl DatabaseManager {
                                 let calls_json = calls_array.value(i);
                                 let calls_list = crate::database::parse_call_list(calls_json)?;
                                 if calls_list.contains(&function_name.to_string()) {
-                                    callers.push(caller_name.to_string());
+                                    callers.push((caller_name.to_string(), file_path.to_string()));
                                 }
                             }
                         }
