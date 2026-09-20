@@ -4124,6 +4124,44 @@ impl DatabaseManager {
             .await
     }
 
+    /// What the definition this build reaches calls.
+    ///
+    /// Merging the callees of every definition of a name is how a chain
+    /// rooted in x86 grew sparc leaves: `__flush_tlb_all` has three
+    /// definitions and the union of their callees belongs to no build. The
+    /// architecture's own definition wins over a generic one, the way an
+    /// `asm/` header overrides `asm-generic/`.
+    pub async fn get_function_callees_in(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+        context: crate::domain::Context,
+    ) -> Result<Vec<String>> {
+        if matches!(context, crate::domain::Context::Any) {
+            return self
+                .get_function_callees_git_aware(function_name, git_sha)
+                .await;
+        }
+        let definitions = self
+            .get_function_callees_by_definition_git_aware(function_name, git_sha)
+            .await?;
+        let mut admitted: Vec<&crate::types::CalleeDefinition> = definitions
+            .iter()
+            .filter(|definition| context.admits(crate::domain::domain_of(&definition.file_path)))
+            .collect();
+        if admitted.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Most specific first: an architecture's own definition, then a
+        // generic one.
+        admitted.sort_by_key(|definition| {
+            crate::domain::domain_of(&definition.file_path)
+                .arch
+                .is_none()
+        });
+        Ok(admitted[0].callees.clone())
+    }
+
     /// Every definition of the name at this commit, with what each calls.
     pub async fn get_function_callees_by_definition_git_aware(
         &self,

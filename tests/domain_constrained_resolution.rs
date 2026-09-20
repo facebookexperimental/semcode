@@ -227,3 +227,89 @@ async fn a_caller_list_is_about_the_definition_not_the_name() {
         "sparc_fault calls sparc's definition, not x86's: {from_x86:?}"
     );
 }
+
+#[tokio::test]
+async fn callees_come_from_one_definition_not_from_all_of_them() {
+    let (dir, db, sha) = tree_with_one_definition_per_arch().await;
+    let repo = dir.path();
+
+    // Each architecture's page_present calls its own helper. Merging the
+    // callees of all three gives a set that belongs to no build -- the
+    // sparc leaves under an x86 root.
+    for arch in ["x86", "sparc"] {
+        std::fs::write(
+            repo.join(format!("arch/{arch}/include/asm/pgtable.h")),
+            format!(
+                "static inline int page_present(unsigned long pte)\n{{\n\treturn {arch}_lookup(pte);\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    // A generic definition beside them, which an architecture's own
+    // definition overrides the way asm/ overrides asm-generic/.
+    std::fs::create_dir_all(repo.join("include/linux")).unwrap();
+    std::fs::write(
+        repo.join("include/linux/pgtable.h"),
+        "static inline int page_present(unsigned long pte)\n{\n\treturn generic_lookup(pte);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "per-arch helpers"]);
+    let sha2 = git::get_git_sha(repo).unwrap().unwrap();
+    let extensions = ["c".to_string(), "h".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha2, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+    let _ = sha;
+
+    let from_x86 = db
+        .get_function_callees_in(
+            "page_present",
+            &sha2,
+            Context::In(domain_of("arch/x86/mm/fault.c")),
+        )
+        .await
+        .unwrap();
+    assert!(
+        from_x86.contains(&"x86_lookup".to_string()),
+        "x86's definition calls x86_lookup: {from_x86:?}"
+    );
+    assert!(
+        !from_x86.contains(&"sparc_lookup".to_string()),
+        "sparc's helper is not reachable from x86: {from_x86:?}"
+    );
+    // The generic definition is admitted but overridden: a build with an
+    // x86 page_present does not also have the generic one.
+    assert!(
+        !from_x86.contains(&"generic_lookup".to_string()),
+        "x86 overrides the generic definition: {from_x86:?}"
+    );
+
+    // A architecture with no definition of its own gets the generic one.
+    let from_arm = db
+        .get_function_callees_in(
+            "page_present",
+            &sha2,
+            Context::In(domain_of("arch/arm/mm/fault.c")),
+        )
+        .await
+        .unwrap();
+    assert!(
+        from_arm.contains(&"generic_lookup".to_string()),
+        "arm has no page_present, so it reaches the generic one: {from_arm:?}"
+    );
+
+    // Unconstrained is unchanged, which is not the same as correct: the
+    // existing query answers from one definition chosen without a reason,
+    // so all that can be asserted is that it still answers and that this
+    // patch did not change which one.
+    let unconstrained = db
+        .get_function_callees_in("page_present", &sha2, Context::Any)
+        .await
+        .unwrap();
+    let existing = db
+        .get_function_callees_git_aware("page_present", &sha2)
+        .await
+        .unwrap();
+    assert_eq!(unconstrained, existing);
+}

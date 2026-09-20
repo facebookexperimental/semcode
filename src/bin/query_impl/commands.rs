@@ -239,12 +239,18 @@ async fn show_callchain_with_limits(
         }
     }
 
+    // Every hop of this chain is about the definition the root resolved to,
+    // so it is answered within that definition's build. Sticky: a hop into
+    // generic code keeps the architecture, because generic code calls
+    // whichever definition the build selects.
+    let chain_context = semcode::domain::Context::In(semcode::domain::domain_of(&func.file_path));
+
     // Get callers and callees using git-aware methods (same as MCP tool)
     let callers = db
-        .get_function_callers_git_aware(function_name, git_sha)
+        .get_function_callers_in(function_name, git_sha, chain_context)
         .await?;
     let callees = db
-        .get_function_callees_git_aware(function_name, git_sha)
+        .get_function_callees_in(function_name, git_sha, chain_context)
         .await?;
 
     // A function reached only through a pointer has no direct callers, so
@@ -288,7 +294,7 @@ async fn show_callchain_with_limits(
 
             // Show caller details if available
             if let Ok(Some(chosen)) = db
-                .find_function_git_aware_reporting(caller, git_sha, semcode::domain::Context::Any)
+                .find_function_git_aware_reporting(caller, git_sha, chain_context)
                 .await
                 .map(|resolution| resolution.chosen())
             {
@@ -310,8 +316,9 @@ async fn show_callchain_with_limits(
 
             // For multi-level depth, show second-level callers
             if up_levels > 1 {
-                if let Ok(second_level_callers) =
-                    db.get_function_callers_git_aware(caller, git_sha).await
+                if let Ok(second_level_callers) = db
+                    .get_function_callers_in(caller, git_sha, chain_context)
+                    .await
                 {
                     let limited_second: Vec<_> = if calls_limit == 0 {
                         second_level_callers
@@ -361,7 +368,7 @@ async fn show_callchain_with_limits(
 
             // Show callee details if available
             if let Ok(Some(chosen)) = db
-                .find_function_git_aware_reporting(callee, git_sha, semcode::domain::Context::Any)
+                .find_function_git_aware_reporting(callee, git_sha, chain_context)
                 .await
                 .map(|resolution| resolution.chosen())
             {
@@ -381,8 +388,9 @@ async fn show_callchain_with_limits(
 
             // For multi-level depth, show second-level callees
             if down_levels > 1 {
-                if let Ok(second_level_callees) =
-                    db.get_function_callees_git_aware(callee, git_sha).await
+                if let Ok(second_level_callees) = db
+                    .get_function_callees_in(callee, git_sha, chain_context)
+                    .await
                 {
                     let limited_second: Vec<_> = if calls_limit == 0 {
                         second_level_callees

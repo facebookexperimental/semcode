@@ -95,6 +95,7 @@ async fn build_forward_callchain_with_git(
         max_depth,
         true,
         &mut HashSet::new(),
+        crate::domain::Context::Any,
     ))
 }
 
@@ -119,9 +120,17 @@ async fn build_reverse_callchain_with_git(
         max_depth,
         false,
         &mut HashSet::new(),
+        crate::domain::Context::Any,
     ))
 }
 
+/// Walk the chain, carrying the build it entered from.
+///
+/// The context is sticky. A hop into generic code does not clear it, because
+/// generic code calls whichever definition the build selects: that is what
+/// keeps `do_page_fault` -> `handle_mm_fault` -> `pte_present` on x86
+/// through a file in mm/. A hop into an architecture's own code narrows it,
+/// and a hop into another architecture is not walked at all.
 fn build_callchain_recursive_sync(
     function_map: &HashMap<String, Vec<FunctionInfo>>,
     call_relationships: &CallRelationships,
@@ -129,6 +138,7 @@ fn build_callchain_recursive_sync(
     remaining_depth: usize,
     forward: bool,
     visited: &mut HashSet<String>,
+    context: crate::domain::Context,
 ) -> CallNode {
     // Prevent infinite recursion
     if remaining_depth == 0 || visited.contains(func_name) {
@@ -149,9 +159,26 @@ fn build_callchain_recursive_sync(
         children: vec![],
     };
 
-    if let Some(func) = function_map.get(func_name).and_then(|f| f.first()) {
+    // The definition this walk can reach, not whichever one sorts first.
+    // Choosing per hop, with nothing carried between them, is what lets a
+    // chain rooted in x86 list an alpha caller and a sparc callee.
+    let reachable = function_map.get(func_name).and_then(|definitions| {
+        definitions
+            .iter()
+            .find(|func| context.admits(crate::domain::domain_of(&func.file_path)))
+    });
+
+    if let Some(func) = reachable {
         node.file = func.file_path.clone();
         node.line = func.line_start;
+
+        // Narrow on entering an architecture's own code, keep what we had on
+        // generic code.
+        let here = crate::domain::domain_of(&func.file_path);
+        let child_context = match context {
+            crate::domain::Context::In(current) if current.arch.is_some() => context,
+            _ => crate::domain::Context::In(here),
+        };
 
         let next_funcs = if forward {
             call_relationships.function_calls.get(func_name)
@@ -168,6 +195,7 @@ fn build_callchain_recursive_sync(
                     remaining_depth - 1,
                     forward,
                     visited,
+                    child_context,
                 );
                 node.children.push(child);
             }
