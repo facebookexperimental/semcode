@@ -361,15 +361,21 @@ async fn context_for_scope(
     }
 }
 
-/// The architecture an answer is about, for a line that reports it.
-fn arch_suffix(context: Context) -> String {
-    match context {
-        Context::In(domain) => domain
-            .arch
-            .map(|arch| format!(" from {arch}"))
-            .unwrap_or_default(),
-        Context::Any => String::new(),
+/// The build an answer is about, for a line that reports it.
+///
+/// Empty where naming the build distinguishes nothing: an unconstrained
+/// search, and a generic definition of the kernel, which is what most
+/// answers are about and what every answer on a tree that is not
+/// Linux-shaped reads as. Suffixing those would put "in the kernel build"
+/// on every line of a Rust crate's call graph.
+fn scope_suffix(context: Context) -> String {
+    let Context::In(domain) = context else {
+        return String::new();
+    };
+    if domain.arch.is_none() && domain.program == semcode::domain::Program::Kernel {
+        return String::new();
     }
+    format!(" in {}", domain.describe())
 }
 
 async fn mcp_show_callers(
@@ -409,17 +415,22 @@ async fn mcp_show_callers(
                 .get_function_callers_in(function_name, git_sha, subject_context)
                 .await?;
             if callers.is_empty() {
+                // A zero that a filter produced is not the same answer as a
+                // zero the tree holds, and the reader cannot tell them apart
+                // unless the line says which build it counted.
                 writeln!(
                     buffer,
-                    "Info: No functions call {entity_type} '{function_name}'"
+                    "Info: No functions call {entity_type} '{function_name}'{}",
+                    scope_suffix(subject_context)
                 )?;
             } else if callers.len() > 1000 {
                 // Just show count when there are too many
                 writeln!(
                     buffer,
-                    "{} functions call {entity_type} '{}' (too many to display)",
+                    "{} functions call {entity_type} '{}'{} (too many to display)",
                     callers.len(),
-                    function_name
+                    function_name,
+                    scope_suffix(subject_context)
                 )?;
             } else {
                 writeln!(buffer, "\n=== Direct Callers ===")?;
@@ -428,7 +439,7 @@ async fn mcp_show_callers(
                     "{} functions directly call {entity_type} '{}'{}:",
                     callers.len(),
                     function_name,
-                    arch_suffix(subject_context)
+                    scope_suffix(subject_context)
                 )?;
 
                 for (i, caller) in callers.iter().enumerate() {
@@ -615,15 +626,17 @@ async fn mcp_show_calls(
             if calls.is_empty() {
                 writeln!(
                     buffer,
-                    "Info: {entity_type} '{function_name}' doesn't call any other functions"
+                    "Info: {entity_type} '{function_name}' doesn't call any other functions{}",
+                    scope_suffix(subject_context)
                 )?;
             } else if calls.len() > 1000 {
                 // Just show count when there are too many
                 writeln!(
                     buffer,
-                    "{entity_type} '{}' calls {} functions (too many to display)",
+                    "{entity_type} '{}' calls {} functions{} (too many to display)",
                     function_name,
-                    calls.len()
+                    calls.len(),
+                    scope_suffix(subject_context)
                 )?;
             } else {
                 writeln!(buffer, "\n=== Direct Calls ===")?;
@@ -632,7 +645,7 @@ async fn mcp_show_calls(
                     "{entity_type} '{}' directly calls {} functions{}:",
                     function_name,
                     calls.len(),
-                    arch_suffix(subject_context)
+                    scope_suffix(subject_context)
                 )?;
 
                 for (i, callee) in calls.iter().enumerate() {
@@ -2161,7 +2174,11 @@ async fn mcp_show_callchain_with_limits(
         }
 
         if callers.is_empty() && callees.is_empty() && dispatched == 0 {
-            writeln!(buffer, "This function is isolated (no callers or callees)")?;
+            writeln!(
+                buffer,
+                "This function is isolated (no callers or callees{})",
+                scope_suffix(chain_context)
+            )?;
         }
     }
 
@@ -6376,6 +6393,26 @@ mod tests {
         env::remove_var(key);
         let args = Args::try_parse_from(["semcode-mcp"]).unwrap();
         assert_eq!(args.git_repo, ".");
+    }
+
+    #[test]
+    fn a_line_names_the_build_only_where_that_says_something() {
+        use semcode::domain::domain_of;
+
+        // A count produced under a filter has to say so, or a scoped zero
+        // reads as a fact about the tree.
+        assert_eq!(
+            scope_suffix(Context::In(domain_of("arch/x86/mm/tlb.c"))),
+            " in the kernel build for x86"
+        );
+        assert_eq!(
+            scope_suffix(Context::In(domain_of("tools/perf/arch/x86/util/evsel.c"))),
+            " in the tools build for x86"
+        );
+        // Naming these distinguishes nothing, and every answer about a tree
+        // that is not Linux-shaped reads as the second one.
+        assert_eq!(scope_suffix(Context::Any), "");
+        assert_eq!(scope_suffix(Context::In(domain_of("mm/memory.c"))), "");
     }
 
     #[test]
