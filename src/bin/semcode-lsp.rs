@@ -160,8 +160,13 @@ impl SemcodeLspBackend {
             // should land on the definition the other commands answer about,
             // not on whichever file sorts first.
             if let Ok(Some(chosen)) = db
-                .find_function_git_aware_reporting(identifier_name, git_sha)
+                .find_function_git_aware_reporting(
+                    identifier_name,
+                    git_sha,
+                    semcode::domain::Context::Any,
+                )
                 .await
+                .map(|resolution| resolution.chosen())
             {
                 functions.sort_by_key(|func| {
                     func.file_path != chosen.function.file_path

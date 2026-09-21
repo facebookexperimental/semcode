@@ -3,6 +3,7 @@
 mod database;
 pub mod database_utils;
 pub mod date_utils;
+pub mod domain;
 pub mod file_extensions;
 pub mod file_survey;
 pub mod git;
@@ -42,7 +43,7 @@ pub use types::{
     path_is_other_program, path_language, row_defines_the_function, ArgumentFunction,
     ChosenDefinition, DefinitionSite, DispatchKind, DispatchSite, FieldInfo, FunctionInfo,
     GitCommitInfo, GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry, LoreEmailInfo,
-    ParameterInfo, Registration, RegistrationKind, TypeInfo, TypedefInfo,
+    ParameterInfo, Registration, RegistrationKind, Resolution, Surface, TypeInfo, TypedefInfo,
 };
 pub use vectorizer::CodeVectorizer;
 pub use workdir::WorkdirIndex;

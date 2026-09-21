@@ -24,7 +24,9 @@ use crate::database::content::{ContentInfo, ContentStore};
 use crate::database::processed_files::{ProcessedFileRecord, ProcessedFileStore};
 use crate::database::vectors::VectorStore;
 use crate::treesitter_analyzer::TreeSitterAnalyzer;
-use crate::types::{ChosenDefinition, FunctionInfo, TypeInfo, TypedefInfo};
+use crate::types::{
+    ChosenDefinition, DefinitionSite, FunctionInfo, Resolution, TypeInfo, TypedefInfo,
+};
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
 use crate::worktree::{WorkingCopy, WorkingCopyHashes};
@@ -2371,19 +2373,19 @@ impl DatabaseManager {
         &self,
         name: &str,
         git_sha: &str,
-    ) -> Result<Option<ChosenDefinition>> {
+        context: crate::domain::Context,
+    ) -> Result<Resolution> {
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         if git_manifest.is_empty() {
             let why = self.why_nothing_resolved(git_sha);
             return Ok(self
                 .function_not_at_revision(name, git_sha, why)
                 .await?
-                .map(|function| ChosenDefinition {
-                    function,
-                    others: Vec::new(),
+                .map_or(Resolution::NotFound, |function| {
+                    Resolution::Chosen(ChosenDefinition::only(function))
                 }));
         }
-        self.find_function_with_manifest_reporting(name, &git_manifest)
+        self.find_function_with_manifest_reporting(name, &git_manifest, context)
             .await
     }
 
@@ -2394,9 +2396,9 @@ impl DatabaseManager {
         git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Option<FunctionInfo>> {
         Ok(self
-            .find_function_with_manifest_reporting(name, git_manifest)
+            .find_function_with_manifest_reporting(name, git_manifest, crate::domain::Context::Any)
             .await?
-            .map(|chosen| chosen.function))
+            .function())
     }
 
     /// The body of `find_function_with_manifest`, keeping the alternatives.
@@ -2404,7 +2406,8 @@ impl DatabaseManager {
         &self,
         name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
-    ) -> Result<Option<ChosenDefinition>> {
+        context: crate::domain::Context,
+    ) -> Result<Resolution> {
         let revision = match git_manifest.revision() {
             "" => "the revision asked about",
             sha => sha,
@@ -2422,7 +2425,9 @@ impl DatabaseManager {
             return Ok(self
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
                 .await?
-                .map(ChosenDefinition::only));
+                .map_or(Resolution::NotFound, |function| {
+                    Resolution::Chosen(ChosenDefinition::only(function))
+                }));
         }
 
         // Step 2: Use manifest to get hashes for candidate files (fast HashMap lookups)
@@ -2437,7 +2442,9 @@ impl DatabaseManager {
             return Ok(self
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
                 .await?
-                .map(ChosenDefinition::only));
+                .map_or(Resolution::NotFound, |function| {
+                    Resolution::Chosen(ChosenDefinition::only(function))
+                }));
         }
 
         // Step 3: stat (and, on a mismatch, hash) each candidate against the
@@ -2466,10 +2473,12 @@ impl DatabaseManager {
             return Ok(self
                 .function_not_at_revision(name, revision, Absent::ContentNotIndexed)
                 .await?
-                .map(ChosenDefinition::only));
+                .map_or(Resolution::NotFound, |function| {
+                    Resolution::Chosen(ChosenDefinition::only(function))
+                }));
         }
 
-        Ok(Some(self.choose_definition(matches)))
+        Ok(self.choose_definition_in(matches, context))
     }
 
     /// Get just the types field for a function using pre-generated manifest (very fast - no body fetching)
@@ -2564,8 +2573,9 @@ impl DatabaseManager {
         // definition and list another's callees; the types beside them were
         // ranked by this copy of the older ladder and could disagree with both.
         let Some(chosen) = self
-            .find_function_with_manifest_reporting(name, git_manifest)
+            .find_function_with_manifest_reporting(name, git_manifest, crate::domain::Context::Any)
             .await?
+            .chosen()
         else {
             return Ok(Vec::new());
         };
@@ -2706,6 +2716,43 @@ impl DatabaseManager {
     /// A prototype is not an alternative: nearly every exported function has
     /// one, and counting it would call almost every name ambiguous. The row's
     /// own text decides, the same test a callee query uses.
+    /// The definition to answer about, within a constraint.
+    ///
+    /// The constraint runs before the ranking rather than as another rung of
+    /// it: a definition in another program or another architecture is not a
+    /// worse answer, it is not an answer. Where it admits nothing, the
+    /// candidates travel with the refusal, because "no x86 definition, and
+    /// here are the eleven that exist" is an answer and "not found" is not.
+    ///
+    /// `Context::Any` admits everything, so an unconstrained search ranks
+    /// exactly the candidates it found.
+    fn choose_definition_in(
+        &self,
+        matches: Vec<FunctionInfo>,
+        context: crate::domain::Context,
+    ) -> Resolution {
+        if matches.is_empty() {
+            return Resolution::NotFound;
+        }
+        let admitted: Vec<FunctionInfo> = matches
+            .iter()
+            .filter(|func| context.admits(crate::domain::domain_of(&func.file_path)))
+            .cloned()
+            .collect();
+        if admitted.is_empty() {
+            return Resolution::NoneAdmitted {
+                candidates: matches
+                    .iter()
+                    .map(|func| DefinitionSite {
+                        file_path: func.file_path.clone(),
+                        line_start: func.line_start,
+                    })
+                    .collect(),
+            };
+        }
+        Resolution::Chosen(self.choose_definition(admitted))
+    }
+
     fn choose_definition(&self, mut matches: Vec<FunctionInfo>) -> ChosenDefinition {
         if matches.len() == 1 {
             return ChosenDefinition::only(matches.into_iter().next().unwrap());
@@ -3761,18 +3808,42 @@ impl DatabaseManager {
         function_name: &str,
         git_sha: &str,
     ) -> Result<Vec<String>> {
+        self.get_function_callers_in(function_name, git_sha, crate::domain::Context::Any)
+            .await
+    }
+
+    /// Callers of a name that belong to a build the subject can be called
+    /// from.
+    ///
+    /// A caller list is built from every row whose `calls` names the target,
+    /// across the whole tree. Under `Context::Any` that is what comes back,
+    /// as before. Given a context, a caller in another architecture or
+    /// another program is dropped: it calls a different function that
+    /// happens to share the spelling, and listing it under this definition
+    /// says otherwise.
+    pub async fn get_function_callers_in(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+        context: crate::domain::Context,
+    ) -> Result<Vec<String>> {
+        let admits = |file_path: &str| context.admits(crate::domain::domain_of(file_path));
+
         // Collect callers from workdir overlay
         let workdir_callers = self.workdir_find_callers(function_name, git_sha);
-        let mut caller_names: Vec<String> =
-            workdir_callers.iter().map(|f| f.name.clone()).collect();
+        let mut caller_names: Vec<String> = workdir_callers
+            .iter()
+            .filter(|func| admits(&func.file_path))
+            .map(|func| func.name.clone())
+            .collect();
 
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         if !git_manifest.is_empty() {
             let db_callers = self
                 .get_function_callers_with_manifest(function_name, &git_manifest)
                 .await?;
-            for name in db_callers {
-                if !caller_names.contains(&name) {
+            for (name, file_path) in db_callers {
+                if admits(&file_path) && !caller_names.contains(&name) {
                     caller_names.push(name);
                 }
             }
@@ -3995,6 +4066,9 @@ impl DatabaseManager {
                     let callers = if let Some(manifest) = &git_manifest {
                         self.get_function_callers_with_manifest(&func_name, manifest)
                             .await?
+                            .into_iter()
+                            .map(|(name, _file_path)| name)
+                            .collect()
                     } else {
                         self.get_function_callers(&func_name).await?
                     };
@@ -4048,6 +4122,44 @@ impl DatabaseManager {
         }
         self.get_function_callees_with_manifest(function_name, &git_manifest)
             .await
+    }
+
+    /// What the definition this build reaches calls.
+    ///
+    /// Merging the callees of every definition of a name is how a chain
+    /// rooted in x86 grew sparc leaves: `__flush_tlb_all` has three
+    /// definitions and the union of their callees belongs to no build. The
+    /// architecture's own definition wins over a generic one, the way an
+    /// `asm/` header overrides `asm-generic/`.
+    pub async fn get_function_callees_in(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+        context: crate::domain::Context,
+    ) -> Result<Vec<String>> {
+        if matches!(context, crate::domain::Context::Any) {
+            return self
+                .get_function_callees_git_aware(function_name, git_sha)
+                .await;
+        }
+        let definitions = self
+            .get_function_callees_by_definition_git_aware(function_name, git_sha)
+            .await?;
+        let mut admitted: Vec<&crate::types::CalleeDefinition> = definitions
+            .iter()
+            .filter(|definition| context.admits(crate::domain::domain_of(&definition.file_path)))
+            .collect();
+        if admitted.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Most specific first: an architecture's own definition, then a
+        // generic one.
+        admitted.sort_by_key(|definition| {
+            crate::domain::domain_of(&definition.file_path)
+                .arch
+                .is_none()
+        });
+        Ok(admitted[0].callees.clone())
     }
 
     /// Every definition of the name at this commit, with what each calls.
@@ -4692,6 +4804,36 @@ impl DatabaseManager {
     /// Get all processed file records
     pub async fn get_all_processed_files(&self) -> Result<Vec<ProcessedFileRecord>> {
         self.processed_file_store.get_all().await
+    }
+
+    /// The architectures this index holds, sorted, from the paths it read.
+    ///
+    /// Empty on a tree that has no architectures, which is every tree that
+    /// is not Linux-shaped. A caller that offers an architecture constraint
+    /// checks a reader's pin against this rather than against the list of
+    /// architectures Linux has: on a tree with no architectures the
+    /// constraint admits everything, so a pin that is accepted there is a
+    /// filter that silently does nothing.
+    ///
+    /// Only the kernel's architectures. An architecture pin resolves to the
+    /// kernel build for that architecture, so offering one that exists only
+    /// under `tools/` -- `tools/perf/arch/x86`, `tools/arch/arm64` -- would
+    /// accept a pin that then admits no definition at all, which is the same
+    /// silent no-op one step later.
+    pub async fn indexed_architectures(&self) -> Result<Vec<&'static str>> {
+        let paths = self
+            .processed_file_store
+            .files_under_an_arch_directory()
+            .await?;
+        let mut arches: Vec<&'static str> = paths
+            .iter()
+            .map(|path| crate::domain::domain_of(path))
+            .filter(|domain| domain.program == crate::domain::Program::Kernel)
+            .filter_map(|domain| domain.arch)
+            .collect();
+        arches.sort_unstable();
+        arches.dedup();
+        Ok(arches)
     }
 
     /// Get all symbol-filename pairs
@@ -5833,9 +5975,13 @@ impl DatabaseManager {
             .get_function_callees_by_definition(function_name, git_manifest)
             .await?;
         let chosen = self
-            .find_function_with_manifest_reporting(function_name, git_manifest)
+            .find_function_with_manifest_reporting(
+                function_name,
+                git_manifest,
+                crate::domain::Context::Any,
+            )
             .await?;
-        let Some(chosen) = chosen else {
+        let Some(chosen) = chosen.chosen() else {
             return Ok(Vec::new());
         };
         Ok(definitions
@@ -5933,11 +6079,15 @@ impl DatabaseManager {
     }
 
     /// Get function callers using pre-generated manifest (fast)
+    /// Callers of a name, with the file each was found in.
+    ///
+    /// The file is what says which build a caller belongs to, and a caller
+    /// in another build is not a caller of this definition.
     pub async fn get_function_callers_with_manifest(
         &self,
         function_name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(String, String)>> {
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
         let table = self.connection.open_table("functions").execute().await?;
@@ -5998,7 +6148,7 @@ impl DatabaseManager {
                                 let calls_json = calls_array.value(i);
                                 let calls_list = crate::database::parse_call_list(calls_json)?;
                                 if calls_list.contains(&function_name.to_string()) {
-                                    callers.push(caller_name.to_string());
+                                    callers.push((caller_name.to_string(), file_path.to_string()));
                                 }
                             }
                         }

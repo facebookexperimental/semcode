@@ -11,6 +11,21 @@ function names, commit messages, symbols, and lore email searches.
 - **git_sha**: commit to search (default: current)
 - **branch**: branch name, resolved to its tip (e.g., "main"); takes
   precedence over git_sha if both are given
+- **scope**: which of several same-named definitions to answer about
+  (`find_callers`, `find_calls`, `find_callchain` only).  An object with one
+  key per axis; the only axis today is `arch`, so `{"arch": "x86"}`.  The
+  axis a language other than C needs -- the class, module or namespace that
+  owns a method -- is a different question and will get its own key rather
+  than being spelled `arch`.
+
+  Without a scope, a name defined once per architecture is answered from
+  whichever definition the resolver chooses.  An axis this index cannot
+  honour, or an architecture no indexed file belongs to, is refused rather
+  than ignored, and the refusal says what the index does have: on a tree
+  with no `arch` directories there is nothing to pin, and a pin accepted
+  there would be a filter that silently does nothing.  Where the name has no
+  definition the scope can reach, the answer says where it is defined
+  instead of "not found".
 - **page**: pagination (1-based); pages are 50 lines of the tool's
   rendered text output, not 50 result records.  Omit for full results.
 - **since_date / until_date**: e.g., "yesterday", "2 weeks ago",
@@ -37,6 +52,7 @@ function-like macros.
   - name: type/typedef name or regex
 **find_callers**: find callers (functions or macros) of the named entity
   - name: function or macro to search
+  - scope: answer about that scope's definition, e.g. `{"arch": "x86"}`
   - also reports callers that reach it through a function pointer, with the
     evidence for each: a site that names it outright, or a member it is
     installed in whose receiver has the matching type. Sites that match on
@@ -50,8 +66,11 @@ function-like macros.
   - answers "who can reach this?", the reverse of find_implementors
 **find_calls**: find callees (functions or macros) of the named entity
   - name: function or macro to search
+  - scope: answer about that scope's definition, e.g. `{"arch": "x86"}`
 **find_callchain**: complete call chain (forward and reverse)
   - name: function or macro to search
+  - scope: start the chain at that scope's definition; every hop is then
+    answered within that build
   - up_levels: number of caller levels to show (default: 2, 0 = unlimited)
   - down_levels: number of callee levels to show (default: 3, 0 = unlimited)
   - calls_limit: max calls to show per level (default: 15, 0 = unlimited)

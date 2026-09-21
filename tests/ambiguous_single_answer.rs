@@ -3,7 +3,7 @@
 // What a command that must give ONE answer says when the tree defines the name
 // more than once. A callee query reports every definition; `callers`, `func`
 // and `callchain` start from one, so what they owe the reader is the choice.
-use semcode::{git, DatabaseManager};
+use semcode::{git, DatabaseManager, Surface};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -88,15 +88,16 @@ async fn a_single_answer_names_the_definitions_it_set_aside() {
     let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
 
     let chosen = db
-        .find_function_git_aware_reporting("report", &sha)
+        .find_function_git_aware_reporting("report", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap_or_else(|| panic!("report should resolve"));
 
     // Every other definition is named, so the reader can ask again about one.
     assert_eq!(chosen.others.len(), 2, "{:?}", chosen.others);
     let note = chosen
-        .ambiguity_note()
+        .ambiguity_note(Surface::Repl)
         .unwrap_or_else(|| panic!("three definitions, so there is a choice to report"));
     assert!(note.contains("defined 3 times"), "{note}");
     assert!(note.contains("arch/x86/tools/decoder_test.c"), "{note}");
@@ -108,9 +109,10 @@ async fn the_answer_is_not_another_program_in_the_same_tree() {
     let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
 
     let chosen = db
-        .find_function_git_aware_reporting("report", &sha)
+        .find_function_git_aware_reporting("report", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
 
     // Ranked by the older ladder this is decoder_test.c: a `.c` file beats a
@@ -132,9 +134,10 @@ async fn the_chain_lists_the_callees_of_the_definition_it_names() {
     let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
 
     let named = db
-        .find_function_git_aware_reporting("report", &sha)
+        .find_function_git_aware_reporting("report", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
     let walked = db
         .get_function_callees_git_aware("report", &sha)
@@ -155,13 +158,14 @@ async fn a_name_defined_once_reports_no_choice() {
     let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
 
     let chosen = db
-        .find_function_git_aware_reporting("probe", &sha)
+        .find_function_git_aware_reporting("probe", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
     assert!(chosen.others.is_empty(), "{:?}", chosen.others);
     // A note on every answer is noise, and noise is skipped rather than read.
-    assert!(chosen.ambiguity_note().is_none());
+    assert!(chosen.ambiguity_note(Surface::Repl).is_none());
 }
 
 #[tokio::test]
@@ -297,9 +301,10 @@ async fn the_types_belong_to_the_definition_that_was_named() {
     let manifest = db.git_manifest_cached(&sha).await.unwrap();
 
     let chosen = db
-        .find_function_git_aware_reporting("report", &sha)
+        .find_function_git_aware_reporting("report", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
     let types = db
         .get_function_types_with_manifest("report", &manifest)
@@ -360,9 +365,10 @@ async fn a_use_of_the_name_is_not_an_answer_about_it() {
         .unwrap();
 
     let chosen = db
-        .find_function_git_aware_reporting("CHECK", &sha)
+        .find_function_git_aware_reporting("CHECK", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
     // Whatever else is stored under this name, the answer is the definition.
     assert_eq!(
@@ -421,18 +427,20 @@ async fn two_languages_one_definition_each_is_not_a_majority() {
         .unwrap();
 
     let first = db
-        .find_function_git_aware_reporting("solo", &sha)
+        .find_function_git_aware_reporting("solo", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
     let again = db
-        .find_function_git_aware_reporting("solo", &sha)
+        .find_function_git_aware_reporting("solo", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
     assert_eq!(first.function.file_path, again.function.file_path);
     assert_eq!(first.others.len(), 1, "{:?}", first.others);
-    let note = first.ambiguity_note().unwrap();
+    let note = first.ambiguity_note(Surface::Repl).unwrap();
     assert!(note.contains("defined 2 times"), "{note}");
 }
 
@@ -671,9 +679,10 @@ async fn the_three_commands_count_the_same_definitions() {
     let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
 
     let chosen = db
-        .find_function_git_aware_reporting("report", &sha)
+        .find_function_git_aware_reporting("report", &sha, semcode::domain::Context::Any)
         .await
         .unwrap()
+        .chosen()
         .unwrap();
     let listed = db
         .find_all_functions_git_aware("report", &sha)

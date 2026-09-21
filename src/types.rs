@@ -82,6 +82,76 @@ pub struct DefinitionSite {
 /// A command that walks a chain or lists callers needs one starting point, so
 /// it cannot report every definition the way a callee query does. Carrying the
 /// others with the choice lets it name them, which is the difference between
+/// What a name resolved to, within whatever constrained the search.
+///
+/// Three outcomes, not two. A name with no definition at this revision and a
+/// name whose every definition belongs to another architecture or another
+/// program are both "no answer", but only the second one knows where the
+/// other side is, and saying so is the difference between a dead end and a
+/// breadcrumb.
+///
+/// `NoneAdmitted` arises only where a search is constrained: an
+/// unconstrained one admits everything it finds.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    Chosen(ChosenDefinition),
+    /// No definition of the name at this revision.
+    NotFound,
+    /// Definitions exist, and the constraint admits none of them.
+    NoneAdmitted {
+        candidates: Vec<DefinitionSite>,
+    },
+}
+
+impl Resolution {
+    /// The answer, where there is one. For a caller with nothing to say
+    /// about the other two outcomes.
+    pub fn chosen(self) -> Option<ChosenDefinition> {
+        match self {
+            Resolution::Chosen(chosen) => Some(chosen),
+            _ => None,
+        }
+    }
+
+    /// The chosen function, where there is one.
+    pub fn function(self) -> Option<FunctionInfo> {
+        self.chosen().map(|chosen| chosen.function)
+    }
+}
+
+/// Where an answer is being read, which decides how a reader names an
+/// architecture.
+///
+/// The note that reports a choice has to say what to do about it, and the
+/// two surfaces take the constraint differently: a person types a flag, an
+/// MCP client sets an argument. A note that names the other surface's
+/// spelling is a remedy its reader cannot apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// The interactive query tool.
+    Repl,
+    /// The MCP server, read by an agent.
+    Mcp,
+}
+
+impl Surface {
+    /// How to ask the same question about a named architecture here.
+    fn arch_remedy(self) -> &'static str {
+        match self {
+            Surface::Repl => "Ask another with '--arch <arch>'",
+            Surface::Mcp => "Ask another with scope {\"arch\": \"<arch>\"}",
+        }
+    }
+
+    /// How to list every definition of a name here.
+    fn list_all(self, name: &str) -> String {
+        match self {
+            Surface::Repl => format!("'func {name}' lists them all"),
+            Surface::Mcp => format!("find_function '{name}' lists them all"),
+        }
+    }
+}
+
 /// picking one and hiding that there was a choice.
 #[derive(Debug, Clone)]
 pub struct ChosenDefinition {
@@ -102,9 +172,12 @@ impl ChosenDefinition {
     ///
     /// `None` where the name has one definition: a note on every answer would
     /// be noise, and noise is skipped rather than read.
-    pub fn ambiguity_note(&self) -> Option<String> {
+    pub fn ambiguity_note(&self, surface: Surface) -> Option<String> {
         if self.others.is_empty() {
             return None;
+        }
+        if let Some(note) = self.one_definition_per_architecture(surface) {
+            return Some(note);
         }
         let mut sites: Vec<String> = self
             .others
@@ -118,10 +191,10 @@ impl ChosenDefinition {
         const SHOWN: usize = 8;
         let listed = if sites.len() > SHOWN {
             format!(
-                "{}, and {} more ('func {}' lists them all)",
+                "{}, and {} more ({})",
                 sites[..SHOWN].join(", "),
                 sites.len() - SHOWN,
-                self.function.name
+                surface.list_all(&self.function.name)
             )
         } else {
             sites.join(", ")
@@ -138,36 +211,79 @@ impl ChosenDefinition {
             listed
         ))
     }
+
+    /// The note for a name that is defined once per architecture.
+    ///
+    /// `None` unless every definition belongs to an architecture and at
+    /// least two architectures are involved, because that is the case where
+    /// the general note is both true and useless: it says the answer depends
+    /// on the configuration without saying that the reader can decide it.
+    ///
+    /// A name with a generic definition beside the architecture-specific
+    /// ones is not this case. Generic is what a build without its own
+    /// definition reaches, so there is a sensible answer to give.
+    fn one_definition_per_architecture(&self, surface: Surface) -> Option<String> {
+        let sites: Vec<(&str, u32)> =
+            std::iter::once((self.function.file_path.as_str(), self.function.line_start))
+                .chain(
+                    self.others
+                        .iter()
+                        .map(|site| (site.file_path.as_str(), site.line_start)),
+                )
+                .collect();
+
+        let mut arches: Vec<&str> = Vec::new();
+        for (path, _) in &sites {
+            let domain = crate::domain::domain_of(path);
+            let arch = domain.arch?;
+            if domain.program != crate::domain::Program::Kernel {
+                return None;
+            }
+            if !arches.contains(&arch) {
+                arches.push(arch);
+            }
+        }
+        if arches.len() < 2 {
+            return None;
+        }
+        arches.sort_unstable();
+
+        let chosen_arch = crate::domain::domain_of(&self.function.file_path).arch?;
+        Some(format!(
+            "'{}' has one definition per architecture: {}. This answer is \
+             about {}, at {}:{}. {}; no build has more than one.",
+            self.function.name,
+            arches.join(", "),
+            chosen_arch,
+            self.function.file_path,
+            self.function.line_start,
+            surface.arch_remedy(),
+        ))
+    }
 }
 
 /// Whether a path holds a program other than the one an audit is about.
 ///
-/// A source tree can build more than one program. Linux builds host tools from
-/// every directory named `tools` -- the top-level one and `arch/x86/tools`,
-/// `arch/arm64/tools`, `drivers/comedi/drivers/ni_routing/tools` and nine more
-/// -- example code from `samples`, and prose from `Documentation`. Those
+/// A source tree can build more than one program. Linux builds host tools
+/// from every directory named `tools` -- the top-level one and
+/// `arch/x86/tools` and eleven more -- example code from `samples`, prose
+/// from `Documentation`, and a proc-macro crate from `rust/macros`. Those
 /// programs define names the kernel also defines: of nine definitions of
 /// `pr_warn`, eight are outside the kernel image.
 ///
-/// A path component, not a prefix: the definition that made this necessary is
-/// `arch/x86/tools/insn_decoder_test.c`, which no prefix of `tools/` matches.
-/// Every directory named `tools` in that tree holds a host program, so the
-/// component is the signal.
+/// This orders a choice between definitions. It never drops one: a name
+/// defined only under `tools` still answers, and the choice is reported
+/// either way.
 ///
-/// This orders a choice between definitions. It never drops one: a name defined
-/// only under `tools` still answers, and the choice is reported either way, so
-/// a tie-break that goes the wrong way is visible rather than silent.
-///
-/// `scripts` and `usr` are deliberately absent, though they read as though they
-/// belong: both hold code that ends up in the built image. `scripts/module-common.c`
-/// is compiled into every `.ko` (`scripts/Makefile.modfinal:28`) and
-/// `usr/initramfs_data.S` is linked in, so the directory name does not imply
-/// another program there the way it does for `tools`.
+/// The taxonomy lives in [`crate::domain`], which reads the same paths for
+/// the resolution filter. Two answers to this question in one binary is how
+/// a host tool becomes the preferred definition for a caller in its
+/// directory, so there is one: this asks whether the program is the kernel.
+/// That module also holds what a component test could not: `samples/` is
+/// half kernel modules and half userspace programs, and
+/// `scripts/dtc/libfdt` is compiled into the kernel by `lib/fdt_ro.c`.
 pub fn path_is_other_program(file_path: &str) -> bool {
-    const OTHER_PROGRAMS: [&str; 3] = ["tools", "samples", "Documentation"];
-    file_path
-        .split('/')
-        .any(|component| OTHER_PROGRAMS.contains(&component))
+    crate::domain::path_is_other_program(file_path)
 }
 
 /// The language a path's extension names, for grouping definitions of one name.
@@ -786,4 +902,120 @@ impl Drop for GitFileEntry {
 pub struct GitFileManifestEntry {
     pub relative_path: std::path::PathBuf,
     pub object_id: gix::ObjectId,
+}
+
+#[cfg(test)]
+mod ambiguity_note_tests {
+    use super::*;
+
+    fn definition(name: &str, path: &str, line: u32) -> FunctionInfo {
+        FunctionInfo {
+            name: name.to_string(),
+            file_path: path.to_string(),
+            git_file_hash: String::new(),
+            line_start: line,
+            line_end: line,
+            return_type: "void".to_string(),
+            parameters: Vec::new(),
+            body: String::new(),
+            calls: None,
+            types: None,
+        }
+    }
+
+    fn site(path: &str, line: u32) -> DefinitionSite {
+        DefinitionSite {
+            file_path: path.to_string(),
+            line_start: line,
+        }
+    }
+
+    #[test]
+    fn one_definition_is_no_note() {
+        let chosen = ChosenDefinition::only(definition("f", "mm/memory.c", 1));
+        assert!(chosen.ambiguity_note(Surface::Repl).is_none());
+    }
+
+    #[test]
+    fn one_per_architecture_says_so_and_says_how_to_ask() {
+        let chosen = ChosenDefinition {
+            function: definition("__flush_tlb_all", "arch/sparc/mm/init_64.c", 2758),
+            others: vec![
+                site("arch/x86/mm/tlb.c", 1663),
+                site("arch/arm/include/asm/tlbflush.h", 343),
+            ],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(note.contains("one definition per architecture"), "{note}");
+        assert!(note.contains("arm, sparc, x86"), "{note}");
+        assert!(note.contains("--arch"), "{note}");
+        // The general note's prose about configuration is the thing this
+        // replaces: it is true and it tells the reader nothing to do.
+        assert!(!note.contains("depends on"), "{note}");
+    }
+
+    #[test]
+    fn the_remedy_is_the_one_its_reader_can_use() {
+        // A note read by an agent that names the query tool's flag asks for
+        // something the protocol has no way to send.
+        let chosen = ChosenDefinition {
+            function: definition("__flush_tlb_all", "arch/sparc/mm/init_64.c", 2758),
+            others: vec![site("arch/x86/mm/tlb.c", 1663)],
+        };
+        let note = chosen.ambiguity_note(Surface::Mcp).unwrap();
+        assert!(note.contains(r#"scope {"arch": "<arch>"}"#), "{note}");
+        assert!(!note.contains("--arch"), "{note}");
+    }
+
+    #[test]
+    fn the_way_to_list_every_definition_is_named_per_surface() {
+        // The general note points at a command; an MCP client has a tool of
+        // another name and no command line to type it on.
+        let others: Vec<DefinitionSite> = (0..12)
+            .map(|i| site(&format!("drivers/net/e{i}.c"), 10 + i))
+            .collect();
+        let chosen = ChosenDefinition {
+            function: definition("probe", "drivers/net/e0.c", 5),
+            others,
+        };
+        let repl = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(repl.contains("'func probe' lists them all"), "{repl}");
+        let mcp = chosen.ambiguity_note(Surface::Mcp).unwrap();
+        assert!(mcp.contains("find_function 'probe'"), "{mcp}");
+        assert!(!mcp.contains("'func probe'"), "{mcp}");
+    }
+
+    #[test]
+    fn a_generic_definition_beside_them_is_a_different_case() {
+        // Generic is what a build without its own definition reaches, so
+        // there is a sensible answer and no choice to push back.
+        let chosen = ChosenDefinition {
+            function: definition("handle_mm_fault", "mm/memory.c", 6841),
+            others: vec![site("arch/x86/mm/fault.c", 100)],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(!note.contains("one definition per architecture"), "{note}");
+    }
+
+    #[test]
+    fn two_definitions_in_one_architecture_are_not_one_per_architecture() {
+        // sparc has setup_32 and setup_64, and neither --arch nor anything
+        // else in the index tells them apart.
+        let chosen = ChosenDefinition {
+            function: definition("setup_arch", "arch/sparc/kernel/setup_32.c", 283),
+            others: vec![site("arch/sparc/kernel/setup_64.c", 622)],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(!note.contains("one definition per architecture"), "{note}");
+    }
+
+    #[test]
+    fn a_definition_in_another_program_is_not_an_architecture_choice() {
+        let chosen = ChosenDefinition {
+            function: definition("report", "arch/x86/kernel/setup.c", 10),
+            others: vec![site("tools/perf/builtin-stat.c", 20)],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(!note.contains("one definition per architecture"), "{note}");
+    }
 }

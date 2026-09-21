@@ -95,6 +95,7 @@ async fn build_forward_callchain_with_git(
         max_depth,
         true,
         &mut HashSet::new(),
+        crate::domain::Context::Any,
     ))
 }
 
@@ -119,9 +120,17 @@ async fn build_reverse_callchain_with_git(
         max_depth,
         false,
         &mut HashSet::new(),
+        crate::domain::Context::Any,
     ))
 }
 
+/// Walk the chain, carrying the build it entered from.
+///
+/// The context is sticky. A hop into generic code does not clear it, because
+/// generic code calls whichever definition the build selects: that is what
+/// keeps `do_page_fault` -> `handle_mm_fault` -> `pte_present` on x86
+/// through a file in mm/. A hop into an architecture's own code narrows it,
+/// and a hop into another architecture is not walked at all.
 fn build_callchain_recursive_sync(
     function_map: &HashMap<String, Vec<FunctionInfo>>,
     call_relationships: &CallRelationships,
@@ -129,6 +138,7 @@ fn build_callchain_recursive_sync(
     remaining_depth: usize,
     forward: bool,
     visited: &mut HashSet<String>,
+    context: crate::domain::Context,
 ) -> CallNode {
     // Prevent infinite recursion
     if remaining_depth == 0 || visited.contains(func_name) {
@@ -149,9 +159,26 @@ fn build_callchain_recursive_sync(
         children: vec![],
     };
 
-    if let Some(func) = function_map.get(func_name).and_then(|f| f.first()) {
+    // The definition this walk can reach, not whichever one sorts first.
+    // Choosing per hop, with nothing carried between them, is what lets a
+    // chain rooted in x86 list an alpha caller and a sparc callee.
+    let reachable = function_map.get(func_name).and_then(|definitions| {
+        definitions
+            .iter()
+            .find(|func| context.admits(crate::domain::domain_of(&func.file_path)))
+    });
+
+    if let Some(func) = reachable {
         node.file = func.file_path.clone();
         node.line = func.line_start;
+
+        // Narrow on entering an architecture's own code, keep what we had on
+        // generic code.
+        let here = crate::domain::domain_of(&func.file_path);
+        let child_context = match context {
+            crate::domain::Context::In(current) if current.arch.is_some() => context,
+            _ => crate::domain::Context::In(here),
+        };
 
         let next_funcs = if forward {
             call_relationships.function_calls.get(func_name)
@@ -168,6 +195,7 @@ fn build_callchain_recursive_sync(
                     remaining_depth - 1,
                     forward,
                     visited,
+                    child_context,
                 );
                 node.children.push(child);
             }
@@ -274,6 +302,42 @@ fn when_it_runs(level: &str) -> &'static str {
 /// this tree, 2 of 20 rows of one such list have an ambiguous name, so the
 /// count is worth carrying and the paths are not. The reader who wants them
 /// asks about that name.
+/// What to say about a name whose definitions all belong to another build.
+///
+/// "Not found" would be a lie: the name is defined, just not anywhere this
+/// caller can reach. Naming where the other side lives is the whole
+/// difference between a dead end and a breadcrumb.
+pub fn elsewhere_note(
+    candidates: &[crate::types::DefinitionSite],
+    context: crate::domain::Context,
+) -> String {
+    // The whole build, not only its architecture. A candidate can be
+    // rejected for belonging to another program while sitting in a path that
+    // names the architecture that was asked for, and an answer that says
+    // "no definition in x86" beside an `arch/x86` path reads as wrong rather
+    // than as a different program.
+    let here = match context {
+        crate::domain::Context::In(domain) => domain.describe(),
+        crate::domain::Context::Any => "this build".to_string(),
+    };
+    let mut sites: Vec<String> = candidates
+        .iter()
+        .map(|site| format!("{}:{}", site.file_path, site.line_start))
+        .collect();
+    sites.sort();
+    const SHOWN: usize = 3;
+    let listed = if sites.len() > SHOWN {
+        format!(
+            "{}, and {} more",
+            sites[..SHOWN].join(", "),
+            sites.len() - SHOWN
+        )
+    } else {
+        sites.join(", ")
+    };
+    format!("no definition in {here}; defined at {listed}")
+}
+
 fn definition_marker(chosen: &crate::types::ChosenDefinition) -> String {
     match chosen.others.len() {
         0 => String::new(),
@@ -288,23 +352,50 @@ pub async fn show_callers_to_writer(
     verbose: bool,
     git_sha: &str,
 ) -> Result<()> {
+    show_callers_to_writer_in(
+        db,
+        name,
+        writer,
+        verbose,
+        git_sha,
+        crate::domain::Context::Any,
+    )
+    .await
+}
+
+pub async fn show_callers_to_writer_in(
+    db: &DatabaseManager,
+    name: &str,
+    writer: &mut dyn Write,
+    verbose: bool,
+    git_sha: &str,
+    pin: crate::domain::Context,
+) -> Result<()> {
     let search_msg = format!("Finding all functions that call: {}", name.cyan());
     writeln!(writer, "{search_msg}")?;
 
     // Search for function - macros are now stored as functions
-    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(name, git_sha, pin)
+        .await?
+        .chosen();
 
     match chosen_opt {
         Some(chosen) => {
             // Callers are found by name, and a name can belong to several
             // functions. Listing them under one definition's heading says the
             // callers of the others belong to it.
-            if let Some(note) = chosen.ambiguity_note() {
+            if let Some(note) = chosen.ambiguity_note(crate::types::Surface::Repl) {
                 writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
             }
             let func = chosen.function;
-            // Always use git-aware callers query
-            let callers = db.get_function_callers_git_aware(name, git_sha).await?;
+            let subject_context =
+                crate::domain::Context::In(crate::domain::domain_of(&func.file_path));
+            // Callers of THIS definition, not of the name: a caller in
+            // another architecture calls the definition in its own.
+            let callers = db
+                .get_function_callers_in(name, git_sha, subject_context)
+                .await?;
             let indirect = db.find_indirect_callers(name, git_sha).await?;
             // Nothing in the source calls an initcall: the pointer sits in a
             // section that do_initcalls() walks at boot. Saying only that
@@ -423,9 +514,16 @@ pub async fn show_callers_to_writer(
 
                 writeln!(
                     writer,
-                    "{} functions directly call '{}':",
+                    "{} functions directly call '{}'{}:",
                     callers.len(),
-                    name
+                    name,
+                    match subject_context {
+                        crate::domain::Context::In(domain) => domain
+                            .arch
+                            .map(|arch| format!(" from {arch}"))
+                            .unwrap_or_default(),
+                        crate::domain::Context::Any => String::new(),
+                    }
                 )?;
 
                 for (i, caller) in callers.iter().enumerate() {
@@ -434,24 +532,38 @@ pub async fn show_callers_to_writer(
 
                     // Only perform extra lookups in verbose mode
                     if verbose {
-                        // Get more info about the caller
-                        if let Ok(Some(chosen)) =
-                            db.find_function_git_aware_reporting(caller, git_sha).await
+                        // Resolved within the subject's own build: a caller of
+                        // an x86 function is x86 or generic code, and a sparc
+                        // definition of that name is a different function that
+                        // happens to share a spelling.
+                        match db
+                            .find_function_git_aware_reporting(caller, git_sha, subject_context)
+                            .await
                         {
-                            // The file and line of a name with several
-                            // definitions is one of them, and a row of a list
-                            // has no other way to say so.
-                            let marker = definition_marker(&chosen);
-                            let caller_func = chosen.function;
-                            let info = format!(
-                                "     {} ({}:{}) [file SHA: {}]{}",
-                                caller_func.return_type.bright_black(),
-                                caller_func.file_path.bright_black(),
-                                caller_func.line_start,
-                                caller_func.git_file_hash.bright_black(),
-                                marker.yellow()
-                            );
-                            writeln!(writer, "{info}")?;
+                            Ok(crate::types::Resolution::NoneAdmitted { candidates }) => {
+                                writeln!(
+                                    writer,
+                                    "     {}",
+                                    elsewhere_note(&candidates, subject_context).bright_black()
+                                )?;
+                            }
+                            Ok(crate::types::Resolution::Chosen(chosen)) => {
+                                // The file and line of a name with several
+                                // definitions is one of them, and a row of a list
+                                // has no other way to say so.
+                                let marker = definition_marker(&chosen);
+                                let caller_func = chosen.function;
+                                let info = format!(
+                                    "     {} ({}:{}) [file SHA: {}]{}",
+                                    caller_func.return_type.bright_black(),
+                                    caller_func.file_path.bright_black(),
+                                    caller_func.line_start,
+                                    caller_func.git_file_hash.bright_black(),
+                                    marker.yellow()
+                                );
+                                writeln!(writer, "{info}")?;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -962,8 +1074,14 @@ pub async fn show_callees_to_writer(
                     // Only perform extra lookups in verbose mode
                     if verbose {
                         // Get more info about the callee
-                        if let Ok(Some(chosen)) =
-                            db.find_function_git_aware_reporting(callee, git_sha).await
+                        if let Ok(Some(chosen)) = db
+                            .find_function_git_aware_reporting(
+                                callee,
+                                git_sha,
+                                crate::domain::Context::Any,
+                            )
+                            .await
+                            .map(|resolution| resolution.chosen())
                         {
                             let marker = definition_marker(&chosen);
                             let callee_func = chosen.function;
@@ -1159,14 +1277,17 @@ pub async fn show_callchain_to_writer(
     writeln!(writer, "{search_msg}")?;
 
     // Use provided git SHA
-    let chosen_opt = db.find_function_git_aware_reporting(name, git_sha).await?;
+    let chosen_opt = db
+        .find_function_git_aware_reporting(name, git_sha, crate::domain::Context::Any)
+        .await?
+        .chosen();
 
     match chosen_opt {
         Some(chosen) => {
             // A chain is read as one path, so it starts at one definition. It
             // said which file that was and not that there had been a choice,
             // which reads as the tree having one.
-            if let Some(note) = chosen.ambiguity_note() {
+            if let Some(note) = chosen.ambiguity_note(crate::types::Surface::Repl) {
                 writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
             }
             let func = chosen.function;
@@ -1394,7 +1515,22 @@ pub async fn show_callers(
     verbose: bool,
     git_sha: &str,
 ) -> Result<()> {
-    show_callers_to_writer(db, name, &mut stdout(), verbose, git_sha).await
+    show_callers_in(db, name, verbose, git_sha, crate::domain::Context::Any).await
+}
+
+/// `callers`, asked from a named build.
+///
+/// A pin decides which definition the question is about before the chooser
+/// gets a say, which is the difference between "callers of the x86
+/// definition" and "callers of whichever definition sorted first".
+pub async fn show_callers_in(
+    db: &DatabaseManager,
+    name: &str,
+    verbose: bool,
+    git_sha: &str,
+    pin: crate::domain::Context,
+) -> Result<()> {
+    show_callers_to_writer_in(db, name, &mut stdout(), verbose, git_sha, pin).await
 }
 
 /// Wrapper function for show_callees with verbose option

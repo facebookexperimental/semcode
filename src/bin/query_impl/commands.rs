@@ -7,9 +7,7 @@ use regex;
 use semcode::{git, DatabaseManager, LoreEmailFilters};
 
 use owo_colors::OwoColorize as _;
-use semcode::callchain::{
-    find_all_paths, show_callees, show_callers, show_implementors, show_registrations,
-};
+use semcode::callchain::{find_all_paths, show_callees, show_implementors, show_registrations};
 use semcode::display::print_help;
 use semcode::file_survey::survey_file_json_with_references;
 use semcode::lore_writers::{
@@ -93,6 +91,44 @@ struct ShowCommitMetadataParams<'a> {
 
 /// Parse a potential git SHA from command arguments or default to current HEAD
 /// Returns (remaining_args, git_sha)
+/// The build a question is asked from, if the reader named one.
+///
+/// `--arch x86` is to architecture what `--git` is to revision: without it a
+/// name with one definition per architecture is answered from whichever the
+/// chooser lands on, which is a coin flip presented as a fact.
+fn parse_arch_pin<'a>(parts: &'a [&'a str]) -> (Vec<&'a str>, Option<String>) {
+    let mut pin = None;
+    let mut remaining = Vec::new();
+    let mut index = 0;
+    while index < parts.len() {
+        if parts[index] == "--arch" && index + 1 < parts.len() {
+            pin = Some(parts[index + 1].to_string());
+            index += 2;
+            continue;
+        }
+        remaining.push(parts[index]);
+        index += 1;
+    }
+    (remaining, pin)
+}
+
+/// The context a pin names, or no constraint at all.
+///
+/// A pin that names no architecture this build knows is refused rather than
+/// ignored: a typo that silently answers about everything is the failure
+/// this whole series is about.
+fn context_for_pin(pin: Option<&str>) -> Result<semcode::domain::Context> {
+    let Some(arch) = pin else {
+        return Ok(semcode::domain::Context::Any);
+    };
+    match semcode::domain::kernel_arch(arch) {
+        Some(domain) => Ok(semcode::domain::Context::In(domain)),
+        None => Err(anyhow::anyhow!(
+            "'{arch}' is not an architecture in this tree"
+        )),
+    }
+}
+
 /// Now always returns a git SHA - either from --git flag, target branch, current HEAD, or a default
 fn parse_git_sha<'a>(
     parts: &'a [&'a str],
@@ -192,6 +228,7 @@ async fn show_callchain_with_limits(
     up_levels: usize,
     down_levels: usize,
     calls_limit: usize,
+    pin: semcode::domain::Context,
 ) -> Result<()> {
     println!("Building call chain for: {}", function_name.cyan());
     println!("Git SHA: {}", git_sha.bright_black());
@@ -202,8 +239,9 @@ async fn show_callchain_with_limits(
 
     // First, check if function exists using git-aware query
     let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha)
-        .await?;
+        .find_function_git_aware_reporting(function_name, git_sha, pin)
+        .await?
+        .chosen();
 
     let chosen = match chosen_opt {
         Some(chosen) => chosen,
@@ -219,7 +257,7 @@ async fn show_callchain_with_limits(
     };
     // One chain, so one definition. Say so rather than presenting the choice
     // as the tree's only answer.
-    if let Some(note) = chosen.ambiguity_note() {
+    if let Some(note) = chosen.ambiguity_note(semcode::Surface::Repl) {
         println!("{} {}", "Ambiguous:".bold().yellow(), note);
     }
     let func = chosen.function;
@@ -238,12 +276,18 @@ async fn show_callchain_with_limits(
         }
     }
 
+    // Every hop of this chain is about the definition the root resolved to,
+    // so it is answered within that definition's build. Sticky: a hop into
+    // generic code keeps the architecture, because generic code calls
+    // whichever definition the build selects.
+    let chain_context = semcode::domain::Context::In(semcode::domain::domain_of(&func.file_path));
+
     // Get callers and callees using git-aware methods (same as MCP tool)
     let callers = db
-        .get_function_callers_git_aware(function_name, git_sha)
+        .get_function_callers_in(function_name, git_sha, chain_context)
         .await?;
     let callees = db
-        .get_function_callees_git_aware(function_name, git_sha)
+        .get_function_callees_in(function_name, git_sha, chain_context)
         .await?;
 
     // A function reached only through a pointer has no direct callers, so
@@ -286,7 +330,11 @@ async fn show_callchain_with_limits(
             println!("{}. {}", (i + 1).to_string().yellow(), caller.cyan());
 
             // Show caller details if available
-            if let Ok(Some(chosen)) = db.find_function_git_aware_reporting(caller, git_sha).await {
+            if let Ok(Some(chosen)) = db
+                .find_function_git_aware_reporting(caller, git_sha, chain_context)
+                .await
+                .map(|resolution| resolution.chosen())
+            {
                 // One of several definitions, where the name has several. A
                 // row of a list has no other room to say so.
                 let marker = match chosen.others.len() {
@@ -305,8 +353,9 @@ async fn show_callchain_with_limits(
 
             // For multi-level depth, show second-level callers
             if up_levels > 1 {
-                if let Ok(second_level_callers) =
-                    db.get_function_callers_git_aware(caller, git_sha).await
+                if let Ok(second_level_callers) = db
+                    .get_function_callers_in(caller, git_sha, chain_context)
+                    .await
                 {
                     let limited_second: Vec<_> = if calls_limit == 0 {
                         second_level_callers
@@ -355,7 +404,11 @@ async fn show_callchain_with_limits(
             println!("{}. {}", (i + 1).to_string().yellow(), callee.cyan());
 
             // Show callee details if available
-            if let Ok(Some(chosen)) = db.find_function_git_aware_reporting(callee, git_sha).await {
+            if let Ok(Some(chosen)) = db
+                .find_function_git_aware_reporting(callee, git_sha, chain_context)
+                .await
+                .map(|resolution| resolution.chosen())
+            {
                 let marker = match chosen.others.len() {
                     0 => String::new(),
                     others => format!(" [1 of {} definitions]", others + 1),
@@ -372,8 +425,9 @@ async fn show_callchain_with_limits(
 
             // For multi-level depth, show second-level callees
             if down_levels > 1 {
-                if let Ok(second_level_callees) =
-                    db.get_function_callees_git_aware(callee, git_sha).await
+                if let Ok(second_level_callees) = db
+                    .get_function_callees_in(callee, git_sha, chain_context)
+                    .await
                 {
                     let limited_second: Vec<_> = if calls_limit == 0 {
                         second_level_callees
@@ -1161,12 +1215,13 @@ pub async fn handle_command(
         }
         "callers" => {
             // Parse only -v flag (git_sha already parsed by main handler)
+            let (parts, arch_pin) = parse_arch_pin(&parts);
             let (parsed_parts, verbose) = parse_verbose_flag(&parts);
 
             if parsed_parts.len() < 2 {
                 println!(
                     "{}",
-                    "Usage: callers [-v] [--git <sha>] <function_name>".red()
+                    "Usage: callers [-v] [--git <sha>] [--arch <arch>] <function_name>".red()
                 );
                 println!("  Find functions that call the given function, optionally at a specific git commit");
                 println!(
@@ -1175,7 +1230,13 @@ pub async fn handle_command(
                 println!("  Defaults to current git commit when in a git repository");
             } else {
                 let name = parsed_parts[1..].join(" ");
-                show_callers(db, &name, verbose, &git_sha).await?;
+                match context_for_pin(arch_pin.as_deref()) {
+                    Ok(pinned) => {
+                        semcode::callchain::show_callers_in(db, &name, verbose, &git_sha, pinned)
+                            .await?
+                    }
+                    Err(e) => println!("{}", e.to_string().red()),
+                }
             }
         }
         "implementors" => {
@@ -1246,6 +1307,7 @@ pub async fn handle_command(
             }
         }
         "callchain" => {
+            let (parts, arch_pin) = parse_arch_pin(&parts);
             if parts.len() < 2 {
                 println!("{}", "Usage: callchain [--git <sha>] [--up <levels>] [--down <levels>] [--calls <limit>] <function_name>".red());
                 println!(
@@ -1258,7 +1320,15 @@ pub async fn handle_command(
                     "  --down <levels>: Number of callee levels to show (default: 5, 0 = no limit)"
                 );
                 println!("  --calls <limit>: Maximum calls to show per level (default: 15, 0 = no limit)");
+                println!("  --arch <arch>:   Ask from one architecture, rather than from whichever definition is chosen");
             } else {
+                let pinned_context = match context_for_pin(arch_pin.as_deref()) {
+                    Ok(pinned) => pinned,
+                    Err(e) => {
+                        println!("{}", e.to_string().red());
+                        return Ok(true);
+                    }
+                };
                 // Parse --up, --down, and --calls arguments
                 let mut up_levels = 2; // default
                 let mut down_levels = 3; // default
@@ -1325,6 +1395,7 @@ pub async fn handle_command(
                     up_levels,
                     down_levels,
                     calls_limit,
+                    pinned_context,
                 )
                 .await
                 {
