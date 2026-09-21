@@ -8325,3 +8325,214 @@ mod macro_defined_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod preproc_error_recovery_tests {
+    //! What an unparseable construct does to the `#define`s after it.
+    //!
+    //! A construct tree-sitter-c cannot read -- an attribute macro between
+    //! the storage class and the return type, `static inline __printf(3, 4)`
+    //! -- yields an `ERROR` node that does not stop at the declaration. It
+    //! runs on and swallows every following directive, so no
+    //! `preproc_function_def` exists for the extraction query to match.
+    //! `include/linux/dev_printk.h` contributes one of its 41 function-like
+    //! macros to the index for this reason, and nothing is logged: the file
+    //! indexes "successfully".
+    //!
+    //! Measured on Linux 50d05c7c76c9 with tree-sitter 0.26.11 and
+    //! tree-sitter-c 0.24.2: 1,224 function-like `#define`s across 435 files
+    //! do not exist in the index. The parser version is part of that
+    //! measurement.
+    //!
+    //! These fixtures are the shapes, reduced until each is the smallest
+    //! source that still reproduces what the tree does. The tests that hold
+    //! today record what is lost and where recovery must not go; the ones
+    //! marked `ignore` are the recovery's own gates, and they fail until it
+    //! exists (`cargo test -- --ignored`).
+
+    use super::*;
+
+    /// The defect, minimised. `before` is indexed; `after` is not.
+    const ATTRIBUTE_SWALLOW: &str = "#define before(x) x\n\
+         \n\
+         static inline __printf(3, 4)\n\
+         void plain_printk(const char *level, const char *fmt, ...)\n\
+         {}\n\
+         \n\
+         #define after(x) x\n";
+
+    /// `dev_printk.h`'s shape: one macro, then the unreadable declaration,
+    /// then everything the header exists to define -- including a macro
+    /// whose body continues over a line and one defined once per branch.
+    const LOGGING_HEADER: &str = "#define dev_fmt(fmt) fmt\n\
+         \n\
+         static inline __printf(3, 4)\n\
+         void dev_printk_emit(int level, const struct device *dev, const char *fmt, ...)\n\
+         {}\n\
+         \n\
+         #define dev_printk(level, dev, fmt, ...) \\\n\
+         \tdev_printk_emit(level, dev, fmt, ##__VA_ARGS__)\n\
+         \n\
+         #define dev_err(dev, fmt, ...) dev_printk(3, dev, fmt, ##__VA_ARGS__)\n\
+         \n\
+         #ifdef CONFIG_DYNAMIC_DEBUG\n\
+         #define dev_dbg(dev, fmt, ...) dynamic_dev_dbg(dev, fmt, ##__VA_ARGS__)\n\
+         #elif defined(DEBUG)\n\
+         #define dev_dbg(dev, fmt, ...) dev_printk(7, dev, fmt, ##__VA_ARGS__)\n\
+         #else\n\
+         #define dev_dbg(dev, fmt, ...) dev_no_printk(dev, fmt)\n\
+         #endif\n";
+
+    /// A commented-out `#define` inside the swallowed span. Recovery works
+    /// by blanking what an `ERROR` covers, which can strip the comment
+    /// delimiters around this one and leave a directive the file never
+    /// declared.
+    const SWALLOWED_COMMENT: &str = "#define kept(x) x\n\
+         \n\
+         static inline __printf(3, 4)\n\
+         void plain_printk(const char *level, const char *fmt, ...)\n\
+         {\n\
+         \tif (level) {\n\
+         \n\
+         /*\n\
+          * #define GHOST(x) x\n\
+          */\n\
+         #define real(x) x\n";
+
+    /// A `#define` between the members of an `enum`. The grammar reports a
+    /// missing comma and produces no node for the directive, and the span
+    /// covers only the directive's own lines, so the file's later macros are
+    /// unaffected. Recovery blanks code lines, not directives, so this one
+    /// is out of its reach by construction.
+    const DEFINE_INSIDE_ENUM: &str = "enum thing {\n\
+         \tFIRST,\n\
+         #define IN_ENUM(x) x\n\
+         \tSECOND\n\
+         #define SECOND_IN_ENUM(x) x\n\
+         };\n\
+         \n\
+         #define after_enum(x) x\n";
+
+    fn macros_in(source: &str) -> Vec<(String, u32)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new("fixture.h"), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, u32)> = analysis
+            .macros
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.line_start))
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn macro_names(source: &str) -> Vec<String> {
+        let mut names: Vec<String> = macros_in(source)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.dedup();
+        names
+    }
+
+    #[test]
+    fn an_unreadable_declaration_swallows_the_directives_after_it() {
+        // The seven lines the whole defect reduces to. The directive before
+        // the declaration is indexed and the one after it does not exist.
+        assert_eq!(
+            macros_in(ATTRIBUTE_SWALLOW),
+            vec![("before".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_logging_header_contributes_the_macro_above_the_declaration() {
+        // dev_printk.h in miniature: of the four names it defines, the index
+        // gets the one that sits above the unreadable line.
+        assert_eq!(macro_names(LOGGING_HEADER), vec!["dev_fmt".to_string()]);
+    }
+
+    #[test]
+    fn a_define_between_enum_members_is_lost_and_takes_nothing_with_it() {
+        // Both directives inside the braces are gone, and the macro after
+        // the enum is not, which is what bounds this case: the span does not
+        // run on. Recovery must not claim it.
+        assert_eq!(
+            macros_in(DEFINE_INSIDE_ENUM),
+            vec![("after_enum".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    fn a_commented_out_define_is_never_a_definition() {
+        // The guard against a phantom: a count that goes up is not evidence
+        // that what was gained was ever declared. This holds now because
+        // nothing in the swallowed span is read at all, and it must still
+        // hold once the span is recovered.
+        for source in [
+            ATTRIBUTE_SWALLOW,
+            LOGGING_HEADER,
+            SWALLOWED_COMMENT,
+            DEFINE_INSIDE_ENUM,
+        ] {
+            assert!(
+                !macro_names(source).contains(&"GHOST".to_string()),
+                "a macro inside a comment was extracted"
+            );
+        }
+    }
+
+    #[test]
+    fn what_parses_today_is_the_baseline_recovery_may_not_lose() {
+        // Recovery replaces a parse with one of a blanked file, and blanking
+        // is not semantics-preserving: a prototype turned dce_hwseq.h from
+        // 59 definitions into 35 by blanking a struct whose tokens the
+        // extraction depended on. Every pair here must survive, so the
+        // baseline is stated rather than recomputed from whatever the
+        // recovered tree happens to return.
+        assert_eq!(
+            macros_in(SWALLOWED_COMMENT),
+            vec![("kept".to_string(), 1)],
+            "the directive above the unreadable line"
+        );
+        assert_eq!(
+            macros_in(ATTRIBUTE_SWALLOW),
+            vec![("before".to_string(), 1)]
+        );
+        assert_eq!(macros_in(LOGGING_HEADER), vec![("dev_fmt".to_string(), 1)]);
+        assert_eq!(
+            macros_in(DEFINE_INSIDE_ENUM),
+            vec![("after_enum".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    #[ignore = "gate for ERROR-healing recovery; fails until it lands"]
+    fn recovery_finds_the_directive_after_an_unreadable_declaration() {
+        assert_eq!(
+            macros_in(ATTRIBUTE_SWALLOW),
+            vec![("after".to_string(), 7), ("before".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    #[ignore = "gate for ERROR-healing recovery; fails until it lands"]
+    fn recovery_finds_every_name_a_logging_header_defines() {
+        // Names, not directive lines: dev_dbg is defined three times here
+        // and the index holds one row per name per file. Which arm that row
+        // comes from is a separate question, and the answer today is
+        // whichever body is longest.
+        let mut names = macro_names(LOGGING_HEADER);
+        names.sort();
+        assert_eq!(names, vec!["dev_dbg", "dev_err", "dev_fmt", "dev_printk"]);
+    }
+
+    #[test]
+    #[ignore = "gate for ERROR-healing recovery; fails until it lands"]
+    fn recovery_finds_the_real_directive_beside_a_commented_out_one() {
+        let names = macro_names(SWALLOWED_COMMENT);
+        assert!(names.contains(&"real".to_string()), "{names:?}");
+        assert!(!names.contains(&"GHOST".to_string()), "{names:?}");
+    }
+}
