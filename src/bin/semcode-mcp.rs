@@ -279,6 +279,41 @@ async fn mcp_query_type_or_typedef(
 /// caller that learned `scope` learns the next axis without a rename.
 const SCOPE_AXES: &[&str] = &["arch"];
 
+/// The tools that answer about one definition, and so can be scoped.
+///
+/// Every other tool either reports all definitions of a name or does not
+/// resolve one at all. Kept beside the schemas it must agree with, and a
+/// test asserts it does.
+const SCOPED_TOOLS: &[&str] = &["find_callers", "find_calls", "find_callchain"];
+
+/// Refuse a scope handed to a tool that would ignore it.
+///
+/// A handler reads the arguments it knows and drops the rest, so a scope
+/// sent to `find_function` produced a whole-tree answer that looked
+/// constrained -- the failure this parameter exists to prevent, on every
+/// tool that does not take it. The ambiguity note names `find_function`
+/// and the scope object in the same paragraph, so a reader is pushed
+/// exactly there. A misspelled `scopes` or a flat `arch` is the same
+/// mistake and is refused the same way.
+fn refuse_unscopable_tool(tool: &str, arguments: &Value) -> Option<Value> {
+    if SCOPED_TOOLS.contains(&tool) {
+        return None;
+    }
+    // An unknown tool has its own answer; this is not the place to give it.
+    get_tool_schema(tool)?;
+    let named = ["scope", "scopes", "arch"]
+        .into_iter()
+        .find(|key| arguments.get(key).is_some_and(|value| !value.is_null()))?;
+    Some(json!({
+        "error": format!(
+            "'{tool}' does not take '{named}'; it does not answer about one \
+             definition. Scope is taken by {}.",
+            SCOPED_TOOLS.join(", ")
+        ),
+        "isError": true
+    }))
+}
+
 /// What an index can be asked to constrain by, read from the index.
 ///
 /// A tree with no architectures supports no axes, and saying so is the
@@ -3321,6 +3356,10 @@ impl McpServer {
         let name = params["name"].as_str().unwrap_or("");
         let arguments = &params["arguments"];
 
+        if let Some(refusal) = refuse_unscopable_tool(name, arguments) {
+            return refusal;
+        }
+
         match name {
             "file_survey" => self.handle_file_survey(arguments).await,
             "find_function" => self.handle_find_function(arguments).await,
@@ -3416,6 +3455,10 @@ impl McpServer {
         let tool_name = args["tool_name"].as_str().unwrap_or("");
         let empty_obj = json!({});
         let tool_args = args.get("arguments").unwrap_or(&empty_obj);
+
+        if let Some(refusal) = refuse_unscopable_tool(tool_name, tool_args) {
+            return refusal;
+        }
 
         // Dispatch to the underlying tool handler directly
         // (avoids async recursion through handle_tool_call)
@@ -6427,6 +6470,47 @@ mod tests {
 
         let said = axes_available(&["arm64", "x86"]);
         assert!(said.contains("'arch': arm64, x86"), "{said}");
+    }
+
+    #[test]
+    fn a_scope_a_tool_would_ignore_is_refused() {
+        // Silently dropping it is an answer about the whole tree that looks
+        // constrained, which is what the parameter exists to prevent.
+        let scoped = json!({"name": "vfs_read", "scope": {"arch": "x86"}});
+        let refusal = refuse_unscopable_tool("find_function", &scoped).unwrap();
+        let text = refusal["error"].as_str().unwrap();
+        assert!(text.contains("find_callers"), "{text}");
+        assert!(refusal["isError"].as_bool().unwrap());
+
+        // The same mistake spelled differently.
+        assert!(
+            refuse_unscopable_tool("grep_functions", &json!({"pattern": "x", "arch": "x86"}))
+                .is_some()
+        );
+
+        // A tool that takes one answers for itself, an unknown tool gets
+        // its own error, and a call that named no scope is untouched.
+        assert!(refuse_unscopable_tool("find_callers", &scoped).is_none());
+        assert!(refuse_unscopable_tool("no_such_tool", &scoped).is_none());
+        assert!(refuse_unscopable_tool("find_function", &json!({"name": "vfs_read"})).is_none());
+        assert!(
+            refuse_unscopable_tool("find_function", &json!({"name": "x", "scope": null})).is_none()
+        );
+    }
+
+    #[test]
+    fn the_tools_that_take_a_scope_are_the_ones_whose_schema_offers_one() {
+        // Two lists that disagree is how a tool starts refusing a parameter
+        // its schema advertises, or accepting one it drops.
+        for tool in get_all_tool_schemas() {
+            let name = tool["name"].as_str().unwrap();
+            let offers = tool["inputSchema"]["properties"]["scope"].is_object();
+            assert_eq!(
+                offers,
+                SCOPED_TOOLS.contains(&name),
+                "{name}: schema offers scope = {offers}"
+            );
+        }
     }
 
     #[test]
