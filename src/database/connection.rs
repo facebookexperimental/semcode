@@ -4814,6 +4814,12 @@ impl DatabaseManager {
     /// architectures Linux has: on a tree with no architectures the
     /// constraint admits everything, so a pin that is accepted there is a
     /// filter that silently does nothing.
+    ///
+    /// Only the kernel's architectures. An architecture pin resolves to the
+    /// kernel build for that architecture, so offering one that exists only
+    /// under `tools/` -- `tools/perf/arch/x86`, `tools/arch/arm64` -- would
+    /// accept a pin that then admits no definition at all, which is the same
+    /// silent no-op one step later.
     pub async fn indexed_architectures(&self) -> Result<Vec<&'static str>> {
         let paths = self
             .processed_file_store
@@ -4821,7 +4827,9 @@ impl DatabaseManager {
             .await?;
         let mut arches: Vec<&'static str> = paths
             .iter()
-            .filter_map(|path| crate::domain::domain_of(path).arch)
+            .map(|path| crate::domain::domain_of(path))
+            .filter(|domain| domain.program == crate::domain::Program::Kernel)
+            .filter_map(|domain| domain.arch)
             .collect();
         arches.sort_unstable();
         arches.dedup();

@@ -359,6 +359,64 @@ async fn the_architectures_offered_are_the_ones_the_index_holds() {
     );
 }
 
+/// A tree whose only `arch` directories belong to another program, which is
+/// what `tools/perf/arch/x86` and `tools/arch/arm64` are in Linux.
+async fn tree_whose_architectures_are_all_another_program(
+) -> (tempfile::TempDir, Arc<DatabaseManager>) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+
+    git_run(repo, &["init", "-q"]);
+    std::fs::create_dir_all(repo.join("tools/perf/arch/x86/util")).unwrap();
+    std::fs::write(
+        repo.join("tools/perf/arch/x86/util/evsel.c"),
+        "int arch_evsel_init(void)\n{\n\treturn 0;\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("mm")).unwrap();
+    std::fs::write(
+        repo.join("mm/memory.c"),
+        "int handle_fault(void)\n{\n\treturn 0;\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(
+        repo,
+        &["commit", "-q", "-m", "only tools has architectures"],
+    );
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["c".to_string(), "h".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+
+    (dir, db)
+}
+
+#[tokio::test]
+async fn an_architecture_only_another_program_has_is_not_offered() {
+    // A pin resolves to the kernel build for an architecture, so offering
+    // one that only tools/ has would accept a pin that admits nothing: the
+    // same accept-and-filter-nothing failure, one step later.
+    let (_dir, db) = tree_whose_architectures_are_all_another_program().await;
+
+    assert!(
+        db.indexed_architectures().await.unwrap().is_empty(),
+        "tools/perf/arch/x86 is not an architecture of the kernel build"
+    );
+}
+
 #[tokio::test]
 async fn a_tree_with_no_architectures_offers_none() {
     // The constraint admits everything on a tree with no architectures, so
