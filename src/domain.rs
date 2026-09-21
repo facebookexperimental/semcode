@@ -129,6 +129,27 @@ impl Domain {
         }
     }
 
+    /// What to call this build in a sentence a reader has to act on.
+    ///
+    /// Naming the program as well as the architecture is what keeps an
+    /// answer from contradicting itself: `tools/perf/arch/x86/util/evsel.c`
+    /// is x86 code, and a search pinned to x86 does not admit it, because a
+    /// pin means the kernel's x86 and that file is another program. Saying
+    /// only "no definition in x86" while pointing at a path under
+    /// `arch/x86` reads as a bug in the answer.
+    pub fn describe(self) -> String {
+        let program = match self.program {
+            Program::Kernel => "the kernel build",
+            Program::Tools => "the tools build",
+            Program::Host => "the host tools",
+            Program::Documentation => "documentation",
+        };
+        match self.arch {
+            Some(arch) => format!("{program} for {arch}"),
+            None => program.to_string(),
+        }
+    }
+
     /// Whether this definition's code can call `callee`'s.
     ///
     /// Directional on purpose: `arch/um` is hosted on another architecture,
@@ -308,6 +329,25 @@ mod tests {
     // Witnesses are paths taken from the index at Linux 50d05c7c76c9, not
     // from memory. The previous version of this file passed every test while
     // being wrong, because the test and the code had chosen the same witness.
+
+    #[test]
+    fn a_build_is_named_by_its_program_and_its_architecture() {
+        assert_eq!(
+            domain_of("arch/x86/mm/tlb.c").describe(),
+            "the kernel build for x86"
+        );
+        assert_eq!(domain_of("mm/memory.c").describe(), "the kernel build");
+        // The case the naming exists for: x86 code that a pin to x86 does
+        // not admit, because the pin means the kernel's x86.
+        assert_eq!(
+            domain_of("tools/perf/arch/x86/util/evsel.c").describe(),
+            "the tools build for x86"
+        );
+        assert_eq!(
+            domain_of("scripts/kconfig/conf.c").describe(),
+            "the host tools"
+        );
+    }
 
     #[test]
     fn arch_comes_from_the_path() {

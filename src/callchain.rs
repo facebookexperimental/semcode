@@ -311,9 +311,14 @@ pub fn elsewhere_note(
     candidates: &[crate::types::DefinitionSite],
     context: crate::domain::Context,
 ) -> String {
+    // The whole build, not only its architecture. A candidate can be
+    // rejected for belonging to another program while sitting in a path that
+    // names the architecture that was asked for, and an answer that says
+    // "no definition in x86" beside an `arch/x86` path reads as wrong rather
+    // than as a different program.
     let here = match context {
-        crate::domain::Context::In(domain) => domain.arch.unwrap_or("this build"),
-        crate::domain::Context::Any => "this build",
+        crate::domain::Context::In(domain) => domain.describe(),
+        crate::domain::Context::Any => "this build".to_string(),
     };
     let mut sites: Vec<String> = candidates
         .iter()
