@@ -317,6 +317,48 @@ impl ProcessedFileStore {
         Ok(records)
     }
 
+    /// Paths of indexed files that sit under a directory named `arch`.
+    ///
+    /// The vocabulary a reader's architecture pin is checked against has to
+    /// come from the tree that was indexed, not from a list compiled into
+    /// the binary: a list says every tree has architectures, and a tree that
+    /// has none would accept a pin and filter nothing.
+    ///
+    /// Only the path column, and only the rows that can name an
+    /// architecture, so this is not a scan of the table.
+    pub async fn files_under_an_arch_directory(&self) -> Result<Vec<String>> {
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+
+        let results = table
+            .query()
+            .only_if("file LIKE 'arch/%' OR file LIKE '%/arch/%'")
+            .select(lancedb::query::Select::Columns(vec!["file".to_string()]))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut paths = Vec::new();
+        for batch in &results {
+            let Some(column) = batch.column_by_name("file") else {
+                continue;
+            };
+            let Some(files) = column.as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
+            for i in 0..files.len() {
+                if !files.is_null(i) {
+                    paths.push(files.value(i).to_string());
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     /// Get only git file SHAs for efficient deduplication (much faster than loading full records)
     pub async fn get_all_git_file_shas(&self) -> Result<std::collections::HashSet<String>> {
         use futures::TryStreamExt;

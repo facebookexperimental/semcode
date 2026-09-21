@@ -3,7 +3,7 @@
 // What a command that must give ONE answer says when the tree defines the name
 // more than once. A callee query reports every definition; `callers`, `func`
 // and `callchain` start from one, so what they owe the reader is the choice.
-use semcode::{git, DatabaseManager};
+use semcode::{git, DatabaseManager, Surface};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -97,7 +97,7 @@ async fn a_single_answer_names_the_definitions_it_set_aside() {
     // Every other definition is named, so the reader can ask again about one.
     assert_eq!(chosen.others.len(), 2, "{:?}", chosen.others);
     let note = chosen
-        .ambiguity_note()
+        .ambiguity_note(Surface::Repl)
         .unwrap_or_else(|| panic!("three definitions, so there is a choice to report"));
     assert!(note.contains("defined 3 times"), "{note}");
     assert!(note.contains("arch/x86/tools/decoder_test.c"), "{note}");
@@ -165,7 +165,7 @@ async fn a_name_defined_once_reports_no_choice() {
         .unwrap();
     assert!(chosen.others.is_empty(), "{:?}", chosen.others);
     // A note on every answer is noise, and noise is skipped rather than read.
-    assert!(chosen.ambiguity_note().is_none());
+    assert!(chosen.ambiguity_note(Surface::Repl).is_none());
 }
 
 #[tokio::test]
@@ -440,7 +440,7 @@ async fn two_languages_one_definition_each_is_not_a_majority() {
         .unwrap();
     assert_eq!(first.function.file_path, again.function.file_path);
     assert_eq!(first.others.len(), 1, "{:?}", first.others);
-    let note = first.ambiguity_note().unwrap();
+    let note = first.ambiguity_note(Surface::Repl).unwrap();
     assert!(note.contains("defined 2 times"), "{note}");
 }
 

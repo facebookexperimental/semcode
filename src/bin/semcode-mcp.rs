@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use clap::Parser;
+use semcode::domain::{domain_of, kernel_arch, Context};
 use semcode::{
     git, lore_writers::decode_email_body, pages::PageCache, process_database_path,
     row_defines_the_function, search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
+    Resolution, Surface,
 };
 use serde_json::{json, Value};
 use std::io::Write;
@@ -267,10 +269,114 @@ async fn mcp_query_type_or_typedef(
     Ok(result.trim_end().to_string())
 }
 
+/// The axes a question can be asked from, named rather than implied.
+///
+/// One object with a key per axis, rather than one parameter per axis: a
+/// name is answered about a definition, and what distinguishes definitions
+/// of one name differs by language. Architecture is C's, and the axis an
+/// object language needs -- the class, module or namespace that owns a
+/// method -- is not the same question and will not be spelled `arch`. A
+/// caller that learned `scope` learns the next axis without a rename.
+const SCOPE_AXES: &[&str] = &["arch"];
+
+/// What an index can be asked to constrain by, read from the index.
+///
+/// A tree with no architectures supports no axes, and saying so is the
+/// difference between a refusal and an answer that quietly filtered
+/// nothing.
+fn axes_available(architectures: &[&'static str]) -> String {
+    if architectures.is_empty() {
+        return "this index has no axes to ask from: no indexed file is under an 'arch' directory"
+            .to_string();
+    }
+    format!(
+        "this index has one axis, 'arch': {}",
+        architectures.join(", ")
+    )
+}
+
+/// The constraint a tool call named, or no constraint at all.
+///
+/// Every refusal here is a case that would otherwise answer about the whole
+/// tree while looking constrained: an axis this index cannot honour, a
+/// misspelled architecture, an architecture no indexed file belongs to. The
+/// vocabulary comes from the index rather than from a list of Linux's
+/// architectures, so a pin against a tree that has none is refused instead
+/// of accepted and ignored.
+async fn context_for_scope(
+    db: &DatabaseManager,
+    scope: Option<&Value>,
+) -> std::result::Result<Context, String> {
+    let Some(scope) = scope else {
+        return Ok(Context::Any);
+    };
+    // A client that sends the parameter set to null has named no constraint,
+    // which is the same as not sending it.
+    if scope.is_null() {
+        return Ok(Context::Any);
+    }
+    let Some(fields) = scope.as_object() else {
+        return Err(
+            "'scope' takes an object naming an axis, for example {\"arch\": \"x86\"}".to_string(),
+        );
+    };
+    if fields.is_empty() {
+        return Ok(Context::Any);
+    }
+
+    let architectures = db
+        .indexed_architectures()
+        .await
+        .map_err(|e| format!("could not read this index's architectures: {e}"))?;
+
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| !SCOPE_AXES.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "'{unknown}' is not an axis semcode answers about; {}",
+            axes_available(&architectures)
+        ));
+    }
+
+    let Some(arch) = fields.get("arch") else {
+        return Ok(Context::Any);
+    };
+    let Some(arch) = arch.as_str() else {
+        return Err(
+            "'scope.arch' takes the name of an architecture, for example \"x86\"".to_string(),
+        );
+    };
+    if !architectures.contains(&arch) {
+        return Err(format!(
+            "'{arch}' is not an architecture in this index; {}",
+            axes_available(&architectures)
+        ));
+    }
+    match kernel_arch(arch) {
+        Some(domain) => Ok(Context::In(domain)),
+        // Unreachable while the index's architectures are read with the same
+        // table this consults; refused rather than assumed.
+        None => Err(format!("'{arch}' is not an architecture semcode knows")),
+    }
+}
+
+/// The architecture an answer is about, for a line that reports it.
+fn arch_suffix(context: Context) -> String {
+    match context {
+        Context::In(domain) => domain
+            .arch
+            .map(|arch| format!(" from {arch}"))
+            .unwrap_or_default(),
+        Context::Any => String::new(),
+    }
+}
+
 async fn mcp_show_callers(
     db: &DatabaseManager,
     function_name: &str,
     git_sha: &str,
+    pin: Context,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
@@ -279,25 +385,28 @@ async fn mcp_show_callers(
 
     // Find function or macro - both are stored in the functions table
     // Macros are distinguished by having an empty return_type
-    let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha, semcode::domain::Context::Any)
-        .await?
-        .chosen();
+    let resolution = db
+        .find_function_git_aware_reporting(function_name, git_sha, pin)
+        .await?;
 
-    match chosen_opt {
-        Some(chosen) => {
+    match resolution {
+        Resolution::Chosen(chosen) => {
             // Callers are found by name, and a name can belong to several
             // functions. An agent reading this has no other way to learn that.
-            if let Some(note) = chosen.ambiguity_note() {
+            if let Some(note) = chosen.ambiguity_note(Surface::Mcp) {
                 writeln!(buffer, "Ambiguous: {note}")?;
             }
             let entity = chosen.function;
             let is_macro = entity.return_type.is_empty();
             let entity_type = if is_macro { "macro" } else { "function" };
 
+            // Callers of THIS definition, not of the name: a caller in
+            // another architecture calls the definition in its own.
+            let subject_context = Context::In(domain_of(&entity.file_path));
+
             // Get callers
             let callers = db
-                .get_function_callers_git_aware(function_name, git_sha)
+                .get_function_callers_in(function_name, git_sha, subject_context)
                 .await?;
             if callers.is_empty() {
                 writeln!(
@@ -316,38 +425,63 @@ async fn mcp_show_callers(
                 writeln!(buffer, "\n=== Direct Callers ===")?;
                 writeln!(
                     buffer,
-                    "{} functions directly call {entity_type} '{}':",
+                    "{} functions directly call {entity_type} '{}'{}:",
                     callers.len(),
-                    function_name
+                    function_name,
+                    arch_suffix(subject_context)
                 )?;
 
                 for (i, caller) in callers.iter().enumerate() {
                     writeln!(buffer, "  {}. {}", i + 1, caller)?;
 
-                    // Try to get more info about the caller
-                    if let Ok(Some(caller_entity)) =
-                        db.find_function_git_aware(caller, git_sha).await
+                    // Resolved within the subject's own build: a caller of an
+                    // x86 function is x86 or generic code, and a sparc
+                    // definition of that name is a different function that
+                    // happens to share a spelling.
+                    match db
+                        .find_function_git_aware_reporting(caller, git_sha, subject_context)
+                        .await
                     {
-                        if caller_entity.return_type.is_empty() {
+                        Ok(Resolution::Chosen(caller_chosen)) => {
+                            let caller_entity = caller_chosen.function;
+                            if caller_entity.return_type.is_empty() {
+                                writeln!(
+                                    buffer,
+                                    "     macro ({}:{})",
+                                    caller_entity.file_path, caller_entity.line_start
+                                )?;
+                            } else {
+                                writeln!(
+                                    buffer,
+                                    "     {} ({}:{})",
+                                    caller_entity.return_type,
+                                    caller_entity.file_path,
+                                    caller_entity.line_start
+                                )?;
+                            }
+                        }
+                        Ok(Resolution::NoneAdmitted { candidates }) => {
                             writeln!(
                                 buffer,
-                                "     macro ({}:{})",
-                                caller_entity.file_path, caller_entity.line_start
-                            )?;
-                        } else {
-                            writeln!(
-                                buffer,
-                                "     {} ({}:{})",
-                                caller_entity.return_type,
-                                caller_entity.file_path,
-                                caller_entity.line_start
+                                "     {}",
+                                semcode::callchain::elsewhere_note(&candidates, subject_context)
                             )?;
                         }
+                        _ => {}
                     }
                 }
             }
         }
-        None => {
+        Resolution::NoneAdmitted { candidates } => {
+            // Not the same answer as "not found": the name is defined, just
+            // not in the build the question was asked from.
+            writeln!(
+                buffer,
+                "Error: '{function_name}' has {}",
+                semcode::callchain::elsewhere_note(&candidates, pin)
+            )?;
+        }
+        Resolution::NotFound => {
             writeln!(
                 buffer,
                 "Error: Function or macro '{function_name}' not found in database"
@@ -445,6 +579,7 @@ async fn mcp_show_calls(
     db: &DatabaseManager,
     function_name: &str,
     git_sha: &str,
+    pin: Context,
 ) -> Result<String> {
     let mut buffer = Vec::new();
 
@@ -453,25 +588,28 @@ async fn mcp_show_calls(
 
     // Find function or macro - both are stored in the functions table
     // Macros are distinguished by having an empty return_type
-    let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha, semcode::domain::Context::Any)
-        .await?
-        .chosen();
+    let resolution = db
+        .find_function_git_aware_reporting(function_name, git_sha, pin)
+        .await?;
 
-    match chosen_opt {
-        Some(chosen) => {
-            if let Some(note) = chosen.ambiguity_note() {
+    match resolution {
+        Resolution::Chosen(chosen) => {
+            if let Some(note) = chosen.ambiguity_note(Surface::Mcp) {
                 writeln!(buffer, "Ambiguous: {note}")?;
             }
             let entity = chosen.function;
             let is_macro = entity.return_type.is_empty();
             let entity_type = if is_macro { "Macro" } else { "Function" };
 
+            // What this definition calls is answered within its own build:
+            // generic code reaches whichever definition its build selects.
+            let subject_context = Context::In(domain_of(&entity.file_path));
+
             // The callees of the definition named above. Reading them off the
             // row for macros took them from whichever definition the resolver
             // returned, which is the same silent choice one step earlier.
             let calls = db
-                .get_function_callees_git_aware(function_name, git_sha)
+                .get_function_callees_in(function_name, git_sha, subject_context)
                 .await?;
 
             if calls.is_empty() {
@@ -491,38 +629,60 @@ async fn mcp_show_calls(
                 writeln!(buffer, "\n=== Direct Calls ===")?;
                 writeln!(
                     buffer,
-                    "{entity_type} '{}' directly calls {} functions:",
+                    "{entity_type} '{}' directly calls {} functions{}:",
                     function_name,
-                    calls.len()
+                    calls.len(),
+                    arch_suffix(subject_context)
                 )?;
 
                 for (i, callee) in calls.iter().enumerate() {
                     writeln!(buffer, "  {}. {}", i + 1, callee)?;
 
-                    // Try to get more info about the callee
-                    if let Ok(Some(callee_entity)) =
-                        db.find_function_git_aware(callee, git_sha).await
+                    // Resolved within the caller's build: the sparc
+                    // definition of a name an x86 function calls is a
+                    // different function that shares a spelling.
+                    match db
+                        .find_function_git_aware_reporting(callee, git_sha, subject_context)
+                        .await
                     {
-                        if callee_entity.return_type.is_empty() {
+                        Ok(Resolution::Chosen(callee_chosen)) => {
+                            let callee_entity = callee_chosen.function;
+                            if callee_entity.return_type.is_empty() {
+                                writeln!(
+                                    buffer,
+                                    "     macro ({}:{})",
+                                    callee_entity.file_path, callee_entity.line_start
+                                )?;
+                            } else {
+                                writeln!(
+                                    buffer,
+                                    "     {} ({}:{})",
+                                    callee_entity.return_type,
+                                    callee_entity.file_path,
+                                    callee_entity.line_start
+                                )?;
+                            }
+                        }
+                        Ok(Resolution::NoneAdmitted { candidates }) => {
                             writeln!(
                                 buffer,
-                                "     macro ({}:{})",
-                                callee_entity.file_path, callee_entity.line_start
-                            )?;
-                        } else {
-                            writeln!(
-                                buffer,
-                                "     {} ({}:{})",
-                                callee_entity.return_type,
-                                callee_entity.file_path,
-                                callee_entity.line_start
+                                "     {}",
+                                semcode::callchain::elsewhere_note(&candidates, subject_context)
                             )?;
                         }
+                        _ => {}
                     }
                 }
             }
         }
-        None => {
+        Resolution::NoneAdmitted { candidates } => {
+            writeln!(
+                buffer,
+                "Error: '{function_name}' has {}",
+                semcode::callchain::elsewhere_note(&candidates, pin)
+            )?;
+        }
+        Resolution::NotFound => {
             writeln!(
                 buffer,
                 "Error: Function or macro '{function_name}' not found in database"
@@ -1704,6 +1864,7 @@ async fn mcp_show_callchain_with_limits(
     up_levels: usize,
     down_levels: usize,
     calls_limit: usize,
+    pin: Context,
 ) -> Result<String> {
     use std::io::Write;
 
@@ -1723,16 +1884,32 @@ async fn mcp_show_callchain_with_limits(
     // by temporarily redirecting stdout to capture the output
 
     // First, check if function exists
-    let chosen_opt = db
-        .find_function_git_aware_reporting(function_name, git_sha, semcode::domain::Context::Any)
+    let chosen_opt = match db
+        .find_function_git_aware_reporting(function_name, git_sha, pin)
         .await?
-        .chosen();
+    {
+        Resolution::Chosen(chosen) => Some(chosen),
+        Resolution::NoneAdmitted { candidates } => {
+            // The name is defined, just not in the build this chain was
+            // asked from. Saying "not found" would end a search that should
+            // continue in the architecture named here.
+            writeln!(
+                buffer,
+                "Error: '{function_name}' has {}",
+                semcode::callchain::elsewhere_note(&candidates, pin)
+            )?;
+            None
+        }
+        Resolution::NotFound => {
+            writeln!(
+                buffer,
+                "Error: Function '{function_name}' not found in database at git SHA {git_sha}"
+            )?;
+            None
+        }
+    };
 
     if chosen_opt.is_none() {
-        writeln!(
-            buffer,
-            "Error: Function '{function_name}' not found in database at git SHA {git_sha}"
-        )?;
         return Ok(String::from_utf8_lossy(&buffer).to_string());
     }
 
@@ -1751,10 +1928,15 @@ async fn mcp_show_callchain_with_limits(
     // Get the function info first. One chain starts at one definition, so the
     // chain says which one rather than reading as the tree having one.
     if let Some(chosen) = chosen_opt {
-        if let Some(note) = chosen.ambiguity_note() {
+        if let Some(note) = chosen.ambiguity_note(Surface::Mcp) {
             writeln!(buffer, "Ambiguous: {note}")?;
         }
         let func = chosen.function;
+        // Every hop of this chain is about the definition the root resolved
+        // to, so it is answered within that definition's build. Sticky: a hop
+        // into generic code keeps the architecture, because generic code
+        // calls whichever definition the build selects.
+        let chain_context = Context::In(domain_of(&func.file_path));
         writeln!(buffer, "\n=== Function Information ===")?;
         writeln!(
             buffer,
@@ -1772,10 +1954,10 @@ async fn mcp_show_callchain_with_limits(
 
         // Get callers and callees
         let callers = db
-            .get_function_callers_git_aware(function_name, git_sha)
+            .get_function_callers_in(function_name, git_sha, chain_context)
             .await?;
         let callees = db
-            .get_function_callees_git_aware(function_name, git_sha)
+            .get_function_callees_in(function_name, git_sha, chain_context)
             .await?;
 
         // A function reached only through a pointer has no direct callers, so
@@ -1816,7 +1998,13 @@ async fn mcp_show_callchain_with_limits(
                 writeln!(buffer, "{}. {}", i + 1, caller)?;
 
                 // Show caller details if available
-                if let Ok(Some(caller_func)) = db.find_function_git_aware(caller, git_sha).await {
+                // Within the chain's own build: a sparc definition of a
+                // name an x86 chain passes through is a different function.
+                if let Ok(Resolution::Chosen(caller_chosen)) = db
+                    .find_function_git_aware_reporting(caller, git_sha, chain_context)
+                    .await
+                {
+                    let caller_func = caller_chosen.function;
                     writeln!(
                         buffer,
                         "   └─ {} ({}:{})",
@@ -1826,8 +2014,9 @@ async fn mcp_show_callchain_with_limits(
 
                 // For multi-level depth, show second-level callers
                 if up_levels > 1 {
-                    if let Ok(second_level_callers) =
-                        db.get_function_callers_git_aware(caller, git_sha).await
+                    if let Ok(second_level_callers) = db
+                        .get_function_callers_in(caller, git_sha, chain_context)
+                        .await
                     {
                         let limited_second: Vec<_> = if calls_limit == 0 {
                             second_level_callers
@@ -1877,7 +2066,11 @@ async fn mcp_show_callchain_with_limits(
                 writeln!(buffer, "{}. {}", i + 1, callee)?;
 
                 // Show callee details if available
-                if let Ok(Some(callee_func)) = db.find_function_git_aware(callee, git_sha).await {
+                if let Ok(Resolution::Chosen(callee_chosen)) = db
+                    .find_function_git_aware_reporting(callee, git_sha, chain_context)
+                    .await
+                {
+                    let callee_func = callee_chosen.function;
                     writeln!(
                         buffer,
                         "   └─ {} ({}:{})",
@@ -1887,8 +2080,9 @@ async fn mcp_show_callchain_with_limits(
 
                 // For multi-level depth, show second-level callees
                 if down_levels > 1 {
-                    if let Ok(second_level_callees) =
-                        db.get_function_callees_git_aware(callee, git_sha).await
+                    if let Ok(second_level_callees) = db
+                        .get_function_callees_in(callee, git_sha, chain_context)
+                        .await
                     {
                         let limited_second: Vec<_> = if calls_limit == 0 {
                             second_level_callees
@@ -2217,13 +2411,24 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "find_callers" => Some(json!({
             "name": "find_callers",
-            "description": "Find all functions that call a specific function, optionally at a specific git commit or branch",
+            "description": "Find all functions that call a specific function, optionally at a specific git commit or branch, and optionally scoped to one architecture",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
                         "description": "The name of the function to find callers for"
+                    },
+                    "scope": {
+                        "type": "object",
+                        "description": "Optional constraint naming which of several same-named definitions to answer about. One key per axis; the only axis today is 'arch'. Without it, a name defined once per architecture is answered from whichever definition the resolver chooses. An axis this index cannot honour, or an architecture no indexed file belongs to, is refused rather than ignored, and the refusal says what the index does have.",
+                        "properties": {
+                            "arch": {
+                                "type": "string",
+                                "description": "Kernel architecture to ask from, e.g. 'x86' or 'arm64'. Only on an index whose tree has architectures."
+                            }
+                        },
+                        "additionalProperties": false
                     },
                     "git_sha": {
                         "type": "string",
@@ -2287,13 +2492,24 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "find_calls" => Some(json!({
             "name": "find_calls",
-            "description": "Find all functions called by a specific function, optionally at a specific git commit or branch",
+            "description": "Find all functions called by a specific function, optionally at a specific git commit or branch, and optionally scoped to one architecture",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
                         "description": "The name of the function to find calls for"
+                    },
+                    "scope": {
+                        "type": "object",
+                        "description": "Optional constraint naming which of several same-named definitions to answer about. One key per axis; the only axis today is 'arch'. Without it, a name defined once per architecture is answered from whichever definition the resolver chooses. An axis this index cannot honour, or an architecture no indexed file belongs to, is refused rather than ignored, and the refusal says what the index does have.",
+                        "properties": {
+                            "arch": {
+                                "type": "string",
+                                "description": "Kernel architecture to ask from, e.g. 'x86' or 'arm64'. Only on an index whose tree has architectures."
+                            }
+                        },
+                        "additionalProperties": false
                     },
                     "git_sha": {
                         "type": "string",
@@ -2309,13 +2525,24 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "find_callchain" => Some(json!({
             "name": "find_callchain",
-            "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit or branch",
+            "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit or branch, and optionally scoped to one architecture",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
                         "description": "The name of the function to analyze the call chain for"
+                    },
+                    "scope": {
+                        "type": "object",
+                        "description": "Optional constraint naming which of several same-named definitions to answer about. One key per axis; the only axis today is 'arch'. Without it, a name defined once per architecture is answered from whichever definition the resolver chooses. An axis this index cannot honour, or an architecture no indexed file belongs to, is refused rather than ignored, and the refusal says what the index does have.",
+                        "properties": {
+                            "arch": {
+                                "type": "string",
+                                "description": "Kernel architecture to ask from, e.g. 'x86' or 'arm64'. Only on an index whose tree has architectures."
+                            }
+                        },
+                        "additionalProperties": false
                     },
                     "git_sha": {
                         "type": "string",
@@ -3326,8 +3553,12 @@ impl McpServer {
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
         let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
+        let pin = match context_for_scope(&self.db, args.get("scope")).await {
+            Ok(pin) => pin,
+            Err(refusal) => return json!({"error": refusal, "isError": true}),
+        };
 
-        match mcp_show_callers(&self.db, name, &git_sha).await {
+        match mcp_show_callers(&self.db, name, &git_sha, pin).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
@@ -3444,8 +3675,12 @@ impl McpServer {
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
         let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
+        let pin = match context_for_scope(&self.db, args.get("scope")).await {
+            Ok(pin) => pin,
+            Err(refusal) => return json!({"error": refusal, "isError": true}),
+        };
 
-        match mcp_show_calls(&self.db, name, &git_sha).await {
+        match mcp_show_calls(&self.db, name, &git_sha, pin).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
@@ -3471,6 +3706,10 @@ impl McpServer {
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
         let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
+        let pin = match context_for_scope(&self.db, args.get("scope")).await {
+            Ok(pin) => pin,
+            Err(refusal) => return json!({"error": refusal, "isError": true}),
+        };
 
         // Parse the new parameters with same defaults as query tool
         let up_levels = args["up_levels"].as_u64().unwrap_or(2) as usize;
@@ -3488,6 +3727,7 @@ impl McpServer {
             up_levels,
             down_levels,
             calls_limit,
+            pin,
         )
         .await
         {
@@ -6136,6 +6376,39 @@ mod tests {
         env::remove_var(key);
         let args = Args::try_parse_from(["semcode-mcp"]).unwrap();
         assert_eq!(args.git_repo, ".");
+    }
+
+    #[test]
+    fn what_an_index_has_no_architectures_for_offers_no_axis() {
+        // The refusal is the only place a caller learns that this tree has
+        // nothing to pin, so it says which axes exist rather than only that
+        // the one asked for does not.
+        let none: Vec<&'static str> = Vec::new();
+        let said = axes_available(&none);
+        assert!(said.contains("no axes"), "{said}");
+        assert!(said.contains("arch"), "{said}");
+
+        let said = axes_available(&["arm64", "x86"]);
+        assert!(said.contains("'arch': arm64, x86"), "{said}");
+    }
+
+    #[test]
+    fn every_call_graph_tool_takes_a_scope_with_an_arch_axis() {
+        // A tool that resolves a definition but does not accept the
+        // constraint answers from whichever definition was chosen, with
+        // nothing in its schema to say so.
+        for tool in ["find_callers", "find_calls", "find_callchain"] {
+            let schema = get_tool_schema(tool).unwrap();
+            let scope = &schema["inputSchema"]["properties"]["scope"];
+            assert!(scope.is_object(), "{tool} has no scope parameter");
+            assert!(
+                scope["properties"]["arch"].is_object(),
+                "{tool} scope has no arch axis"
+            );
+            // Named axes only: a key nobody implemented must not read as a
+            // constraint that was applied.
+            assert_eq!(scope["additionalProperties"], serde_json::json!(false));
+        }
     }
 
     #[test]

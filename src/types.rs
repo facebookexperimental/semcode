@@ -119,6 +119,39 @@ impl Resolution {
     }
 }
 
+/// Where an answer is being read, which decides how a reader names an
+/// architecture.
+///
+/// The note that reports a choice has to say what to do about it, and the
+/// two surfaces take the constraint differently: a person types a flag, an
+/// MCP client sets an argument. A note that names the other surface's
+/// spelling is a remedy its reader cannot apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// The interactive query tool.
+    Repl,
+    /// The MCP server, read by an agent.
+    Mcp,
+}
+
+impl Surface {
+    /// How to ask the same question about a named architecture here.
+    fn arch_remedy(self) -> &'static str {
+        match self {
+            Surface::Repl => "Ask another with '--arch <arch>'",
+            Surface::Mcp => "Ask another with scope {\"arch\": \"<arch>\"}",
+        }
+    }
+
+    /// How to list every definition of a name here.
+    fn list_all(self, name: &str) -> String {
+        match self {
+            Surface::Repl => format!("'func {name}' lists them all"),
+            Surface::Mcp => format!("find_function '{name}' lists them all"),
+        }
+    }
+}
+
 /// picking one and hiding that there was a choice.
 #[derive(Debug, Clone)]
 pub struct ChosenDefinition {
@@ -139,11 +172,11 @@ impl ChosenDefinition {
     ///
     /// `None` where the name has one definition: a note on every answer would
     /// be noise, and noise is skipped rather than read.
-    pub fn ambiguity_note(&self) -> Option<String> {
+    pub fn ambiguity_note(&self, surface: Surface) -> Option<String> {
         if self.others.is_empty() {
             return None;
         }
-        if let Some(note) = self.one_definition_per_architecture() {
+        if let Some(note) = self.one_definition_per_architecture(surface) {
             return Some(note);
         }
         let mut sites: Vec<String> = self
@@ -158,10 +191,10 @@ impl ChosenDefinition {
         const SHOWN: usize = 8;
         let listed = if sites.len() > SHOWN {
             format!(
-                "{}, and {} more ('func {}' lists them all)",
+                "{}, and {} more ({})",
                 sites[..SHOWN].join(", "),
                 sites.len() - SHOWN,
-                self.function.name
+                surface.list_all(&self.function.name)
             )
         } else {
             sites.join(", ")
@@ -189,7 +222,7 @@ impl ChosenDefinition {
     /// A name with a generic definition beside the architecture-specific
     /// ones is not this case. Generic is what a build without its own
     /// definition reaches, so there is a sensible answer to give.
-    fn one_definition_per_architecture(&self) -> Option<String> {
+    fn one_definition_per_architecture(&self, surface: Surface) -> Option<String> {
         let sites: Vec<(&str, u32)> =
             std::iter::once((self.function.file_path.as_str(), self.function.line_start))
                 .chain(
@@ -218,13 +251,13 @@ impl ChosenDefinition {
         let chosen_arch = crate::domain::domain_of(&self.function.file_path).arch?;
         Some(format!(
             "'{}' has one definition per architecture: {}. This answer is \
-             about {}, at {}:{}. Ask another with '--arch <arch>'; no build \
-             has more than one.",
+             about {}, at {}:{}. {}; no build has more than one.",
             self.function.name,
             arches.join(", "),
             chosen_arch,
             self.function.file_path,
             self.function.line_start,
+            surface.arch_remedy(),
         ))
     }
 }
@@ -900,7 +933,7 @@ mod ambiguity_note_tests {
     #[test]
     fn one_definition_is_no_note() {
         let chosen = ChosenDefinition::only(definition("f", "mm/memory.c", 1));
-        assert!(chosen.ambiguity_note().is_none());
+        assert!(chosen.ambiguity_note(Surface::Repl).is_none());
     }
 
     #[test]
@@ -912,13 +945,44 @@ mod ambiguity_note_tests {
                 site("arch/arm/include/asm/tlbflush.h", 343),
             ],
         };
-        let note = chosen.ambiguity_note().unwrap();
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
         assert!(note.contains("one definition per architecture"), "{note}");
         assert!(note.contains("arm, sparc, x86"), "{note}");
         assert!(note.contains("--arch"), "{note}");
         // The general note's prose about configuration is the thing this
         // replaces: it is true and it tells the reader nothing to do.
         assert!(!note.contains("depends on"), "{note}");
+    }
+
+    #[test]
+    fn the_remedy_is_the_one_its_reader_can_use() {
+        // A note read by an agent that names the query tool's flag asks for
+        // something the protocol has no way to send.
+        let chosen = ChosenDefinition {
+            function: definition("__flush_tlb_all", "arch/sparc/mm/init_64.c", 2758),
+            others: vec![site("arch/x86/mm/tlb.c", 1663)],
+        };
+        let note = chosen.ambiguity_note(Surface::Mcp).unwrap();
+        assert!(note.contains(r#"scope {"arch": "<arch>"}"#), "{note}");
+        assert!(!note.contains("--arch"), "{note}");
+    }
+
+    #[test]
+    fn the_way_to_list_every_definition_is_named_per_surface() {
+        // The general note points at a command; an MCP client has a tool of
+        // another name and no command line to type it on.
+        let others: Vec<DefinitionSite> = (0..12)
+            .map(|i| site(&format!("drivers/net/e{i}.c"), 10 + i))
+            .collect();
+        let chosen = ChosenDefinition {
+            function: definition("probe", "drivers/net/e0.c", 5),
+            others,
+        };
+        let repl = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(repl.contains("'func probe' lists them all"), "{repl}");
+        let mcp = chosen.ambiguity_note(Surface::Mcp).unwrap();
+        assert!(mcp.contains("find_function 'probe'"), "{mcp}");
+        assert!(!mcp.contains("'func probe'"), "{mcp}");
     }
 
     #[test]
@@ -929,7 +993,7 @@ mod ambiguity_note_tests {
             function: definition("handle_mm_fault", "mm/memory.c", 6841),
             others: vec![site("arch/x86/mm/fault.c", 100)],
         };
-        let note = chosen.ambiguity_note().unwrap();
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
         assert!(!note.contains("one definition per architecture"), "{note}");
     }
 
@@ -941,7 +1005,7 @@ mod ambiguity_note_tests {
             function: definition("setup_arch", "arch/sparc/kernel/setup_32.c", 283),
             others: vec![site("arch/sparc/kernel/setup_64.c", 622)],
         };
-        let note = chosen.ambiguity_note().unwrap();
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
         assert!(!note.contains("one definition per architecture"), "{note}");
     }
 
@@ -951,7 +1015,7 @@ mod ambiguity_note_tests {
             function: definition("report", "arch/x86/kernel/setup.c", 10),
             others: vec![site("tools/perf/builtin-stat.c", 20)],
         };
-        let note = chosen.ambiguity_note().unwrap();
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
         assert!(!note.contains("one definition per architecture"), "{note}");
     }
 }

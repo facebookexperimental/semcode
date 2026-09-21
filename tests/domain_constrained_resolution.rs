@@ -9,7 +9,7 @@
 // these drive the resolver directly with each one.
 use semcode::domain::{domain_of, Context};
 use semcode::Resolution;
-use semcode::{git, DatabaseManager};
+use semcode::{git, DatabaseManager, Surface};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -87,7 +87,7 @@ async fn an_unconstrained_search_still_chooses_and_reports() {
     // Which of the three it picks is the chooser's business; that it says
     // there were three is the contract.
     assert_eq!(chosen.others.len(), 2);
-    assert!(chosen.ambiguity_note().is_some());
+    assert!(chosen.ambiguity_note(Surface::Repl).is_some());
 }
 
 #[tokio::test]
@@ -108,7 +108,7 @@ async fn a_constraint_picks_its_own_architecture() {
     // The other two are not worse answers that lost a ranking; they were
     // never candidates, so there is no choice left to report.
     assert!(chosen.others.is_empty());
-    assert!(chosen.ambiguity_note().is_none());
+    assert!(chosen.ambiguity_note(Surface::Repl).is_none());
 }
 
 #[tokio::test]
@@ -312,4 +312,59 @@ async fn callees_come_from_one_definition_not_from_all_of_them() {
         .await
         .unwrap();
     assert_eq!(unconstrained, existing);
+}
+
+/// A tree that has no architectures, indexed the same way. The shape of
+/// every repository semcode can read that is not Linux.
+async fn tree_with_no_architectures() -> (tempfile::TempDir, Arc<DatabaseManager>) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+
+    git_run(repo, &["init", "-q"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn read(buffer: &mut [u8]) -> usize {\n    buffer.len()\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "no architectures here"]);
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["rs".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+
+    (dir, db)
+}
+
+#[tokio::test]
+async fn the_architectures_offered_are_the_ones_the_index_holds() {
+    let (_dir, db, _sha) = tree_with_one_definition_per_arch().await;
+
+    assert_eq!(
+        db.indexed_architectures().await.unwrap(),
+        vec!["arm64", "sparc", "x86"]
+    );
+}
+
+#[tokio::test]
+async fn a_tree_with_no_architectures_offers_none() {
+    // The constraint admits everything on a tree with no architectures, so
+    // a pin accepted here would be a filter that silently does nothing.
+    // Offering no architecture is what lets a caller be refused instead.
+    let (_dir, db) = tree_with_no_architectures().await;
+
+    assert!(db.indexed_architectures().await.unwrap().is_empty());
 }

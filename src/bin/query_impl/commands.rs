@@ -257,7 +257,7 @@ async fn show_callchain_with_limits(
     };
     // One chain, so one definition. Say so rather than presenting the choice
     // as the tree's only answer.
-    if let Some(note) = chosen.ambiguity_note() {
+    if let Some(note) = chosen.ambiguity_note(semcode::Surface::Repl) {
         println!("{} {}", "Ambiguous:".bold().yellow(), note);
     }
     let func = chosen.function;

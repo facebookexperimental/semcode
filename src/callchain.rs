@@ -307,7 +307,7 @@ fn when_it_runs(level: &str) -> &'static str {
 /// "Not found" would be a lie: the name is defined, just not anywhere this
 /// caller can reach. Naming where the other side lives is the whole
 /// difference between a dead end and a breadcrumb.
-fn elsewhere_note(
+pub fn elsewhere_note(
     candidates: &[crate::types::DefinitionSite],
     context: crate::domain::Context,
 ) -> String {
@@ -380,7 +380,7 @@ pub async fn show_callers_to_writer_in(
             // Callers are found by name, and a name can belong to several
             // functions. Listing them under one definition's heading says the
             // callers of the others belong to it.
-            if let Some(note) = chosen.ambiguity_note() {
+            if let Some(note) = chosen.ambiguity_note(crate::types::Surface::Repl) {
                 writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
             }
             let func = chosen.function;
@@ -1282,7 +1282,7 @@ pub async fn show_callchain_to_writer(
             // A chain is read as one path, so it starts at one definition. It
             // said which file that was and not that there had been a choice,
             // which reads as the tree having one.
-            if let Some(note) = chosen.ambiguity_note() {
+            if let Some(note) = chosen.ambiguity_note(crate::types::Surface::Repl) {
                 writeln!(writer, "{} {}", "Ambiguous:".bold().yellow(), note)?;
             }
             let func = chosen.function;

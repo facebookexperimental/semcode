@@ -4806,6 +4806,28 @@ impl DatabaseManager {
         self.processed_file_store.get_all().await
     }
 
+    /// The architectures this index holds, sorted, from the paths it read.
+    ///
+    /// Empty on a tree that has no architectures, which is every tree that
+    /// is not Linux-shaped. A caller that offers an architecture constraint
+    /// checks a reader's pin against this rather than against the list of
+    /// architectures Linux has: on a tree with no architectures the
+    /// constraint admits everything, so a pin that is accepted there is a
+    /// filter that silently does nothing.
+    pub async fn indexed_architectures(&self) -> Result<Vec<&'static str>> {
+        let paths = self
+            .processed_file_store
+            .files_under_an_arch_directory()
+            .await?;
+        let mut arches: Vec<&'static str> = paths
+            .iter()
+            .filter_map(|path| crate::domain::domain_of(path).arch)
+            .collect();
+        arches.sort_unstable();
+        arches.dedup();
+        Ok(arches)
+    }
+
     /// Get all symbol-filename pairs
     pub async fn get_all_symbol_filename_pairs(&self) -> Result<Vec<(String, String)>> {
         self.symbol_filename_store.get_all().await
