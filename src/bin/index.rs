@@ -1112,6 +1112,7 @@ async fn main() -> Result<()> {
 
             let mut total_new_emails = 0usize;
             let mut total_emails_all_archives = 0usize;
+            let mut failed_archives: Vec<(String, String)> = Vec::new();
 
             // Process each lore archive
             for lore_url in lore_args {
@@ -1123,6 +1124,7 @@ async fn main() -> Result<()> {
                     Ok(path) => path,
                     Err(e) => {
                         eprintln!("Error cloning {}: {:#}", lore_url, e);
+                        failed_archives.push((lore_url.clone(), format!("{:#}", e)));
                         continue;
                     }
                 };
@@ -1133,6 +1135,7 @@ async fn main() -> Result<()> {
                     Ok(repo) => repo,
                     Err(e) => {
                         eprintln!("Error opening repository {}: {}", clone_path.display(), e);
+                        failed_archives.push((lore_url.clone(), e.to_string()));
                         continue;
                     }
                 };
@@ -1158,6 +1161,7 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         eprintln!("Error indexing {}: {}", lore_url, e);
+                        failed_archives.push((lore_url.clone(), e.to_string()));
                         continue;
                     }
                 }
@@ -1167,12 +1171,24 @@ async fn main() -> Result<()> {
 
             println!("\n=== Lore Email Indexing Complete ===");
             println!("Total time: {:.1}s", total_time.as_secs_f64());
-            println!("Archives processed: {}", lore_args.len());
+            println!(
+                "Archives processed: {}/{}",
+                lore_args.len() - failed_archives.len(),
+                lore_args.len()
+            );
             println!("New emails indexed: {}", total_new_emails);
             println!(
                 "Total emails across archives: {}",
                 total_emails_all_archives
             );
+
+            // Report failed archives if any
+            if !failed_archives.is_empty() {
+                eprintln!("\nFailed archives:");
+                for (name, err) in &failed_archives {
+                    eprintln!("  {}: {}", name, err);
+                }
+            }
 
             if total_new_emails > 0 {
                 // Compact only lore tables.  The full optimize_database()
@@ -1203,6 +1219,14 @@ async fn main() -> Result<()> {
 
             println!("\nTo query this database, run:");
             println!("  semcode --database {}", database_path);
+
+            if !failed_archives.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "{} of {} lore archive(s) failed",
+                    failed_archives.len(),
+                    lore_args.len()
+                ));
+            }
 
             return Ok(());
         } else {
@@ -1400,6 +1424,14 @@ async fn main() -> Result<()> {
 
             println!("\nTo query this database, run:");
             println!("  semcode --database {}", database_path);
+
+            if !failed_archives.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "{} of {} lore archive(s) failed to refresh",
+                    failed_archives.len(),
+                    total_archives
+                ));
+            }
 
             return Ok(());
         }
