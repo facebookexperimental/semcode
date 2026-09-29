@@ -1253,25 +1253,59 @@ impl TreeSitterAnalyzer {
                 .iter()
                 .any(|entry| !readable.contains(&(entry.name.as_str(), entry.line_start)))
             {
+                tracing::info!(
+                    file = %file_path.display(),
+                    "refused to read the macros an unreadable construct swallowed here: \
+                     the second reading of this file that would recover them no longer \
+                     sees a definition the first reading does, so nothing it found can \
+                     be trusted. The swallowed macros stay missing from the index."
+                );
                 return Ok(GraftedMacros::keeping(macros));
             }
         }
 
-        let healed_macros = self.deduplicate_macros_within_file(raw_healed);
-        let known: HashSet<&str> = macros.iter().map(|entry| entry.name.as_str()).collect();
+        // Keep only the rows the file states are `#define`s before one row
+        // per name survives: a row that looked like a definition once the
+        // construct around it was blanked can carry a longer body than the
+        // real definition of the same name, and would take that name's place.
+        let (on_define_rows, elsewhere): (Vec<FunctionInfo>, Vec<FunctionInfo>) = raw_healed
+            .into_iter()
+            .partition(|entry| declared.contains(&entry.line_start));
 
-        let gained: Vec<FunctionInfo> = healed_macros
-            .iter()
-            .filter(|entry| {
-                // A name the original already read keeps the row the original
-                // read: the index holds one row per name per file, and on a
-                // tie the tree that needed no blanking wins.
-                !known.contains(entry.name.as_str()) && declared.contains(&entry.line_start)
-            })
-            .cloned()
+        let known: HashSet<&str> = macros.iter().map(|entry| entry.name.as_str()).collect();
+        let gained: Vec<FunctionInfo> = self
+            .deduplicate_macros_within_file(on_define_rows)
+            .into_iter()
+            // A name the original already read keeps the row the original
+            // read: the index holds one row per name per file, and on a tie
+            // the tree that needed no blanking wins.
+            .filter(|entry| !known.contains(entry.name.as_str()))
             .collect();
 
+        // The names a blanked parse found where the file writes a comment or
+        // a string. Naming them matters: it is the difference between a file
+        // this cannot help and a file it refused to invent a macro for.
+        let refused: HashSet<&str> = {
+            let taken: HashSet<&str> = gained.iter().map(|entry| entry.name.as_str()).collect();
+            elsewhere
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .filter(|name| !known.contains(name) && !taken.contains(name))
+                .collect()
+        };
+        let invented = refused.len();
+
         if gained.is_empty() {
+            if invented > 0 {
+                tracing::info!(
+                    file = %file_path.display(),
+                    refused = invented,
+                    "read no macros an unreadable construct swallowed here: every \
+                     definition found inside the swallowed part of this file sits where \
+                     the file writes a comment or a string, so none of them is a macro \
+                     the file defines"
+                );
+            }
             return Ok(GraftedMacros::keeping(macros));
         }
 
@@ -1280,6 +1314,28 @@ impl TreeSitterAnalyzer {
         // `dev_printk`, which is the same silence one hop along. Offsets
         // survive blanking, so a site read from the healed tree is at the
         // place the file puts it.
+        // A file that indexes without the macros it defines says nothing
+        // today, which is why the defect stood for as long as it did: 41
+        // directives in one logging header, one row, no warning. Say it.
+        tracing::info!(
+            file = %file_path.display(),
+            recovered = gained.len(),
+            refused = invented,
+            "read {} function-like macro{} an unreadable construct had swallowed in this \
+             file{}",
+            gained.len(),
+            if gained.len() == 1 { "" } else { "s" },
+            match invented {
+                0 => String::new(),
+                1 => ", and refused one more that sits where the file writes a comment or a \
+                      string"
+                    .to_string(),
+                n => format!(
+                    ", and refused {n} more that sit where the file writes a comment or a string"
+                ),
+            }
+        );
+
         let recovered: HashSet<&str> = gained.iter().map(|entry| entry.name.as_str()).collect();
         let grafted = GraftedMacros {
             dispatch_sites: sites
@@ -8919,6 +8975,47 @@ mod preproc_error_recovery_tests {
         found
     }
 
+    /// Somewhere for a test to read what the analyzer said.
+    #[derive(Clone, Default)]
+    struct Recorded(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Recorded {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Recorded {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// What the analyzer logs while reading one file. The subscriber is
+    /// thread-local, so tests running beside each other do not read each
+    /// other's lines.
+    fn log_of(source: &str) -> String {
+        let recorded = Recorded::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(recorded.clone())
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = macros_in(source);
+        });
+        let bytes = recorded.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
     fn macro_names(source: &str) -> Vec<String> {
         let mut names: Vec<String> = macros_in(source)
             .into_iter()
@@ -9079,6 +9176,68 @@ mod preproc_error_recovery_tests {
          #define GHOST(x) x\n\
           */\n\
          #define real(x) x\n";
+
+    /// A row inside a spliced comment that defines the same name as a real
+    /// swallowed definition below it, with a longer body. One row per name
+    /// survives, and the longer body wins, so choosing the survivor before
+    /// the file has been asked which rows are comments hands the name to
+    /// the row that was never a definition.
+    const PHANTOM_TAKES_A_NAME: &str = "#define kept(x) x\n\
+         static inline __printf(3, 4)\n\
+         int broken(const char *fmt, ...);\n\
+         // this comment continues over the row below \\\n\
+         #define shared(x) a_much_longer_expansion_of(x, x, x, x)\n\
+         #define shared(x) x\n";
+
+    #[test]
+    fn a_phantom_cannot_take_the_name_of_a_real_definition() {
+        // The real definition is on row 6 and the comment's row 5 carries
+        // the longer body. Recovering row 5 would be inventing a macro; not
+        // recovering row 6 because row 5 outbid it loses a real one.
+        let found = macros_in(PHANTOM_TAKES_A_NAME);
+        assert!(
+            found.contains(&("shared".to_string(), 6)),
+            "the real definition was not recovered: {found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|(name, line)| name == "shared" && *line == 5),
+            "a row the file writes as a comment was read as a definition: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_macros_were_recovered_says_which_and_how_many() {
+        // The defect stood as long as it did because a file that indexes
+        // without the macros it defines indexes "successfully": 41
+        // directives in one logging header, one row, nothing logged.
+        let said = log_of(LOGGING_HEADER);
+        assert!(
+            said.contains("read 3 function-like macros"),
+            "the count of what was recovered is not in the log: {said}"
+        );
+        assert!(said.contains("fixture.h"), "{said}");
+    }
+
+    #[test]
+    fn a_file_where_a_definition_was_refused_says_that_too() {
+        // Recovery declining is as much a fact about the file as recovery
+        // working. Here one row looked like a definition once the construct
+        // around it was blanked, and the file states it is the continuation
+        // of a comment.
+        let said = log_of(SPLICED_COMMENT);
+        assert!(said.contains("refused=1"), "{said}");
+    }
+
+    #[test]
+    fn a_file_the_parser_reads_whole_says_nothing() {
+        // Silence is the answer for the file with nothing to recover, or the
+        // log is noise: 1,639 files on one kernel tree enter recovery and
+        // 139 of them gain anything.
+        let said = log_of("#define fine(x) x\n\nvoid plain(void)\n{}\n");
+        assert!(said.is_empty(), "{said}");
+    }
 
     #[test]
     fn a_recovered_macro_brings_what_its_body_does() {
