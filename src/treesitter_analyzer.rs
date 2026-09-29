@@ -68,6 +68,28 @@ type ExtractedMacros = (
     Vec<crate::types::UnresolvedEdge>,
 );
 
+/// What a healed parse adds to a file's macros: the definitions the original
+/// parse could not see, and what their bodies do.
+#[derive(Debug, Default)]
+struct GraftedMacros {
+    macros: Vec<FunctionInfo>,
+    dispatch_sites: Vec<DispatchSite>,
+    registrations: Vec<Registration>,
+    argument_functions: Vec<ArgumentFunction>,
+    unresolved_edges: Vec<crate::types::UnresolvedEdge>,
+}
+
+impl GraftedMacros {
+    /// A graft that was refused: the original macros, and nothing from the
+    /// healed tree.
+    fn keeping(macros: Vec<FunctionInfo>) -> Self {
+        Self {
+            macros,
+            ..Default::default()
+        }
+    }
+}
+
 /// What one file yields.
 #[derive(Debug, Default)]
 pub struct FileAnalysis {
@@ -337,6 +359,16 @@ struct Table {
     /// the declarator itself said the elements are functions.
     element_type: Option<String>,
 }
+
+/// Rounds of blanking a file gets before recovery gives up on it.
+///
+/// Measured over Linux 28a2bc7211da, where 1,639 files enter recovery: a cap
+/// of one reads 572 recovered names in 110 files, two reads 673 in 136, and
+/// four reads 681 in 139 and is where it stops improving. The last two rounds
+/// buy 8 names for 317 of the 2,003 second parses, which is a rounding error
+/// against the cost of indexing the tree at all -- so this is set where
+/// recovery stops finding rather than where the returns thin out.
+const HEAL_ROUND_CAP: usize = 4;
 
 impl TreeSitterAnalyzer {
     pub fn new() -> Result<Self> {
@@ -981,7 +1013,26 @@ impl TreeSitterAnalyzer {
         // Perform intra-file deduplication (no thread contention since this is per-file)
         let functions = self.deduplicate_functions_within_file(raw_functions);
         let types = self.deduplicate_types_within_file(raw_types);
-        let macros = self.deduplicate_macros_within_file(raw_macros);
+        let mut macros = self.deduplicate_macros_within_file(raw_macros);
+
+        // Read the directives an unreadable construct swallowed here too, so
+        // this path and `analyze_source_with_metadata` cannot answer
+        // differently for one file.
+        if let Some((healed_source, healed_tree, declared)) =
+            self.heal_swallowed_directives(&source_code, &tree, language)
+        {
+            macros = self
+                .graft_recovered_macros(
+                    macros,
+                    &healed_source,
+                    &healed_tree,
+                    &declared,
+                    file_path,
+                    &git_hash,
+                    source_root,
+                )?
+                .macros;
+        }
 
         Ok((functions, types, macros))
     }
@@ -1020,15 +1071,21 @@ impl TreeSitterAnalyzer {
             anyhow::anyhow!("Failed to parse source code for: {}", file_path.display())
         })?;
 
+        // An unreadable construct yields an ERROR node that does not stop at
+        // the declaration: it runs on and swallows the directives after it, so
+        // the file indexes without the macros it defines. Read those from a
+        // second parse of the same file with what the ERROR covers blanked.
+        let healed = self.heal_swallowed_directives(source_code, &tree, language);
+
         // Single-pass extraction with optimized call analysis
         let FileAnalysis {
             functions: raw_functions,
             types: mut raw_types,
             macros: raw_macros,
-            dispatch_sites,
-            registrations,
-            argument_functions,
-            unresolved_edges,
+            mut dispatch_sites,
+            mut registrations,
+            mut argument_functions,
+            mut unresolved_edges,
             globals,
         } = self.extract_all_with_embedded_data(
             &tree,
@@ -1053,7 +1110,27 @@ impl TreeSitterAnalyzer {
         // Perform intra-file deduplication (no thread contention since this is per-file)
         let functions = self.deduplicate_functions_within_file(raw_functions);
         let types = self.deduplicate_types_within_file(raw_types);
-        let macros = self.deduplicate_macros_within_file(raw_macros);
+        let mut macros = self.deduplicate_macros_within_file(raw_macros);
+
+        // The healed tree contributes macro rows and nothing else: functions
+        // and types stay as the original parse read them, so blanking cannot
+        // cost a definition that parses today.
+        if let Some((healed_source, healed_tree, declared)) = healed {
+            let grafted = self.graft_recovered_macros(
+                macros,
+                &healed_source,
+                &healed_tree,
+                &declared,
+                file_path,
+                git_hash,
+                source_root,
+            )?;
+            macros = grafted.macros;
+            dispatch_sites.extend(grafted.dispatch_sites);
+            registrations.extend(grafted.registrations);
+            argument_functions.extend(grafted.argument_functions);
+            unresolved_edges.extend(grafted.unresolved_edges);
+        }
 
         // Call relationships are now embedded in function/macro JSON columns
 
@@ -1067,6 +1144,421 @@ impl TreeSitterAnalyzer {
             unresolved_edges,
             globals,
         })
+    }
+
+    /// Blank the code an `ERROR` covers, reparse, and hand back that source
+    /// and tree when the directives inside the span became readable.
+    ///
+    /// Returns `None` unless the file is one this can help: the pre-gate is
+    /// that an `ERROR` covers a line that looks like a directive, so a file
+    /// whose ERROR swallows only code pays for no extra parse.
+    fn heal_swallowed_directives(
+        &mut self,
+        source: &str,
+        tree: &Tree,
+        language: Language,
+    ) -> Option<(String, Tree, HashSet<u32>)> {
+        // Most files parse whole, and for those the flag on the root is the
+        // whole test: reserve the tree walk and the row scan for a file that
+        // has an ERROR at all.
+        if language != Language::C || !tree.root_node().has_error() {
+            return None;
+        }
+
+        // The rows the file really opens a directive on, read once from the
+        // original source. Gating on these rather than on directive-shaped
+        // text keeps a file whose ERROR covers only a commented-out
+        // `#define` from paying for a second parse it cannot gain from.
+        let declared = Self::define_rows_in_code_region(source);
+        if !Self::error_covers_declared_define(tree, &declared) {
+            return None;
+        }
+
+        let mut text = source.to_string();
+        let mut current = tree.clone();
+        let mut healed = false;
+
+        for _ in 0..HEAL_ROUND_CAP {
+            // A round that changes no text has nothing left to try: the rows
+            // an ERROR still covers are all directives, which are never
+            // blanked. Without this the loop re-blanks identical rows until
+            // the cap, parsing the file as many times for no delta.
+            let Some(next_text) = Self::blank_error_lines(&text, &current) else {
+                break;
+            };
+            // Belt to the braces above: a round that reproduces the text it
+            // was given has nothing left to blank, whatever the row
+            // bookkeeping says.
+            if next_text == text {
+                break;
+            }
+            let Some(next_tree) = self.get_parser(language).parse(&next_text, None) else {
+                break;
+            };
+            text = next_text;
+            current = next_tree;
+            healed = true;
+            if !Self::error_covers_declared_define(&current, &declared) {
+                break;
+            }
+        }
+
+        healed.then_some((text, current, declared))
+    }
+
+    /// Add the macros a healed parse reads and the original did not.
+    ///
+    /// Blanking is not semantics-preserving -- it can cost the tokens an
+    /// extraction depended on, turning one header from 59 definitions into
+    /// 35 -- and it can strip the delimiters around a commented-out
+    /// `#define`, inventing one the file never declared. So a gain is
+    /// believed only when the healed tree lost nothing, the gained name is
+    /// new to the file, and its line held a directive in the original source
+    /// outside any comment or string.
+    #[allow(clippy::too_many_arguments)]
+    fn graft_recovered_macros(
+        &self,
+        macros: Vec<FunctionInfo>,
+        healed_source: &str,
+        healed_tree: &Tree,
+        declared: &HashSet<u32>,
+        file_path: &Path,
+        git_hash: &str,
+        source_root: Option<&Path>,
+    ) -> Result<GraftedMacros> {
+        let (raw_healed, sites, registrations, arguments, edges) = self
+            .extract_macros_with_embedded_data(
+                healed_tree,
+                healed_source,
+                file_path,
+                git_hash,
+                source_root,
+                Language::C,
+            )?;
+        // Losslessness: a healed parse that no longer reads a definition the
+        // original read is a corrupted read of the file, not a recovery of
+        // it, and a count or a name-superset check cannot tell the two apart.
+        // Reject the whole graft rather than reason about which row moved.
+        //
+        // Ask this of every row the healed tree read, before one row per
+        // name survives deduplication: a name defined once per `#if` arm
+        // loses its original row to a longer arm the healing made readable,
+        // which is a recovery rather than a loss.
+        {
+            let readable: HashSet<(&str, u32)> = raw_healed
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.line_start))
+                .collect();
+            if macros
+                .iter()
+                .any(|entry| !readable.contains(&(entry.name.as_str(), entry.line_start)))
+            {
+                return Ok(GraftedMacros::keeping(macros));
+            }
+        }
+
+        let healed_macros = self.deduplicate_macros_within_file(raw_healed);
+        let known: HashSet<&str> = macros.iter().map(|entry| entry.name.as_str()).collect();
+
+        let gained: Vec<FunctionInfo> = healed_macros
+            .iter()
+            .filter(|entry| {
+                // A name the original already read keeps the row the original
+                // read: the index holds one row per name per file, and on a
+                // tie the tree that needed no blanking wins.
+                !known.contains(entry.name.as_str()) && declared.contains(&entry.line_start)
+            })
+            .cloned()
+            .collect();
+
+        if gained.is_empty() {
+            return Ok(GraftedMacros::keeping(macros));
+        }
+
+        // What a recovered body does, not only that it exists. Dropping
+        // these would leave `dev_dbg` with a row and no edge to
+        // `dev_printk`, which is the same silence one hop along. Offsets
+        // survive blanking, so a site read from the healed tree is at the
+        // place the file puts it.
+        let recovered: HashSet<&str> = gained.iter().map(|entry| entry.name.as_str()).collect();
+        let grafted = GraftedMacros {
+            dispatch_sites: sites
+                .into_iter()
+                .filter(|site| recovered.contains(site.caller_name.as_str()))
+                .collect(),
+            registrations: registrations
+                .into_iter()
+                .filter(|entry| recovered.contains(entry.enclosing_function.as_str()))
+                .collect(),
+            argument_functions: arguments
+                .into_iter()
+                .filter(|entry| recovered.contains(entry.enclosing_function.as_str()))
+                .collect(),
+            unresolved_edges: edges
+                .into_iter()
+                .filter(|edge| recovered.contains(edge.name.as_str()))
+                .collect(),
+            macros: {
+                let mut all = macros;
+                all.extend(gained);
+                all
+            },
+        };
+        Ok(grafted)
+    }
+
+    /// Whether `define` follows the `#` at `at`, allowing whitespace
+    /// between them, as `#  define X(y) y` does.
+    fn opens_a_define(bytes: &[u8], at: usize) -> bool {
+        let mut at = at;
+        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        let Some(rest) = bytes.get(at..) else {
+            return false;
+        };
+        rest.starts_with(b"define")
+            && !matches!(rest.get(6), Some(b) if b.is_ascii_alphanumeric() || *b == b'_')
+    }
+
+    /// Whether an `ERROR` node covers a row on which the file opens a
+    /// `#define`.
+    ///
+    /// This is the pre-gate and the loop's exit test: while it holds, the
+    /// file has directives the extraction query cannot see. `declared` holds
+    /// 1-based rows and a tree reports 0-based ones.
+    fn error_covers_declared_define(tree: &Tree, declared: &HashSet<u32>) -> bool {
+        Self::error_rows(tree)
+            .into_iter()
+            .any(|row| declared.contains(&(row as u32 + 1)))
+    }
+
+    /// The rows every `ERROR` node in the tree covers.
+    fn error_rows(tree: &Tree) -> Vec<usize> {
+        let mut rows = Vec::new();
+        let mut cursor = tree.walk();
+        let mut descend = true;
+        loop {
+            let node = cursor.node();
+            if node.is_error() {
+                rows.extend(node.start_position().row..=node.end_position().row);
+                // Everything under an ERROR is inside the span already.
+                descend = false;
+            }
+            if descend && cursor.goto_first_child() {
+                continue;
+            }
+            descend = true;
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return rows;
+                }
+            }
+        }
+    }
+
+    /// Blank every row an `ERROR` covers that is not part of a directive,
+    /// returning `None` when that leaves the text unchanged.
+    ///
+    /// Blanking is whole-row and byte-for-byte the same length, so every
+    /// offset, row and column outside a blanked row is what it was. Rows are
+    /// split on `\n`, which a file using lone `\r` for line endings does not
+    /// have: that file reads as one row, no row is ever blanked, and
+    /// recovery declines it.
+    fn blank_error_lines(text: &str, tree: &Tree) -> Option<String> {
+        let directive = Self::directive_lines(text);
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let mut blank = vec![false; directive.len()];
+        let mut any = false;
+        for row in Self::error_rows(tree) {
+            // A row a previous round already blanked would rewrite the same
+            // text, and an ERROR that survives blanking covers those rows
+            // every round: without this the loop reparses identical source
+            // until the cap.
+            let worth_blanking = matches!(directive.get(row), Some(false))
+                && !blank[row]
+                && lines.get(row).is_some_and(|line| !line.trim().is_empty());
+            if worth_blanking {
+                blank[row] = true;
+                any = true;
+            }
+        }
+        if !any {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(text.len());
+        for (row, line) in lines.iter().enumerate() {
+            if blank.get(row).copied().unwrap_or(false) {
+                out.extend(line.bytes().map(|byte| {
+                    if byte == b'\n' || byte == b'\r' {
+                        byte
+                    } else {
+                        b' '
+                    }
+                }));
+            } else {
+                out.extend_from_slice(line.as_bytes());
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// For each row, whether it is part of a preprocessor directive: it
+    /// starts with `#`, or it continues a directive because the row above it
+    /// ended in a backslash.
+    ///
+    /// The continuation rule is what makes recovery worth having. Without it
+    /// the body of every multi-line macro is blanked along with the code,
+    /// and one logging header recovers 25 of its 41 directives instead of
+    /// all of them.
+    fn directive_lines(source: &str) -> Vec<bool> {
+        let mut rows = Vec::new();
+        let mut continuing = false;
+        for line in source.split_inclusive('\n') {
+            let line = line.trim_end_matches('\n').trim_end_matches('\r');
+            let directive = continuing || line.trim_start().starts_with('#');
+            rows.push(directive);
+            // Only a backslash last on the row splices; whitespace after it
+            // does not, and treating it as if it did would pin a row of code
+            // as a directive and leave it unblanked.
+            continuing = directive && line.ends_with('\\');
+        }
+        rows
+    }
+
+    /// The rows on which the original source opens a `#define` with the `#`
+    /// outside any comment or string literal.
+    ///
+    /// This is what separates a recovered directive from an invented one: a
+    /// `#define` inside a block comment becomes a real node once blanking
+    /// strips the comment's delimiters, and it was never a definition.
+    fn define_rows_in_code_region(source: &str) -> HashSet<u32> {
+        #[derive(PartialEq)]
+        enum Region {
+            Code,
+            LineComment,
+            BlockComment,
+            Str,
+            Char,
+        }
+
+        let mut declared = HashSet::new();
+        let mut region = Region::Code;
+        let mut row = 1u32;
+        // Whether a `#` here would open a directive: everything before it on
+        // this logical line is whitespace or a comment, and the line is not
+        // the continuation of another.
+        let mut opens_row = true;
+        let bytes = source.as_bytes();
+        let mut at = 0usize;
+
+        // A byte-order mark is not code and does not stop the row it leads
+        // from opening a directive.
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            at = 3;
+        }
+
+        while at < bytes.len() {
+            let byte = bytes[at];
+            let next = bytes.get(at + 1).copied();
+
+            if byte == b'\n' {
+                // A backslash immediately before the newline splices this row
+                // onto the next, and that happens before a comment or a
+                // string is recognised: `// ...\` continues the comment over
+                // the row below, so a `#` down there opens nothing. Only a
+                // lone row-ending backslash splices -- trailing whitespace
+                // after it does not.
+                let spliced = match at.checked_sub(1).map(|i| bytes[i]) {
+                    Some(b'\r') => at.checked_sub(2).map(|i| bytes[i]) == Some(b'\\'),
+                    last => last == Some(b'\\'),
+                };
+                row += 1;
+                opens_row = !spliced;
+                if !spliced {
+                    // A `//` comment ends at an unspliced newline, and so
+                    // does an unterminated literal: C has no literal that
+                    // crosses a row without a splice, and leaving one open
+                    // would hand the rest of the file the wrong region --
+                    // which reads a `#define` inside a later comment as
+                    // code and believes a macro the file never declared.
+                    if matches!(region, Region::LineComment | Region::Str | Region::Char) {
+                        region = Region::Code;
+                    }
+                }
+                at += 1;
+                continue;
+            }
+
+            match region {
+                // A comment is whitespace by the time directives are read, so
+                // `/* c */ #define REAL(x) x` really does define a macro and
+                // neither delimiter closes the row to one.
+                Region::Code => match (byte, next) {
+                    (b'/', Some(b'/')) => {
+                        region = Region::LineComment;
+                        at += 2;
+                    }
+                    (b'/', Some(b'*')) => {
+                        region = Region::BlockComment;
+                        at += 2;
+                    }
+                    (b'"', _) => {
+                        region = Region::Str;
+                        opens_row = false;
+                        at += 1;
+                    }
+                    (b'\'', _) => {
+                        region = Region::Char;
+                        opens_row = false;
+                        at += 1;
+                    }
+                    (b'#', _) => {
+                        // Only a `#define` row matters: a gained row is a
+                        // macro definition, and gating on every directive
+                        // shape sends files into a second parse that cannot
+                        // gain anything from it.
+                        if opens_row && Self::opens_a_define(bytes, at + 1) {
+                            declared.insert(row);
+                        }
+                        opens_row = false;
+                        at += 1;
+                    }
+                    _ => {
+                        if !byte.is_ascii_whitespace() {
+                            opens_row = false;
+                        }
+                        at += 1;
+                    }
+                },
+                Region::BlockComment => {
+                    if (byte, next) == (b'*', Some(b'/')) {
+                        region = Region::Code;
+                        at += 2;
+                    } else {
+                        at += 1;
+                    }
+                }
+                Region::Str | Region::Char => {
+                    let closes = if region == Region::Str { b'"' } else { b'\'' };
+                    if byte == b'\\' {
+                        if next == Some(b'\n') {
+                            row += 1;
+                        }
+                        at += 2;
+                    } else {
+                        if byte == closes {
+                            region = Region::Code;
+                        }
+                        at += 1;
+                    }
+                }
+                Region::LineComment => at += 1,
+            }
+        }
+
+        declared
     }
 
     /// Optimized single-pass extraction with embedded JSON data
@@ -8437,23 +8929,6 @@ mod preproc_error_recovery_tests {
     }
 
     #[test]
-    fn an_unreadable_declaration_swallows_the_directives_after_it() {
-        // The seven lines the whole defect reduces to. The directive before
-        // the declaration is indexed and the one after it does not exist.
-        assert_eq!(
-            macros_in(ATTRIBUTE_SWALLOW),
-            vec![("before".to_string(), 1)]
-        );
-    }
-
-    #[test]
-    fn a_logging_header_contributes_the_macro_above_the_declaration() {
-        // dev_printk.h in miniature: of the four names it defines, the index
-        // gets the one that sits above the unreadable line.
-        assert_eq!(macro_names(LOGGING_HEADER), vec!["dev_fmt".to_string()]);
-    }
-
-    #[test]
     fn a_define_between_enum_members_is_lost_and_takes_nothing_with_it() {
         // Both directives inside the braces are gone, and the macro after
         // the enum is not, which is what bounds this case: the span does not
@@ -8490,25 +8965,26 @@ mod preproc_error_recovery_tests {
         // 59 definitions into 35 by blanking a struct whose tokens the
         // extraction depended on. Every pair here must survive, so the
         // baseline is stated rather than recomputed from whatever the
-        // recovered tree happens to return.
-        assert_eq!(
-            macros_in(SWALLOWED_COMMENT),
-            vec![("kept".to_string(), 1)],
-            "the directive above the unreadable line"
-        );
-        assert_eq!(
-            macros_in(ATTRIBUTE_SWALLOW),
-            vec![("before".to_string(), 1)]
-        );
-        assert_eq!(macros_in(LOGGING_HEADER), vec![("dev_fmt".to_string(), 1)]);
-        assert_eq!(
-            macros_in(DEFINE_INSIDE_ENUM),
-            vec![("after_enum".to_string(), 8)]
-        );
+        // recovered tree happens to return. Recovery adds rows, so this
+        // states what may not go missing and not what the whole list is --
+        // the lists themselves are the gates below.
+        for (source, baseline) in [
+            (SWALLOWED_COMMENT, ("kept", 1u32)),
+            (ATTRIBUTE_SWALLOW, ("before", 1)),
+            (LOGGING_HEADER, ("dev_fmt", 1)),
+            (DEFINE_INSIDE_ENUM, ("after_enum", 8)),
+        ] {
+            let found = macros_in(source);
+            assert!(
+                found
+                    .iter()
+                    .any(|(name, line)| name == baseline.0 && *line == baseline.1),
+                "the directive above the unreadable line: {baseline:?} not in {found:?}"
+            );
+        }
     }
 
     #[test]
-    #[ignore = "gate for ERROR-healing recovery; fails until it lands"]
     fn recovery_finds_the_directive_after_an_unreadable_declaration() {
         assert_eq!(
             macros_in(ATTRIBUTE_SWALLOW),
@@ -8517,7 +8993,6 @@ mod preproc_error_recovery_tests {
     }
 
     #[test]
-    #[ignore = "gate for ERROR-healing recovery; fails until it lands"]
     fn recovery_finds_every_name_a_logging_header_defines() {
         // Names, not directive lines: dev_dbg is defined three times here
         // and the index holds one row per name per file. Which arm that row
@@ -8529,10 +9004,249 @@ mod preproc_error_recovery_tests {
     }
 
     #[test]
-    #[ignore = "gate for ERROR-healing recovery; fails until it lands"]
     fn recovery_finds_the_real_directive_beside_a_commented_out_one() {
         let names = macro_names(SWALLOWED_COMMENT);
         assert!(names.contains(&"real".to_string()), "{names:?}");
         assert!(!names.contains(&"GHOST".to_string()), "{names:?}");
+    }
+
+    /// A `//` comment whose row ends in a backslash. The splice happens
+    /// before comments are read, so the `#define` below it is comment text
+    /// and not a definition -- but it is directive-shaped, so blanking
+    /// leaves it alone while destroying the `//` above it, and the healed
+    /// tree holds a real node for it.
+    const SPLICED_COMMENT: &str = "#define kept(x) x\n\
+         static inline __printf(3, 4)\n\
+         int broken(const char *fmt, ...);\n\
+         // this comment continues over the row below \\\n\
+         #define PHANTOM(x) x\n\
+         #define REAL(x) x\n";
+
+    /// A name defined once above the unreadable construct and once inside
+    /// the span it swallows, with a longer body. One row per name survives
+    /// deduplication and the longer body wins it, so the row the original
+    /// parse read is not in the healed parse's deduplicated set.
+    const REPEATED_NAME: &str = "#define DUP(x) x\n\
+         static inline __printf(3, 4)\n\
+         int broken(const char *fmt, ...);\n\
+         #define DUP(x) a_longer_expansion_of(x, x, x)\n\
+         #define NEWFOUND(x) x\n";
+
+    #[test]
+    fn a_spliced_comment_hides_the_directive_below_it() {
+        // Blanking destroys the `//` and leaves the row under it, which is
+        // where a phantom comes from that the masked scan of the original
+        // has to refuse. The real directive below it is still recovered.
+        let names = macro_names(SPLICED_COMMENT);
+        assert!(!names.contains(&"PHANTOM".to_string()), "{names:?}");
+        assert!(names.contains(&"REAL".to_string()), "{names:?}");
+        assert!(names.contains(&"kept".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_name_defined_twice_does_not_forfeit_the_others() {
+        // The losslessness guard asks whether the healed tree still *reads*
+        // every original definition, which it must ask before one row per
+        // name survives. Asking it afterwards rejects this whole graft and
+        // forfeits a macro that was recovered correctly -- and a logging
+        // header defining one name once per `#if` arm is exactly this shape.
+        let names = macro_names(REPEATED_NAME);
+        assert!(names.contains(&"NEWFOUND".to_string()), "{names:?}");
+        assert!(names.contains(&"DUP".to_string()), "{names:?}");
+    }
+
+    /// A string literal spliced over a row, then a commented-out
+    /// `#define`. Counting the spliced newline as no row at all puts every
+    /// row after it out of step, and the comment's row then reads as code.
+    const SPLICED_STRING: &str = "#define before(x) \"a\\\nb\"\n\
+         static inline __printf(3, 4)\n\
+         int broken(const char *fmt, ...);\n\
+         /*\n\
+         #define GHOST(x) x */\n\
+         #define real(x) x\n";
+
+    /// An apostrophe in prose the compiler never compiles, above a
+    /// commented-out `#define`. A scan that lets a literal run past the end
+    /// of its row is inside a string from there on, so the comment below
+    /// looks like code.
+    const UNTERMINATED_QUOTE: &str = "#define before(x) x\n\
+         static inline __printf(3, 4)\n\
+         int broken(const char *fmt, ...);\n\
+         #if 0\n\
+         this doesn't build\n\
+         #endif\n\
+         /* it's gone\n\
+         #define GHOST(x) x\n\
+          */\n\
+         #define real(x) x\n";
+
+    #[test]
+    fn a_recovered_macro_brings_what_its_body_does() {
+        // A row for the definition is half of it. The body of a recovered
+        // macro calls through a parameter, and that edge has to arrive with
+        // it -- a definition whose calls are dropped is the same silence one
+        // hop along.
+        let source = "#define kept(x) x\n\
+             static inline __printf(3, 4)\n\
+             int broken(const char *fmt, ...);\n\
+             #define call_through(f) f(1)\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new("fixture.h"), "hash", None)
+            .unwrap();
+        assert!(
+            analysis
+                .macros
+                .iter()
+                .any(|entry| entry.name == "call_through"),
+            "the definition itself was not recovered"
+        );
+        assert!(
+            analysis
+                .unresolved_edges
+                .iter()
+                .any(|edge| edge.name == "call_through"),
+            "recovered the definition and dropped what it calls: {:?}",
+            analysis
+                .unresolved_edges
+                .iter()
+                .map(|edge| (&edge.name, &edge.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_spliced_string_keeps_the_rows_after_it_in_step() {
+        // Counting the spliced newline as no row puts the block comment one
+        // row off, and the commented-out `#define` is then believed. The
+        // real macro below it stays unread either way -- blanking leaves the
+        // comment's closing `*/` behind and the fresh ERROR over it is the
+        // tail this does not reach -- so what this pins is that being unable
+        // to recover a row is never an excuse to invent one.
+        let names = macro_names(SPLICED_STRING);
+        assert!(!names.contains(&"GHOST".to_string()), "{names:?}");
+        assert_eq!(names, vec!["before".to_string()]);
+    }
+
+    #[test]
+    fn an_unterminated_literal_ends_with_its_row() {
+        let names = macro_names(UNTERMINATED_QUOTE);
+        assert!(!names.contains(&"GHOST".to_string()), "{names:?}");
+        assert!(names.contains(&"real".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_round_with_nothing_left_to_blank_does_not_reparse() {
+        // An ERROR that survives blanking covers the same rows every round.
+        // Where those rows are empty there is no text to change, and a round
+        // that hands back what it was given makes the file parse again for
+        // nothing, up to the round cap.
+        let source = "#if A\n\n#elif B\n\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let tree = analyzer
+            .get_parser(Language::C)
+            .parse(source, None)
+            .unwrap();
+        assert!(
+            TreeSitterAnalyzer::blank_error_lines(source, &tree).is_none(),
+            "a round rewrote rows that were already blank"
+        );
+    }
+
+    #[test]
+    fn a_comment_does_not_stop_a_row_from_opening_a_directive() {
+        // A comment is whitespace by the time directives are read, so a
+        // `#define` after one on the same row is a definition and the masked
+        // scan may not refuse it as a gain.
+        // A byte-order mark leads the file, not the row, which is why it is
+        // on the first of these.
+        let source =
+            "\u{feff}#define after_a_byte_order_mark(x) x\n/* c */ #define after_comment(x) x\n";
+        let mut rows: Vec<u32> = TreeSitterAnalyzer::define_rows_in_code_region(source)
+            .into_iter()
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_file_the_parser_reads_whole_is_never_reparsed() {
+        // The pre-gate. Recovery costs a second parse of the file, so a file
+        // whose parse holds no ERROR over a directive must not enter it --
+        // and neither must one whose ERROR covers only code.
+        let clean = "#define fine(x) x\n\nvoid plain(void)\n{}\n";
+        let error_over_code_only = "void plain(void)\n{\n\tint x = = 1;\n}\n";
+        for source in [clean, error_over_code_only] {
+            let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+            let tree = analyzer
+                .get_parser(Language::C)
+                .parse(source, None)
+                .unwrap();
+            assert!(
+                analyzer
+                    .heal_swallowed_directives(source, &tree, Language::C)
+                    .is_none(),
+                "recovery ran on a file it cannot help: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_continuation_line_is_part_of_the_directive_it_continues() {
+        // Blanking a continuation line destroys the body of every multi-line
+        // macro, which is the difference between reading 25 of a logging
+        // header's 41 directives and all of them. A backslash on a line of
+        // code continues nothing.
+        let source = "#define two(x) \\\n\tuse(x)\n\nint code = 1; \\\nstill_code;\n";
+        assert_eq!(
+            TreeSitterAnalyzer::directive_lines(source),
+            vec![true, true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn blanking_keeps_every_offset_outside_the_rows_it_blanks() {
+        // The recovered rows are reported at their original line and byte
+        // offset, which holds only because blanking is whole-row and
+        // byte-for-byte the same length.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let tree = analyzer
+            .get_parser(Language::C)
+            .parse(ATTRIBUTE_SWALLOW, None)
+            .unwrap();
+        let (healed, _, _) = analyzer
+            .heal_swallowed_directives(ATTRIBUTE_SWALLOW, &tree, Language::C)
+            .expect("the fixture is the case recovery exists for");
+        assert_eq!(healed.len(), ATTRIBUTE_SWALLOW.len());
+        assert_eq!(
+            healed.lines().count(),
+            ATTRIBUTE_SWALLOW.lines().count(),
+            "a blanked row is still a row"
+        );
+        for (blanked, original) in healed.lines().zip(ATTRIBUTE_SWALLOW.lines()) {
+            assert!(
+                blanked == original || blanked.trim().is_empty(),
+                "a row was rewritten rather than blanked: {blanked:?}"
+            );
+            assert_eq!(blanked.len(), original.len());
+        }
+    }
+
+    #[test]
+    fn a_directive_inside_a_comment_or_a_string_is_not_one() {
+        // What separates a recovered directive from an invented one. The
+        // scan runs on the original source, before any blanking, so the
+        // commented-out `#define` is never in code region.
+        let source = "#define first(x) x\n\
+             /*\n\
+              * #define in_block(x) x\n\
+              */\n\
+             // #define in_line(x) x\n\
+             const char *s = \"\\n#define in_string(x) x\";\n\
+             #define last(x) x\n";
+        let declared = TreeSitterAnalyzer::define_rows_in_code_region(source);
+        let mut rows: Vec<u32> = declared.into_iter().collect();
+        rows.sort();
+        assert_eq!(rows, vec![1, 7]);
     }
 }
