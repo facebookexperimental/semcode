@@ -3817,6 +3817,10 @@ impl TreeSitterAnalyzer {
             let mut function_end_byte = 0;
             let mut body_start_byte = 0;
             let mut function_node = None;
+            // A declaration has no definition node, but sits under an arm
+            // all the same; without it a declaration and the definition it
+            // announces under one `#ifdef` read as two configurations.
+            let mut declaration_node = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -3871,6 +3875,7 @@ impl TreeSitterAnalyzer {
                     "declaration" if function_start_byte == 0 => {
                         // Function declaration without body - skip call/type extraction
                         // Set minimal bounds for declaration-only functions
+                        declaration_node = Some(node);
                         function_start_byte = node.start_byte();
                         function_end_byte = node.end_byte();
                         if line_end == 0 {
@@ -4036,7 +4041,9 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(function_types)
                     },
-                    guard: function_node.and_then(|node| Self::guard_of(node, ctx.source)),
+                    guard: function_node
+                        .or(declaration_node)
+                        .and_then(|node| Self::guard_of(node, ctx.source)),
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -4094,9 +4101,11 @@ impl TreeSitterAnalyzer {
         // that follows carries every call the function makes.
         if matches!(ctx.language, Language::C) {
             for defined in Self::macro_defined_functions(ctx.tree.root_node(), ctx.source) {
+                // Already read by the query under this arm. Another arm of
+                // the same name is another definition, and is kept.
                 if functions
                     .iter()
-                    .any(|f: &FunctionInfo| f.name == defined.name)
+                    .any(|f: &FunctionInfo| f.name == defined.name && f.guard == defined.guard)
                 {
                     continue;
                 }
@@ -9987,5 +9996,48 @@ mod config_variant_tests {
         let arms = arms_of(source, "arch/x86/kernel/cpu/bugs.c", "pr_fmt");
         assert_eq!(arms.len(), 1, "{arms:#?}");
         assert_eq!(arms[0].0, None);
+    }
+
+    #[test]
+    fn a_declaration_and_its_definition_under_one_arm_are_one_row() {
+        // The declaration sits under the same `#ifdef` as the definition.
+        // Read as file scope, it would be an arm of its own and survive
+        // beside the definition as a second, bodiless configuration.
+        let source = "#ifdef CONFIG_X\n\
+             static int foo(int x);\n\
+             static int foo(int x) { return x; }\n\
+             #endif\n";
+        let arms = arms_of(source, "fixture.c", "foo");
+        assert_eq!(arms.len(), 1, "{arms:#?}");
+        assert_eq!(arms[0].0.as_deref(), Some("defined(CONFIG_X)"));
+        assert!(arms[0].1.contains("return x;"), "{arms:#?}");
+    }
+
+    #[test]
+    fn each_arm_of_a_macro_opened_function_is_kept() {
+        // A function a macro opens is found after the query's own, and was
+        // skipped when the name was already taken -- by its other arm.
+        let source = "#if A\n\
+             SYSCALL_DEFINE1(foo, int, x) { return one(); }\n\
+             #else\n\
+             SYSCALL_DEFINE1(foo, int, x) { return two(); }\n\
+             #endif\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new("fixture.c"), "testhash", None)
+            .unwrap();
+        let bodies: Vec<(Option<String>, String)> = analysis
+            .functions
+            .into_iter()
+            .filter(|row| row.name.ends_with("foo"))
+            .map(|row| (row.guard, row.body))
+            .collect();
+        assert_eq!(bodies.len(), 2, "{bodies:#?}");
+        assert!(bodies
+            .iter()
+            .any(|(guard, body)| guard.as_deref() == Some("A") && body.contains("one()")));
+        assert!(bodies
+            .iter()
+            .any(|(guard, body)| guard.as_deref() == Some("!A") && body.contains("two()")));
     }
 }
