@@ -3091,30 +3091,44 @@ impl DatabaseManager {
         }
 
         let macros = self.object_macro_store.all().await?;
-        let bodies: HashMap<&str, &str> = macros
-            .iter()
-            .map(|(name, expansion)| (name.as_str(), expansion.as_str()))
-            .collect();
-
-        let mut attributes = HashSet::new();
-        for (name, body) in &bodies {
-            let mut current = *body;
-            // Alias chains are short; the bound stops a cycle.
-            for _ in 0..8 {
-                if current.contains("__attribute__") {
-                    attributes.insert((*name).to_string());
-                    break;
-                }
-                match bodies.get(current.trim()) {
-                    Some(next) => current = next,
-                    None => break,
-                }
-            }
-        }
+        let attributes = Self::names_of_attributes(&macros);
 
         let attributes = Arc::new(attributes);
         let _ = self.attribute_names.set(attributes.clone());
         Ok(attributes)
+    }
+
+    /// The macros that expand to an attribute in some configuration,
+    /// directly or through aliases.
+    ///
+    /// A name with several expansions (several files, or several arms of
+    /// one) is an attribute if any of them leads to one: the question is
+    /// whether the identifier can name nothing, and an auditor has to see
+    /// the member that is flattened away in one configuration.
+    fn names_of_attributes(macros: &HashMap<String, Vec<String>>) -> HashSet<String> {
+        let mut attributes = HashSet::new();
+        for (name, expansions) in macros {
+            let mut frontier: Vec<&str> = expansions.iter().map(String::as_str).collect();
+            let mut seen: HashSet<&str> = HashSet::new();
+            // Alias chains are short; the bound stops a cycle.
+            for _ in 0..8 {
+                if frontier.iter().any(|body| body.contains("__attribute__")) {
+                    attributes.insert(name.clone());
+                    break;
+                }
+                frontier = frontier
+                    .iter()
+                    .filter_map(|body| macros.get(body.trim()))
+                    .flatten()
+                    .map(String::as_str)
+                    .filter(|next| seen.insert(next))
+                    .collect();
+                if frontier.is_empty() {
+                    break;
+                }
+            }
+        }
+        attributes
     }
 
     /// Drop from a field path what is an attribute rather than a member.
@@ -8362,6 +8376,32 @@ mod tests {
             types: None,
             guard: None,
         }
+    }
+
+    #[test]
+    fn a_macro_is_an_attribute_if_any_arm_makes_it_one() {
+        // `__tag` expands to an attribute under CONFIG_X and to nothing
+        // otherwise; `__alias` reaches it through another name. Neither
+        // answer may depend on which row the table returned first.
+        let macros: HashMap<String, Vec<String>> = [
+            ("__tag", vec!["", "__attribute__((randomize_layout))"]),
+            ("__alias", vec!["__tag"]),
+            ("__plain", vec!["", "1"]),
+            ("__loop", vec!["__loop"]),
+        ]
+        .into_iter()
+        .map(|(name, bodies)| {
+            (
+                name.to_string(),
+                bodies.into_iter().map(str::to_string).collect(),
+            )
+        })
+        .collect();
+        let mut found: Vec<String> = DatabaseManager::names_of_attributes(&macros)
+            .into_iter()
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["__alias".to_string(), "__tag".to_string()]);
     }
 
     #[tokio::test]
