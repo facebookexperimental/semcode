@@ -741,7 +741,22 @@ impl SchemaManager {
             "registrations" => self.create_registrations_table().await,
             "dispatch_sites" => self.create_dispatch_sites_table().await,
             other => Err(anyhow::anyhow!("no way to recreate {other}")),
+        }?;
+
+        // A branch recorded as indexed is skipped while its tip does not
+        // move, and its functions were in the table just dropped: it has to
+        // be read again, not trusted.
+        if name == "functions" {
+            if let Ok(branches) = self
+                .connection
+                .open_table("indexed_branches")
+                .execute()
+                .await
+            {
+                branches.delete("1=1").await?;
+            }
         }
+        Ok(())
     }
 
     async fn create_symbol_filename_table(&self) -> Result<()> {

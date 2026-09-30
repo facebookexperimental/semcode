@@ -437,6 +437,9 @@ impl DatabaseManager {
             "lore",
             "lore_indexed_commits",
             "indexed_branches",
+            // Every expansion of a macro counts towards whether it names an
+            // attribute, so a row left behind here outlives the definition.
+            "object_macros",
         ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
                 table.delete("1=1").await?;

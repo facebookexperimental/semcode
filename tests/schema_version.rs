@@ -147,6 +147,9 @@ async fn tables_written_before_the_guard_column_are_started_again() {
     // re-indexing, the one repair a user will try, could never succeed.
     let dir = tempfile::tempdir().unwrap();
     let db = manager(dir.path()).await;
+    db.record_branch_indexed("main", "cafe1234", None)
+        .await
+        .unwrap();
     for name in ["functions", "object_macros"] {
         let table = db.connection().open_table(name).execute().await.unwrap();
         let schema = table.schema().await.unwrap();
@@ -176,6 +179,8 @@ async fn tables_written_before_the_guard_column_are_started_again() {
             "{name} still lacks the guard column"
         );
     }
+    // The branch's functions went with the table, so it is not current.
+    assert!(!db.is_branch_current("main", "cafe1234").await.unwrap());
     db.insert_functions(vec![semcode::FunctionInfo {
         name: "pick".to_string(),
         file_path: "pick.h".to_string(),
