@@ -9729,4 +9729,94 @@ mod config_variant_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].guard.as_deref(), Some("defined(CONFIG_A)"));
     }
+
+    /// `include/linux/sched.h`, the four `_cond_resched()` arms verbatim.
+    const COND_RESCHED: &str =
+        "#if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)\n\
+         extern int __cond_resched(void);\n\
+         \n\
+         #if defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)\n\
+         \n\
+         DECLARE_STATIC_CALL(cond_resched, __cond_resched);\n\
+         \n\
+         static __always_inline int _cond_resched(void)\n\
+         {\n\
+         \treturn static_call_mod(cond_resched)();\n\
+         }\n\
+         \n\
+         #elif defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)\n\
+         \n\
+         extern int dynamic_cond_resched(void);\n\
+         \n\
+         static __always_inline int _cond_resched(void)\n\
+         {\n\
+         \treturn dynamic_cond_resched();\n\
+         }\n\
+         \n\
+         #else /* !CONFIG_PREEMPTION */\n\
+         \n\
+         static inline int _cond_resched(void)\n\
+         {\n\
+         \treturn __cond_resched();\n\
+         }\n\
+         \n\
+         #endif /* PREEMPT_DYNAMIC && CONFIG_HAVE_PREEMPT_DYNAMIC_CALL */\n\
+         \n\
+         #else /* CONFIG_PREEMPTION && !CONFIG_PREEMPT_DYNAMIC */\n\
+         \n\
+         static inline int _cond_resched(void)\n\
+         {\n\
+         \treturn 0;\n\
+         }\n\
+         \n\
+         #endif /* !CONFIG_PREEMPTION || CONFIG_PREEMPT_DYNAMIC */\n";
+
+    /// `include/linux/dev_printk.h`, the three `dev_dbg()` arms verbatim.
+    const DEV_DBG: &str = "#if defined(CONFIG_DYNAMIC_DEBUG) || \\\n\
+         \t(defined(CONFIG_DYNAMIC_DEBUG_CORE) && defined(DYNAMIC_DEBUG_MODULE))\n\
+         #define dev_dbg(dev, fmt, ...)\t\t\t\t\t\t\\\n\
+         \tdynamic_dev_dbg(dev, dev_fmt(fmt), ##__VA_ARGS__)\n\
+         #elif defined(DEBUG)\n\
+         #define dev_dbg(dev, fmt, ...)\t\t\t\t\t\t\\\n\
+         \tdev_printk(KERN_DEBUG, dev, dev_fmt(fmt), ##__VA_ARGS__)\n\
+         #else\n\
+         #define dev_dbg(dev, fmt, ...)\t\t\t\t\t\t\\\n\
+         \tdev_no_printk(KERN_DEBUG, dev, dev_fmt(fmt), ##__VA_ARGS__)\n\
+         #endif\n";
+
+    /// Every row the file analysis keeps for `name`, functions and macros
+    /// alike, ordered by line.
+    fn kept_definitions(source: &str, path: &str, name: &str) -> Vec<FunctionInfo> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap();
+        let mut rows: Vec<FunctionInfo> = analysis
+            .functions
+            .into_iter()
+            .chain(analysis.macros)
+            .filter(|row| row.name == name)
+            .collect();
+        rows.sort_by_key(|row| row.line_start);
+        rows
+    }
+
+    #[test]
+    fn cond_resched_keeps_only_the_arm_that_does_nothing() {
+        // Today's choice, pinned before it changes: four arms parse, one
+        // survives, and it is the one whose body is `return 0;`, so every
+        // route that reaches the scheduler is invisible.
+        let rows = kept_definitions(COND_RESCHED, "include/linux/sched.h", "_cond_resched");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].body.contains("return 0;"), "{}", rows[0].body);
+    }
+
+    #[test]
+    fn dev_dbg_keeps_only_the_arm_that_prints_nothing() {
+        // Today's choice, pinned before it changes: the longest body wins,
+        // which is the `#else` arm a CONFIG_DYNAMIC_DEBUG build never uses.
+        let rows = kept_definitions(DEV_DBG, "include/linux/dev_printk.h", "dev_dbg");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].body.contains("dev_no_printk"), "{}", rows[0].body);
+    }
 }
