@@ -5069,11 +5069,48 @@ impl TreeSitterAnalyzer {
             parent = current.parent();
         }
 
-        if terms.is_empty() {
-            return None;
+        match terms.len() {
+            0 => None,
+            1 => terms.pop(),
+            _ => {
+                terms.reverse();
+                Some(
+                    terms
+                        .iter()
+                        .map(|term| Self::as_conjunct(term))
+                        .collect::<Vec<_>>()
+                        .join(" && "),
+                )
+            }
         }
-        terms.reverse();
-        Some(terms.join(" && "))
+    }
+
+    /// A condition as one operand of `&&`, parenthesized where it would
+    /// otherwise come apart.
+    ///
+    /// `&&` binds tighter than `||` and `?:`, so an outer arm reading
+    /// `!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)`
+    /// joined bare to an inner `defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)`
+    /// reads as "not preemptible, or dynamic with the call" -- a
+    /// configuration no arm of `sched.h` states.
+    fn as_conjunct(condition: &str) -> String {
+        let bytes = condition.as_bytes();
+        let mut depth = 0usize;
+        let mut splits = false;
+        for (at, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b'?' if depth == 0 => splits = true,
+                b'|' if depth == 0 && bytes.get(at + 1) == Some(&b'|') => splits = true,
+                _ => {}
+            }
+        }
+        if splits {
+            format!("({condition})")
+        } else {
+            condition.to_string()
+        }
     }
 
     /// The condition a conditional node asserts, as the file writes it, with
@@ -9699,6 +9736,38 @@ mod config_variant_tests {
              #define wrapped(x) x\n\
              #endif\n";
         assert_eq!(guards_in(wrapped), guards_in(inline));
+    }
+
+    #[test]
+    fn an_outer_disjunction_stays_whole_under_an_inner_arm() {
+        // `&&` binds tighter than `||`: joined bare, the outer arm's
+        // disjunction would absorb the inner condition into its second half.
+        let source = "#if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)\n\
+             #if defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)\n\
+             #define inner(x) x\n\
+             #endif\n\
+             #define outer(x) x\n\
+             #endif\n";
+        assert_eq!(
+            guards_in(source),
+            vec![
+                (
+                    "inner".to_string(),
+                    Some(
+                        "(!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)) && \
+                         defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)"
+                            .to_string()
+                    ),
+                ),
+                (
+                    "outer".to_string(),
+                    Some(
+                        "!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)"
+                            .to_string()
+                    ),
+                ),
+            ]
+        );
     }
 
     #[test]
