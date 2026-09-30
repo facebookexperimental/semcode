@@ -46,8 +46,8 @@ pub struct FunctionStore {
 /// the file wins, which is stable across runs.
 ///
 /// The key includes the guard: two arms of one name are two rows, not a
-/// duplicate. (Keying the extractor's own dedup on the guard is b2; until
-/// then one arm per key still arrives here.)
+/// duplicate, and the extractor keeps one row per name per arm, so several
+/// arms of one name routinely arrive here together.
 fn one_per_key(functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::with_capacity(functions.len());

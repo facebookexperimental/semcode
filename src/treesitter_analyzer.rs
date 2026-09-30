@@ -1242,9 +1242,9 @@ impl TreeSitterAnalyzer {
         // Reject the whole graft rather than reason about which row moved.
         //
         // Ask this of every row the healed tree read, before one row per
-        // name survives deduplication: a name defined once per `#if` arm
-        // loses its original row to a longer arm the healing made readable,
-        // which is a recovery rather than a loss.
+        // name and arm survives deduplication: a name defined twice under
+        // one arm loses its original row to a longer definition the healing
+        // made readable, which is a recovery rather than a loss.
         {
             let readable: HashSet<(&str, u32)> = raw_healed
                 .iter()
@@ -1266,7 +1266,7 @@ impl TreeSitterAnalyzer {
         }
 
         // Keep only the rows the file states are `#define`s before one row
-        // per name survives: a row that looked like a definition once the
+        // per name and arm survives: a row that looked like a definition once the
         // construct around it was blanked can carry a longer body than the
         // real definition of the same name, and would take that name's place.
         let (on_define_rows, elsewhere): (Vec<FunctionInfo>, Vec<FunctionInfo>) = raw_healed
@@ -1277,9 +1277,12 @@ impl TreeSitterAnalyzer {
         let gained: Vec<FunctionInfo> = self
             .deduplicate_macros_within_file(on_define_rows)
             .into_iter()
-            // A name the original already read keeps the row the original
-            // read: the index holds one row per name per file, and on a tie
-            // the tree that needed no blanking wins.
+            // A name the original already read keeps the rows the original
+            // read, every arm of it, and gains no arm from the blanked parse:
+            // the two parses do not see the same conditionals (the original
+            // lost the directives the ERROR swallowed), so a guard read from
+            // one is not trusted to name the same arm as a guard read from
+            // the other, and on a tie the tree that needed no blanking wins.
             .filter(|entry| !known.contains(entry.name.as_str()))
             .collect();
 
@@ -6292,18 +6295,24 @@ impl TreeSitterAnalyzer {
         calls
     }
 
-    /// Deduplicate functions within a single file (no threading issues)
-    /// Prefers definitions over declarations, longer bodies over shorter ones
+    /// Deduplicate functions within a single file (no threading issues).
+    ///
+    /// One row per name **per preprocessor arm**: `_cond_resched()` is
+    /// defined four times in `sched.h`, once per configuration, and those are
+    /// four definitions, not four copies of one. Keyed on name alone, the
+    /// preference below kept `return 0;` and hid every route that reaches the
+    /// scheduler. Within one arm the preference is unchanged: definitions
+    /// over declarations, then longer span, longer body, more parameters.
     fn deduplicate_functions_within_file(
         &self,
         raw_functions: Vec<FunctionInfo>,
     ) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_functions = HashMap::<String, FunctionInfo>::new();
+        let mut seen_functions = HashMap::<(String, Option<String>), FunctionInfo>::new();
 
         for func in raw_functions {
-            let key = func.name.clone();
+            let key = (func.name.clone(), func.guard.clone());
 
             if let Some(existing) = seen_functions.get(&key) {
                 // Skip if bodies are identical
@@ -6376,15 +6385,21 @@ impl TreeSitterAnalyzer {
         seen_types.into_values().collect()
     }
 
-    /// Deduplicate macros within a single file  
-    /// Simple deduplication by name - macros should be unique within a file anyway
+    /// Deduplicate macros within a single file, one row per name per
+    /// preprocessor arm.
+    ///
+    /// `dev_dbg()` has three arms, and keyed on name alone the longest body
+    /// won: the `#else` arm a `CONFIG_DYNAMIC_DEBUG` build never uses. Arms
+    /// are now distinct rows. A name redefined under the same arm (`pr_fmt`
+    /// after each `#undef`) still collapses, and there the longer body wins
+    /// as before.
     fn deduplicate_macros_within_file(&self, raw_macros: Vec<FunctionInfo>) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_macros = HashMap::<String, FunctionInfo>::new();
+        let mut seen_macros = HashMap::<(String, Option<String>), FunctionInfo>::new();
 
         for macro_info in raw_macros {
-            let key = macro_info.name.clone();
+            let key = (macro_info.name.clone(), macro_info.guard.clone());
 
             if let Some(existing) = seen_macros.get(&key) {
                 // If bodies are identical, skip
@@ -9375,8 +9390,9 @@ mod preproc_error_recovery_tests {
         // without the macros it defines indexes "successfully": 41
         // directives in one logging header, one row, nothing logged.
         let said = log_of(LOGGING_HEADER);
+        // Five: dev_printk, dev_err, and each of dev_dbg's three arms.
         assert!(
-            said.contains("read 3 function-like macros"),
+            said.contains("read 5 function-like macros"),
             "the count of what was recovered is not in the log: {said}"
         );
         assert!(said.contains("fixture.h"), "{said}");
@@ -9770,14 +9786,9 @@ mod config_variant_tests {
         );
     }
 
-    #[test]
-    fn collapsing_still_keeps_the_survivors_guard() {
-        // b1 half-state, pinned on purpose: the extractor dedup is still
-        // keyed on name (b2 rekeys it on (name, guard)), so several arms
-        // collapse to one row — and that row carries the surviving arm's
-        // guard, not None and not another arm's.
-        let analyzer = TreeSitterAnalyzer::new().unwrap();
-        let arm = |guard: &str, body_len: usize| FunctionInfo {
+    /// A row of `_cond_resched` under `guard`, with a body of `body_len`.
+    fn arm(guard: Option<&str>, body_len: usize) -> FunctionInfo {
+        FunctionInfo {
             name: "_cond_resched".to_string(),
             file_path: "include/linux/sched.h".to_string(),
             git_file_hash: "abc".to_string(),
@@ -9788,15 +9799,50 @@ mod config_variant_tests {
             body: "x".repeat(body_len),
             calls: None,
             types: None,
-            guard: Some(guard.to_string()),
-        };
+            guard: guard.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn each_arm_survives_with_its_own_guard() {
+        // Three arms of one name are three definitions: none of them is
+        // collapsed into another, whatever their bodies.
+        let analyzer = TreeSitterAnalyzer::new().unwrap();
         let rows = analyzer.deduplicate_functions_within_file(vec![
-            arm("defined(CONFIG_A)", 100),
-            arm("!defined(CONFIG_A) && defined(CONFIG_B)", 50),
-            arm("!defined(CONFIG_A) && !defined(CONFIG_B)", 60),
+            arm(Some("defined(CONFIG_A)"), 100),
+            arm(Some("!defined(CONFIG_A) && defined(CONFIG_B)"), 50),
+            arm(Some("!defined(CONFIG_A) && !defined(CONFIG_B)"), 60),
         ]);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].guard.as_deref(), Some("defined(CONFIG_A)"));
+        let mut guards: Vec<Option<String>> = rows.into_iter().map(|row| row.guard).collect();
+        guards.sort();
+        assert_eq!(
+            guards,
+            vec![
+                Some("!defined(CONFIG_A) && !defined(CONFIG_B)".to_string()),
+                Some("!defined(CONFIG_A) && defined(CONFIG_B)".to_string()),
+                Some("defined(CONFIG_A)".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn within_one_arm_the_old_preference_still_decides() {
+        // The key changed which rows are distinct, not which row wins a
+        // genuine tie: two definitions under one arm still collapse to the
+        // longer one, and file scope is an arm of its own.
+        let analyzer = TreeSitterAnalyzer::new().unwrap();
+        let mut rows = analyzer.deduplicate_functions_within_file(vec![
+            arm(Some("defined(CONFIG_A)"), 10),
+            arm(Some("defined(CONFIG_A)"), 30),
+            arm(None, 5),
+            arm(None, 20),
+        ]);
+        rows.sort_by_key(|row| row.body.len());
+        let kept: Vec<(Option<&str>, usize)> = rows
+            .iter()
+            .map(|row| (row.guard.as_deref(), row.body.len()))
+            .collect();
+        assert_eq!(kept, vec![(None, 20), (Some("defined(CONFIG_A)"), 30)]);
     }
 
     /// `include/linux/sched.h`, the four `_cond_resched()` arms verbatim.
@@ -9870,22 +9916,76 @@ mod config_variant_tests {
         rows
     }
 
-    #[test]
-    fn cond_resched_keeps_only_the_arm_that_does_nothing() {
-        // Today's choice, pinned before it changes: four arms parse, one
-        // survives, and it is the one whose body is `return 0;`, so every
-        // route that reaches the scheduler is invisible.
-        let rows = kept_definitions(COND_RESCHED, "include/linux/sched.h", "_cond_resched");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].body.contains("return 0;"), "{}", rows[0].body);
+    /// What each kept row of `name` does and under which arm, by line.
+    fn arms_of(source: &str, path: &str, name: &str) -> Vec<(Option<String>, String)> {
+        kept_definitions(source, path, name)
+            .into_iter()
+            .map(|row| (row.guard, row.body))
+            .collect()
     }
 
     #[test]
-    fn dev_dbg_keeps_only_the_arm_that_prints_nothing() {
-        // Today's choice, pinned before it changes: the longest body wins,
-        // which is the `#else` arm a CONFIG_DYNAMIC_DEBUG build never uses.
-        let rows = kept_definitions(DEV_DBG, "include/linux/dev_printk.h", "dev_dbg");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].body.contains("dev_no_printk"), "{}", rows[0].body);
+    fn cond_resched_keeps_all_four_arms() {
+        // The case this exists for: all four arms are indexed, each under
+        // its own configuration, so the route through `__cond_resched()` is
+        // there to follow instead of a clean dead end at `return 0;`.
+        let arms = arms_of(COND_RESCHED, "include/linux/sched.h", "_cond_resched");
+        let outer = "(!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC))";
+        let call = "defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)";
+        let key = "defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)";
+        let expected = [
+            (
+                format!("{outer} && {call}"),
+                "static_call_mod(cond_resched)",
+            ),
+            (
+                format!("{outer} && !({call}) && {key}"),
+                "dynamic_cond_resched()",
+            ),
+            (
+                format!("{outer} && !({call}) && !({key})"),
+                "__cond_resched()",
+            ),
+            (format!("!{outer}"), "return 0;"),
+        ];
+        assert_eq!(arms.len(), expected.len(), "{arms:#?}");
+        for ((guard, body), (want_guard, want_body)) in arms.iter().zip(expected.iter()) {
+            assert_eq!(guard.as_deref(), Some(want_guard.as_str()), "{arms:#?}");
+            assert!(body.contains(want_body), "{body}");
+        }
+    }
+
+    #[test]
+    fn dev_dbg_keeps_the_dynamic_debug_arm() {
+        // Swallowed-directive recovery pointed 16,125 call sites at `dev_dbg`, and the row they reached
+        // was the `#else` arm. Every arm is now there, the one a
+        // CONFIG_DYNAMIC_DEBUG build uses included.
+        let arms = arms_of(DEV_DBG, "include/linux/dev_printk.h", "dev_dbg");
+        let bodies: Vec<&str> = arms.iter().map(|(_, body)| body.as_str()).collect();
+        assert_eq!(arms.len(), 3, "{arms:#?}");
+        assert!(bodies[0].contains("dynamic_dev_dbg("), "{bodies:#?}");
+        assert!(bodies[1].contains("dev_printk("), "{bodies:#?}");
+        assert!(bodies[2].contains("dev_no_printk("), "{bodies:#?}");
+        let guards: HashSet<&Option<String>> = arms.iter().map(|(guard, _)| guard).collect();
+        assert_eq!(guards.len(), 3, "{arms:#?}");
+    }
+
+    #[test]
+    fn a_macro_redefined_under_one_arm_stays_one_row() {
+        // `arch/x86/kernel/cpu/bugs.c` redefines `pr_fmt` 19 times at file
+        // scope, one per section. Those share an arm, so they are not
+        // configurations and must stay collapsed: that is a different defect
+        // from the one keying on the arm fixes.
+        let source = "#undef pr_fmt\n\
+             #define pr_fmt(fmt)\t\"mitigations: \" fmt\n\
+             \n\
+             #undef pr_fmt\n\
+             #define pr_fmt(fmt)\t\"MDS: \" fmt\n\
+             \n\
+             #undef pr_fmt\n\
+             #define pr_fmt(fmt)\t\"Spectre V1 : \" fmt\n";
+        let arms = arms_of(source, "arch/x86/kernel/cpu/bugs.c", "pr_fmt");
+        assert_eq!(arms.len(), 1, "{arms:#?}");
+        assert_eq!(arms[0].0, None);
     }
 }
