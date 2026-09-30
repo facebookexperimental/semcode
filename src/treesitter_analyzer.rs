@@ -5104,12 +5104,10 @@ impl TreeSitterAnalyzer {
     /// `!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)`
     /// joined bare to an inner `defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)`
     /// reads as "not preemptible, or dynamic with the call" -- a
-    /// configuration no arm of `sched.h` states. Deciding which conditions
-    /// need parentheses by scanning for `||` would have to lex C (a `'('`
-    /// or a comment in the condition throws the count off), so anything
-    /// that is not a single name, a negated one, or already wholly
-    /// parenthesized is wrapped: redundant parentheses cost nothing, a
-    /// missing pair changes the configuration.
+    /// configuration no arm of `sched.h` states. Anything that is not a
+    /// single name, a negated one, or already wholly parenthesized is
+    /// wrapped: redundant parentheses cost nothing, a missing pair changes
+    /// the configuration.
     fn as_conjunct(condition: &str) -> String {
         let one_term =
             |text: &str| Self::binds_tighter_than_not(text) || Self::wholly_parenthesized(text);
@@ -5124,16 +5122,21 @@ impl TreeSitterAnalyzer {
     /// that parenthesis closes at the last character, not before. `(A) &&
     /// (B)` opens and closes with parentheses and is two groups.
     ///
-    /// A parenthesis inside a character constant can only make the group
-    /// look closed early or unclosed, and both answer "no", which costs a
-    /// redundant pair rather than a wrong predicate.
+    /// Character constants are skipped, so `(A == '(') || (B == ')')` is two
+    /// groups; comments are already gone by the time a condition gets here.
     fn wholly_parenthesized(text: &str) -> bool {
         if !text.starts_with('(') {
             return false;
         }
+        let bytes = text.as_bytes();
         let mut depth = 0usize;
-        for (at, byte) in text.bytes().enumerate() {
-            match byte {
+        let mut at = 0;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\'' => {
+                    at = Self::char_constant_end(bytes, at);
+                    continue;
+                }
                 b'(' => depth += 1,
                 b')' => {
                     depth = match depth.checked_sub(1) {
@@ -5141,11 +5144,12 @@ impl TreeSitterAnalyzer {
                         None => return false,
                     };
                     if depth == 0 {
-                        return at + 1 == text.len();
+                        return at + 1 == bytes.len();
                     }
                 }
                 _ => {}
             }
+            at += 1;
         }
         false
     }
@@ -5216,14 +5220,64 @@ impl TreeSitterAnalyzer {
         !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
     }
 
-    /// One predicate on one line: continuations and runs of whitespace
-    /// become single spaces, so the same arm reads the same however the file
-    /// wraps it.
+    /// One predicate on one line: continuations go, comments go, and runs of
+    /// whitespace become single spaces, so the same arm reads the same
+    /// however the file wraps or annotates it -- and a parenthesis in a
+    /// comment is not left behind to be counted as part of the condition.
     fn one_line(text: &str) -> String {
-        text.split_whitespace()
+        let spliced = text.replace("\\\r\n", "").replace("\\\n", "");
+        Self::without_comments(&spliced)
+            .split_whitespace()
+            // A continuation with trailing blanks after the backslash.
             .filter(|piece| *piece != "\\")
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The text with its `/* */` and `//` comments replaced by a space,
+    /// leaving character constants alone: `'/'` opens no comment.
+    fn without_comments(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut kept = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            match (bytes[at], bytes.get(at + 1)) {
+                (b'/', Some(b'*')) => {
+                    at = text[at + 2..]
+                        .find("*/")
+                        .map_or(bytes.len(), |end| at + 2 + end + 2);
+                    kept.push(b' ');
+                }
+                (b'/', Some(b'/')) => {
+                    at = text[at..].find('\n').map_or(bytes.len(), |end| at + end);
+                    kept.push(b' ');
+                }
+                (b'\'', _) => {
+                    let end = Self::char_constant_end(bytes, at);
+                    kept.extend_from_slice(&bytes[at..end]);
+                    at = end;
+                }
+                (byte, _) => {
+                    kept.push(byte);
+                    at += 1;
+                }
+            }
+        }
+        String::from_utf8(kept).unwrap_or_else(|_| text.to_string())
+    }
+
+    /// Where a character constant opened at `start` ends: past its closing
+    /// quote, reading `\'` and `\\` as escapes, or at the end of the text.
+    fn char_constant_end(bytes: &[u8], start: usize) -> usize {
+        let mut at = start + 1;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at += 2,
+                b'\'' => return at + 1,
+                _ => at += 1,
+            }
+        }
+        bytes.len()
     }
 
     /// Whether the node sits at file scope, reading through conditionals.
@@ -10085,14 +10139,36 @@ mod config_variant_tests {
                 Some("('(' == 40 || defined(A)) && defined(INNER)".to_string())
             )]
         );
-        let commented = "#if A /* ( */ || B\n\
+        let commented = "#if (A /* ( */) || (B /* ) */)\n\
              #if C\n\
              #define hit(x) x\n\
              #endif\n\
              #endif\n";
-        let guard = guards_in(commented).pop().unwrap().1.unwrap();
-        assert!(guard.starts_with("(A "), "{guard}");
-        assert!(guard.ends_with("|| B) && C"), "{guard}");
+        assert_eq!(
+            guards_in(commented),
+            vec![("hit".to_string(), Some("((A ) || (B )) && C".to_string()))]
+        );
+        let quoted_groups = "#if (A == '(') || (B == ')')\n\
+             #if C\n\
+             #define hit(x) x\n\
+             #endif\n\
+             #endif\n";
+        assert_eq!(
+            guards_in(quoted_groups),
+            vec![(
+                "hit".to_string(),
+                Some("((A == '(') || (B == ')')) && C".to_string())
+            )]
+        );
+        let spliced = "#if A\\\n|| B\n\
+             #if C\n\
+             #define hit(x) x\n\
+             #endif\n\
+             #endif\n";
+        assert_eq!(
+            guards_in(spliced),
+            vec![("hit".to_string(), Some("(A|| B) && C".to_string()))]
+        );
     }
 
     #[test]
