@@ -56,6 +56,11 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "functions") {
             self.create_functions_table().await?;
+        } else {
+            // The merge key names `guard`: a table without it rejects every
+            // insert, so re-indexing could never bring it up to date.
+            self.recreate_without_columns("functions", &["guard"])
+                .await?;
         }
 
         if !table_names.iter().any(|n| n == "types") {
@@ -110,6 +115,9 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "object_macros") {
             self.create_object_macros_table().await?;
+        } else {
+            self.recreate_without_columns("object_macros", &["guard"])
+                .await?;
         }
 
         if !table_names.iter().any(|n| n == "schema_meta") {
@@ -726,6 +734,8 @@ impl SchemaManager {
         self.connection.drop_table(name, &[]).await?;
         match name {
             "processed_files" => self.create_processed_files_table().await,
+            "functions" => self.create_functions_table().await,
+            "object_macros" => self.create_object_macros_table().await,
             "argument_functions" => self.create_argument_functions_table().await,
             "globals" => self.create_globals_table().await,
             "registrations" => self.create_registrations_table().await,

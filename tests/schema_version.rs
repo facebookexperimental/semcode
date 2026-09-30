@@ -139,3 +139,56 @@ async fn a_file_read_by_an_older_extractor_is_forgotten() {
         .unwrap();
     assert!(db.processed_by_this_extractor().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn tables_written_before_the_guard_column_are_started_again() {
+    // A version 9 index has `functions` and `object_macros` without `guard`,
+    // and the merge key names it: every insert into such a table fails, so
+    // re-indexing, the one repair a user will try, could never succeed.
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+    for name in ["functions", "object_macros"] {
+        let table = db.connection().open_table(name).execute().await.unwrap();
+        let schema = table.schema().await.unwrap();
+        let older = std::sync::Arc::new(arrow_schema::Schema::new(
+            schema
+                .fields()
+                .iter()
+                .filter(|field| field.name() != "guard")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        db.connection().drop_table(name, &[]).await.unwrap();
+        db.connection()
+            .create_empty_table(name, older)
+            .execute()
+            .await
+            .unwrap();
+    }
+    drop(db);
+
+    let db = manager(dir.path()).await;
+    for name in ["functions", "object_macros"] {
+        let table = db.connection().open_table(name).execute().await.unwrap();
+        let schema = table.schema().await.unwrap();
+        assert!(
+            schema.fields().iter().any(|field| field.name() == "guard"),
+            "{name} still lacks the guard column"
+        );
+    }
+    db.insert_functions(vec![semcode::FunctionInfo {
+        name: "pick".to_string(),
+        file_path: "pick.h".to_string(),
+        git_file_hash: "abc".to_string(),
+        line_start: 1,
+        line_end: 1,
+        return_type: String::new(),
+        parameters: Vec::new(),
+        body: "#define pick(x) x".to_string(),
+        calls: None,
+        types: None,
+        guard: Some("defined(CONFIG_A)".to_string()),
+    }])
+    .await
+    .unwrap();
+}
