@@ -36,7 +36,11 @@ pub enum OptimizeOutcome {
 /// 9: a call in a macro body to one of the macro's own parameters is recorded
 ///    as an unresolved edge naming the parameter, instead of as a call to a
 ///    name no function has. A version 8 index holds the wrong edge.
-pub const SCHEMA_VERSION: u32 = 9;
+/// 10: a `guard` column on `functions` and `object_macros` records the
+///    preprocessor arm a definition sits under, and the merge key includes
+///    it, so two arms of one name coexist. A version 9 index holds one row
+///    per name and cannot tell the arms apart.
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -161,6 +165,13 @@ impl SchemaManager {
             Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this function
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this function
+            // The preprocessor arm this definition sits under, as the file
+            // writes it. Empty where no conditional holds it, which is most
+            // rows. Non-nullable and last: it is part of the merge key, and
+            // a null key column matches nothing, so the row would be
+            // dropped. Existing column order is frozen — readers in
+            // search.rs index this table positionally.
+            Field::new("guard", DataType::Utf8, false),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -243,6 +254,10 @@ impl SchemaManager {
             Field::new("expansion", DataType::Utf8, false),
             Field::new("file_path", DataType::Utf8, false),
             Field::new("git_file_hash", DataType::Utf8, false),
+            // Same arm rule as `functions.guard`: the condition holding this
+            // definition, empty at file scope. Last for the same reason —
+            // `ObjectMacroStore::all` reads this table positionally.
+            Field::new("guard", DataType::Utf8, false),
         ]));
 
         self.connection

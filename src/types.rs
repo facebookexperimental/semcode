@@ -94,7 +94,7 @@ pub struct DefinitionSite {
 /// unconstrained one admits everything it finds.
 #[derive(Debug, Clone)]
 pub enum Resolution {
-    Chosen(ChosenDefinition),
+    Chosen(Box<ChosenDefinition>),
     /// No definition of the name at this revision.
     NotFound,
     /// Definitions exist, and the constraint admits none of them.
@@ -108,7 +108,7 @@ impl Resolution {
     /// about the other two outcomes.
     pub fn chosen(self) -> Option<ChosenDefinition> {
         match self {
-            Resolution::Chosen(chosen) => Some(chosen),
+            Resolution::Chosen(chosen) => Some(*chosen),
             _ => None,
         }
     }
@@ -364,6 +364,16 @@ pub struct FunctionInfo {
     pub calls: Option<Vec<String>>, // Function names called by this function
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names used by this function
+    /// The configuration this definition exists under: the condition of every
+    /// preprocessor arm enclosing it, outermost first. `None` where no
+    /// conditional holds it, which is most definitions.
+    ///
+    /// A name defined once per `#if` arm is several definitions, not one.
+    /// `_cond_resched()` has four and the index kept whichever a length
+    /// comparison preferred, so `cond_resched()` answered with a clean dead
+    /// end. This is what tells the arms apart.
+    #[serde(default)]
+    pub guard: Option<String>,
 }
 
 /// Parameters for creating FunctionInfo from a macro
@@ -377,6 +387,7 @@ pub struct MacroParams {
     pub definition: String,
     pub calls: Option<Vec<String>>,
     pub types: Option<Vec<String>>,
+    pub guard: Option<String>,
 }
 
 impl FunctionInfo {
@@ -392,6 +403,7 @@ impl FunctionInfo {
             definition,
             calls,
             types,
+            guard,
         } = params;
         // Convert simple parameter names to ParameterInfo structs
         let params = parameters
@@ -415,6 +427,7 @@ impl FunctionInfo {
             body: definition,
             calls,
             types,
+            guard,
         }
     }
 }
@@ -920,6 +933,7 @@ mod ambiguity_note_tests {
             body: String::new(),
             calls: None,
             types: None,
+            guard: None,
         }
     }
 

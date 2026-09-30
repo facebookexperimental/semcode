@@ -198,6 +198,7 @@ struct MacroDefinedFunction {
     end_byte: usize,
     line_start: u32,
     line_end: u32,
+    guard: Option<String>,
 }
 
 /// A file-scope variable, before its file is known.
@@ -2628,6 +2629,7 @@ impl TreeSitterAnalyzer {
                     end_byte: body.end_byte(),
                     line_start: node.start_position().row as u32 + 1,
                     line_end: body.end_position().row as u32 + 1,
+                    guard: Self::guard_of(*node, source),
                 });
             }
         }
@@ -4031,6 +4033,7 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(function_types)
                     },
+                    guard: function_node.and_then(|node| Self::guard_of(node, ctx.source)),
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -4141,6 +4144,7 @@ impl TreeSitterAnalyzer {
                     body: ctx.source[defined.start_byte..defined.end_byte].to_string(),
                     calls: (!calls.is_empty()).then_some(calls),
                     types: None,
+                    guard: defined.guard.clone(),
                 });
             }
         }
@@ -4559,6 +4563,7 @@ impl TreeSitterAnalyzer {
             let mut definition = String::new();
             let mut line_start = 0;
             let mut is_function_like = false;
+            let mut macro_node: Option<tree_sitter::Node> = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -4577,6 +4582,7 @@ impl TreeSitterAnalyzer {
                     "value" => body = Some(node),
                     "macro" | "function_macro" => {
                         definition = text.to_string();
+                        macro_node = Some(node);
                         if capture_name == "function_macro" {
                             is_function_like = true;
                         }
@@ -4703,6 +4709,7 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(macro_types)
                     },
+                    guard: macro_node.and_then(|node| Self::guard_of(node, source)),
                 });
 
                 // Function-like macros, and the object-like ones needed to
@@ -5022,6 +5029,124 @@ impl TreeSitterAnalyzer {
     /// before this was one definition.
     fn is_conditional_group(kind: &str) -> bool {
         kind.starts_with("preproc_if") || kind.starts_with("preproc_el")
+    }
+
+    /// The configuration under which a definition exists: the condition of
+    /// every conditional arm enclosing it, outermost first, joined by `&&`.
+    /// `None` where no conditional encloses it, which is most definitions.
+    ///
+    /// `include/linux/sched.h` defines `_cond_resched()` four times, one per
+    /// configuration, and the index keeps whichever the collapse prefers --
+    /// `return 0;` -- so every route that does something is invisible and the
+    /// query reports a clean dead end. Telling the four apart starts with
+    /// being able to say which is which.
+    ///
+    /// The arms of one conditional are not siblings in this grammar: an
+    /// `#elif` and an `#else` are children of the `#if` they belong to. So an
+    /// arm's condition is its own **plus the negation of the arm above it**,
+    /// which is what the measurement that missed this got wrong -- requiring
+    /// the chains of two definitions to diverge reported 493 collapsed names
+    /// instead of 9,778, and missed `_cond_resched` itself.
+    fn guard_of(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut terms: Vec<String> = Vec::new();
+        let mut child = node;
+        let mut parent = node.parent();
+
+        while let Some(current) = parent {
+            if let Some(condition) = Self::arm_condition(current, source) {
+                // Reached through the arm below this one: the condition that
+                // got us here is that this one did not hold.
+                let via_alternative = current
+                    .child_by_field_name("alternative")
+                    .is_some_and(|alternative| alternative.id() == child.id());
+                terms.push(if via_alternative {
+                    Self::negated(&condition)
+                } else {
+                    condition
+                });
+            }
+            child = current;
+            parent = current.parent();
+        }
+
+        if terms.is_empty() {
+            return None;
+        }
+        terms.reverse();
+        Some(terms.join(" && "))
+    }
+
+    /// The condition a conditional node asserts, as the file writes it, with
+    /// line continuations and runs of whitespace collapsed so that one arm
+    /// reads as one predicate. `#else` asserts nothing of its own; what it
+    /// means is the negation of the arm above, which its parent supplies.
+    fn arm_condition(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let text_of = |field: &str| {
+            node.child_by_field_name(field)
+                .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                .map(Self::one_line)
+        };
+
+        match node.kind() {
+            "preproc_if" | "preproc_elif" => text_of("condition"),
+            "preproc_ifdef" | "preproc_elifdef" => {
+                let name = text_of("name")?;
+                // One node kind spells both `#ifdef` and `#ifndef`; the
+                // directive itself is the only thing that says which.
+                let negated = node
+                    .child(0)
+                    .and_then(|directive| directive.utf8_text(source.as_bytes()).ok())
+                    .is_some_and(|directive| directive.ends_with("ndef"));
+                Some(if negated {
+                    format!("!defined({name})")
+                } else {
+                    format!("defined({name})")
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// A condition with its sense reversed, spelled the way the file would.
+    ///
+    /// Parentheses are not decoration here: `defined(A) || defined(B)` also
+    /// begins with `defined(` and ends with `)`, so reversing it by writing a
+    /// `!` in front turns "neither A nor B" into "not A, or B" -- a different
+    /// configuration, silently.
+    fn negated(condition: &str) -> String {
+        if let Some(inner) = condition.strip_prefix('!') {
+            if Self::binds_tighter_than_not(inner) {
+                return inner.to_string();
+            }
+            if let Some(unwrapped) = inner.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+                return unwrapped.to_string();
+            }
+        }
+        if Self::binds_tighter_than_not(condition) {
+            format!("!{condition}")
+        } else {
+            format!("!({condition})")
+        }
+    }
+
+    /// Whether a condition is one term -- `defined(CONFIG_X)` or a bare name
+    /// -- so that a `!` in front of it reverses the whole of it.
+    fn binds_tighter_than_not(condition: &str) -> bool {
+        let name = condition
+            .strip_prefix("defined(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or(condition);
+        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    }
+
+    /// One predicate on one line: continuations and runs of whitespace
+    /// become single spaces, so the same arm reads the same however the file
+    /// wraps it.
+    fn one_line(text: &str) -> String {
+        text.split_whitespace()
+            .filter(|piece| *piece != "\\")
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Whether the node sits at file scope, reading through conditionals.
@@ -9407,5 +9532,201 @@ mod preproc_error_recovery_tests {
         let mut rows: Vec<u32> = declared.into_iter().collect();
         rows.sort();
         assert_eq!(rows, vec![1, 7]);
+    }
+}
+
+#[cfg(test)]
+mod config_variant_tests {
+    //! Which configuration a definition belongs to.
+    //!
+    //! `include/linux/sched.h` defines `_cond_resched()` four times, one per
+    //! configuration; the index keeps one of them and the other three are
+    //! invisible, so `cond_resched()` reports a dead end rather than a
+    //! missing answer. Reading the arm a definition sits under is the first
+    //! half of telling them apart.
+
+    use super::*;
+
+    /// Every arm shape one conditional can have, and a nested one.
+    const ARMS: &str = "#if defined(CONFIG_A) || defined(CONFIG_B)\n\
+         #define pick(x) one(x)\n\
+         #elif defined(DEBUG)\n\
+         #define pick(x) two(x)\n\
+         #else\n\
+         #define pick(x) three(x)\n\
+         #endif\n\
+         \n\
+         #ifndef HAVE_IT\n\
+         #define plain(x) x\n\
+         #endif\n\
+         \n\
+         #ifdef CONFIG_OUTER\n\
+         #if defined(CONFIG_INNER)\n\
+         #define nested(x) x\n\
+         #endif\n\
+         #endif\n\
+         \n\
+         #define unguarded(x) x\n";
+
+    /// The guard of every macro the source defines, by name.
+    fn guards_in(source: &str) -> Vec<(String, Option<String>)> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let mut found = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "preproc_function_def" {
+                let name = node
+                    .child_by_field_name("name")
+                    .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                    .unwrap_or_default()
+                    .to_string();
+                found.push((name, TreeSitterAnalyzer::guard_of(node, source)));
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn each_arm_of_one_conditional_reads_as_its_own_configuration() {
+        // The three arms of one `#if` are not three copies of one condition:
+        // the second holds only where the first did not, and the third only
+        // where neither did. An `#else` states nothing of its own.
+        let mut guards: Vec<String> = guards_in(ARMS)
+            .into_iter()
+            .filter(|(name, _)| name == "pick")
+            .filter_map(|(_, guard)| guard)
+            .collect();
+        guards.sort();
+        let mut expected = vec![
+            "defined(CONFIG_A) || defined(CONFIG_B)".to_string(),
+            "!(defined(CONFIG_A) || defined(CONFIG_B)) && defined(DEBUG)".to_string(),
+            "!(defined(CONFIG_A) || defined(CONFIG_B)) && !defined(DEBUG)".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(guards, expected);
+    }
+
+    #[test]
+    fn the_four_arms_of_cond_resched_read_as_four_configurations() {
+        // `include/linux/sched.h`'s shape, and the motivating case: four
+        // definitions of one name, one per configuration, of which the index
+        // keeps `return 0;` -- so the three that do something, including the
+        // route through `__cond_resched()` to `rcu_all_qs()`, are invisible.
+        let sched = "#ifdef CONFIG_PREEMPT_DYNAMIC
+             #if defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)
+             #define _cond_resched(x) static_call_mod(cond_resched)(x)
+             #elif defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)
+             #define _cond_resched(x) dynamic_cond_resched(x)
+             #endif
+             #else
+             #ifndef CONFIG_PREEMPTION
+             #define _cond_resched(x) __cond_resched(x)
+             #else
+             #define _cond_resched(x) 0
+             #endif
+             #endif
+";
+        let mut guards: Vec<String> = guards_in(sched)
+            .into_iter()
+            .filter_map(|(name, guard)| (name == "_cond_resched").then_some(guard).flatten())
+            .collect();
+        guards.sort();
+        let mut expected = vec![
+            "defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)"
+                .to_string(),
+            "defined(CONFIG_PREEMPT_DYNAMIC) && !defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL) && \
+             defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)"
+                .replace("             ", "")
+                .to_string(),
+            "!defined(CONFIG_PREEMPT_DYNAMIC) && !defined(CONFIG_PREEMPTION)".to_string(),
+            "!defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_PREEMPTION)".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(guards.len(), 4, "{guards:?}");
+        assert_eq!(guards, expected);
+    }
+
+    #[test]
+    fn a_definition_no_conditional_holds_has_no_guard() {
+        // Most definitions in a tree are this, and a guard on all of them
+        // would make the column useless as a discriminator.
+        let guards = guards_in(ARMS);
+        assert_eq!(
+            guards
+                .iter()
+                .find(|(name, _)| name == "unguarded")
+                .map(|(_, guard)| guard.clone()),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn ifndef_is_the_negation_and_nesting_reads_outermost_first() {
+        let guards = guards_in(ARMS);
+        let guard_of = |wanted: &str| {
+            guards
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .and_then(|(_, guard)| guard.clone())
+        };
+        assert_eq!(guard_of("plain"), Some("!defined(HAVE_IT)".to_string()));
+        assert_eq!(
+            guard_of("nested"),
+            Some("defined(CONFIG_OUTER) && defined(CONFIG_INNER)".to_string())
+        );
+    }
+
+    #[test]
+    fn an_arm_reads_the_same_however_the_file_wraps_it() {
+        // Kernel headers wrap long conditions over a continuation, and two
+        // definitions under the same arm have to compare equal whether or
+        // not the file wrapped it.
+        let wrapped = "#if defined(CONFIG_DYNAMIC_DEBUG) || \\\n\
+             \t(defined(CONFIG_DYNAMIC_DEBUG_CORE) && defined(DYNAMIC_DEBUG_MODULE))\n\
+             #define wrapped(x) x\n\
+             #endif\n";
+        let inline = "#if defined(CONFIG_DYNAMIC_DEBUG) || (defined(CONFIG_DYNAMIC_DEBUG_CORE) && defined(DYNAMIC_DEBUG_MODULE))\n\
+             #define wrapped(x) x\n\
+             #endif\n";
+        assert_eq!(guards_in(wrapped), guards_in(inline));
+    }
+
+    #[test]
+    fn collapsing_still_keeps_the_survivors_guard() {
+        // b1 half-state, pinned on purpose: the extractor dedup is still
+        // keyed on name (b2 rekeys it on (name, guard)), so several arms
+        // collapse to one row — and that row carries the surviving arm's
+        // guard, not None and not another arm's.
+        let analyzer = TreeSitterAnalyzer::new().unwrap();
+        let arm = |guard: &str, body_len: usize| FunctionInfo {
+            name: "_cond_resched".to_string(),
+            file_path: "include/linux/sched.h".to_string(),
+            git_file_hash: "abc".to_string(),
+            line_start: 1,
+            line_end: 2,
+            return_type: "void".to_string(),
+            parameters: Vec::new(),
+            body: "x".repeat(body_len),
+            calls: None,
+            types: None,
+            guard: Some(guard.to_string()),
+        };
+        let rows = analyzer.deduplicate_functions_within_file(vec![
+            arm("defined(CONFIG_A)", 100),
+            arm("!defined(CONFIG_A) && defined(CONFIG_B)", 50),
+            arm("!defined(CONFIG_A) && !defined(CONFIG_B)", 60),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].guard.as_deref(), Some("defined(CONFIG_A)"));
     }
 }

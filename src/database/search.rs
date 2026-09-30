@@ -202,6 +202,7 @@ impl SearchManager {
                     body,
                     calls: None, // Not populated in search results
                     types: None, // Not populated in search results
+                    guard: None,
                 });
             }
         }
@@ -380,6 +381,7 @@ impl SearchManager {
                         body,
                         calls: None, // Not populated in search results
                         types: None, // Not populated in search results
+                        guard: None,
                     });
                 }
             }
@@ -1599,6 +1601,7 @@ impl SearchManager {
                     body,
                     calls: None, // Not populated in search results
                     types: None, // Not populated in search results
+                    guard: None,
                 });
             }
         }
@@ -1763,6 +1766,7 @@ impl SearchManager {
                         body,
                         calls: None,
                         types: None,
+                        guard: None,
                     });
                 }
             }
@@ -2290,6 +2294,7 @@ impl VectorSearchManager {
                     body,
                     calls: meta.calls,
                     types: meta.types,
+                    guard: None,
                 },
                 similarity_score,
             });

@@ -1814,6 +1814,7 @@ impl DatabaseManager {
                     expansion: expansion.to_string(),
                     file_path: f.file_path.clone(),
                     git_file_hash: f.git_file_hash.clone(),
+                    guard: f.guard.clone().unwrap_or_default(),
                 })
             })
             .collect()
@@ -2382,7 +2383,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, git_sha, why)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
         self.find_function_with_manifest_reporting(name, &git_manifest, context)
@@ -2426,7 +2427,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
 
@@ -2443,7 +2444,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
 
@@ -2474,7 +2475,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, revision, Absent::ContentNotIndexed)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
 
@@ -2750,7 +2751,7 @@ impl DatabaseManager {
                     .collect(),
             };
         }
-        Resolution::Chosen(self.choose_definition(admitted))
+        Resolution::Chosen(Box::new(self.choose_definition(admitted)))
     }
 
     fn choose_definition(&self, mut matches: Vec<FunctionInfo>) -> ChosenDefinition {
@@ -8359,7 +8360,73 @@ mod tests {
             body: format!("int {name}(void) {{ return 0; }}"),
             calls: Some(vec!["target".to_string()]),
             types: None,
+            guard: None,
         }
+    }
+
+    #[tokio::test]
+    async fn two_arms_of_one_name_coexist_and_file_scope_round_trips() {
+        // The merge key includes the guard, so two preprocessor arms of
+        // one name are two rows, not a duplicate-batch failure and not one
+        // row. File scope stores "" and reads back None.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("arms.c"), "/* arms */\n").unwrap();
+        git(repo_path, &["add", "arms.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+        let file_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "arms.c")
+            .unwrap()
+            .unwrap();
+
+        let db_path = repo_path.join(".semcode.db");
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let arm = |guard: Option<&str>| {
+            let mut function = test_function("pick", "arms.c", &file_hash);
+            function.guard = guard.map(str::to_string);
+            function
+        };
+        db.insert_functions(vec![
+            arm(Some("defined(CONFIG_A)")),
+            arm(Some("!defined(CONFIG_A)")),
+            test_function("plain", "arms.c", &file_hash),
+        ])
+        .await
+        .unwrap();
+
+        let mut guards: Vec<Option<String>> = db
+            .function_store
+            .find_all_by_name_unfiltered("pick")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|function| function.guard)
+            .collect();
+        guards.sort();
+        assert_eq!(
+            guards,
+            vec![
+                Some("!defined(CONFIG_A)".to_string()),
+                Some("defined(CONFIG_A)".to_string())
+            ]
+        );
+
+        let plain = db
+            .function_store
+            .find_all_by_name_unfiltered("plain")
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].guard, None);
     }
 
     #[tokio::test]
@@ -8651,6 +8718,7 @@ mod tests {
                 body: "void caller_one(void) { target(); }".to_string(),
                 calls: Some(vec!["target".to_string()]),
                 types: Some(vec!["duplicate".to_string()]),
+                guard: None,
             },
             FunctionInfo {
                 name: "caller_two".to_string(),
@@ -8663,6 +8731,7 @@ mod tests {
                 body: "void caller_two(void) { target(); }".to_string(),
                 calls: Some(vec!["target".to_string()]),
                 types: Some(vec!["duplicate".to_string()]),
+                guard: None,
             },
         ])
         .await
