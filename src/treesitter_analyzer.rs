@@ -5097,32 +5097,57 @@ impl TreeSitterAnalyzer {
         }
     }
 
-    /// A condition as one operand of `&&`, parenthesized where it would
-    /// otherwise come apart.
+    /// A condition as one operand of `&&`, parenthesized unless it is
+    /// plainly one term.
     ///
     /// `&&` binds tighter than `||` and `?:`, so an outer arm reading
     /// `!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)`
     /// joined bare to an inner `defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)`
     /// reads as "not preemptible, or dynamic with the call" -- a
-    /// configuration no arm of `sched.h` states.
+    /// configuration no arm of `sched.h` states. Deciding which conditions
+    /// need parentheses by scanning for `||` would have to lex C (a `'('`
+    /// or a comment in the condition throws the count off), so anything
+    /// that is not a single name, a negated one, or already wholly
+    /// parenthesized is wrapped: redundant parentheses cost nothing, a
+    /// missing pair changes the configuration.
     fn as_conjunct(condition: &str) -> String {
-        let bytes = condition.as_bytes();
+        let one_term =
+            |text: &str| Self::binds_tighter_than_not(text) || Self::wholly_parenthesized(text);
+        if one_term(condition) || condition.strip_prefix('!').is_some_and(one_term) {
+            condition.to_string()
+        } else {
+            format!("({condition})")
+        }
+    }
+
+    /// Whether the text is one parenthesized group: it opens with `(` and
+    /// that parenthesis closes at the last character, not before. `(A) &&
+    /// (B)` opens and closes with parentheses and is two groups.
+    ///
+    /// A parenthesis inside a character constant can only make the group
+    /// look closed early or unclosed, and both answer "no", which costs a
+    /// redundant pair rather than a wrong predicate.
+    fn wholly_parenthesized(text: &str) -> bool {
+        if !text.starts_with('(') {
+            return false;
+        }
         let mut depth = 0usize;
-        let mut splits = false;
-        for (at, byte) in bytes.iter().enumerate() {
+        for (at, byte) in text.bytes().enumerate() {
             match byte {
                 b'(' => depth += 1,
-                b')' => depth = depth.saturating_sub(1),
-                b'?' if depth == 0 => splits = true,
-                b'|' if depth == 0 && bytes.get(at + 1) == Some(&b'|') => splits = true,
+                b')' => {
+                    depth = match depth.checked_sub(1) {
+                        Some(depth) => depth,
+                        None => return false,
+                    };
+                    if depth == 0 {
+                        return at + 1 == text.len();
+                    }
+                }
                 _ => {}
             }
         }
-        if splits {
-            format!("({condition})")
-        } else {
-            condition.to_string()
-        }
+        false
     }
 
     /// The condition a conditional node asserts, as the file writes it, with
@@ -5167,8 +5192,11 @@ impl TreeSitterAnalyzer {
             if Self::binds_tighter_than_not(inner) {
                 return inner.to_string();
             }
-            if let Some(unwrapped) = inner.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
-                return unwrapped.to_string();
+            // `!(A) && (B)` begins with `!(` and ends with `)` but is not
+            // the negation of one group; stripping those two characters
+            // would leave `A) && (B`.
+            if Self::wholly_parenthesized(inner) {
+                return inner[1..inner.len() - 1].to_string();
             }
         }
         if Self::binds_tighter_than_not(condition) {
@@ -9944,11 +9972,11 @@ mod config_variant_tests {
         let key = "defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)";
         let expected = [
             (
-                format!("{outer} && {call}"),
+                format!("{outer} && ({call})"),
                 "static_call_mod(cond_resched)",
             ),
             (
-                format!("{outer} && !({call}) && {key}"),
+                format!("{outer} && !({call}) && ({key})"),
                 "dynamic_cond_resched()",
             ),
             (
@@ -10039,5 +10067,51 @@ mod config_variant_tests {
         assert!(bodies
             .iter()
             .any(|(guard, body)| guard.as_deref() == Some("!A") && body.contains("two()")));
+    }
+
+    #[test]
+    fn a_condition_is_kept_whole_whatever_it_contains() {
+        // A parenthesis in a character constant or a comment cannot be
+        // allowed to decide where a condition ends.
+        let quoted = "#if '(' == 40 || defined(A)\n\
+             #if defined(INNER)\n\
+             #define hit(x) x\n\
+             #endif\n\
+             #endif\n";
+        assert_eq!(
+            guards_in(quoted),
+            vec![(
+                "hit".to_string(),
+                Some("('(' == 40 || defined(A)) && defined(INNER)".to_string())
+            )]
+        );
+        let commented = "#if A /* ( */ || B\n\
+             #if C\n\
+             #define hit(x) x\n\
+             #endif\n\
+             #endif\n";
+        let guard = guards_in(commented).pop().unwrap().1.unwrap();
+        assert!(guard.starts_with("(A "), "{guard}");
+        assert!(guard.ends_with("|| B) && C"), "{guard}");
+    }
+
+    #[test]
+    fn negating_two_groups_does_not_strip_their_parentheses() {
+        // `!(A) && (B)` opens with `!(` and closes with `)` but is two
+        // groups; its `#else` is the negation of all of it.
+        let source = "#if !(A) && (B)\n\
+             #define pick(x) one(x)\n\
+             #else\n\
+             #define pick(x) two(x)\n\
+             #endif\n";
+        let mut guards: Vec<String> = guards_in(source)
+            .into_iter()
+            .filter_map(|(_, guard)| guard)
+            .collect();
+        guards.sort();
+        assert_eq!(
+            guards,
+            vec!["!(!(A) && (B))".to_string(), "!(A) && (B)".to_string()]
+        );
     }
 }
