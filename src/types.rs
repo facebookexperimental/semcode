@@ -67,6 +67,9 @@ pub struct CalleeDefinition {
     /// ambiguous. A definition that calls nothing is not a prototype: it is a
     /// second answer, and a different one.
     pub is_definition: bool,
+    /// The preprocessor arm the definition sits under; `None` at file scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
 }
 
 /// Where one definition of a name was read.
@@ -74,6 +77,15 @@ pub struct CalleeDefinition {
 pub struct DefinitionSite {
     pub file_path: String,
     pub line_start: u32,
+    /// The preprocessor arm the definition sits under; `None` at file scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+}
+
+/// " under <guard>" for a definition inside a conditional, nothing at file
+/// scope: the words that tell two arms of one name in one file apart.
+pub fn under(guard: Option<&str>) -> String {
+    guard.map_or_else(String::new, |guard| format!(" under {guard}"))
 }
 
 /// The definition a command that must give one answer is about, beside the
@@ -176,13 +188,23 @@ impl ChosenDefinition {
         if self.others.is_empty() {
             return None;
         }
+        if let Some(note) = self.one_definition_per_configuration(surface) {
+            return Some(note);
+        }
         if let Some(note) = self.one_definition_per_architecture(surface) {
             return Some(note);
         }
         let mut sites: Vec<String> = self
             .others
             .iter()
-            .map(|site| format!("{}:{}", site.file_path, site.line_start))
+            .map(|site| {
+                format!(
+                    "{}:{}{}",
+                    site.file_path,
+                    site.line_start,
+                    under(site.guard.as_deref())
+                )
+            })
             .collect();
         sites.sort();
         // A name with a hundred definitions would otherwise print a hundred
@@ -201,14 +223,62 @@ impl ChosenDefinition {
         };
         Some(format!(
             "'{}' is defined {} times in this revision. This answer is about \
-             {}:{}; the others are {}. Which one a call site reaches depends on \
+             {}:{}{}; the others are {}. Which one a call site reaches depends on \
              the file it is written in and on the configuration the tree is \
              built with, and neither is recorded here.",
             self.function.name,
             self.others.len() + 1,
             self.function.file_path,
             self.function.line_start,
+            under(self.function.guard.as_deref()),
             listed
+        ))
+    }
+
+    /// The note for a name one file defines once per configuration.
+    ///
+    /// `None` unless every definition is in one file, under a conditional,
+    /// and every two of them sit in different arms of one `#if` (one guard
+    /// holds a term the other negates). Then no build compiles two of them,
+    /// and the general note's "depends on the file it is written in" is
+    /// wrong: it depends only on the configuration, and the guards say how.
+    ///
+    /// Distinct guards are not enough. `#if A` and a later, separate `#if B`
+    /// both hold in a build with A and B, and claiming otherwise would tell
+    /// an auditor to look at one definition where the build has two.
+    fn one_definition_per_configuration(&self, surface: Surface) -> Option<String> {
+        let file = self.function.file_path.as_str();
+        let mut arms: Vec<(u32, &str)> =
+            vec![(self.function.line_start, self.function.guard.as_deref()?)];
+        for site in &self.others {
+            if site.file_path != file {
+                return None;
+            }
+            arms.push((site.line_start, site.guard.as_deref()?));
+        }
+        let exclusive = arms.iter().enumerate().all(|(index, (_, left))| {
+            arms[index + 1..]
+                .iter()
+                .all(|(_, right)| crate::guard::excludes(left, right))
+        });
+        if !exclusive {
+            return None;
+        }
+        arms.sort_unstable();
+        let listed: Vec<String> = arms
+            .iter()
+            .map(|(line, guard)| format!("line {line} under {guard}"))
+            .collect();
+        Some(format!(
+            "'{}' has one definition per configuration, all in {}: {}. This \
+             answer is about line {}, under {}. No build compiles more than one \
+             of them; {}.",
+            self.function.name,
+            file,
+            listed.join("; "),
+            self.function.line_start,
+            self.function.guard.as_deref().unwrap_or_default(),
+            surface.list_all(&self.function.name),
         ))
     }
 
@@ -941,7 +1011,95 @@ mod ambiguity_note_tests {
         DefinitionSite {
             file_path: path.to_string(),
             line_start: line,
+            guard: None,
         }
+    }
+
+    fn arm(path: &str, line: u32, guard: &str) -> DefinitionSite {
+        DefinitionSite {
+            guard: Some(guard.to_string()),
+            ..site(path, line)
+        }
+    }
+
+    #[test]
+    fn one_per_configuration_names_every_arm_and_its_guard() {
+        // `_cond_resched()` in sched.h: four arms of one file's #if, so
+        // which one a call reaches depends on the configuration alone.
+        let mut chosen_fn = definition("_cond_resched", "include/linux/sched.h", 2152);
+        chosen_fn.guard = Some("C && !A && B".to_string());
+        let chosen = ChosenDefinition {
+            function: chosen_fn,
+            others: vec![
+                arm("include/linux/sched.h", 2143, "C && A"),
+                arm("include/linux/sched.h", 2159, "C && !A && !B"),
+                arm("include/linux/sched.h", 2168, "!C"),
+            ],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(note.contains("one definition per configuration"), "{note}");
+        assert!(
+            note.contains(
+                "line 2143 under C && A; line 2152 under C && !A && B; \
+                 line 2159 under C && !A && !B; line 2168 under !C"
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains("about line 2152, under C && !A && B"),
+            "{note}"
+        );
+        assert!(note.contains("No build compiles more than one"), "{note}");
+        assert!(
+            note.contains("'func _cond_resched' lists them all"),
+            "{note}"
+        );
+        assert!(!note.contains("depends on"), "{note}");
+    }
+
+    #[test]
+    fn independent_ifs_in_one_file_are_not_one_per_configuration() {
+        // `#if A` ... `#endif` and a later `#if B` ... `#endif`: a build with
+        // both compiles both definitions.
+        let mut chosen_fn = definition("pick", "include/a.h", 3);
+        chosen_fn.guard = Some("A".to_string());
+        let chosen = ChosenDefinition {
+            function: chosen_fn,
+            others: vec![arm("include/a.h", 9, "B")],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(!note.contains("per configuration"), "{note}");
+        assert!(note.contains("include/a.h:9 under B"), "{note}");
+    }
+
+    #[test]
+    fn arms_spread_over_files_get_the_general_note_with_guards() {
+        // A guarded definition in another file is not an arm of this one's
+        // #if: which one a call reaches depends on the file too.
+        let mut chosen_fn = definition("pick", "include/a.h", 3);
+        chosen_fn.guard = Some("A".to_string());
+        let chosen = ChosenDefinition {
+            function: chosen_fn,
+            others: vec![arm("include/b.h", 7, "!A")],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(!note.contains("per configuration"), "{note}");
+        assert!(note.contains("include/a.h:3 under A"), "{note}");
+        assert!(note.contains("include/b.h:7 under !A"), "{note}");
+    }
+
+    #[test]
+    fn a_file_scope_definition_beside_arms_is_not_one_per_configuration() {
+        // One unguarded definition compiles in every configuration, so the
+        // arms are not the only choice and the claim would be false.
+        let mut chosen_fn = definition("pick", "include/a.h", 3);
+        chosen_fn.guard = Some("A".to_string());
+        let chosen = ChosenDefinition {
+            function: chosen_fn,
+            others: vec![site("include/a.h", 9)],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(!note.contains("per configuration"), "{note}");
     }
 
     #[test]

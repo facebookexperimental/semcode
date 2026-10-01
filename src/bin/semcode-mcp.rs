@@ -13,6 +13,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Truncate output at 3,000 lines with a warning message
+/// "Under: <guard>" as its own line for a definition inside a conditional,
+/// nothing at file scope.
+fn under_line(guard: Option<&str>) -> String {
+    guard.map_or_else(String::new, |guard| format!("Under: {guard}\n"))
+}
+
 fn truncate_output(output: String) -> String {
     const MAX_LINES: usize = 3000;
 
@@ -108,8 +114,8 @@ async fn mcp_query_function_or_macro(
                 .unwrap_or_default();
 
             format!(
-                "Macro: {} (git SHA: {})\nFile: {}:{}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}",
-                entity.name, git_sha, entity.file_path, entity.line_start, params_str, macro_calls.len(), macro_callers.len(), entity.body
+                "Macro: {} (git SHA: {})\nFile: {}:{}\n{}Parameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}",
+                entity.name, git_sha, entity.file_path, entity.line_start, under_line(entity.guard.as_deref()), params_str, macro_calls.len(), macro_callers.len(), entity.body
             )
         } else {
             // Found function
@@ -133,12 +139,13 @@ async fn mcp_query_function_or_macro(
                 .unwrap_or_default();
 
             format!(
-                "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
+                "Function: {} (git SHA: {})\nFile: {}:{}-{}\n{}Return Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
                 func.name,
                 git_sha,
                 func.file_path,
                 func.line_start,
                 func.line_end,
+                under_line(func.guard.as_deref()),
                 func.return_type,
                 params_str,
                 calls.len(),
@@ -172,8 +179,13 @@ async fn mcp_query_function_or_macro(
                     .join(", ");
 
                 result.push_str(&format!(
-                    "Macro: {}\nFile: {}:{}\nParameters: ({})\nDefinition:\n{}\n\n",
-                    entity.name, entity.file_path, entity.line_start, params_str, entity.body
+                    "Macro: {}\nFile: {}:{}\n{}Parameters: ({})\nDefinition:\n{}\n\n",
+                    entity.name,
+                    entity.file_path,
+                    entity.line_start,
+                    under_line(entity.guard.as_deref()),
+                    params_str,
+                    entity.body
                 ));
             } else {
                 // Function
@@ -185,11 +197,12 @@ async fn mcp_query_function_or_macro(
                     .join(", ");
 
                 result.push_str(&format!(
-                    "Function: {}\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\nBody:\n{}\n\n",
+                    "Function: {}\nFile: {}:{}-{}\n{}Return Type: {}\nParameters: ({})\nBody:\n{}\n\n",
                     entity.name,
                     entity.file_path,
                     entity.line_start,
                     entity.line_end,
+                    under_line(entity.guard.as_deref()),
                     entity.return_type,
                     params_str,
                     entity.body

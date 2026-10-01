@@ -341,7 +341,11 @@ pub fn elsewhere_note(
 fn definition_marker(chosen: &crate::types::ChosenDefinition) -> String {
     match chosen.others.len() {
         0 => String::new(),
-        others => format!(" [1 of {} definitions]", others + 1),
+        others => format!(
+            " [1 of {} definitions{}]",
+            others + 1,
+            crate::types::under(chosen.function.guard.as_deref())
+        ),
     }
 }
 
@@ -946,9 +950,10 @@ fn write_callees_per_definition(
     for definition in answering {
         writeln!(
             writer,
-            "\n  {}:{}",
+            "\n  {}:{}{}",
             definition.file_path.bright_black(),
-            definition.line_start
+            definition.line_start,
+            crate::types::under(definition.guard.as_deref()).yellow()
         )?;
         if definition.callees.is_empty() {
             writeln!(writer, "    calls nothing")?;

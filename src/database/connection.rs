@@ -2742,6 +2742,7 @@ impl DatabaseManager {
                     .map(|func| DefinitionSite {
                         file_path: func.file_path.clone(),
                         line_start: func.line_start,
+                        guard: func.guard.clone(),
                     })
                     .collect(),
             };
@@ -2761,10 +2762,14 @@ impl DatabaseManager {
         // call. Ranking the minority language last answers the question the
         // tree is mostly written in; where a name is defined in one language
         // this decides nothing.
+        // Counted per file, not per row: a header that defines a name once
+        // per configuration is one definition site, and counting each arm
+        // would let one file's #if outvote the rest of the tree.
         let mut by_language: HashMap<&str, usize> = HashMap::new();
-        for candidate in &matches {
+        let files: HashSet<&str> = matches.iter().map(|m| m.file_path.as_str()).collect();
+        for file in &files {
             *by_language
-                .entry(crate::types::path_language(&candidate.file_path))
+                .entry(crate::types::path_language(file))
                 .or_default() += 1;
         }
         // A strict majority or nothing: more than half the definitions, not
@@ -2780,7 +2785,7 @@ impl DatabaseManager {
             .filter(|count| **count == highest)
             .count()
             == 1;
-        let majority_language = match unique_top && highest * 2 > matches.len() {
+        let majority_language = match unique_top && highest * 2 > files.len() {
             true => by_language
                 .iter()
                 .find(|(_, count)| **count == highest)
@@ -2874,6 +2879,7 @@ impl DatabaseManager {
             .map(|candidate| crate::types::DefinitionSite {
                 file_path: candidate.file_path,
                 line_start: candidate.line_start,
+                guard: candidate.guard,
             })
             .collect();
         ChosenDefinition { function, others }
@@ -4230,6 +4236,7 @@ impl DatabaseManager {
                             &function.return_type,
                             &function.body,
                         ),
+                        guard: function.guard.clone(),
                     })
                     .collect()
             })
@@ -5894,10 +5901,16 @@ impl DatabaseManager {
                             .as_any()
                             .downcast_ref::<arrow::array::StringArray>()
                     });
+                let guard_array = batch
+                    .column_by_name("guard")
+                    .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>());
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
                     let git_file_hash = git_file_hash_array.value(i);
+                    let guard = guard_array
+                        .map(|array| array.value(i).to_string())
+                        .filter(|guard| !guard.is_empty());
                     let body_hash = body_hash_array.and_then(|array| {
                         array
                             .is_valid(i)
@@ -5922,6 +5935,7 @@ impl DatabaseManager {
                                 line_end_array.value(i) as u32,
                                 calls,
                                 body_hash,
+                                guard,
                             ));
                         }
                     }
@@ -5933,7 +5947,7 @@ impl DatabaseManager {
         // text decides, so it is read here -- for the handful of rows that
         // share one name, not for the table.
         let mut definitions: Vec<crate::types::CalleeDefinition> = Vec::new();
-        for (file_path, line_start, line_end, calls, body_hash) in matches {
+        for (file_path, line_start, line_end, calls, body_hash, guard) in matches {
             let text = match &body_hash {
                 Some(hash) => self.get_content(hash).await?.unwrap_or_default(),
                 None => String::new(),
@@ -5951,6 +5965,7 @@ impl DatabaseManager {
                 // on the tree, so a divergence here would show up as two
                 // commands reporting different numbers.
                 is_definition: !text.is_empty() && !crate::types::text_is_prototype(&text),
+                guard,
             });
         }
         // A stable order, so two runs and two readers see the same list.

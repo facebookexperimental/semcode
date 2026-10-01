@@ -380,6 +380,9 @@ pub fn display_function_to_writer_with_options(
     writeln!(writer, "File: {}", func.file_path.cyan())?;
     writeln!(writer, "Hash: {}", func.git_file_hash.bright_black())?;
     writeln!(writer, "Lines: {} - {}", func.line_start, func.line_end)?;
+    if let Some(guard) = &func.guard {
+        writeln!(writer, "Under: {}", guard.yellow())?;
+    }
 
     // Construct and display function declaration/signature
     let params = if func.parameters.is_empty() {
