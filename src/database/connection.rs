@@ -2750,8 +2750,21 @@ impl DatabaseManager {
         Resolution::Chosen(Box::new(self.choose_definition(admitted)))
     }
 
-    fn choose_definition(&self, mut matches: Vec<FunctionInfo>) -> ChosenDefinition {
-        if matches.len() == 1 {
+    fn choose_definition(&self, all: Vec<FunctionInfo>) -> ChosenDefinition {
+        if all.len() == 1 {
+            return ChosenDefinition::only(all.into_iter().next().unwrap());
+        }
+
+        // One candidate per file: the first row that defines the name, by
+        // line. A file that defines a name once per configuration is one
+        // place, and letting every arm compete let whichever arm had the
+        // longest body speak for the file -- arch/um's `return 0;` stub for
+        // !CONFIG_PRINTK outranked include/linux/printk.h for 6,895 calls.
+        // The first arm is the `#if` side, which the kernel conventionally
+        // writes as the configured implementation, with the stub in
+        // `#else`. The file's other arms are reported with the choice.
+        let (mut matches, siblings) = one_per_file(all);
+        if matches.len() == 1 && siblings.is_empty() {
             return ChosenDefinition::only(matches.into_iter().next().unwrap());
         }
 
@@ -2873,6 +2886,7 @@ impl DatabaseManager {
         let mut matches = matches.into_iter();
         let function = matches.next().unwrap();
         let others = matches
+            .chain(siblings)
             .filter(|candidate| {
                 crate::types::row_defines_the_function(&candidate.return_type, &candidate.body)
             })
@@ -8354,6 +8368,29 @@ impl DatabaseManager {
 
         Ok(())
     }
+}
+
+/// Split candidate rows into one per file -- the first row by line that
+/// defines the name, or the first row where none does -- and the rest.
+fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo>) {
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
+        let a_defines = crate::types::row_defines_the_function(&a.return_type, &a.body);
+        let b_defines = crate::types::row_defines_the_function(&b.return_type, &b.body);
+        a.file_path
+            .cmp(&b.file_path)
+            .then(b_defines.cmp(&a_defines))
+            .then(a.line_start.cmp(&b.line_start))
+    });
+    let mut representatives: Vec<FunctionInfo> = Vec::new();
+    let mut rest = Vec::new();
+    for row in rows {
+        match representatives.last() {
+            Some(last) if last.file_path == row.file_path => rest.push(row),
+            _ => representatives.push(row),
+        }
+    }
+    (representatives, rest)
 }
 
 /// The definitions in `file` that a chain walks through: the chosen row at

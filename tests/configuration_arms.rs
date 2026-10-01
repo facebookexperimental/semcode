@@ -49,6 +49,24 @@ static inline int cond_resched(void)\n{\n\treturn _cond_resched();\n}\n\
         "int __cond_resched(void)\n{\n\trcu_all_qs();\n\treturn 1;\n}\n",
     )
     .unwrap();
+    // printk's shape: a generic macro, and an architecture header that
+    // defines it once per configuration, the #else arm a stub with a body.
+    std::fs::create_dir_all(repo.join("include/linux")).unwrap();
+    std::fs::create_dir_all(repo.join("arch/um/include/shared")).unwrap();
+    std::fs::write(
+        repo.join("include/linux/printk.h"),
+        "#define printk(fmt, ...) printk_index_wrap(_printk, fmt, ##__VA_ARGS__)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("arch/um/include/shared/user.h"),
+        "#if IS_ENABLED(CONFIG_PRINTK)\n\
+#define printk(...) _printk(__VA_ARGS__)\n\
+#else\n\
+static inline int printk(const char *fmt, ...)\n{\n\treturn 0;\n}\n\
+#endif\n",
+    )
+    .unwrap();
     std::fs::write(
         repo.join("preempt.h"),
         "#ifdef CONFIG_PREEMPTION\n\
@@ -175,4 +193,25 @@ async fn an_arm_a_path_contradicts_is_shown_and_not_walked() {
         "{text}"
     );
     assert!(!text.contains("voluntary_side"), "{text}");
+}
+
+#[tokio::test]
+async fn a_stub_arm_does_not_speak_for_its_file() {
+    // Once every arm of a file competed, arch/um's `return 0;` stub won on
+    // body length and printk resolved to it. A file is one candidate.
+    let (_dir, db, sha) = tree().await;
+    let chosen = db
+        .find_function_git_aware_reporting("printk", &sha, semcode::domain::Context::Any)
+        .await
+        .unwrap()
+        .chosen()
+        .unwrap();
+    assert_eq!(chosen.function.file_path, "include/linux/printk.h");
+    // Both um arms are still reported as other definitions.
+    let um: Vec<_> = chosen
+        .others
+        .iter()
+        .filter(|site| site.file_path.starts_with("arch/um"))
+        .collect();
+    assert_eq!(um.len(), 2, "{:?}", chosen.others);
 }
