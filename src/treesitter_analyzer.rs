@@ -5092,38 +5092,77 @@ impl TreeSitterAnalyzer {
     }
 
     /// Whether a conditional is the header's include guard: an `#ifndef X`
-    /// at file scope whose first line is `#define X`.
+    /// (or `#if !defined(X)`) whose first line is `#define X`, with no
+    /// `#else`, wrapping everything else in the file.
     ///
     /// Every definition in a header sits under it, so it tells no two of
     /// them apart and holds in every build that reads the header; carried
     /// into the guard it is noise on every row, and it makes two independent
-    /// `#if`s look as if they shared a conditional.
+    /// `#if`s look as if they shared a conditional. Anything less than the
+    /// whole-file wrapper is a real condition: `#ifndef MODE` / `#define
+    /// MODE` / ... / `#else` picks between two definitions, and dropping it
+    /// would merge them.
     fn is_include_guard(node: tree_sitter::Node, source: &str) -> bool {
-        if node.kind() != "preproc_ifdef"
-            || node.parent().map(|parent| parent.kind()) != Some("translation_unit")
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.kind() != "translation_unit" || node.child_by_field_name("alternative").is_some()
         {
             return false;
         }
-        let is_ifndef = node
-            .child(0)
-            .and_then(|directive| directive.utf8_text(source.as_bytes()).ok())
-            .is_some_and(|directive| directive.ends_with("ndef"));
-        let Some(name) = node.child_by_field_name("name") else {
+        let text = |n: tree_sitter::Node| n.utf8_text(source.as_bytes()).ok().map(str::to_string);
+        let guarded_name = match node.kind() {
+            "preproc_ifdef" => {
+                let is_ifndef = node
+                    .child(0)
+                    .and_then(|directive| directive.utf8_text(source.as_bytes()).ok())
+                    .is_some_and(|directive| directive.ends_with("ndef"));
+                if !is_ifndef {
+                    return false;
+                }
+                node.child_by_field_name("name").and_then(text)
+            }
+            "preproc_if" => node
+                .child_by_field_name("condition")
+                .and_then(text)
+                .map(|condition| Self::one_line(&condition))
+                .and_then(|condition| {
+                    let inner = condition.strip_prefix('!')?.trim();
+                    let name = inner
+                        .strip_prefix("defined(")
+                        .and_then(|rest| rest.strip_suffix(')'))
+                        .or_else(|| inner.strip_prefix("defined "))?
+                        .trim();
+                    crate::guard::is_atom(name).then(|| name.to_string())
+                }),
+            _ => None,
+        };
+        let Some(guarded_name) = guarded_name else {
             return false;
         };
-        if !is_ifndef {
+
+        // The wrapper is the file's only top-level construct.
+        let mut top = parent.walk();
+        let alone = parent
+            .named_children(&mut top)
+            .filter(|named| named.kind() != "comment")
+            .all(|named| named.id() == node.id());
+        if !alone {
             return false;
         }
+
+        let skip: Vec<usize> = ["name", "condition"]
+            .iter()
+            .filter_map(|field| node.child_by_field_name(field).map(|n| n.id()))
+            .collect();
         let mut cursor = node.walk();
         let first = node
             .named_children(&mut cursor)
-            .find(|named| named.id() != name.id() && named.kind() != "comment");
+            .find(|named| !skip.contains(&named.id()) && named.kind() != "comment");
         first.is_some_and(|define| {
             define.kind() == "preproc_def"
-                && define
-                    .child_by_field_name("name")
-                    .and_then(|defined| defined.utf8_text(source.as_bytes()).ok())
-                    == name.utf8_text(source.as_bytes()).ok()
+                && define.child_by_field_name("name").and_then(text).as_deref()
+                    == Some(guarded_name.as_str())
         })
     }
 
@@ -10141,6 +10180,48 @@ mod config_variant_tests {
         assert_eq!(
             guards_in(fallback),
             vec![("other".to_string(), Some("!defined(pr_fmt)".to_string()))]
+        );
+    }
+
+    #[test]
+    fn an_ifndef_with_an_else_is_a_real_condition() {
+        // Not an include guard: it picks between two definitions, and
+        // dropping it would collapse them into one.
+        let source = "#ifndef MODE\n\
+             #define MODE\n\
+             #define pick(x) one(x)\n\
+             #else\n\
+             #define pick(x) two(x)\n\
+             #endif\n";
+        assert_eq!(
+            guards_in(source),
+            vec![
+                ("pick".to_string(), Some("!defined(MODE)".to_string())),
+                ("pick".to_string(), Some("defined(MODE)".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_if_not_defined_include_guard_is_recognized_and_a_partial_one_is_not() {
+        let whole = "/* header */\n\
+             #if !defined(_ASM_THING_H)\n\
+             #define _ASM_THING_H\n\
+             #define plain(x) x\n\
+             #endif\n";
+        assert_eq!(guards_in(whole), vec![("plain".to_string(), None)]);
+        // Something after the wrapper: not the whole file, so a condition.
+        let partial = "#ifndef ONCE\n\
+             #define ONCE\n\
+             #define inside(x) x\n\
+             #endif\n\
+             #define outside(x) x\n";
+        assert_eq!(
+            guards_in(partial),
+            vec![
+                ("inside".to_string(), Some("!defined(ONCE)".to_string())),
+                ("outside".to_string(), None),
+            ]
         );
     }
 }

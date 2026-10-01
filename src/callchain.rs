@@ -303,8 +303,8 @@ fn facts_below(facts: &[String], guard: Option<&str>, node: &mut CallNode) -> Op
     }
     let mut below = facts.to_vec();
     for term in crate::guard::config_facts(guard) {
-        if !below.iter().any(|fact| fact == term) {
-            below.push(term.to_string());
+        if !below.contains(&term) {
+            below.push(term);
         }
     }
     Some(below)
