@@ -1993,7 +1993,18 @@ async fn mcp_show_callchain_with_limits(
             writeln!(buffer, "Ambiguous: {note}")?;
         }
         let func = chosen.function;
-        let root_guard = func.guard.clone();
+        // What every arm of the root asserts: the root's callees are the union
+        // over those arms, so only these facts hold on all of their paths.
+        let root_facts = semcode::guard::shared_facts(
+            db.get_callee_arms_in(
+                function_name,
+                git_sha,
+                semcode::domain::Context::In(semcode::domain::domain_of(&func.file_path)),
+            )
+            .await?
+            .iter()
+            .map(|arm| arm.guard.as_deref()),
+        );
         // Every hop of this chain is about the definition the root resolved
         // to, so it is answered within that definition's build. Sticky: a hop
         // into generic code keeps the architecture, because generic code
@@ -2137,7 +2148,7 @@ async fn mcp_show_callchain_with_limits(
                     semcode::callchain::write_callee_arms(
                         &mut buffer,
                         &arms,
-                        root_guard.as_deref(),
+                        &root_facts,
                         down_levels,
                         false,
                     )?;

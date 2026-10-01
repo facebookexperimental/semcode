@@ -313,20 +313,20 @@ fn facts_below(facts: &[String], guard: Option<&str>, node: &mut CallNode) -> Op
 /// The arms of a callee its file defines more than once, as a chain lists
 /// them under the callee: each arm's location and guard, and what it calls.
 ///
-/// An arm whose guard negates a Kconfig term the chain's root sits under
-/// cannot run on this chain: it is listed with the term, and what it calls
-/// is not. `colored` is false for a reader that is not a terminal.
+/// An arm whose guard negates a Kconfig term every arm of the chain's root
+/// asserts (see [`crate::guard::shared_facts`]) cannot run on this chain: it
+/// is listed with the term, and what it calls is not. The root's callees
+/// are the union over its arms, so a fact only one root arm asserts would
+/// hide a callee another root arm reaches. `colored` is false for a reader
+/// that is not a terminal.
 pub fn write_callee_arms(
     writer: &mut dyn Write,
     arms: &[crate::types::CalleeDefinition],
-    root_guard: Option<&str>,
+    root_facts: &[String],
     down_levels: usize,
     colored: bool,
 ) -> Result<()> {
-    let facts = root_guard
-        .map(crate::guard::config_facts)
-        .unwrap_or_default();
-    let held: Vec<&str> = facts.iter().map(String::as_str).collect();
+    let held: Vec<&str> = root_facts.iter().map(String::as_str).collect();
     for arm in arms {
         let place = format!("{}:{}", arm.file_path, arm.line_start);
         let mut note = crate::types::under(arm.guard.as_deref());
@@ -1784,7 +1784,7 @@ mod tests {
         super::write_callee_arms(
             &mut out,
             &arms,
-            Some("defined(CONFIG_PREEMPTION)"),
+            &["defined(CONFIG_PREEMPTION)".to_string()],
             2,
             false,
         )

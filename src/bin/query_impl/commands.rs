@@ -261,7 +261,18 @@ async fn show_callchain_with_limits(
         println!("{} {}", "Ambiguous:".bold().yellow(), note);
     }
     let func = chosen.function;
-    let root_guard = func.guard.clone();
+    // What every arm of the root asserts: the root's callees are the union
+    // over those arms, so only these facts hold on all of their paths.
+    let root_facts = semcode::guard::shared_facts(
+        db.get_callee_arms_in(
+            function_name,
+            git_sha,
+            semcode::domain::Context::In(semcode::domain::domain_of(&func.file_path)),
+        )
+        .await?
+        .iter()
+        .map(|arm| arm.guard.as_deref()),
+    );
 
     println!("{}", "=== Function Information ===".bold().green());
     println!(
@@ -415,7 +426,7 @@ async fn show_callchain_with_limits(
                 semcode::callchain::write_callee_arms(
                     &mut std::io::stdout(),
                     &arms,
-                    root_guard.as_deref(),
+                    &root_facts,
                     down_levels,
                     true,
                 )?;

@@ -125,7 +125,7 @@ fn collect_facts(conjunction: &str, facts: &mut Vec<String>) {
             continue;
         }
         let canonical = canonical_atom(positive);
-        if !symbol_of(&canonical).starts_with("CONFIG_") {
+        if !symbol_of(&canonical).starts_with("CONFIG_") || !is_build_wide(&canonical) {
             continue;
         }
         let fact = if negated {
@@ -149,6 +149,34 @@ pub fn contradiction<'a>(facts: &[&'a str], guard: &str) -> Option<&'a str> {
         };
         facts.iter().copied().find(|fact| *fact == negation)
     })
+}
+
+/// Whether an atom's value is the same in every translation unit of a
+/// build: a bare symbol, `defined`, and the Kconfig tests that read only the
+/// configuration. `IS_REACHABLE(CONFIG_X)` is not: it depends on whether the
+/// file asking is built as a module, so a caller and a callee can disagree.
+fn is_build_wide(atom: &str) -> bool {
+    match atom.split_once('(') {
+        None => true,
+        Some((test, _)) => matches!(test, "defined" | "IS_ENABLED" | "IS_BUILTIN" | "IS_MODULE"),
+    }
+}
+
+/// The facts every one of several guards asserts: what holds on a path
+/// that entered through any of them. One unguarded arm asserts nothing.
+pub fn shared_facts<'a>(guards: impl IntoIterator<Item = Option<&'a str>>) -> Vec<String> {
+    let mut shared: Option<Vec<String>> = None;
+    for guard in guards {
+        let facts = guard.map(config_facts).unwrap_or_default();
+        shared = Some(match shared {
+            None => facts,
+            Some(previous) => previous
+                .into_iter()
+                .filter(|fact| facts.contains(fact))
+                .collect(),
+        });
+    }
+    shared.unwrap_or_default()
 }
 
 /// One spelling per atom, so `defined CONFIG_X` and `defined(CONFIG_X)`
@@ -335,6 +363,20 @@ mod tests {
         );
         // A macro other than a Kconfig symbol proves nothing across a call.
         assert_eq!(contradiction(&["defined(DEBUG)"], "!defined(DEBUG)"), None);
+        // Nor does a test whose answer depends on the asking file.
+        assert!(config_facts("IS_REACHABLE(CONFIG_X)").is_empty());
+    }
+
+    #[test]
+    fn a_path_entered_through_several_arms_holds_only_what_all_assert() {
+        assert_eq!(
+            shared_facts([
+                Some("defined(CONFIG_A) && CONFIG_B"),
+                Some("defined(CONFIG_A) && !CONFIG_B")
+            ]),
+            vec!["defined(CONFIG_A)"]
+        );
+        assert!(shared_facts([Some("defined(CONFIG_A)"), None]).is_empty());
     }
 
     #[test]
