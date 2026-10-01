@@ -310,6 +310,55 @@ fn facts_below(facts: &[String], guard: Option<&str>, node: &mut CallNode) -> Op
     Some(below)
 }
 
+/// The arms of a callee its file defines more than once, as a chain lists
+/// them under the callee: each arm's location and guard, and what it calls.
+///
+/// An arm whose guard negates a Kconfig term the chain's root sits under
+/// cannot run on this chain: it is listed with the term, and what it calls
+/// is not. `colored` is false for a reader that is not a terminal.
+pub fn write_callee_arms(
+    writer: &mut dyn Write,
+    arms: &[crate::types::CalleeDefinition],
+    root_guard: Option<&str>,
+    down_levels: usize,
+    colored: bool,
+) -> Result<()> {
+    let facts = root_guard
+        .map(crate::guard::config_facts)
+        .unwrap_or_default();
+    let held: Vec<&str> = facts.iter().map(String::as_str).collect();
+    for arm in arms {
+        let place = format!("{}:{}", arm.file_path, arm.line_start);
+        let mut note = crate::types::under(arm.guard.as_deref());
+        let contradicted = arm
+            .guard
+            .as_deref()
+            .and_then(|guard| crate::guard::contradiction(&held, guard));
+        if let Some(fact) = contradicted {
+            note.push_str(&format!(" [cannot run here: {fact} holds above]"));
+        }
+        if colored {
+            writeln!(writer, "   └─ ({}){}", place.bright_black(), note.yellow())?;
+        } else {
+            writeln!(writer, "   └─ ({place}){note}")?;
+        }
+        if contradicted.is_some() || down_levels < 2 {
+            continue;
+        }
+        for next in arm.callees.iter().take(3) {
+            if colored {
+                writeln!(writer, "      └─ {}", next.bright_black())?;
+            } else {
+                writeln!(writer, "      └─ {next}")?;
+            }
+        }
+        if arm.callees.len() > 3 {
+            writeln!(writer, "      └─ ... and {} more", arm.callees.len() - 3)?;
+        }
+    }
+    Ok(())
+}
+
 /// What a node prints after its location: the arm it sits under, and why
 /// the walk stopped there if it did.
 fn node_annotation(node: &CallNode) -> String {
@@ -1713,5 +1762,46 @@ mod tests {
 
         assert!(text.contains("1 call sites can reach it"), "{text}");
         assert!(text.contains("1 further call sites"), "{text}");
+    }
+
+    #[test]
+    fn a_callee_arm_the_root_contradicts_is_listed_but_not_followed() {
+        // The REPL and MCP callchain list a callee's arms under it; one whose
+        // guard negates a Kconfig term the root sits under cannot run there.
+        let arm = |line: u32, guard: &str, calls: &[&str]| crate::types::CalleeDefinition {
+            file_path: "preempt.h".to_string(),
+            line_start: line,
+            line_end: line,
+            callees: calls.iter().map(|c| c.to_string()).collect(),
+            is_definition: true,
+            guard: Some(guard.to_string()),
+        };
+        let arms = vec![
+            arm(7, "defined(CONFIG_PREEMPTION)", &["preemptible_side"]),
+            arm(12, "!defined(CONFIG_PREEMPTION)", &["voluntary_side"]),
+        ];
+        let mut out = Vec::new();
+        super::write_callee_arms(
+            &mut out,
+            &arms,
+            Some("defined(CONFIG_PREEMPTION)"),
+            2,
+            false,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("(preempt.h:7) under defined(CONFIG_PREEMPTION)\n"),
+            "{text}"
+        );
+        assert!(text.contains("preemptible_side"), "{text}");
+        assert!(
+            text.contains(
+                "(preempt.h:12) under !defined(CONFIG_PREEMPTION) \
+                 [cannot run here: defined(CONFIG_PREEMPTION) holds above]"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("voluntary_side"), "{text}");
     }
 }

@@ -1993,6 +1993,7 @@ async fn mcp_show_callchain_with_limits(
             writeln!(buffer, "Ambiguous: {note}")?;
         }
         let func = chosen.function;
+        let root_guard = func.guard.clone();
         // Every hop of this chain is about the definition the root resolved
         // to, so it is answered within that definition's build. Sticky: a hop
         // into generic code keeps the architecture, because generic code
@@ -2125,6 +2126,23 @@ async fn mcp_show_callchain_with_limits(
 
             for (i, callee) in limited_callees.iter().enumerate() {
                 writeln!(buffer, "{}. {}", i + 1, callee)?;
+
+                // A callee its file defines once per configuration: every
+                // arm, under its guard, with what that arm calls.
+                let arms = db
+                    .get_callee_arms_in(callee, git_sha, chain_context)
+                    .await
+                    .unwrap_or_default();
+                if arms.len() > 1 {
+                    semcode::callchain::write_callee_arms(
+                        &mut buffer,
+                        &arms,
+                        root_guard.as_deref(),
+                        down_levels,
+                        false,
+                    )?;
+                    continue;
+                }
 
                 // Show callee details if available
                 if let Ok(Resolution::Chosen(callee_chosen)) = db

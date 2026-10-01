@@ -144,7 +144,7 @@ async fn every_arm_is_reported_with_its_guard() {
         .unwrap();
     let note = chosen.ambiguity_note(semcode::Surface::Repl).unwrap();
     assert!(note.contains("one definition per configuration"), "{note}");
-    assert!(note.contains("No build compiles more than one"), "{note}");
+    assert!(note.contains("no build compiles more than one"), "{note}");
 }
 
 #[tokio::test]

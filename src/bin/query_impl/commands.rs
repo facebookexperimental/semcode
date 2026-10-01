@@ -261,6 +261,7 @@ async fn show_callchain_with_limits(
         println!("{} {}", "Ambiguous:".bold().yellow(), note);
     }
     let func = chosen.function;
+    let root_guard = func.guard.clone();
 
     println!("{}", "=== Function Information ===".bold().green());
     println!(
@@ -411,22 +412,13 @@ async fn show_callchain_with_limits(
                 .await
                 .unwrap_or_default();
             if arms.len() > 1 {
-                for arm in &arms {
-                    println!(
-                        "   └─ ({}:{}){}",
-                        arm.file_path.bright_black(),
-                        arm.line_start.to_string().bright_black(),
-                        semcode::under(arm.guard.as_deref()).yellow()
-                    );
-                    if down_levels > 1 {
-                        for next in arm.callees.iter().take(3) {
-                            println!("      └─ {}", next.bright_black());
-                        }
-                        if arm.callees.len() > 3 {
-                            println!("      └─ ... and {} more", arm.callees.len() - 3);
-                        }
-                    }
-                }
+                semcode::callchain::write_callee_arms(
+                    &mut std::io::stdout(),
+                    &arms,
+                    root_guard.as_deref(),
+                    down_levels,
+                    true,
+                )?;
                 continue;
             }
 

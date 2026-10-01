@@ -271,8 +271,9 @@ impl ChosenDefinition {
             .collect();
         Some(format!(
             "'{}' has one definition per configuration, all in {}: {}. This \
-             answer is about line {}, under {}. No build compiles more than one \
-             of them; {}.",
+             answer is about line {}, under {}. As written, every two of these \
+             guards contradict each other, so no build compiles more than one \
+             (unless a macro they test is redefined between them); {}.",
             self.function.name,
             file,
             listed.join("; "),
@@ -1049,7 +1050,7 @@ mod ambiguity_note_tests {
             note.contains("about line 2152, under C && !A && B"),
             "{note}"
         );
-        assert!(note.contains("No build compiles more than one"), "{note}");
+        assert!(note.contains("no build compiles more than one"), "{note}");
         assert!(
             note.contains("'func _cond_resched' lists them all"),
             "{note}"
