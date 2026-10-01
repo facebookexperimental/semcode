@@ -2747,6 +2747,37 @@ impl DatabaseManager {
                     .collect(),
             };
         }
+        // Within an architecture, its own definition first: an `asm/` header
+        // overrides `asm-generic/` and the generic fallbacks. The chain's
+        // callees have always been read this way; the definition it names
+        // has to be the same one, or a chain shows one definition and lists
+        // another's calls.
+        if let crate::domain::Context::In(here) = context {
+            if here.arch.is_some() {
+                let (own, rest): (Vec<FunctionInfo>, Vec<FunctionInfo>) = admitted
+                    .into_iter()
+                    .partition(|func| crate::domain::domain_of(&func.file_path).arch == here.arch);
+                if !own.is_empty() {
+                    let mut chosen = self.choose_definition(own);
+                    chosen.others.extend(
+                        rest.into_iter()
+                            .filter(|func| {
+                                crate::types::row_defines_the_function(
+                                    &func.return_type,
+                                    &func.body,
+                                )
+                            })
+                            .map(|func| DefinitionSite {
+                                file_path: func.file_path,
+                                line_start: func.line_start,
+                                guard: func.guard,
+                            }),
+                    );
+                    return Resolution::Chosen(Box::new(chosen));
+                }
+                return Resolution::Chosen(Box::new(self.choose_definition(rest)));
+            }
+        }
         Resolution::Chosen(Box::new(self.choose_definition(admitted)))
     }
 
@@ -4172,29 +4203,13 @@ impl DatabaseManager {
                 .get_function_callees_git_aware(function_name, git_sha)
                 .await;
         }
-        let definitions = self
-            .get_function_callees_by_definition_git_aware(function_name, git_sha)
-            .await?;
-        let mut admitted: Vec<&crate::types::CalleeDefinition> = definitions
-            .iter()
-            .filter(|definition| context.admits(crate::domain::domain_of(&definition.file_path)))
-            .collect();
-        if admitted.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Most specific first: an architecture's own definition, then a
-        // generic one.
-        admitted.sort_by_key(|definition| {
-            crate::domain::domain_of(&definition.file_path)
-                .arch
-                .is_none()
-        });
-        let chosen = admitted[0];
-        Ok(callees_of_arms(&arms_beside(
-            &definitions,
-            &chosen.file_path,
-            chosen.line_start,
-        )))
+        // The definition the chain names, chosen the one way every other
+        // reader chooses it, then every arm of its file.
+        Ok(callees_of_arms(
+            &self
+                .get_callee_arms_in(function_name, git_sha, context)
+                .await?,
+        ))
     }
 
     /// The definitions a chain walks through for `function_name`: every arm
