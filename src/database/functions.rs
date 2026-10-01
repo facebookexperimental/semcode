@@ -428,13 +428,18 @@ impl FunctionStore {
         Ok(all_functions)
     }
 
-    /// Find function by name, file path, and exact git file hash - for targeted git-aware lookups
-    pub async fn find_by_name_file_and_hash(
+    /// Every row of a name in one file at one blob: one per preprocessor arm.
+    ///
+    /// A file can define a name once per configuration -- `_cond_resched()`
+    /// four times in `sched.h` -- and each arm is its own row. Returning the
+    /// first match answered every lookup with whichever arm the table
+    /// happened to return, and hid the others.
+    pub async fn find_all_by_name_file_and_hash(
         &self,
         name: &str,
         file_path: &str,
         git_file_hash: &str,
-    ) -> Result<Option<FunctionInfo>> {
+    ) -> Result<Vec<FunctionInfo>> {
         let table = self.connection.open_table("functions").execute().await?;
         let escaped_name = name.replace("'", "''");
         let escaped_file_path = file_path.replace("'", "''");
@@ -453,9 +458,12 @@ impl FunctionStore {
             .await?;
 
         let functions = self.extract_functions_from_batches(&results).await?;
-        Ok(functions
+        let mut arms: Vec<FunctionInfo> = functions
             .into_iter()
-            .find(|f| f.git_file_hash == git_hash_to_match))
+            .filter(|f| f.git_file_hash == git_hash_to_match)
+            .collect();
+        arms.sort_by_key(|f| f.line_start);
+        Ok(arms)
     }
 
     pub async fn get_all(&self) -> Result<Vec<FunctionInfo>> {

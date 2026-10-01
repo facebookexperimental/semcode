@@ -2458,15 +2458,11 @@ impl DatabaseManager {
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
             match self.candidate_state(file_path, git_hash, revision) {
-                CandidateFile::Indexed => {
-                    if let Some(func) = self
-                        .function_store
-                        .find_by_name_file_and_hash(name, file_path, git_hash)
-                        .await?
-                    {
-                        matches.push(func);
-                    }
-                }
+                CandidateFile::Indexed => matches.extend(
+                    self.function_store
+                        .find_all_by_name_file_and_hash(name, file_path, git_hash)
+                        .await?,
+                ),
                 CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
                 CandidateFile::Deleted => {}
             }
@@ -2646,15 +2642,11 @@ impl DatabaseManager {
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
             match self.candidate_state(file_path, git_hash, git_sha) {
-                CandidateFile::Indexed => {
-                    if let Some(func) = self
-                        .function_store
-                        .find_by_name_file_and_hash(name, file_path, git_hash)
-                        .await?
-                    {
-                        matches.push(func);
-                    }
-                }
+                CandidateFile::Indexed => matches.extend(
+                    self.function_store
+                        .find_all_by_name_file_and_hash(name, file_path, git_hash)
+                        .await?,
+                ),
                 CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
                 CandidateFile::Deleted => {}
             }
@@ -8470,6 +8462,62 @@ mod tests {
             .unwrap();
         assert_eq!(plain.len(), 1);
         assert_eq!(plain[0].guard, None);
+    }
+
+    #[tokio::test]
+    async fn a_git_aware_lookup_returns_every_arm_of_a_name() {
+        // The rows coexist (above); the lookup a query goes through has to
+        // hand back both of them, not whichever the table returns first.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("arms.c"), "/* arms */\n").unwrap();
+        git(repo_path, &["add", "arms.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+        let file_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "arms.c")
+            .unwrap()
+            .unwrap();
+        let db = DatabaseManager::new(
+            repo_path.join(".semcode.db").to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let arm = |guard: &str, line: u32| {
+            let mut function = test_function("pick", "arms.c", &file_hash);
+            function.guard = Some(guard.to_string());
+            function.line_start = line;
+            function.line_end = line;
+            function
+        };
+        db.insert_functions(vec![
+            arm("defined(CONFIG_A)", 2),
+            arm("!defined(CONFIG_A)", 4),
+        ])
+        .await
+        .unwrap();
+
+        let all = db
+            .find_all_functions_git_aware("pick", &git_sha)
+            .await
+            .unwrap();
+        let guards: Vec<Option<&str>> = all.iter().map(|f| f.guard.as_deref()).collect();
+        assert_eq!(
+            guards,
+            vec![Some("defined(CONFIG_A)"), Some("!defined(CONFIG_A)")]
+        );
+
+        let chosen = db
+            .find_function_git_aware_reporting("pick", &git_sha, crate::domain::Context::Any)
+            .await
+            .unwrap()
+            .chosen()
+            .expect("a definition is chosen");
+        assert_eq!(chosen.others.len(), 1, "the other arm was not reported");
     }
 
     #[tokio::test]
