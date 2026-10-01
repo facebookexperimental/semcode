@@ -5066,92 +5066,65 @@ impl TreeSitterAnalyzer {
 
         while let Some(current) = parent {
             if let Some(condition) = Self::arm_condition(current, source) {
-                // Reached through the arm below this one: the condition that
-                // got us here is that this one did not hold.
-                let via_alternative = current
-                    .child_by_field_name("alternative")
-                    .is_some_and(|alternative| alternative.id() == child.id());
-                terms.push(if via_alternative {
-                    Self::negated(&condition)
-                } else {
-                    condition
-                });
+                if !Self::is_include_guard(current, source) {
+                    let term = crate::guard::as_conjunct(&condition);
+                    // Reached through the arm below this one: the condition
+                    // that got us here is that this one did not hold.
+                    let via_alternative = current
+                        .child_by_field_name("alternative")
+                        .is_some_and(|alternative| alternative.id() == child.id());
+                    terms.push(if via_alternative {
+                        crate::guard::negate_term(&term)
+                    } else {
+                        term
+                    });
+                }
             }
             child = current;
             parent = current.parent();
         }
 
-        match terms.len() {
-            0 => None,
-            1 => terms.pop(),
-            _ => {
-                terms.reverse();
-                Some(
-                    terms
-                        .iter()
-                        .map(|term| Self::as_conjunct(term))
-                        .collect::<Vec<_>>()
-                        .join(" && "),
-                )
-            }
+        if terms.is_empty() {
+            return None;
         }
+        terms.reverse();
+        Some(terms.join(" && "))
     }
 
-    /// A condition as one operand of `&&`, parenthesized unless it is
-    /// plainly one term.
+    /// Whether a conditional is the header's include guard: an `#ifndef X`
+    /// at file scope whose first line is `#define X`.
     ///
-    /// `&&` binds tighter than `||` and `?:`, so an outer arm reading
-    /// `!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)`
-    /// joined bare to an inner `defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)`
-    /// reads as "not preemptible, or dynamic with the call" -- a
-    /// configuration no arm of `sched.h` states. Anything that is not a
-    /// single name, a negated one, or already wholly parenthesized is
-    /// wrapped: redundant parentheses cost nothing, a missing pair changes
-    /// the configuration.
-    fn as_conjunct(condition: &str) -> String {
-        let one_term =
-            |text: &str| Self::binds_tighter_than_not(text) || Self::wholly_parenthesized(text);
-        if one_term(condition) || condition.strip_prefix('!').is_some_and(one_term) {
-            condition.to_string()
-        } else {
-            format!("({condition})")
-        }
-    }
-
-    /// Whether the text is one parenthesized group: it opens with `(` and
-    /// that parenthesis closes at the last character, not before. `(A) &&
-    /// (B)` opens and closes with parentheses and is two groups.
-    ///
-    /// Character constants are skipped, so `(A == '(') || (B == ')')` is two
-    /// groups; comments are already gone by the time a condition gets here.
-    fn wholly_parenthesized(text: &str) -> bool {
-        if !text.starts_with('(') {
+    /// Every definition in a header sits under it, so it tells no two of
+    /// them apart and holds in every build that reads the header; carried
+    /// into the guard it is noise on every row, and it makes two independent
+    /// `#if`s look as if they shared a conditional.
+    fn is_include_guard(node: tree_sitter::Node, source: &str) -> bool {
+        if node.kind() != "preproc_ifdef"
+            || node.parent().map(|parent| parent.kind()) != Some("translation_unit")
+        {
             return false;
         }
-        let bytes = text.as_bytes();
-        let mut depth = 0usize;
-        let mut at = 0;
-        while at < bytes.len() {
-            match bytes[at] {
-                b'\'' => {
-                    at = Self::char_constant_end(bytes, at);
-                    continue;
-                }
-                b'(' => depth += 1,
-                b')' => {
-                    depth = match depth.checked_sub(1) {
-                        Some(depth) => depth,
-                        None => return false,
-                    };
-                    if depth == 0 {
-                        return at + 1 == bytes.len();
-                    }
-                }
-                _ => {}
-            }
-            at += 1;
+        let is_ifndef = node
+            .child(0)
+            .and_then(|directive| directive.utf8_text(source.as_bytes()).ok())
+            .is_some_and(|directive| directive.ends_with("ndef"));
+        let Some(name) = node.child_by_field_name("name") else {
+            return false;
+        };
+        if !is_ifndef {
+            return false;
         }
-        false
+        let mut cursor = node.walk();
+        let first = node
+            .named_children(&mut cursor)
+            .find(|named| named.id() != name.id() && named.kind() != "comment");
+        first.is_some_and(|define| {
+            define.kind() == "preproc_def"
+                && define
+                    .child_by_field_name("name")
+                    .and_then(|defined| defined.utf8_text(source.as_bytes()).ok())
+                    == name.utf8_text(source.as_bytes()).ok()
+        })
     }
 
     /// The condition a conditional node asserts, as the file writes it, with
@@ -5183,41 +5156,6 @@ impl TreeSitterAnalyzer {
             }
             _ => None,
         }
-    }
-
-    /// A condition with its sense reversed, spelled the way the file would.
-    ///
-    /// Parentheses are not decoration here: `defined(A) || defined(B)` also
-    /// begins with `defined(` and ends with `)`, so reversing it by writing a
-    /// `!` in front turns "neither A nor B" into "not A, or B" -- a different
-    /// configuration, silently.
-    fn negated(condition: &str) -> String {
-        if let Some(inner) = condition.strip_prefix('!') {
-            if Self::binds_tighter_than_not(inner) {
-                return inner.to_string();
-            }
-            // `!(A) && (B)` begins with `!(` and ends with `)` but is not
-            // the negation of one group; stripping those two characters
-            // would leave `A) && (B`.
-            if Self::wholly_parenthesized(inner) {
-                return inner[1..inner.len() - 1].to_string();
-            }
-        }
-        if Self::binds_tighter_than_not(condition) {
-            format!("!{condition}")
-        } else {
-            format!("!({condition})")
-        }
-    }
-
-    /// Whether a condition is one term -- `defined(CONFIG_X)` or a bare name
-    /// -- so that a `!` in front of it reverses the whole of it.
-    fn binds_tighter_than_not(condition: &str) -> bool {
-        let name = condition
-            .strip_prefix("defined(")
-            .and_then(|rest| rest.strip_suffix(')'))
-            .unwrap_or(condition);
-        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
     }
 
     /// One predicate on one line: continuations go, comments go, and runs of
@@ -5253,7 +5191,7 @@ impl TreeSitterAnalyzer {
                     kept.push(b' ');
                 }
                 (b'\'', _) => {
-                    let end = Self::char_constant_end(bytes, at);
+                    let end = crate::guard::char_constant_end(bytes, at);
                     kept.extend_from_slice(&bytes[at..end]);
                     at = end;
                 }
@@ -5264,20 +5202,6 @@ impl TreeSitterAnalyzer {
             }
         }
         String::from_utf8(kept).unwrap_or_else(|_| text.to_string())
-    }
-
-    /// Where a character constant opened at `start` ends: past its closing
-    /// quote, reading `\'` and `\\` as escapes, or at the end of the text.
-    fn char_constant_end(bytes: &[u8], start: usize) -> usize {
-        let mut at = start + 1;
-        while at < bytes.len() {
-            match bytes[at] {
-                b'\\' => at += 2,
-                b'\'' => return at + 1,
-                _ => at += 1,
-            }
-        }
-        bytes.len()
     }
 
     /// Whether the node sits at file scope, reading through conditionals.
@@ -9752,7 +9676,7 @@ mod config_variant_tests {
             .collect();
         guards.sort();
         let mut expected = vec![
-            "defined(CONFIG_A) || defined(CONFIG_B)".to_string(),
+            "(defined(CONFIG_A) || defined(CONFIG_B))".to_string(),
             "!(defined(CONFIG_A) || defined(CONFIG_B)) && defined(DEBUG)".to_string(),
             "!(defined(CONFIG_A) || defined(CONFIG_B)) && !defined(DEBUG)".to_string(),
         ];
@@ -9869,7 +9793,7 @@ mod config_variant_tests {
                 (
                     "outer".to_string(),
                     Some(
-                        "!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)"
+                        "(!defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC))"
                             .to_string()
                     ),
                 ),
@@ -10187,7 +10111,36 @@ mod config_variant_tests {
         guards.sort();
         assert_eq!(
             guards,
-            vec!["!(!(A) && (B))".to_string(), "!(A) && (B)".to_string()]
+            vec!["!(!(A) && (B))".to_string(), "(!(A) && (B))".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_header_include_guard_is_not_part_of_any_guard() {
+        // Every definition in a header sits under its include guard. Carried
+        // into the guard it is noise on every row, and it would make two
+        // independent `#if`s look as if they shared a conditional.
+        let source = "#ifndef _LINUX_THING_H\n\
+             #define _LINUX_THING_H\n\
+             #define plain(x) x\n\
+             #ifdef CONFIG_A\n\
+             #define armed(x) x\n\
+             #endif\n\
+             #endif /* _LINUX_THING_H */\n";
+        assert_eq!(
+            guards_in(source),
+            vec![
+                ("armed".to_string(), Some("defined(CONFIG_A)".to_string())),
+                ("plain".to_string(), None),
+            ]
+        );
+        // An #ifndef that does not define its own name is a real condition.
+        let fallback = "#ifndef pr_fmt\n\
+             #define other(x) x\n\
+             #endif\n";
+        assert_eq!(
+            guards_in(fallback),
+            vec![("other".to_string(), Some("!defined(pr_fmt)".to_string()))]
         );
     }
 }

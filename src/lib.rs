@@ -8,6 +8,7 @@ pub mod file_extensions;
 pub mod file_survey;
 pub mod git;
 pub mod git_range;
+pub mod guard;
 pub mod hash;
 pub mod indexer;
 pub mod perf_monitor;
