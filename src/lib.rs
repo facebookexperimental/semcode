@@ -41,7 +41,7 @@ pub use text_utils::preprocess_code;
 pub use treesitter_analyzer::{ParameterFate, TreeSitterAnalyzer};
 pub use types::Handover;
 pub use types::{
-    path_is_other_program, path_language, row_defines_the_function, ArgumentFunction,
+    path_is_other_program, path_language, row_defines_the_function, under, ArgumentFunction,
     ChosenDefinition, DefinitionSite, DispatchKind, DispatchSite, FieldInfo, FunctionInfo,
     GitCommitInfo, GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry, LoreEmailInfo,
     ParameterInfo, Registration, RegistrationKind, Resolution, Surface, TypeInfo, TypedefInfo,

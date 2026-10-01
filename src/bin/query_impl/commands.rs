@@ -403,6 +403,33 @@ async fn show_callchain_with_limits(
         for (i, callee) in limited_callees.iter().enumerate() {
             println!("{}. {}", (i + 1).to_string().yellow(), callee.cyan());
 
+            // A callee its file defines once per configuration: every arm,
+            // under its guard, with what that arm calls. Showing one arm
+            // here is how a chain reads as a dead end at `return 0;`.
+            let arms = db
+                .get_callee_arms_in(callee, git_sha, chain_context)
+                .await
+                .unwrap_or_default();
+            if arms.len() > 1 {
+                for arm in &arms {
+                    println!(
+                        "   └─ ({}:{}){}",
+                        arm.file_path.bright_black(),
+                        arm.line_start.to_string().bright_black(),
+                        semcode::under(arm.guard.as_deref()).yellow()
+                    );
+                    if down_levels > 1 {
+                        for next in arm.callees.iter().take(3) {
+                            println!("      └─ {}", next.bright_black());
+                        }
+                        if arm.callees.len() > 3 {
+                            println!("      └─ ... and {} more", arm.callees.len() - 3);
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Show callee details if available
             if let Ok(Some(chosen)) = db
                 .find_function_git_aware_reporting(callee, git_sha, chain_context)

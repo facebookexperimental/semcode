@@ -4175,7 +4175,46 @@ impl DatabaseManager {
                 .arch
                 .is_none()
         });
-        Ok(admitted[0].callees.clone())
+        let chosen = admitted[0];
+        Ok(callees_of_arms(&arms_beside(
+            &definitions,
+            &chosen.file_path,
+            chosen.line_start,
+        )))
+    }
+
+    /// The definitions a chain walks through for `function_name`: every arm
+    /// of the file the chosen definition is in, each with what it calls.
+    ///
+    /// One file, never several: the definitions of a name in other files
+    /// belong to other builds or other architectures, and merging their
+    /// callees is how a chain rooted in x86 grew sparc leaves. Within the
+    /// chosen file every arm is walked, because which one a build compiles
+    /// depends only on the configuration, and an audit that follows one arm
+    /// misses what the others can reach: `cond_resched` reaches
+    /// `rcu_all_qs` only through the `__cond_resched()` arm of
+    /// `_cond_resched`.
+    pub async fn get_callee_arms_in(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+        context: crate::domain::Context,
+    ) -> Result<Vec<crate::types::CalleeDefinition>> {
+        let definitions = self
+            .get_function_callees_by_definition_git_aware(function_name, git_sha)
+            .await?;
+        let chosen = self
+            .find_function_git_aware_reporting(function_name, git_sha, context)
+            .await?
+            .chosen();
+        Ok(match chosen {
+            Some(chosen) => arms_beside(
+                &definitions,
+                &chosen.function.file_path,
+                chosen.function.line_start,
+            ),
+            None => Vec::new(),
+        })
     }
 
     /// Every definition of the name at this commit, with what each calls.
@@ -6009,14 +6048,13 @@ impl DatabaseManager {
         let Some(chosen) = chosen.chosen() else {
             return Ok(Vec::new());
         };
-        Ok(definitions
-            .into_iter()
-            .find(|definition| {
-                definition.file_path == chosen.function.file_path
-                    && definition.line_start == chosen.function.line_start
-            })
-            .map(|definition| definition.callees)
-            .unwrap_or_default())
+        // Every arm of the chosen definition's file, not only the chosen
+        // row: see `get_callee_arms_in`.
+        Ok(callees_of_arms(&arms_beside(
+            &definitions,
+            &chosen.function.file_path,
+            chosen.function.line_start,
+        )))
     }
 
     /// Build a complete caller index from the database in ONE scan.
@@ -8316,6 +8354,37 @@ impl DatabaseManager {
 
         Ok(())
     }
+}
+
+/// The definitions in `file` that a chain walks through: the chosen row at
+/// `line`, and every other row of the file that defines the name -- the
+/// arms of its `#if`s. A prototype in the same file is not an arm.
+fn arms_beside(
+    definitions: &[crate::types::CalleeDefinition],
+    file: &str,
+    line: u32,
+) -> Vec<crate::types::CalleeDefinition> {
+    let mut arms: Vec<crate::types::CalleeDefinition> = definitions
+        .iter()
+        .filter(|definition| {
+            definition.file_path == file
+                && (definition.is_definition || definition.line_start == line)
+        })
+        .cloned()
+        .collect();
+    arms.sort_by_key(|definition| definition.line_start);
+    arms
+}
+
+/// What any of the arms calls, each name once, in the order the arms list
+/// them.
+fn callees_of_arms(arms: &[crate::types::CalleeDefinition]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    arms.iter()
+        .flat_map(|arm| arm.callees.iter())
+        .filter(|callee| seen.insert(callee.as_str()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

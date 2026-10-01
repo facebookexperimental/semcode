@@ -90,6 +90,43 @@ pub fn excludes(left: &str, right: &str) -> bool {
         .any(|term| right_terms.contains(&negate_term(term).as_str()))
 }
 
+/// The terms of a guard a path can carry as facts: `defined(CONFIG_X)`,
+/// `CONFIG_X`, and their negations.
+///
+/// Only Kconfig symbols. A configuration is one assignment of them for the
+/// whole build, so a hop under `CONFIG_X` and a deeper hop under
+/// `!CONFIG_X` cannot both run. Any other macro can be defined in one
+/// translation unit and not in another (`DEBUG`, `MODULE`, a header's own
+/// `#define`), so it proves nothing across a call. Disjunctions and other
+/// compound terms are not facts either: they are kept whole, never split.
+pub fn config_facts(guard: &str) -> Vec<&str> {
+    terms(guard)
+        .into_iter()
+        .filter(|term| {
+            let positive = term.strip_prefix('!').unwrap_or(term);
+            is_atom(positive) && symbol_of(positive).starts_with("CONFIG_")
+        })
+        .collect()
+}
+
+/// The fact on the path that a guard contradicts, if there is one: a
+/// Kconfig term of `guard` whose negation an enclosing hop asserted.
+pub fn contradiction<'a>(facts: &[&'a str], guard: &str) -> Option<&'a str> {
+    config_facts(guard).iter().find_map(|term| {
+        let negation = negate_term(term);
+        facts.iter().copied().find(|fact| *fact == negation)
+    })
+}
+
+/// The symbol an atom names: `CONFIG_X` for `defined(CONFIG_X)`,
+/// `defined CONFIG_X` and `CONFIG_X`.
+fn symbol_of(atom: &str) -> &str {
+    atom.strip_prefix("defined(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| atom.strip_prefix("defined "))
+        .unwrap_or(atom)
+}
+
 /// Whether a condition is one conjunct already: a name, a negated name, a
 /// whole group, or a negated whole group.
 fn is_term(condition: &str) -> bool {
@@ -181,6 +218,29 @@ mod tests {
         // Two groups behind one `!` are not one negated group.
         assert_eq!(as_conjunct("!(A) && (B)"), "(!(A) && (B))");
         assert_eq!(negate_term("(!(A) && (B))"), "!(!(A) && (B))");
+    }
+
+    #[test]
+    fn only_kconfig_terms_are_facts_and_compounds_stay_whole() {
+        assert_eq!(
+            config_facts(
+                "defined(CONFIG_A) && !defined(DEBUG) && (CONFIG_B || CONFIG_C) && !CONFIG_D"
+            ),
+            vec!["defined(CONFIG_A)", "!CONFIG_D"]
+        );
+        let facts = ["defined(CONFIG_A)", "!CONFIG_D"];
+        assert_eq!(
+            contradiction(&facts, "X && !defined(CONFIG_A)"),
+            Some("defined(CONFIG_A)")
+        );
+        assert_eq!(contradiction(&facts, "CONFIG_D"), Some("!CONFIG_D"));
+        // A disjunction is never split, so it never contradicts.
+        assert_eq!(
+            contradiction(&facts, "(!defined(CONFIG_A) || CONFIG_E)"),
+            None
+        );
+        // A macro other than a Kconfig symbol proves nothing across a call.
+        assert_eq!(contradiction(&["defined(DEBUG)"], "!defined(DEBUG)"), None);
     }
 
     #[test]
