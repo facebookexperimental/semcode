@@ -22,7 +22,7 @@ https://developercertificate.org/
 If you'd like to use a DCO instead of completing the CLA, please
 send your pull request through:
 
-https://github.com/masoncl/semcode-devel
+https://github.com/rikvanriel/semcode
 
 ## Contributor License Agreement ("CLA")
 In order to accept your pull request, we need you to submit a CLA. You only need
