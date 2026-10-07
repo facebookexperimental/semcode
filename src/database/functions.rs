@@ -25,6 +25,10 @@ pub(crate) struct FunctionMetadata {
     pub body_hash: Option<String>,
     pub calls: Option<Vec<String>>,
     pub types: Option<Vec<String>>,
+    /// The preprocessor arm holding this definition, as the file writes it.
+    /// `None` at file scope. Stored as `""`, never null: the column is part
+    /// of the merge key and a null key drops the row.
+    pub guard: Option<String>,
 }
 
 pub struct FunctionStore {
@@ -40,6 +44,10 @@ pub struct FunctionStore {
 /// rejected outright by lance, which fails the whole batch and loses every
 /// function in it, so the choice has to be made here. The first definition in
 /// the file wins, which is stable across runs.
+///
+/// The key includes the guard: two arms of one name are two rows, not a
+/// duplicate, and the extractor keeps one row per name per arm, so several
+/// arms of one name routinely arrive here together.
 fn one_per_key(functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::with_capacity(functions.len());
@@ -48,6 +56,7 @@ fn one_per_key(functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
             function.name.clone(),
             function.file_path.clone(),
             function.git_file_hash.clone(),
+            function.guard.clone(),
         );
         if seen.insert(key) {
             kept.push(function.clone());
@@ -84,6 +93,7 @@ impl FunctionStore {
                 row.name.clone(),
                 row.file_path.clone(),
                 row.git_file_hash.clone(),
+                row.guard.clone(),
             )
         });
 
@@ -127,6 +137,7 @@ impl FunctionStore {
                 row.name.clone(),
                 row.file_path.clone(),
                 row.git_file_hash.clone(),
+                row.guard.clone(),
             )
         });
 
@@ -171,10 +182,12 @@ impl FunctionStore {
         let mut parameters_builder = StringBuilder::new();
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        let mut guard_builder = StringBuilder::new();
 
         for func in functions {
             name_builder.append_value(&func.name);
             file_path_builder.append_value(&func.file_path);
+            guard_builder.append_value(func.guard.as_deref().unwrap_or_default());
 
             line_start_builder.append_value(func.line_start as i64);
             line_end_builder.append_value(func.line_end as i64);
@@ -236,10 +249,11 @@ impl FunctionStore {
             ("body_hash", Arc::new(body_hash_array) as ArrayRef),
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            ("guard", Arc::new(guard_builder.finish()) as ArrayRef),
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
+        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash", "guard"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -264,6 +278,7 @@ impl FunctionStore {
         let mut parameters_builder = StringBuilder::new();
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        let mut guard_builder = StringBuilder::new();
 
         for func in functions {
             name_builder.append_value(&func.name);
@@ -290,6 +305,7 @@ impl FunctionStore {
                 .map(|types| serde_json::to_string(types).unwrap_or_default())
                 .unwrap_or_default();
             types_builder.append_value(&types_json);
+            guard_builder.append_value(func.guard.as_deref().unwrap_or_default());
         }
 
         // Create body_hash StringArray (non-nullable for metadata-only)
@@ -333,10 +349,11 @@ impl FunctionStore {
             ("body_hash", Arc::new(body_hash_array) as ArrayRef),
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            ("guard", Arc::new(guard_builder.finish()) as ArrayRef),
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
+        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash", "guard"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -411,13 +428,18 @@ impl FunctionStore {
         Ok(all_functions)
     }
 
-    /// Find function by name, file path, and exact git file hash - for targeted git-aware lookups
-    pub async fn find_by_name_file_and_hash(
+    /// Every row of a name in one file at one blob: one per preprocessor arm.
+    ///
+    /// A file can define a name once per configuration -- `_cond_resched()`
+    /// four times in `sched.h` -- and each arm is its own row. Returning the
+    /// first match answered every lookup with whichever arm the table
+    /// happened to return, and hid the others.
+    pub async fn find_all_by_name_file_and_hash(
         &self,
         name: &str,
         file_path: &str,
         git_file_hash: &str,
-    ) -> Result<Option<FunctionInfo>> {
+    ) -> Result<Vec<FunctionInfo>> {
         let table = self.connection.open_table("functions").execute().await?;
         let escaped_name = name.replace("'", "''");
         let escaped_file_path = file_path.replace("'", "''");
@@ -436,9 +458,12 @@ impl FunctionStore {
             .await?;
 
         let functions = self.extract_functions_from_batches(&results).await?;
-        Ok(functions
+        let mut arms: Vec<FunctionInfo> = functions
             .into_iter()
-            .find(|f| f.git_file_hash == git_hash_to_match))
+            .filter(|f| f.git_file_hash == git_hash_to_match)
+            .collect();
+        arms.sort_by_key(|f| f.line_start);
+        Ok(arms)
     }
 
     pub async fn get_all(&self) -> Result<Vec<FunctionInfo>> {
@@ -494,6 +519,7 @@ impl FunctionStore {
                             body,
                             calls: func_data.calls,
                             types: func_data.types,
+                            guard: func_data.guard.clone(),
                         });
                     }
                 }
@@ -579,6 +605,7 @@ impl FunctionStore {
                 body,
                 calls: func_data.calls,
                 types: func_data.types,
+                guard: func_data.guard.clone(),
             });
         }
 
@@ -601,6 +628,13 @@ impl FunctionStore {
         let body_hash_array = get_column::<StringArray>(batch, "body_hash")?;
         let calls_array = get_column::<StringArray>(batch, "calls")?;
         let types_array = get_column::<StringArray>(batch, "types")?;
+        // Stored as `""`, never null: the column is part of the merge key.
+        // Tolerate a missing column for batches built before it existed.
+        let guard = batch
+            .column_by_name("guard")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .map(|array| array.value(row).to_string())
+            .filter(|guard| !guard.is_empty());
 
         let parameters: Vec<ParameterInfo> =
             serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
@@ -636,6 +670,7 @@ impl FunctionStore {
             body_hash,
             calls,
             types,
+            guard,
         }))
     }
 
@@ -700,6 +735,7 @@ impl FunctionStore {
                 body,
                 calls: meta.calls,
                 types: meta.types,
+                guard: meta.guard.clone(),
             });
         }
 
@@ -813,6 +849,7 @@ impl FunctionStore {
             body,
             calls: func_data.calls,
             types: func_data.types,
+            guard: func_data.guard.clone(),
         }
     }
 }

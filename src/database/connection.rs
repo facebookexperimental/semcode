@@ -437,6 +437,9 @@ impl DatabaseManager {
             "lore",
             "lore_indexed_commits",
             "indexed_branches",
+            // Every expansion of a macro counts towards whether it names an
+            // attribute, so a row left behind here outlives the definition.
+            "object_macros",
         ] {
             if let Ok(table) = self.connection.open_table(*table_name).execute().await {
                 table.delete("1=1").await?;
@@ -1814,6 +1817,7 @@ impl DatabaseManager {
                     expansion: expansion.to_string(),
                     file_path: f.file_path.clone(),
                     git_file_hash: f.git_file_hash.clone(),
+                    guard: f.guard.clone().unwrap_or_default(),
                 })
             })
             .collect()
@@ -2382,7 +2386,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, git_sha, why)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
         self.find_function_with_manifest_reporting(name, &git_manifest, context)
@@ -2426,7 +2430,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
 
@@ -2443,7 +2447,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, revision, Absent::PathsNotInTree)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
 
@@ -2454,15 +2458,11 @@ impl DatabaseManager {
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
             match self.candidate_state(file_path, git_hash, revision) {
-                CandidateFile::Indexed => {
-                    if let Some(func) = self
-                        .function_store
-                        .find_by_name_file_and_hash(name, file_path, git_hash)
-                        .await?
-                    {
-                        matches.push(func);
-                    }
-                }
+                CandidateFile::Indexed => matches.extend(
+                    self.function_store
+                        .find_all_by_name_file_and_hash(name, file_path, git_hash)
+                        .await?,
+                ),
                 CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
                 CandidateFile::Deleted => {}
             }
@@ -2474,7 +2474,7 @@ impl DatabaseManager {
                 .function_not_at_revision(name, revision, Absent::ContentNotIndexed)
                 .await?
                 .map_or(Resolution::NotFound, |function| {
-                    Resolution::Chosen(ChosenDefinition::only(function))
+                    Resolution::Chosen(Box::new(ChosenDefinition::only(function)))
                 }));
         }
 
@@ -2642,15 +2642,11 @@ impl DatabaseManager {
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
             match self.candidate_state(file_path, git_hash, git_sha) {
-                CandidateFile::Indexed => {
-                    if let Some(func) = self
-                        .function_store
-                        .find_by_name_file_and_hash(name, file_path, git_hash)
-                        .await?
-                    {
-                        matches.push(func);
-                    }
-                }
+                CandidateFile::Indexed => matches.extend(
+                    self.function_store
+                        .find_all_by_name_file_and_hash(name, file_path, git_hash)
+                        .await?,
+                ),
                 CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
                 CandidateFile::Deleted => {}
             }
@@ -2746,15 +2742,60 @@ impl DatabaseManager {
                     .map(|func| DefinitionSite {
                         file_path: func.file_path.clone(),
                         line_start: func.line_start,
+                        guard: func.guard.clone(),
                     })
                     .collect(),
             };
         }
-        Resolution::Chosen(self.choose_definition(admitted))
+        // Within an architecture, its own definition first: an `asm/` header
+        // overrides `asm-generic/` and the generic fallbacks. The chain's
+        // callees have always been read this way; the definition it names
+        // has to be the same one, or a chain shows one definition and lists
+        // another's calls.
+        if let crate::domain::Context::In(here) = context {
+            if here.arch.is_some() {
+                let (own, rest): (Vec<FunctionInfo>, Vec<FunctionInfo>) = admitted
+                    .into_iter()
+                    .partition(|func| crate::domain::domain_of(&func.file_path).arch == here.arch);
+                if !own.is_empty() {
+                    let mut chosen = self.choose_definition(own);
+                    chosen.others.extend(
+                        rest.into_iter()
+                            .filter(|func| {
+                                crate::types::row_defines_the_function(
+                                    &func.return_type,
+                                    &func.body,
+                                )
+                            })
+                            .map(|func| DefinitionSite {
+                                file_path: func.file_path,
+                                line_start: func.line_start,
+                                guard: func.guard,
+                            }),
+                    );
+                    return Resolution::Chosen(Box::new(chosen));
+                }
+                return Resolution::Chosen(Box::new(self.choose_definition(rest)));
+            }
+        }
+        Resolution::Chosen(Box::new(self.choose_definition(admitted)))
     }
 
-    fn choose_definition(&self, mut matches: Vec<FunctionInfo>) -> ChosenDefinition {
-        if matches.len() == 1 {
+    fn choose_definition(&self, all: Vec<FunctionInfo>) -> ChosenDefinition {
+        if all.len() == 1 {
+            return ChosenDefinition::only(all.into_iter().next().unwrap());
+        }
+
+        // One candidate per file: the first row that defines the name, by
+        // line. A file that defines a name once per configuration is one
+        // place, and letting every arm compete let whichever arm had the
+        // longest body speak for the file -- arch/um's `return 0;` stub for
+        // !CONFIG_PRINTK outranked include/linux/printk.h for 6,895 calls.
+        // The first arm is the `#if` side, which the kernel conventionally
+        // writes as the configured implementation, with the stub in
+        // `#else`. The file's other arms are reported with the choice.
+        let (mut matches, siblings) = one_per_file(all);
+        if matches.len() == 1 && siblings.is_empty() {
             return ChosenDefinition::only(matches.into_iter().next().unwrap());
         }
 
@@ -2765,10 +2806,14 @@ impl DatabaseManager {
         // call. Ranking the minority language last answers the question the
         // tree is mostly written in; where a name is defined in one language
         // this decides nothing.
+        // Counted per file, not per row: a header that defines a name once
+        // per configuration is one definition site, and counting each arm
+        // would let one file's #if outvote the rest of the tree.
         let mut by_language: HashMap<&str, usize> = HashMap::new();
-        for candidate in &matches {
+        let files: HashSet<&str> = matches.iter().map(|m| m.file_path.as_str()).collect();
+        for file in &files {
             *by_language
-                .entry(crate::types::path_language(&candidate.file_path))
+                .entry(crate::types::path_language(file))
                 .or_default() += 1;
         }
         // A strict majority or nothing: more than half the definitions, not
@@ -2784,7 +2829,7 @@ impl DatabaseManager {
             .filter(|count| **count == highest)
             .count()
             == 1;
-        let majority_language = match unique_top && highest * 2 > matches.len() {
+        let majority_language = match unique_top && highest * 2 > files.len() {
             true => by_language
                 .iter()
                 .find(|(_, count)| **count == highest)
@@ -2872,12 +2917,14 @@ impl DatabaseManager {
         let mut matches = matches.into_iter();
         let function = matches.next().unwrap();
         let others = matches
+            .chain(siblings)
             .filter(|candidate| {
                 crate::types::row_defines_the_function(&candidate.return_type, &candidate.body)
             })
             .map(|candidate| crate::types::DefinitionSite {
                 file_path: candidate.file_path,
                 line_start: candidate.line_start,
+                guard: candidate.guard,
             })
             .collect();
         ChosenDefinition { function, others }
@@ -3090,30 +3137,44 @@ impl DatabaseManager {
         }
 
         let macros = self.object_macro_store.all().await?;
-        let bodies: HashMap<&str, &str> = macros
-            .iter()
-            .map(|(name, expansion)| (name.as_str(), expansion.as_str()))
-            .collect();
-
-        let mut attributes = HashSet::new();
-        for (name, body) in &bodies {
-            let mut current = *body;
-            // Alias chains are short; the bound stops a cycle.
-            for _ in 0..8 {
-                if current.contains("__attribute__") {
-                    attributes.insert((*name).to_string());
-                    break;
-                }
-                match bodies.get(current.trim()) {
-                    Some(next) => current = next,
-                    None => break,
-                }
-            }
-        }
+        let attributes = Self::names_of_attributes(&macros);
 
         let attributes = Arc::new(attributes);
         let _ = self.attribute_names.set(attributes.clone());
         Ok(attributes)
+    }
+
+    /// The macros that expand to an attribute in some configuration,
+    /// directly or through aliases.
+    ///
+    /// A name with several expansions (several files, or several arms of
+    /// one) is an attribute if any of them leads to one: the question is
+    /// whether the identifier can name nothing, and an auditor has to see
+    /// the member that is flattened away in one configuration.
+    fn names_of_attributes(macros: &HashMap<String, Vec<String>>) -> HashSet<String> {
+        let mut attributes = HashSet::new();
+        for (name, expansions) in macros {
+            let mut frontier: Vec<&str> = expansions.iter().map(String::as_str).collect();
+            let mut seen: HashSet<&str> = HashSet::new();
+            // Alias chains are short; the bound stops a cycle.
+            for _ in 0..8 {
+                if frontier.iter().any(|body| body.contains("__attribute__")) {
+                    attributes.insert(name.clone());
+                    break;
+                }
+                frontier = frontier
+                    .iter()
+                    .filter_map(|body| macros.get(body.trim()))
+                    .flatten()
+                    .map(String::as_str)
+                    .filter(|next| seen.insert(next))
+                    .collect();
+                if frontier.is_empty() {
+                    break;
+                }
+            }
+        }
+        attributes
     }
 
     /// Drop from a field path what is an attribute rather than a member.
@@ -4142,24 +4203,47 @@ impl DatabaseManager {
                 .get_function_callees_git_aware(function_name, git_sha)
                 .await;
         }
+        // The definition the chain names, chosen the one way every other
+        // reader chooses it, then every arm of its file.
+        Ok(callees_of_arms(
+            &self
+                .get_callee_arms_in(function_name, git_sha, context)
+                .await?,
+        ))
+    }
+
+    /// The definitions a chain walks through for `function_name`: every arm
+    /// of the file the chosen definition is in, each with what it calls.
+    ///
+    /// One file, never several: the definitions of a name in other files
+    /// belong to other builds or other architectures, and merging their
+    /// callees is how a chain rooted in x86 grew sparc leaves. Within the
+    /// chosen file every arm is walked, because which one a build compiles
+    /// depends only on the configuration, and an audit that follows one arm
+    /// misses what the others can reach: `cond_resched` reaches
+    /// `rcu_all_qs` only through the `__cond_resched()` arm of
+    /// `_cond_resched`.
+    pub async fn get_callee_arms_in(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+        context: crate::domain::Context,
+    ) -> Result<Vec<crate::types::CalleeDefinition>> {
         let definitions = self
             .get_function_callees_by_definition_git_aware(function_name, git_sha)
             .await?;
-        let mut admitted: Vec<&crate::types::CalleeDefinition> = definitions
-            .iter()
-            .filter(|definition| context.admits(crate::domain::domain_of(&definition.file_path)))
-            .collect();
-        if admitted.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Most specific first: an architecture's own definition, then a
-        // generic one.
-        admitted.sort_by_key(|definition| {
-            crate::domain::domain_of(&definition.file_path)
-                .arch
-                .is_none()
-        });
-        Ok(admitted[0].callees.clone())
+        let chosen = self
+            .find_function_git_aware_reporting(function_name, git_sha, context)
+            .await?
+            .chosen();
+        Ok(match chosen {
+            Some(chosen) => arms_beside(
+                &definitions,
+                &chosen.function.file_path,
+                chosen.function.line_start,
+            ),
+            None => Vec::new(),
+        })
     }
 
     /// Every definition of the name at this commit, with what each calls.
@@ -4220,6 +4304,7 @@ impl DatabaseManager {
                             &function.return_type,
                             &function.body,
                         ),
+                        guard: function.guard.clone(),
                     })
                     .collect()
             })
@@ -5884,10 +5969,16 @@ impl DatabaseManager {
                             .as_any()
                             .downcast_ref::<arrow::array::StringArray>()
                     });
+                let guard_array = batch
+                    .column_by_name("guard")
+                    .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>());
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
                     let git_file_hash = git_file_hash_array.value(i);
+                    let guard = guard_array
+                        .map(|array| array.value(i).to_string())
+                        .filter(|guard| !guard.is_empty());
                     let body_hash = body_hash_array.and_then(|array| {
                         array
                             .is_valid(i)
@@ -5912,6 +6003,7 @@ impl DatabaseManager {
                                 line_end_array.value(i) as u32,
                                 calls,
                                 body_hash,
+                                guard,
                             ));
                         }
                     }
@@ -5923,7 +6015,7 @@ impl DatabaseManager {
         // text decides, so it is read here -- for the handful of rows that
         // share one name, not for the table.
         let mut definitions: Vec<crate::types::CalleeDefinition> = Vec::new();
-        for (file_path, line_start, line_end, calls, body_hash) in matches {
+        for (file_path, line_start, line_end, calls, body_hash, guard) in matches {
             let text = match &body_hash {
                 Some(hash) => self.get_content(hash).await?.unwrap_or_default(),
                 None => String::new(),
@@ -5941,6 +6033,7 @@ impl DatabaseManager {
                 // on the tree, so a divergence here would show up as two
                 // commands reporting different numbers.
                 is_definition: !text.is_empty() && !crate::types::text_is_prototype(&text),
+                guard,
             });
         }
         // A stable order, so two runs and two readers see the same list.
@@ -5984,14 +6077,13 @@ impl DatabaseManager {
         let Some(chosen) = chosen.chosen() else {
             return Ok(Vec::new());
         };
-        Ok(definitions
-            .into_iter()
-            .find(|definition| {
-                definition.file_path == chosen.function.file_path
-                    && definition.line_start == chosen.function.line_start
-            })
-            .map(|definition| definition.callees)
-            .unwrap_or_default())
+        // Every arm of the chosen definition's file, not only the chosen
+        // row: see `get_callee_arms_in`.
+        Ok(callees_of_arms(&arms_beside(
+            &definitions,
+            &chosen.function.file_path,
+            chosen.function.line_start,
+        )))
     }
 
     /// Build a complete caller index from the database in ONE scan.
@@ -8293,6 +8385,60 @@ impl DatabaseManager {
     }
 }
 
+/// Split candidate rows into one per file -- the first row by line that
+/// defines the name, or the first row where none does -- and the rest.
+fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo>) {
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
+        let a_defines = crate::types::row_defines_the_function(&a.return_type, &a.body);
+        let b_defines = crate::types::row_defines_the_function(&b.return_type, &b.body);
+        a.file_path
+            .cmp(&b.file_path)
+            .then(b_defines.cmp(&a_defines))
+            .then(a.line_start.cmp(&b.line_start))
+    });
+    let mut representatives: Vec<FunctionInfo> = Vec::new();
+    let mut rest = Vec::new();
+    for row in rows {
+        match representatives.last() {
+            Some(last) if last.file_path == row.file_path => rest.push(row),
+            _ => representatives.push(row),
+        }
+    }
+    (representatives, rest)
+}
+
+/// The definitions in `file` that a chain walks through: the chosen row at
+/// `line`, and every other row of the file that defines the name -- the
+/// arms of its `#if`s. A prototype in the same file is not an arm.
+fn arms_beside(
+    definitions: &[crate::types::CalleeDefinition],
+    file: &str,
+    line: u32,
+) -> Vec<crate::types::CalleeDefinition> {
+    let mut arms: Vec<crate::types::CalleeDefinition> = definitions
+        .iter()
+        .filter(|definition| {
+            definition.file_path == file
+                && (definition.is_definition || definition.line_start == line)
+        })
+        .cloned()
+        .collect();
+    arms.sort_by_key(|definition| definition.line_start);
+    arms
+}
+
+/// What any of the arms calls, each name once, in the order the arms list
+/// them.
+fn callees_of_arms(arms: &[crate::types::CalleeDefinition]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    arms.iter()
+        .flat_map(|arm| arm.callees.iter())
+        .filter(|callee| seen.insert(callee.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8359,7 +8505,155 @@ mod tests {
             body: format!("int {name}(void) {{ return 0; }}"),
             calls: Some(vec!["target".to_string()]),
             types: None,
+            guard: None,
         }
+    }
+
+    #[test]
+    fn a_macro_is_an_attribute_if_any_arm_makes_it_one() {
+        // `__tag` expands to an attribute under CONFIG_X and to nothing
+        // otherwise; `__alias` reaches it through another name. Neither
+        // answer may depend on which row the table returned first.
+        let macros: HashMap<String, Vec<String>> = [
+            ("__tag", vec!["", "__attribute__((randomize_layout))"]),
+            ("__alias", vec!["__tag"]),
+            ("__plain", vec!["", "1"]),
+            ("__loop", vec!["__loop"]),
+        ]
+        .into_iter()
+        .map(|(name, bodies)| {
+            (
+                name.to_string(),
+                bodies.into_iter().map(str::to_string).collect(),
+            )
+        })
+        .collect();
+        let mut found: Vec<String> = DatabaseManager::names_of_attributes(&macros)
+            .into_iter()
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["__alias".to_string(), "__tag".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn two_arms_of_one_name_coexist_and_file_scope_round_trips() {
+        // The merge key includes the guard, so two preprocessor arms of
+        // one name are two rows, not a duplicate-batch failure and not one
+        // row. File scope stores "" and reads back None.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("arms.c"), "/* arms */\n").unwrap();
+        git(repo_path, &["add", "arms.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+        let file_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "arms.c")
+            .unwrap()
+            .unwrap();
+
+        let db_path = repo_path.join(".semcode.db");
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let arm = |guard: Option<&str>| {
+            let mut function = test_function("pick", "arms.c", &file_hash);
+            function.guard = guard.map(str::to_string);
+            function
+        };
+        db.insert_functions(vec![
+            arm(Some("defined(CONFIG_A)")),
+            arm(Some("!defined(CONFIG_A)")),
+            test_function("plain", "arms.c", &file_hash),
+        ])
+        .await
+        .unwrap();
+
+        let mut guards: Vec<Option<String>> = db
+            .function_store
+            .find_all_by_name_unfiltered("pick")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|function| function.guard)
+            .collect();
+        guards.sort();
+        assert_eq!(
+            guards,
+            vec![
+                Some("!defined(CONFIG_A)".to_string()),
+                Some("defined(CONFIG_A)".to_string())
+            ]
+        );
+
+        let plain = db
+            .function_store
+            .find_all_by_name_unfiltered("plain")
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].guard, None);
+    }
+
+    #[tokio::test]
+    async fn a_git_aware_lookup_returns_every_arm_of_a_name() {
+        // The rows coexist (above); the lookup a query goes through has to
+        // hand back both of them, not whichever the table returns first.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("arms.c"), "/* arms */\n").unwrap();
+        git(repo_path, &["add", "arms.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+        let file_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "arms.c")
+            .unwrap()
+            .unwrap();
+        let db = DatabaseManager::new(
+            repo_path.join(".semcode.db").to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let arm = |guard: &str, line: u32| {
+            let mut function = test_function("pick", "arms.c", &file_hash);
+            function.guard = Some(guard.to_string());
+            function.line_start = line;
+            function.line_end = line;
+            function
+        };
+        db.insert_functions(vec![
+            arm("defined(CONFIG_A)", 2),
+            arm("!defined(CONFIG_A)", 4),
+        ])
+        .await
+        .unwrap();
+
+        let all = db
+            .find_all_functions_git_aware("pick", &git_sha)
+            .await
+            .unwrap();
+        let guards: Vec<Option<&str>> = all.iter().map(|f| f.guard.as_deref()).collect();
+        assert_eq!(
+            guards,
+            vec![Some("defined(CONFIG_A)"), Some("!defined(CONFIG_A)")]
+        );
+
+        let chosen = db
+            .find_function_git_aware_reporting("pick", &git_sha, crate::domain::Context::Any)
+            .await
+            .unwrap()
+            .chosen()
+            .expect("a definition is chosen");
+        assert_eq!(chosen.others.len(), 1, "the other arm was not reported");
     }
 
     #[tokio::test]
@@ -8651,6 +8945,7 @@ mod tests {
                 body: "void caller_one(void) { target(); }".to_string(),
                 calls: Some(vec!["target".to_string()]),
                 types: Some(vec!["duplicate".to_string()]),
+                guard: None,
             },
             FunctionInfo {
                 name: "caller_two".to_string(),
@@ -8663,6 +8958,7 @@ mod tests {
                 body: "void caller_two(void) { target(); }".to_string(),
                 calls: Some(vec!["target".to_string()]),
                 types: Some(vec!["duplicate".to_string()]),
+                guard: None,
             },
         ])
         .await

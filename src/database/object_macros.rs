@@ -25,6 +25,9 @@ pub struct ObjectMacro {
     pub expansion: String,
     pub file_path: String,
     pub git_file_hash: String,
+    /// The preprocessor arm holding this definition, as the file writes it.
+    /// Empty at file scope. Part of the merge key, so never null.
+    pub guard: String,
 }
 
 impl ObjectMacroStore {
@@ -41,6 +44,7 @@ impl ObjectMacroStore {
                 row.name.clone(),
                 row.file_path.clone(),
                 row.git_file_hash.clone(),
+                row.guard.clone(),
             )
         });
 
@@ -48,11 +52,13 @@ impl ObjectMacroStore {
         let mut expansions = StringBuilder::new();
         let mut files = StringBuilder::new();
         let mut hashes = StringBuilder::new();
+        let mut guards = StringBuilder::new();
         for entry in &macros {
             names.append_value(&entry.name);
             expansions.append_value(&entry.expansion);
             files.append_value(&entry.file_path);
             hashes.append_value(&entry.git_file_hash);
+            guards.append_value(&entry.guard);
         }
 
         let batch = RecordBatch::try_from_iter(vec![
@@ -60,6 +66,7 @@ impl ObjectMacroStore {
             ("expansion", Arc::new(expansions.finish()) as ArrayRef),
             ("file_path", Arc::new(files.finish()) as ArrayRef),
             ("git_file_hash", Arc::new(hashes.finish()) as ArrayRef),
+            ("guard", Arc::new(guards.finish()) as ArrayRef),
         ])?;
 
         let table = self
@@ -69,7 +76,7 @@ impl ObjectMacroStore {
             .await?;
         // One row per definition: re-reading a file it already holds stores
         // the same row rather than a second copy.
-        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
+        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash", "guard"]);
         merge_insert
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
@@ -81,13 +88,20 @@ impl ObjectMacroStore {
         Ok(())
     }
 
-    /// Every macro, by name, with what it expands to.
+    /// Every macro, by name, with everything it expands to: one expansion
+    /// per file and per preprocessor arm that defines it.
     ///
     /// The whole table is read: the caller needs the closure over aliases, and
     /// the set is small — a Linux tree has some tens of thousands, against
     /// six million `#define`s that cannot lead to an attribute and are not
     /// stored.
-    pub async fn all(&self) -> Result<HashMap<String, String>> {
+    ///
+    /// Every expansion is kept rather than the first the table returns:
+    /// `#ifdef CONFIG_X` / `#define __tag __attribute__((x))` / `#else` /
+    /// `#define __tag` / `#endif` names an attribute in one configuration
+    /// and nothing in the other, and which of those came first would decide
+    /// the answer, differently from one run to the next.
+    pub async fn all(&self) -> Result<HashMap<String, Vec<String>>> {
         let table = match self.connection.open_table("object_macros").execute().await {
             Ok(table) => table,
             // An index written before this table existed. The version check
@@ -98,7 +112,7 @@ impl ObjectMacroStore {
 
         let batches: Vec<RecordBatch> = table.query().execute().await?.try_collect().await?;
 
-        let mut macros = HashMap::new();
+        let mut macros: HashMap<String, Vec<String>> = HashMap::new();
         for batch in &batches {
             let column = |i: usize| {
                 batch
@@ -109,13 +123,15 @@ impl ObjectMacroStore {
             };
             let (names, expansions) = (column(0), column(1));
             for row in 0..batch.num_rows() {
-                // A macro defined in several files under one name: the first
-                // wins, and a disagreement between them is not a question a
-                // declaration can answer anyway.
-                macros
-                    .entry(names.value(row).to_string())
-                    .or_insert_with(|| expansions.value(row).to_string());
+                let expansions_of = macros.entry(names.value(row).to_string()).or_default();
+                let expansion = expansions.value(row);
+                if !expansions_of.iter().any(|known| known == expansion) {
+                    expansions_of.push(expansion.to_string());
+                }
             }
+        }
+        for expansions_of in macros.values_mut() {
+            expansions_of.sort();
         }
 
         Ok(macros)

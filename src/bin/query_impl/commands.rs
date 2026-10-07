@@ -261,6 +261,18 @@ async fn show_callchain_with_limits(
         println!("{} {}", "Ambiguous:".bold().yellow(), note);
     }
     let func = chosen.function;
+    // What every arm of the root asserts: the root's callees are the union
+    // over those arms, so only these facts hold on all of their paths.
+    let root_facts = semcode::guard::shared_facts(
+        db.get_callee_arms_in(
+            function_name,
+            git_sha,
+            semcode::domain::Context::In(semcode::domain::domain_of(&func.file_path)),
+        )
+        .await?
+        .iter()
+        .map(|arm| arm.guard.as_deref()),
+    );
 
     println!("{}", "=== Function Information ===".bold().green());
     println!(
@@ -402,6 +414,24 @@ async fn show_callchain_with_limits(
 
         for (i, callee) in limited_callees.iter().enumerate() {
             println!("{}. {}", (i + 1).to_string().yellow(), callee.cyan());
+
+            // A callee its file defines once per configuration: every arm,
+            // under its guard, with what that arm calls. Showing one arm
+            // here is how a chain reads as a dead end at `return 0;`.
+            let arms = db
+                .get_callee_arms_in(callee, git_sha, chain_context)
+                .await
+                .unwrap_or_default();
+            if arms.len() > 1 {
+                semcode::callchain::write_callee_arms(
+                    &mut std::io::stdout(),
+                    &arms,
+                    &root_facts,
+                    down_levels,
+                    true,
+                )?;
+                continue;
+            }
 
             // Show callee details if available
             if let Ok(Some(chosen)) = db

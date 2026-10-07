@@ -173,6 +173,11 @@ impl SearchManager {
                 .downcast_ref::<StringArray>()
                 .unwrap();
 
+            // The arm a definition sits under; read by name, since it is the
+            // last column and older batches may not have it.
+            let guard_array = batch
+                .column_by_name("guard")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
             for i in 0..batch.num_rows() {
                 let parameters: Vec<ParameterInfo> =
                     serde_json::from_str(parameters_array.value(i))?;
@@ -202,6 +207,9 @@ impl SearchManager {
                     body,
                     calls: None, // Not populated in search results
                     types: None, // Not populated in search results
+                    guard: guard_array
+                        .map(|array| array.value(i).to_string())
+                        .filter(|guard| !guard.is_empty()),
                 });
             }
         }
@@ -351,6 +359,11 @@ impl SearchManager {
                     .downcast_ref::<StringArray>()
                     .unwrap();
 
+                // The arm a definition sits under; read by name, since it is the
+                // last column and older batches may not have it.
+                let guard_array = batch
+                    .column_by_name("guard")
+                    .and_then(|column| column.as_any().downcast_ref::<StringArray>());
                 for i in 0..batch.num_rows() {
                     let parameters: Vec<ParameterInfo> =
                         serde_json::from_str(parameters_array.value(i))?;
@@ -380,6 +393,9 @@ impl SearchManager {
                         body,
                         calls: None, // Not populated in search results
                         types: None, // Not populated in search results
+                        guard: guard_array
+                            .map(|array| array.value(i).to_string())
+                            .filter(|guard| !guard.is_empty()),
                     });
                 }
             }
@@ -1561,6 +1577,11 @@ impl SearchManager {
                 .downcast_ref::<arrow::array::StringArray>()
                 .unwrap();
 
+            // The arm a definition sits under; read by name, since it is the
+            // last column and older batches may not have it.
+            let guard_array = batch
+                .column_by_name("guard")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
             for i in 0..batch.num_rows() {
                 let name = name_array.value(i);
 
@@ -1599,6 +1620,9 @@ impl SearchManager {
                     body,
                     calls: None, // Not populated in search results
                     types: None, // Not populated in search results
+                    guard: guard_array
+                        .map(|array| array.value(i).to_string())
+                        .filter(|guard| !guard.is_empty()),
                 });
             }
         }
@@ -1725,6 +1749,11 @@ impl SearchManager {
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
 
+                // The arm a definition sits under; read by name, since it is the
+                // last column and older batches may not have it.
+                let guard_array = batch
+                    .column_by_name("guard")
+                    .and_then(|column| column.as_any().downcast_ref::<StringArray>());
                 for i in 0..batch.num_rows() {
                     let name = name_array.value(i);
 
@@ -1763,6 +1792,9 @@ impl SearchManager {
                         body,
                         calls: None,
                         types: None,
+                        guard: guard_array
+                            .map(|array| array.value(i).to_string())
+                            .filter(|guard| !guard.is_empty()),
                     });
                 }
             }
@@ -2290,6 +2322,7 @@ impl VectorSearchManager {
                     body,
                     calls: meta.calls,
                     types: meta.types,
+                    guard: meta.guard,
                 },
                 similarity_score,
             });

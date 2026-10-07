@@ -36,7 +36,11 @@ pub enum OptimizeOutcome {
 /// 9: a call in a macro body to one of the macro's own parameters is recorded
 ///    as an unresolved edge naming the parameter, instead of as a call to a
 ///    name no function has. A version 8 index holds the wrong edge.
-pub const SCHEMA_VERSION: u32 = 9;
+/// 10: a `guard` column on `functions` and `object_macros` records the
+///    preprocessor arm a definition sits under, and the merge key includes
+///    it, so two arms of one name coexist. A version 9 index holds one row
+///    per name and cannot tell the arms apart.
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -52,6 +56,11 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "functions") {
             self.create_functions_table().await?;
+        } else {
+            // The merge key names `guard`: a table without it rejects every
+            // insert, so re-indexing could never bring it up to date.
+            self.recreate_without_columns("functions", &["guard"])
+                .await?;
         }
 
         if !table_names.iter().any(|n| n == "types") {
@@ -106,6 +115,9 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "object_macros") {
             self.create_object_macros_table().await?;
+        } else {
+            self.recreate_without_columns("object_macros", &["guard"])
+                .await?;
         }
 
         if !table_names.iter().any(|n| n == "schema_meta") {
@@ -161,6 +173,13 @@ impl SchemaManager {
             Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
             Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this function
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this function
+            // The preprocessor arm this definition sits under, as the file
+            // writes it. Empty where no conditional holds it, which is most
+            // rows. Non-nullable and last: it is part of the merge key, and
+            // a null key column matches nothing, so the row would be
+            // dropped. Existing column order is frozen — readers in
+            // search.rs index this table positionally.
+            Field::new("guard", DataType::Utf8, false),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -243,6 +262,10 @@ impl SchemaManager {
             Field::new("expansion", DataType::Utf8, false),
             Field::new("file_path", DataType::Utf8, false),
             Field::new("git_file_hash", DataType::Utf8, false),
+            // Same arm rule as `functions.guard`: the condition holding this
+            // definition, empty at file scope. Last for the same reason —
+            // `ObjectMacroStore::all` reads this table positionally.
+            Field::new("guard", DataType::Utf8, false),
         ]));
 
         self.connection
@@ -711,12 +734,29 @@ impl SchemaManager {
         self.connection.drop_table(name, &[]).await?;
         match name {
             "processed_files" => self.create_processed_files_table().await,
+            "functions" => self.create_functions_table().await,
+            "object_macros" => self.create_object_macros_table().await,
             "argument_functions" => self.create_argument_functions_table().await,
             "globals" => self.create_globals_table().await,
             "registrations" => self.create_registrations_table().await,
             "dispatch_sites" => self.create_dispatch_sites_table().await,
             other => Err(anyhow::anyhow!("no way to recreate {other}")),
+        }?;
+
+        // A branch recorded as indexed is skipped while its tip does not
+        // move, and its functions were in the table just dropped: it has to
+        // be read again, not trusted.
+        if name == "functions" {
+            if let Ok(branches) = self
+                .connection
+                .open_table("indexed_branches")
+                .execute()
+                .await
+            {
+                branches.delete("1=1").await?;
+            }
         }
+        Ok(())
     }
 
     async fn create_symbol_filename_table(&self) -> Result<()> {

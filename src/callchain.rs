@@ -12,7 +12,25 @@ pub struct CallNode {
     pub name: String,
     pub file: String,
     pub line: u32,
+    /// The preprocessor arm this definition sits under, if any.
+    pub guard: Option<String>,
+    /// A Kconfig term asserted higher up this path that this definition's
+    /// guard negates: no configuration runs both, so the walk stops here.
+    pub contradicts: Option<String>,
     pub children: Vec<CallNode>,
+}
+
+impl CallNode {
+    fn named(name: &str) -> Self {
+        CallNode {
+            name: name.to_string(),
+            file: String::new(),
+            line: 0,
+            guard: None,
+            contradicts: None,
+            children: Vec::new(),
+        }
+    }
 }
 
 /// Helper structure to hold call relationships for functions and macros
@@ -20,6 +38,9 @@ pub struct CallNode {
 struct CallRelationships {
     function_calls: HashMap<String, Vec<String>>,
     function_callers: HashMap<String, Vec<String>>,
+    /// Where a name is defined more than once in the file the walk reaches,
+    /// each of those definitions with what it calls.
+    function_arms: HashMap<String, Vec<crate::types::CalleeDefinition>>,
 }
 
 impl CallRelationships {
@@ -30,6 +51,7 @@ impl CallRelationships {
     ) -> Result<Self> {
         let mut function_calls = HashMap::new();
         let mut function_callers = HashMap::new();
+        let mut function_arms = HashMap::new();
 
         // Load call relationships for all functions in the chain
         for func_name in function_names {
@@ -57,11 +79,21 @@ impl CallRelationships {
             if !callers.is_empty() {
                 function_callers.insert(func_name.clone(), callers);
             }
+            if let Some(sha) = git_sha {
+                let arms = db
+                    .get_callee_arms_in(func_name, sha, crate::domain::Context::Any)
+                    .await
+                    .unwrap_or_default();
+                if arms.len() > 1 {
+                    function_arms.insert(func_name.clone(), arms);
+                }
+            }
         }
 
         Ok(CallRelationships {
             function_calls,
             function_callers,
+            function_arms,
         })
     }
 }
@@ -88,14 +120,18 @@ async fn build_forward_callchain_with_git(
     let function_map = db.get_functions_by_names(&function_names).await?;
     let call_relationships = CallRelationships::new_with_git(db, &function_names, git_sha).await?;
 
+    let walk = Walk {
+        function_map: &function_map,
+        call_relationships: &call_relationships,
+        forward: true,
+    };
     Ok(build_callchain_recursive_sync(
-        &function_map,
-        &call_relationships,
+        &walk,
         func_name,
         max_depth,
-        true,
         &mut HashSet::new(),
         crate::domain::Context::Any,
+        &[],
     ))
 }
 
@@ -113,15 +149,27 @@ async fn build_reverse_callchain_with_git(
     let function_map = db.get_functions_by_names(&function_names).await?;
     let call_relationships = CallRelationships::new_with_git(db, &function_names, git_sha).await?;
 
+    let walk = Walk {
+        function_map: &function_map,
+        call_relationships: &call_relationships,
+        forward: false,
+    };
     Ok(build_callchain_recursive_sync(
-        &function_map,
-        &call_relationships,
+        &walk,
         func_name,
         max_depth,
-        false,
         &mut HashSet::new(),
         crate::domain::Context::Any,
+        &[],
     ))
+}
+
+/// What one chain walk reads from, and in which direction.
+#[derive(Clone, Copy)]
+struct Walk<'a> {
+    function_map: &'a HashMap<String, Vec<FunctionInfo>>,
+    call_relationships: &'a CallRelationships,
+    forward: bool,
 }
 
 /// Walk the chain, carrying the build it entered from.
@@ -131,33 +179,33 @@ async fn build_reverse_callchain_with_git(
 /// keeps `do_page_fault` -> `handle_mm_fault` -> `pte_present` on x86
 /// through a file in mm/. A hop into an architecture's own code narrows it,
 /// and a hop into another architecture is not walked at all.
+///
+/// A name defined once per configuration in the file the walk reaches is
+/// walked through every arm, each its own node under its guard, because an
+/// audit has to see every branch. `facts` are the Kconfig terms the guards
+/// above this hop asserted; an arm whose guard negates one of them cannot
+/// run on this path, and is shown as such rather than walked.
 fn build_callchain_recursive_sync(
-    function_map: &HashMap<String, Vec<FunctionInfo>>,
-    call_relationships: &CallRelationships,
+    walk: &Walk,
     func_name: &str,
     remaining_depth: usize,
-    forward: bool,
     visited: &mut HashSet<String>,
     context: crate::domain::Context,
+    facts: &[String],
 ) -> CallNode {
+    let Walk {
+        function_map,
+        call_relationships,
+        forward,
+    } = *walk;
     // Prevent infinite recursion
     if remaining_depth == 0 || visited.contains(func_name) {
-        return CallNode {
-            name: func_name.to_string(),
-            file: String::new(),
-            line: 0,
-            children: vec![],
-        };
+        return CallNode::named(func_name);
     }
 
     visited.insert(func_name.to_string());
 
-    let mut node = CallNode {
-        name: func_name.to_string(),
-        file: String::new(),
-        line: 0,
-        children: vec![],
-    };
+    let mut node = CallNode::named(func_name);
 
     // The definition this walk can reach, not whichever one sorts first.
     // Choosing per hop, with nothing carried between them, is what lets a
@@ -180,30 +228,145 @@ fn build_callchain_recursive_sync(
             _ => crate::domain::Context::In(here),
         };
 
-        let next_funcs = if forward {
-            call_relationships.function_calls.get(func_name)
+        let arms = if forward {
+            call_relationships.function_arms.get(func_name)
         } else {
-            call_relationships.function_callers.get(func_name)
+            None
         };
 
-        if let Some(funcs) = next_funcs {
-            for next_func in funcs {
-                let child = build_callchain_recursive_sync(
-                    function_map,
-                    call_relationships,
-                    next_func,
-                    remaining_depth - 1,
-                    forward,
-                    visited,
-                    child_context,
-                );
-                node.children.push(child);
+        if let Some(arms) = arms {
+            // One node per arm, each walked under its own guard.
+            for arm in arms {
+                let mut arm_node = CallNode::named(func_name);
+                arm_node.file = arm.file_path.clone();
+                arm_node.line = arm.line_start;
+                arm_node.guard = arm.guard.clone();
+                if let Some(arm_facts) = facts_below(facts, arm.guard.as_deref(), &mut arm_node) {
+                    for next_func in &arm.callees {
+                        let child = build_callchain_recursive_sync(
+                            walk,
+                            next_func,
+                            remaining_depth - 1,
+                            visited,
+                            child_context,
+                            &arm_facts,
+                        );
+                        arm_node.children.push(child);
+                    }
+                }
+                node.children.push(arm_node);
+            }
+        } else {
+            node.guard = func.guard.clone();
+            let next_funcs = if forward {
+                call_relationships.function_calls.get(func_name)
+            } else {
+                call_relationships.function_callers.get(func_name)
+            };
+            let child_facts = match forward {
+                true => facts_below(facts, func.guard.as_deref(), &mut node),
+                // A caller's guard says nothing about the callee's path.
+                false => Some(facts.to_vec()),
+            };
+
+            if let (Some(funcs), Some(child_facts)) = (next_funcs, child_facts) {
+                for next_func in funcs {
+                    let child = build_callchain_recursive_sync(
+                        walk,
+                        next_func,
+                        remaining_depth - 1,
+                        visited,
+                        child_context,
+                        &child_facts,
+                    );
+                    node.children.push(child);
+                }
             }
         }
     }
 
     visited.remove(func_name);
     node
+}
+
+/// The facts a definition under `guard` hands down to what it calls, or
+/// `None` -- with the node marked -- where the guard contradicts a fact the
+/// path already holds.
+fn facts_below(facts: &[String], guard: Option<&str>, node: &mut CallNode) -> Option<Vec<String>> {
+    let Some(guard) = guard else {
+        return Some(facts.to_vec());
+    };
+    let held: Vec<&str> = facts.iter().map(String::as_str).collect();
+    if let Some(fact) = crate::guard::contradiction(&held, guard) {
+        node.contradicts = Some(fact.to_string());
+        return None;
+    }
+    let mut below = facts.to_vec();
+    for term in crate::guard::config_facts(guard) {
+        if !below.contains(&term) {
+            below.push(term);
+        }
+    }
+    Some(below)
+}
+
+/// The arms of a callee its file defines more than once, as a chain lists
+/// them under the callee: each arm's location and guard, and what it calls.
+///
+/// An arm whose guard negates a Kconfig term every arm of the chain's root
+/// asserts (see [`crate::guard::shared_facts`]) cannot run on this chain: it
+/// is listed with the term, and what it calls is not. The root's callees
+/// are the union over its arms, so a fact only one root arm asserts would
+/// hide a callee another root arm reaches. `colored` is false for a reader
+/// that is not a terminal.
+pub fn write_callee_arms(
+    writer: &mut dyn Write,
+    arms: &[crate::types::CalleeDefinition],
+    root_facts: &[String],
+    down_levels: usize,
+    colored: bool,
+) -> Result<()> {
+    let held: Vec<&str> = root_facts.iter().map(String::as_str).collect();
+    for arm in arms {
+        let place = format!("{}:{}", arm.file_path, arm.line_start);
+        let mut note = crate::types::under(arm.guard.as_deref());
+        let contradicted = arm
+            .guard
+            .as_deref()
+            .and_then(|guard| crate::guard::contradiction(&held, guard));
+        if let Some(fact) = contradicted {
+            note.push_str(&format!(" [cannot run here: {fact} holds above]"));
+        }
+        if colored {
+            writeln!(writer, "   └─ ({}){}", place.bright_black(), note.yellow())?;
+        } else {
+            writeln!(writer, "   └─ ({place}){note}")?;
+        }
+        if contradicted.is_some() || down_levels < 2 {
+            continue;
+        }
+        for next in arm.callees.iter().take(3) {
+            if colored {
+                writeln!(writer, "      └─ {}", next.bright_black())?;
+            } else {
+                writeln!(writer, "      └─ {next}")?;
+            }
+        }
+        if arm.callees.len() > 3 {
+            writeln!(writer, "      └─ ... and {} more", arm.callees.len() - 3)?;
+        }
+    }
+    Ok(())
+}
+
+/// What a node prints after its location: the arm it sits under, and why
+/// the walk stopped there if it did.
+fn node_annotation(node: &CallNode) -> String {
+    let mut text = crate::types::under(node.guard.as_deref());
+    if let Some(fact) = &node.contradicts {
+        text.push_str(&format!(" [cannot run here: {fact} holds above]"));
+    }
+    text
 }
 
 pub fn print_callchain_tree(node: &CallNode, indent: usize) {
@@ -214,12 +377,13 @@ pub fn print_callchain_tree(node: &CallNode, indent: usize) {
         println!("{}{}{}", indent_str, marker, node.name.yellow());
     } else {
         println!(
-            "{}{}{} ({}:{})",
+            "{}{}{} ({}:{}){}",
             indent_str,
             marker,
             node.name.yellow(),
             node.file.bright_black(),
-            node.line
+            node.line,
+            node_annotation(node).yellow()
         );
     }
 
@@ -341,7 +505,11 @@ pub fn elsewhere_note(
 fn definition_marker(chosen: &crate::types::ChosenDefinition) -> String {
     match chosen.others.len() {
         0 => String::new(),
-        others => format!(" [1 of {} definitions]", others + 1),
+        others => format!(
+            " [1 of {} definitions{}]",
+            others + 1,
+            crate::types::under(chosen.function.guard.as_deref())
+        ),
     }
 }
 
@@ -946,9 +1114,10 @@ fn write_callees_per_definition(
     for definition in answering {
         writeln!(
             writer,
-            "\n  {}:{}",
+            "\n  {}:{}{}",
             definition.file_path.bright_black(),
-            definition.line_start
+            definition.line_start,
+            crate::types::under(definition.guard.as_deref()).yellow()
         )?;
         if definition.callees.is_empty() {
             writeln!(writer, "    calls nothing")?;
@@ -1488,12 +1657,13 @@ pub fn print_callchain_tree_to_writer(
     } else {
         writeln!(
             writer,
-            "{}{}{} ({}:{})",
+            "{}{}{} ({}:{}){}",
             indent_str,
             marker,
             node.name.yellow(),
             node.file.bright_black(),
-            node.line
+            node.line,
+            node_annotation(node).yellow()
         )?;
     }
 
@@ -1592,5 +1762,46 @@ mod tests {
 
         assert!(text.contains("1 call sites can reach it"), "{text}");
         assert!(text.contains("1 further call sites"), "{text}");
+    }
+
+    #[test]
+    fn a_callee_arm_the_root_contradicts_is_listed_but_not_followed() {
+        // The REPL and MCP callchain list a callee's arms under it; one whose
+        // guard negates a Kconfig term the root sits under cannot run there.
+        let arm = |line: u32, guard: &str, calls: &[&str]| crate::types::CalleeDefinition {
+            file_path: "preempt.h".to_string(),
+            line_start: line,
+            line_end: line,
+            callees: calls.iter().map(|c| c.to_string()).collect(),
+            is_definition: true,
+            guard: Some(guard.to_string()),
+        };
+        let arms = vec![
+            arm(7, "defined(CONFIG_PREEMPTION)", &["preemptible_side"]),
+            arm(12, "!defined(CONFIG_PREEMPTION)", &["voluntary_side"]),
+        ];
+        let mut out = Vec::new();
+        super::write_callee_arms(
+            &mut out,
+            &arms,
+            &["defined(CONFIG_PREEMPTION)".to_string()],
+            2,
+            false,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("(preempt.h:7) under defined(CONFIG_PREEMPTION)\n"),
+            "{text}"
+        );
+        assert!(text.contains("preemptible_side"), "{text}");
+        assert!(
+            text.contains(
+                "(preempt.h:12) under !defined(CONFIG_PREEMPTION) \
+                 [cannot run here: defined(CONFIG_PREEMPTION) holds above]"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("voluntary_side"), "{text}");
     }
 }
