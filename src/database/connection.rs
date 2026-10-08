@@ -2851,8 +2851,22 @@ impl DatabaseManager {
         // definition site, and counting each row would let one file's #if
         // -- or one file's ten methods -- outvote the rest of the tree.
         // What this measures is the tree's language, not the caller's.
+        //
+        // A file votes only through a row a bare call could reach: a
+        // definition, or a C declaration. A trait signature declares a
+        // method, and no bare call reaches a method -- counting its file
+        // flipped `complete` (1,996 callers, nearly all C) from
+        // kernel/sched/completion.c to a Rust method, on the strength of
+        // a declaration row the old extractor never produced.
         let mut by_language: HashMap<&str, usize> = HashMap::new();
-        let files: HashSet<&str> = matches.iter().map(|m| m.file_path.as_str()).collect();
+        let files: HashSet<&str> = matches
+            .iter()
+            .filter(|m| {
+                m.qualifier.is_none()
+                    || crate::types::row_defines_the_function(&m.return_type, &m.body)
+            })
+            .map(|m| m.file_path.as_str())
+            .collect();
         for file in &files {
             *by_language
                 .entry(crate::types::path_language(file))

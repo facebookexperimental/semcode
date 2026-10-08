@@ -210,6 +210,95 @@ async fn two_owners_in_one_file_compete_rather_than_collapse() {
     }
 }
 
+/// The shape of `complete` in Linux, reduced: a C definition and its
+/// prototype tie two Rust method definitions two-all in the language
+/// majority, and a trait in a fifth file declares the same method.
+/// The signature declares a method no bare call reaches, so its file
+/// must not vote -- counting it flipped 1,996 callers, nearly all C,
+/// from kernel/sched/completion.c to a Rust method.
+async fn tree_shaped_like_complete() -> (tempfile::TempDir, Arc<DatabaseManager>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+
+    git_run(repo, &["init", "-q"]);
+    std::fs::create_dir_all(repo.join("include/linux")).unwrap();
+    std::fs::create_dir_all(repo.join("kernel/sched")).unwrap();
+    std::fs::create_dir_all(repo.join("rust/kernel/subsys")).unwrap();
+
+    // What the tree's own code calls, and its prototype.
+    std::fs::write(
+        repo.join("kernel/sched/finish.c"),
+        "void finish(struct task *t)\n{\n\twake_up(t);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("include/linux/sched.h"),
+        "struct task;\nextern void finish(struct task *t);\n",
+    )
+    .unwrap();
+    // Two method definitions, stored under the bare name.
+    std::fs::write(
+        repo.join("rust/kernel/subsys/thing.rs"),
+        "pub struct Thing;\nimpl Thing {\n    pub fn finish(&self) {\n        self.done();\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("rust/kernel/subsys/other.rs"),
+        "pub struct Other;\nimpl Other {\n    fn finish(&self) {\n    }\n}\n",
+    )
+    .unwrap();
+    // A declaration of the method in a fifth file. It votes for nothing.
+    std::fs::write(
+        repo.join("rust/kernel/subsys/api.rs"),
+        "pub trait Api {\n    fn finish(&self);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(
+        repo,
+        &["commit", "-q", "-m", "a trait signature beside two methods"],
+    );
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["c".to_string(), "h".to_string(), "rs".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+
+    (dir, db, sha)
+}
+
+#[tokio::test]
+async fn a_trait_signature_does_not_vote_for_its_language() {
+    let (_dir, db, sha) = tree_shaped_like_complete().await;
+
+    let chosen = db
+        .find_function_git_aware_reporting("finish", &sha, semcode::domain::Context::Any)
+        .await
+        .unwrap()
+        .chosen()
+        .unwrap_or_else(|| panic!("finish should resolve"));
+
+    // Two C files against two Rust files is no majority, so the `.c` file
+    // answers. If the trait signature voted, Rust would hold three files to
+    // two and a method would answer a C tree's question.
+    assert_eq!(
+        chosen.function.file_path, "kernel/sched/finish.c",
+        "chose {}:{}",
+        chosen.function.file_path, chosen.function.line_start
+    );
+}
+
 #[tokio::test]
 async fn the_answer_is_not_another_program_in_the_same_tree() {
     let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
