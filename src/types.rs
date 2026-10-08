@@ -124,33 +124,45 @@ pub fn split_qualified_name(name: &str) -> (&str, Option<&str>) {
 /// A query without generic arguments addresses every instantiation:
 /// `From::from` finds `From<u8>` and `From<u16>` alike, because the
 /// call site never spells the argument. Spelled arguments match exactly,
-/// so `From<u8>::from` names one.
+/// so `From<u8>::from` names one. The same holds for an inherent owner
+/// with arguments: `Split::m` finds `Split<&T>` and `Split<&mut T>`.
 pub fn qualifier_matches_path(qualifier: &str, path: &str) -> bool {
     if qualifier == path || qualifier.ends_with(&format!("::{path}")) {
         return true;
     }
-    // Only the owner half carries angle brackets; module segments are
-    // identifiers. What is inside them is `Type as Trait`, and neither half
-    // holds another ` as `.
-    let Some(open) = qualifier.find('<') else {
-        return false;
-    };
-    let (before, rest) = qualifier.split_at(open);
-    if !before.is_empty() && !before.ends_with("::") {
+    if owner_halves_match(qualifier, path) {
+        return true;
+    }
+    if path.contains('<') {
         return false;
     }
-    let inner = rest[1..].strip_suffix('>').unwrap_or(&rest[1..]);
-    let Some((left, right)) = inner.split_once(" as ") else {
-        return false;
-    };
-    [left, right].iter().any(|half| {
-        *half == path
-            || half.ends_with(&format!("::{path}"))
-            || (!path.contains('<') && {
-                let bare = strip_generic_args(half);
-                bare == path || bare.ends_with(&format!("::{path}"))
+    let stripped = strip_instantiations(qualifier);
+    stripped != qualifier && (stripped == path || stripped.ends_with(&format!("::{path}")))
+}
+
+/// Whether the path names either half of a `<Type as Trait>` owner:
+/// `<Foo as fmt::Display>` answers `Foo`, `Display`, and `fmt::Display`,
+/// and an argument-less query also matches through instantiations. Any
+/// bracketed segment counts: a method nested under a trait impl is under
+/// its owner as well as its own.
+fn owner_halves_match(qualifier: &str, path: &str) -> bool {
+    top_level_segments(qualifier)
+        .into_iter()
+        .filter(|segment| segment.starts_with('<'))
+        .any(|owner| {
+            let inner = owner[1..].strip_suffix('>').unwrap_or(&owner[1..]);
+            let Some((left, right)) = inner.split_once(" as ") else {
+                return false;
+            };
+            [left, right].iter().any(|half| {
+                *half == path
+                    || half.ends_with(&format!("::{path}"))
+                    || (!path.contains('<') && {
+                        let bare = strip_generic_args(half);
+                        bare == path || bare.ends_with(&format!("::{path}"))
+                    })
             })
-    })
+        })
 }
 
 /// A type with its generic arguments cut off: `From<u8>` is `From`. Only
@@ -161,6 +173,50 @@ fn strip_generic_args(text: &str) -> &str {
         Some(open) => text[..open].trim_end(),
         None => text,
     }
+}
+
+/// The qualifier with every generic argument list cut off, except a
+/// `<Type as Trait>` owner, which the halves rule reads instead:
+/// `file::m::Foo<T>::f` is `file::m::Foo::f`. Only an argument-less query
+/// matches against this; spelled arguments match the stored text exactly.
+fn strip_instantiations(qualifier: &str) -> String {
+    top_level_segments(qualifier)
+        .iter()
+        .map(|segment| {
+            if segment.starts_with('<') {
+                segment.to_string()
+            } else {
+                strip_generic_args(segment).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Split on `::` outside angle brackets: the `::` in `Foo<Bar::Baz>` is an
+/// argument, not a segment.
+fn top_level_segments(qualifier: &str) -> Vec<&str> {
+    let bytes = qualifier.as_bytes();
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut at = 0usize;
+    while at + 1 < bytes.len() {
+        match bytes[at] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if bytes[at + 1] == b':' && depth == 0 => {
+                segments.push(&qualifier[start..at]);
+                at += 2;
+                start = at;
+                continue;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    segments.push(&qualifier[start..]);
+    segments
 }
 
 /// The definition a command that must give one answer is about, beside the
@@ -357,15 +413,13 @@ impl ChosenDefinition {
         // The short spelling that names one owner: the last segment, which
         // is what a call head writes. A `<Type as Trait>` owner has no
         // short half that reads on its own, so it keeps the whole spelling.
+        // The split is top-level, so arguments stay with their owner.
         let remedy = |qualifier: &str| {
-            if qualifier.contains('<') {
+            let last = top_level_segments(qualifier).pop().unwrap_or(qualifier);
+            if last.starts_with('<') {
                 format!("{qualifier}::{}", self.function.name)
             } else {
-                format!(
-                    "{}::{}",
-                    qualifier.rsplit("::").next().unwrap_or(qualifier),
-                    self.function.name
-                )
+                format!("{last}::{}", self.function.name)
             }
         };
         let example = self.function.qualifier.as_deref().map(remedy).or_else(|| {
@@ -1301,6 +1355,26 @@ mod ambiguity_note_tests {
             "alloc::<Vec<T> as IntoIterator>",
             "Vec<u8>"
         ));
+        // An inherent owner keeps its arguments; an argument-less query
+        // matches through them, spelled arguments match exactly.
+        assert!(qualifier_matches_path("sync::arc::Arc<T>", "Arc"));
+        assert!(qualifier_matches_path("sync::arc::Arc<T>", "arc::Arc"));
+        assert!(qualifier_matches_path(
+            "sync::arc::Arc<T>",
+            "sync::arc::Arc<T>"
+        ));
+        assert!(!qualifier_matches_path(
+            "sync::arc::Arc<T>",
+            "sync::arc::Arc<U>"
+        ));
+        assert!(qualifier_matches_path("split::Split<&'a mut T>", "Split"));
+        assert!(!qualifier_matches_path(
+            "split::Split<&'a mut T>",
+            "Split<&'a T>"
+        ));
+        // Arguments containing `::` do not mislead the segment split.
+        assert!(qualifier_matches_path("m::Foo<Bar::Baz>", "Foo"));
+        assert!(!qualifier_matches_path("m::Foo<Bar::Baz>", "Baz"));
         assert!(!qualifier_matches_path("sync::arc::Arc", "sync::arc"));
         let (bare, path) = split_qualified_name("Arc::new");
         assert_eq!((bare, path), ("new", Some("Arc")));

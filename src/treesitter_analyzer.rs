@@ -5282,18 +5282,19 @@ impl TreeSitterAnalyzer {
         segments
     }
 
-    /// The owner an `impl` block lends the methods inside it: the type for
-    /// an inherent impl, `<Type as Trait<Args>>` for a trait impl.
+    /// The owner an `impl` block lends the methods inside it: the full type
+    /// text for an inherent impl, `<Type as Trait<Args>>` for a trait impl.
     ///
     /// This is identity, not dispatch, so it shares nothing with
     /// `rust_type_name`: that sees through `Arc` to `T` because a call
     /// through a smart pointer dispatches on what it holds, but `Arc::new`
     /// and `UniqueArc::new` are two methods and keyed on `T` they are one
-    /// row. The inherent type keeps its path with generic arguments dropped
-    /// (`impl<T> Arc<T>` is `Arc`, as the call site writes it); the trait
-    /// half keeps its arguments (`From<u8>` is not `From<u16>`) and the
-    /// trait impl's type keeps its full text (`Pointer for &T` is not
-    /// `Pointer for &mut T`).
+    /// row. The type keeps its full text, arguments included: `Split<&T>`
+    /// is not `Split<&mut T>`, and zerocopy, auxiliary, and regulator all
+    /// split inherent impls by concrete arguments. Dropping them collapsed
+    /// fourteen rows on the kernel tree. A call site writes the bare path,
+    /// and qualified matching strips arguments for a query that spells
+    /// none, so `Split::m` still finds every instantiation.
     fn impl_owner(impl_node: tree_sitter::Node, source: &str) -> Option<String> {
         let self_type = impl_node.child_by_field_name("type")?;
         let text_of = |node: tree_sitter::Node| {
@@ -5307,37 +5308,7 @@ impl TreeSitterAnalyzer {
                 text_of(self_type)?,
                 text_of(trait_node)?
             )),
-            None => Self::inherent_owner_name(self_type, source).or_else(|| text_of(self_type)),
-        }
-    }
-
-    /// The path an inherent impl's type names, with generic arguments
-    /// dropped: `impl<T> a::Foo<T>` is `a::Foo`. Arguments are dropped
-    /// rather than kept because a call site writes `Foo::new`, and the
-    /// qualifier is what a call head matches against. `None` where the type
-    /// is not a path at all (an array, a tuple), and the caller falls back
-    /// to the full text.
-    fn inherent_owner_name(node: tree_sitter::Node, source: &str) -> Option<String> {
-        match node.kind() {
-            "generic_type" => node
-                .child_by_field_name("type")
-                .and_then(|inner| Self::inherent_owner_name(inner, source)),
-            "scoped_type_identifier" | "scoped_identifier" => {
-                let name = node
-                    .child_by_field_name("name")
-                    .and_then(|name| name.utf8_text(source.as_bytes()).ok())?;
-                match node.child_by_field_name("path") {
-                    Some(path) => Some(format!(
-                        "{}::{name}",
-                        Self::inherent_owner_name(path, source)?
-                    )),
-                    None => Some(name.to_string()),
-                }
-            }
-            "type_identifier" | "primitive_type" | "identifier" | "crate" | "super" | "self" => {
-                node.utf8_text(source.as_bytes()).ok().map(str::to_string)
-            }
-            _ => None,
+            None => text_of(self_type),
         }
     }
 
@@ -8810,7 +8781,8 @@ mod rust_receiver_tests {
     fn smart_pointer_methods_do_not_share_an_owner() {
         // `Arc::new` and `UniqueArc::new` are two methods. Receiver typing
         // sees both through to `T`, which is right for dispatch and wrong
-        // for identity: keyed on `T` they are one row.
+        // for identity: keyed on `T` they are one row. The type keeps its
+        // arguments, and matching strips them for a query that spells none.
         let found = qualifiers_of(
             "struct Arc<T>(T);\n\
              struct UniqueArc<T>(T);\n\
@@ -8825,8 +8797,56 @@ mod rust_receiver_tests {
         assert_eq!(
             found,
             vec![
-                ("new".to_string(), Some("arc::Arc".to_string())),
-                ("new".to_string(), Some("arc::UniqueArc".to_string())),
+                ("new".to_string(), Some("arc::Arc<T>".to_string())),
+                ("new".to_string(), Some("arc::UniqueArc<T>".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn inherent_impls_split_by_arguments_stay_apart() {
+        // `Regulator<Disabled>::get` and `Regulator<Enabled>::get` share the
+        // bare type; with arguments dropped they are one row. The kernel
+        // splits inherent impls this way (regulator, auxiliary, zerocopy),
+        // so the type keeps its full text.
+        let found = qualifiers_of(
+            "struct Regulator<S>(S);\n\
+             struct Disabled;\n\
+             struct Enabled;\n\
+             impl Regulator<Disabled> {\n\
+             \tfn get() {}\n\
+             }\n\
+             impl Regulator<Enabled> {\n\
+             \tfn get() {}\n\
+             }\n\
+             impl<'a, T> Split<&'a T> {\n\
+             \tfn via_unchecked() {}\n\
+             }\n\
+             impl<'a, T> Split<&'a mut T> {\n\
+             \tfn via_unchecked() {}\n\
+             }\n",
+            "reg.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "get".to_string(),
+                    Some("reg::Regulator<Disabled>".to_string())
+                ),
+                (
+                    "get".to_string(),
+                    Some("reg::Regulator<Enabled>".to_string())
+                ),
+                (
+                    "via_unchecked".to_string(),
+                    Some("reg::Split<&'a T>".to_string())
+                ),
+                (
+                    "via_unchecked".to_string(),
+                    Some("reg::Split<&'a mut T>".to_string())
+                ),
             ],
             "{found:?}"
         );
