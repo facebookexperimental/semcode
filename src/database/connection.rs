@@ -2417,10 +2417,14 @@ impl DatabaseManager {
             sha => sha,
         };
 
+        // A spelled path (`Arc::new`) names the owner as well as the
+        // definition: the bare name drives every lookup below, and the rows
+        // it finds are kept only where the path addresses their owner.
+        let (bare_name, owner_path) = crate::types::split_qualified_name(name);
         // Step 1: Get candidate file paths from symbol_filename table
         let unique_file_paths = self
             .symbol_filename_store
-            .get_filenames_for_symbol(name)
+            .get_filenames_for_symbol(bare_name)
             .await?;
         if unique_file_paths.is_empty() {
             // No row has ever named this function: the on-miss path is the
@@ -2460,13 +2464,16 @@ impl DatabaseManager {
             match self.candidate_state(file_path, git_hash, revision) {
                 CandidateFile::Indexed => matches.extend(
                     self.function_store
-                        .find_all_by_name_file_and_hash(name, file_path, git_hash)
+                        .find_all_by_name_file_and_hash(bare_name, file_path, git_hash)
                         .await?,
                 ),
-                CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
+                CandidateFile::Edited => {
+                    matches.extend(self.reparse_functions(file_path, bare_name))
+                }
                 CandidateFile::Deleted => {}
             }
         }
+        let matches = Self::only_addressed_owner(matches, owner_path);
 
         // Step 4: Pick the best result (prefer implementation over declaration)
         if matches.is_empty() {
@@ -2593,10 +2600,16 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
+        // A spelled path (`Arc::new`) names the owner as well as the
+        // definition: the bare name drives every lookup below, and the rows
+        // it finds are kept only where the path addresses their owner. A
+        // bare name answers as before; the misses still report the name as
+        // spelled.
+        let (bare_name, owner_path) = crate::types::split_qualified_name(name);
         // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full function records)
         let unique_file_paths = self
             .symbol_filename_store
-            .get_filenames_for_symbol(name)
+            .get_filenames_for_symbol(bare_name)
             .await?;
         if unique_file_paths.is_empty() {
             // No row has ever named this function: only the on-miss path can
@@ -2644,13 +2657,16 @@ impl DatabaseManager {
             match self.candidate_state(file_path, git_hash, git_sha) {
                 CandidateFile::Indexed => matches.extend(
                     self.function_store
-                        .find_all_by_name_file_and_hash(name, file_path, git_hash)
+                        .find_all_by_name_file_and_hash(bare_name, file_path, git_hash)
                         .await?,
                 ),
-                CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
+                CandidateFile::Edited => {
+                    matches.extend(self.reparse_functions(file_path, bare_name))
+                }
                 CandidateFile::Deleted => {}
             }
         }
+        let matches = Self::only_addressed_owner(matches, owner_path);
 
         // Step 4: Filter out declarations but keep all implementations
         if matches.is_empty() {
@@ -2694,6 +2710,26 @@ impl DatabaseManager {
             .into_iter()
             .filter(|func| crate::types::row_defines_the_function(&func.return_type, &func.body))
             .collect()
+    }
+
+    /// Keep only the rows a spelled owner path addresses. `None` is the bare
+    /// name, which addresses every row; anything else drops the rows whose
+    /// owner the path does not name, including every unqualified row.
+    fn only_addressed_owner(
+        functions: Vec<FunctionInfo>,
+        owner_path: Option<&str>,
+    ) -> Vec<FunctionInfo> {
+        match owner_path {
+            Some(path) => functions
+                .into_iter()
+                .filter(|func| {
+                    func.qualifier.as_deref().is_some_and(|qualifier| {
+                        crate::types::qualifier_matches_path(qualifier, path)
+                    })
+                })
+                .collect(),
+            None => functions,
+        }
     }
 
     /// Select the best function match, prioritizing definitions over declarations
@@ -2788,14 +2824,16 @@ impl DatabaseManager {
             return ChosenDefinition::only(all.into_iter().next().unwrap());
         }
 
-        // One candidate per file: the first row that defines the name, by
-        // line. A file that defines a name once per configuration is one
-        // place, and letting every arm compete let whichever arm had the
-        // longest body speak for the file -- arch/um's `return 0;` stub for
-        // !CONFIG_PRINTK outranked include/linux/printk.h for 6,895 calls.
-        // The first arm is the `#if` side, which the kernel conventionally
-        // writes as the configured implementation, with the stub in
-        // `#else`. The file's other arms are reported with the choice.
+        // One candidate per file per owner: the first row that defines the
+        // name, by line. A file that defines a name once per configuration
+        // is one place, and letting every arm compete let whichever arm had
+        // the longest body speak for the file -- arch/um's `return 0;` stub
+        // for !CONFIG_PRINTK outranked include/linux/printk.h for 6,895
+        // calls. The first arm is the `#if` side, which the kernel
+        // conventionally writes as the configured implementation, with the
+        // stub in `#else`. The file's other arms are reported with the
+        // choice; another owner's rows in the same file are not arms and
+        // compete on their own.
         let (mut matches, siblings) = one_per_file(all);
         if matches.len() == 1 && siblings.is_empty() {
             return ChosenDefinition::only(matches.into_iter().next().unwrap());
@@ -4246,6 +4284,7 @@ impl DatabaseManager {
                 &definitions,
                 &chosen.function.file_path,
                 chosen.function.line_start,
+                chosen.function.qualifier.as_deref(),
             ),
             None => Vec::new(),
         })
@@ -4257,11 +4296,12 @@ impl DatabaseManager {
         function_name: &str,
         git_sha: &str,
     ) -> Result<Vec<crate::types::CalleeDefinition>> {
+        let (bare_name, owner_path) = crate::types::split_qualified_name(function_name);
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         let mut definitions = if git_manifest.is_empty() {
             Vec::new()
         } else {
-            self.get_function_callees_by_definition(function_name, &git_manifest)
+            self.get_function_callees_by_definition(bare_name, &git_manifest)
                 .await?
         };
 
@@ -4269,7 +4309,7 @@ impl DatabaseManager {
         // the same file, and a definition that exists only in an edited file
         // exists. Reporting the committed rows here would answer about a file
         // the reader has already changed.
-        let dirty = self.workdir_callee_definitions(function_name, git_sha);
+        let dirty = self.workdir_callee_definitions(bare_name, git_sha);
         if !dirty.is_empty() {
             definitions.retain(|definition| {
                 !dirty
@@ -4281,6 +4321,14 @@ impl DatabaseManager {
                 a.file_path
                     .cmp(&b.file_path)
                     .then(a.line_start.cmp(&b.line_start))
+            });
+        }
+        if let Some(path) = owner_path {
+            definitions.retain(|definition| {
+                definition
+                    .qualifier
+                    .as_deref()
+                    .is_some_and(|qualifier| crate::types::qualifier_matches_path(qualifier, path))
             });
         }
         Ok(definitions)
@@ -6091,12 +6139,13 @@ impl DatabaseManager {
         let Some(chosen) = chosen.chosen() else {
             return Ok(Vec::new());
         };
-        // Every arm of the chosen definition's file, not only the chosen
-        // row: see `get_callee_arms_in`.
+        // Every arm of the chosen definition's file under its owner, not
+        // only the chosen row: see `get_callee_arms_in`.
         Ok(callees_of_arms(&arms_beside(
             &definitions,
             &chosen.function.file_path,
             chosen.function.line_start,
+            chosen.function.qualifier.as_deref(),
         )))
     }
 
@@ -8399,8 +8448,15 @@ impl DatabaseManager {
     }
 }
 
-/// Split candidate rows into one per file -- the first row by line that
-/// defines the name, or the first row where none does -- and the rest.
+/// Split candidate rows into one per file per owner -- the first row by
+/// line that defines the name, or the first row where none does -- and the
+/// rest.
+///
+/// One file is one place only where the name has one owner there. Ten `fn
+/// new` in one file are ten coexisting definitions, not ten arms of one,
+/// so they compete as ten candidates; the arms of one `#if` share their
+/// owner's qualifier and still collapse to one representative with the
+/// rest reported beside the choice.
 fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo>) {
     let mut rows = rows;
     rows.sort_by(|a, b| {
@@ -8408,6 +8464,7 @@ fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo
         let b_defines = crate::types::row_defines_the_function(&b.return_type, &b.body);
         a.file_path
             .cmp(&b.file_path)
+            .then(a.qualifier.cmp(&b.qualifier))
             .then(b_defines.cmp(&a_defines))
             .then(a.line_start.cmp(&b.line_start))
     });
@@ -8415,7 +8472,9 @@ fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo
     let mut rest = Vec::new();
     for row in rows {
         match representatives.last() {
-            Some(last) if last.file_path == row.file_path => rest.push(row),
+            Some(last) if last.file_path == row.file_path && last.qualifier == row.qualifier => {
+                rest.push(row)
+            }
             _ => representatives.push(row),
         }
     }
@@ -8423,17 +8482,21 @@ fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo
 }
 
 /// The definitions in `file` that a chain walks through: the chosen row at
-/// `line`, and every other row of the file that defines the name -- the
-/// arms of its `#if`s. A prototype in the same file is not an arm.
+/// `line`, and every other row of the file that defines the name under the
+/// same owner -- the arms of its `#if`s. A prototype in the same file is
+/// not an arm, and neither is another owner's definition: merging ten
+/// `new`s' callees attributes every owner's calls to one.
 fn arms_beside(
     definitions: &[crate::types::CalleeDefinition],
     file: &str,
     line: u32,
+    qualifier: Option<&str>,
 ) -> Vec<crate::types::CalleeDefinition> {
     let mut arms: Vec<crate::types::CalleeDefinition> = definitions
         .iter()
         .filter(|definition| {
             definition.file_path == file
+                && definition.qualifier.as_deref() == qualifier
                 && (definition.is_definition || definition.line_start == line)
         })
         .cloned()

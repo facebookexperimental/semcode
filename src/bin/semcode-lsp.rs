@@ -355,14 +355,43 @@ impl SemcodeLspBackend {
             end += 1;
         }
 
-        if start < end {
-            let identifier: String = chars[start..end].iter().collect();
-            if !identifier.is_empty()
-                && (identifier.chars().next().unwrap().is_alphabetic()
-                    || identifier.starts_with('_'))
+        if start == end {
+            return None;
+        }
+
+        // A path names its owner as well as its item: `Arc::new` under the
+        // cursor addresses one method, where the bare `new` addresses every
+        // owner in the tree. Extend over `::` in both directions, so the
+        // cursor on either half still names the path.
+        while start >= 2 && chars[start - 1] == ':' && chars[start - 2] == ':' {
+            let mut segment = start - 2;
+            while segment > 0 && (chars[segment - 1].is_alphanumeric() || chars[segment - 1] == '_')
             {
-                return Some(identifier);
+                segment -= 1;
             }
+            if segment == start - 2 {
+                break;
+            }
+            start = segment;
+        }
+        while end + 2 <= chars.len() && chars[end] == ':' && chars[end + 1] == ':' {
+            let mut segment = end + 2;
+            while segment < chars.len()
+                && (chars[segment].is_alphanumeric() || chars[segment] == '_')
+            {
+                segment += 1;
+            }
+            if segment == end + 2 {
+                break;
+            }
+            end = segment;
+        }
+
+        let identifier: String = chars[start..end].iter().collect();
+        if !identifier.is_empty()
+            && (identifier.chars().next().unwrap().is_alphabetic() || identifier.starts_with('_'))
+        {
+            return Some(identifier);
         }
 
         None
@@ -432,6 +461,14 @@ impl LanguageServer for SemcodeLspBackend {
         // where the tree defines the name several times; the editor offers the
         // list rather than this picking one.
         let mut locations = self.find_function_definitions(&function_name).await;
+        // The cursor names a path the index cannot address -- a C++ name, or
+        // a path through a re-export -- so the bare item is the next best
+        // question. The qualified lookup answers first where it can.
+        if locations.is_empty() {
+            if let Some((_, bare)) = function_name.rsplit_once("::") {
+                locations = self.find_function_definitions(bare).await;
+            }
+        }
         match locations.len() {
             0 => Ok(None),
             1 => Ok(Some(GotoDefinitionResponse::Scalar(locations.remove(0)))),
@@ -464,8 +501,14 @@ impl LanguageServer for SemcodeLspBackend {
             None => return Ok(None),
         };
 
+        // Callers name the bare item -- call edges carry no owner -- so the
+        // path the cursor spells is stripped to what they can have written.
+        let bare_name = match function_name.rsplit_once("::") {
+            Some((_, bare)) => bare,
+            None => function_name.as_str(),
+        };
         // Find all references (callers) of this function
-        let locations = self.find_function_references(&function_name).await;
+        let locations = self.find_function_references(bare_name).await;
 
         if locations.is_empty() {
             Ok(None)

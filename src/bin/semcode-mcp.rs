@@ -3,7 +3,7 @@ use anyhow::Result;
 use clap::Parser;
 use semcode::domain::{domain_of, kernel_arch, Context};
 use semcode::{
-    git, lore_writers::decode_email_body, pages::PageCache, process_database_path,
+    git, lore_writers::decode_email_body, pages::PageCache, process_database_path, qualified_name,
     row_defines_the_function, search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
     Resolution, Surface,
 };
@@ -79,7 +79,7 @@ async fn mcp_query_function_or_macro(
 
                 result.push_str(&format!(
                     "Function: {} (git SHA: {})\nFile: {}:{}-{}\nReturn Type: {}\nParameters: ({})\n\n",
-                    func.name,
+                    qualified_name(&func.name, func.qualifier.as_deref()),
                     git_sha,
                     func.file_path,
                     func.line_start,
@@ -115,7 +115,7 @@ async fn mcp_query_function_or_macro(
 
             format!(
                 "Macro: {} (git SHA: {})\nFile: {}:{}\n{}Parameters: ({})\nCalls: {} functions\nCalled by: {} functions\nDefinition:\n{}",
-                entity.name, git_sha, entity.file_path, entity.line_start, under_line(entity.guard.as_deref()), params_str, macro_calls.len(), macro_callers.len(), entity.body
+                qualified_name(&entity.name, entity.qualifier.as_deref()), git_sha, entity.file_path, entity.line_start, under_line(entity.guard.as_deref()), params_str, macro_calls.len(), macro_callers.len(), entity.body
             )
         } else {
             // Found function
@@ -140,7 +140,7 @@ async fn mcp_query_function_or_macro(
 
             format!(
                 "Function: {} (git SHA: {})\nFile: {}:{}-{}\n{}Return Type: {}\nParameters: ({})\nCalls: {} functions\nCalled by: {} functions\nBody:\n{}\n\n",
-                func.name,
+                qualified_name(&func.name, func.qualifier.as_deref()),
                 git_sha,
                 func.file_path,
                 func.line_start,
@@ -180,7 +180,7 @@ async fn mcp_query_function_or_macro(
 
                 result.push_str(&format!(
                     "Macro: {}\nFile: {}:{}\n{}Parameters: ({})\nDefinition:\n{}\n\n",
-                    entity.name,
+                    qualified_name(&entity.name, entity.qualifier.as_deref()),
                     entity.file_path,
                     entity.line_start,
                     under_line(entity.guard.as_deref()),
@@ -198,7 +198,7 @@ async fn mcp_query_function_or_macro(
 
                 result.push_str(&format!(
                     "Function: {}\nFile: {}:{}-{}\n{}Return Type: {}\nParameters: ({})\nBody:\n{}\n\n",
-                    entity.name,
+                    qualified_name(&entity.name, entity.qualifier.as_deref()),
                     entity.file_path,
                     entity.line_start,
                     entity.line_end,
@@ -2014,7 +2014,9 @@ async fn mcp_show_callchain_with_limits(
         writeln!(
             buffer,
             "Function: {} ({}:{})",
-            func.name, func.file_path, func.line_start
+            qualified_name(&func.name, func.qualifier.as_deref()),
+            func.file_path,
+            func.line_start
         )?;
         writeln!(buffer, "Return Type: {}", func.return_type)?;
 

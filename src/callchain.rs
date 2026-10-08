@@ -486,7 +486,16 @@ pub fn elsewhere_note(
     };
     let mut sites: Vec<String> = candidates
         .iter()
-        .map(|site| format!("{}:{}", site.file_path, site.line_start))
+        .map(|site| {
+            format!(
+                "{}:{}{}",
+                site.file_path,
+                site.line_start,
+                site.qualifier
+                    .as_deref()
+                    .map_or_else(String::new, |owner| format!(" ({owner})")),
+            )
+        })
         .collect();
     sites.sort();
     const SHOWN: usize = 3;
@@ -506,9 +515,14 @@ fn definition_marker(chosen: &crate::types::ChosenDefinition) -> String {
     match chosen.others.len() {
         0 => String::new(),
         others => format!(
-            " [1 of {} definitions{}]",
+            " [1 of {} definitions{}{}]",
             others + 1,
-            crate::types::under(chosen.function.guard.as_deref())
+            crate::types::under(chosen.function.guard.as_deref()),
+            chosen
+                .function
+                .qualifier
+                .as_deref()
+                .map_or_else(String::new, |owner| format!(": {owner}")),
         ),
     }
 }
@@ -1101,24 +1115,57 @@ fn write_callees_per_definition(
     answering: &[crate::types::CalleeDefinition],
     writer: &mut dyn Write,
 ) -> Result<()> {
-    writeln!(
-        writer,
-        "\n{} defines '{}' {} times, {} of them definitions. Which one a call\n\
-         reaches depends on the file it is written in and on the configuration\n\
-         it is built with, so each is reported separately:",
-        "This revision".bold(),
-        name.cyan(),
-        total,
-        answering.len()
-    )?;
-    for definition in answering {
+    // Owners share nothing: which one a call reaches depends on the path
+    // it writes, not on the file or the configuration, so the general
+    // sentence below would mislead where owners differ.
+    let owners: std::collections::HashSet<Option<&str>> = answering
+        .iter()
+        .map(|definition| definition.qualifier.as_deref())
+        .collect();
+    if owners.len() > 1 {
         writeln!(
             writer,
-            "\n  {}:{}{}",
-            definition.file_path.bright_black(),
-            definition.line_start,
-            crate::types::under(definition.guard.as_deref()).yellow()
+            "\n{} defines '{}' {} times under {} owners, {} of them definitions. Which one a call\n\
+             reaches depends on the path it writes, so each is reported separately:",
+            "This revision".bold(),
+            name.cyan(),
+            total,
+            owners.len(),
+            answering.len()
         )?;
+    } else {
+        writeln!(
+            writer,
+            "\n{} defines '{}' {} times, {} of them definitions. Which one a call\n\
+             reaches depends on the file it is written in and on the configuration\n\
+             it is built with, so each is reported separately:",
+            "This revision".bold(),
+            name.cyan(),
+            total,
+            answering.len()
+        )?;
+    }
+    for definition in answering {
+        // The owner first where there is one; an unqualified row reads as
+        // it always has.
+        if let Some(owner) = definition.qualifier.as_deref() {
+            writeln!(
+                writer,
+                "\n  {owner}::{} at {}:{}{}",
+                name.cyan(),
+                definition.file_path.bright_black(),
+                definition.line_start,
+                crate::types::under(definition.guard.as_deref()).yellow()
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "\n  {}:{}{}",
+                definition.file_path.bright_black(),
+                definition.line_start,
+                crate::types::under(definition.guard.as_deref()).yellow()
+            )?;
+        }
         if definition.callees.is_empty() {
             writeln!(writer, "    calls nothing")?;
             continue;

@@ -95,6 +95,74 @@ pub fn under(guard: Option<&str>) -> String {
     guard.map_or_else(String::new, |guard| format!(" under {guard}"))
 }
 
+/// `owner::name` for a definition with an owner, the bare name otherwise:
+/// the spelling that names one definition where several share a name.
+pub fn qualified_name(name: &str, qualifier: Option<&str>) -> String {
+    qualifier.map_or_else(|| name.to_string(), |owner| format!("{owner}::{name}"))
+}
+
+/// Split a spelled path (`Arc::new`) into its bare name and the owner path
+/// addressing it. A bare name has no path; so does a path with an empty
+/// half, which no row can match.
+pub fn split_qualified_name(name: &str) -> (&str, Option<&str>) {
+    match name.rsplit_once("::") {
+        Some((path, bare)) if !path.is_empty() && !bare.is_empty() => (bare, Some(path)),
+        _ => (name, None),
+    }
+}
+
+/// Whether a stored qualifier is what a spelled owner path addresses.
+///
+/// The stored path is the file's module plus its inline owners, which a
+/// caller elsewhere cannot spell exactly: `sync.rs` re-exports `Arc` from
+/// a private `mod arc`, so the only writable path misses the stored one by
+/// a segment. Module segments rank, never gate: the path matches a
+/// qualifier that is or ends with it. A `<Type as Trait>` owner answers
+/// for either half: `<Foo as fmt::Display>` matches `Foo`, `Display`, and
+/// `fmt::Display` alike.
+///
+/// A query without generic arguments addresses every instantiation:
+/// `From::from` finds `From<u8>` and `From<u16>` alike, because the
+/// call site never spells the argument. Spelled arguments match exactly,
+/// so `From<u8>::from` names one.
+pub fn qualifier_matches_path(qualifier: &str, path: &str) -> bool {
+    if qualifier == path || qualifier.ends_with(&format!("::{path}")) {
+        return true;
+    }
+    // Only the owner half carries angle brackets; module segments are
+    // identifiers. What is inside them is `Type as Trait`, and neither half
+    // holds another ` as `.
+    let Some(open) = qualifier.find('<') else {
+        return false;
+    };
+    let (before, rest) = qualifier.split_at(open);
+    if !before.is_empty() && !before.ends_with("::") {
+        return false;
+    }
+    let inner = rest[1..].strip_suffix('>').unwrap_or(&rest[1..]);
+    let Some((left, right)) = inner.split_once(" as ") else {
+        return false;
+    };
+    [left, right].iter().any(|half| {
+        *half == path
+            || half.ends_with(&format!("::{path}"))
+            || (!path.contains('<') && {
+                let bare = strip_generic_args(half);
+                bare == path || bare.ends_with(&format!("::{path}"))
+            })
+    })
+}
+
+/// A type with its generic arguments cut off: `From<u8>` is `From`. Only
+/// well-formed stored text reaches this, so the first `<` is the argument
+/// list; text without one is returned unchanged.
+fn strip_generic_args(text: &str) -> &str {
+    match text.find('<') {
+        Some(open) => text[..open].trim_end(),
+        None => text,
+    }
+}
+
 /// The definition a command that must give one answer is about, beside the
 /// definitions of the same name it set aside.
 ///
@@ -195,6 +263,9 @@ impl ChosenDefinition {
         if self.others.is_empty() {
             return None;
         }
+        if let Some(note) = self.distinct_owners(surface) {
+            return Some(note);
+        }
         if let Some(note) = self.one_definition_per_configuration(surface) {
             return Some(note);
         }
@@ -239,6 +310,81 @@ impl ChosenDefinition {
             self.function.line_start,
             under(self.function.guard.as_deref()),
             listed
+        ))
+    }
+
+    /// The note for a name several owners write: definitions no build
+    /// selects between, because each answers for the path that writes it.
+    ///
+    /// `None` unless at least two owners are in play. This runs before the
+    /// configuration and architecture notes: those say which build selects
+    /// a definition, and coexisting owners are not selected between.
+    fn distinct_owners(&self, surface: Surface) -> Option<String> {
+        use std::collections::HashSet;
+        let mut owners: HashSet<Option<&str>> = HashSet::new();
+        owners.insert(self.function.qualifier.as_deref());
+        for site in &self.others {
+            owners.insert(site.qualifier.as_deref());
+        }
+        if owners.len() < 2 {
+            return None;
+        }
+        let mut sites: Vec<String> = self
+            .others
+            .iter()
+            .map(|site| {
+                format!(
+                    "{} at {}:{}{}",
+                    qualified_name(&self.function.name, site.qualifier.as_deref()),
+                    site.file_path,
+                    site.line_start,
+                    under(site.guard.as_deref())
+                )
+            })
+            .collect();
+        sites.sort();
+        const SHOWN: usize = 8;
+        let listed = if sites.len() > SHOWN {
+            format!(
+                "{}, and {} more ({})",
+                sites[..SHOWN].join(", "),
+                sites.len() - SHOWN,
+                surface.list_all(&self.function.name)
+            )
+        } else {
+            sites.join(", ")
+        };
+        // The short spelling that names one owner: the last segment, which
+        // is what a call head writes. A `<Type as Trait>` owner has no
+        // short half that reads on its own, so it keeps the whole spelling.
+        let remedy = |qualifier: &str| {
+            if qualifier.contains('<') {
+                format!("{qualifier}::{}", self.function.name)
+            } else {
+                format!(
+                    "{}::{}",
+                    qualifier.rsplit("::").next().unwrap_or(qualifier),
+                    self.function.name
+                )
+            }
+        };
+        let example = self.function.qualifier.as_deref().map(remedy).or_else(|| {
+            self.others
+                .iter()
+                .find_map(|site| site.qualifier.as_deref().map(remedy))
+        })?;
+        Some(format!(
+            "'{}' has {} owners in this revision. This answer is about {} at \
+             {}:{}{}; the others are {}. Which one a call site reaches depends \
+             on the path it writes; ask for `{}` to name one.",
+            self.function.name,
+            owners.len(),
+            qualified_name(&self.function.name, self.function.qualifier.as_deref()),
+            self.function.file_path,
+            self.function.line_start,
+            under(self.function.guard.as_deref()),
+            listed,
+            example
         ))
     }
 
@@ -1066,6 +1212,104 @@ mod ambiguity_note_tests {
             guard: Some(guard.to_string()),
             ..site(path, line)
         }
+    }
+
+    fn owned(path: &str, line: u32, qualifier: &str) -> DefinitionSite {
+        DefinitionSite {
+            qualifier: Some(qualifier.to_string()),
+            ..site(path, line)
+        }
+    }
+
+    #[test]
+    fn distinct_owners_name_each_spelling_and_the_short_ask() {
+        let mut chosen_fn = definition("new", "sync/arc.rs", 218);
+        chosen_fn.qualifier = Some("sync::arc::Arc".to_string());
+        let chosen = ChosenDefinition {
+            function: chosen_fn,
+            others: vec![owned("sync/arc.rs", 736, "sync::arc::UniqueArc")],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(note.contains("'new' has 2 owners"), "{note}");
+        assert!(
+            note.contains("about sync::arc::Arc::new at sync/arc.rs:218"),
+            "{note}"
+        );
+        assert!(
+            note.contains("sync::arc::UniqueArc::new at sync/arc.rs:736"),
+            "{note}"
+        );
+        assert!(note.contains("ask for `Arc::new` to name one"), "{note}");
+    }
+
+    #[test]
+    fn one_owner_is_not_an_owner_note() {
+        // Same owner twice (two configurations of one method) is the
+        // configuration note's case, not this one's.
+        let mut chosen_fn = definition("deref", "cpumask.rs", 10);
+        chosen_fn.qualifier = Some("cpumask::Cpumask".to_string());
+        chosen_fn.guard = Some("defined(CONFIG_X)".to_string());
+        let mut other = owned("cpumask.rs", 20, "cpumask::Cpumask");
+        other.guard = Some("!defined(CONFIG_X)".to_string());
+        let chosen = ChosenDefinition {
+            function: chosen_fn,
+            others: vec![other],
+        };
+        let note = chosen.ambiguity_note(Surface::Repl).unwrap();
+        assert!(note.contains("one definition per configuration"), "{note}");
+    }
+
+    #[test]
+    fn spelled_paths_match_owners_by_suffix() {
+        // The stored module cannot be spelled from elsewhere, so the tail
+        // decides; a `<Type as Trait>` owner answers for either half.
+        assert!(qualifier_matches_path("sync::arc::Arc", "Arc"));
+        assert!(qualifier_matches_path("sync::arc::Arc", "arc::Arc"));
+        assert!(qualifier_matches_path("sync::arc::Arc", "sync::arc::Arc"));
+        assert!(!qualifier_matches_path("sync::arc::Arc", "rc::Arc"));
+        assert!(!qualifier_matches_path("sync::arc::Arc", "Ar"));
+        assert!(qualifier_matches_path("fmt::<Foo as Display>", "Foo"));
+        assert!(qualifier_matches_path("fmt::<Foo as Display>", "Display"));
+        assert!(qualifier_matches_path(
+            "fmt::<Foo as fmt::Display>",
+            "Display"
+        ));
+        assert!(qualifier_matches_path(
+            "fmt::<Foo as fmt::Display>",
+            "fmt::Display"
+        ));
+        assert!(qualifier_matches_path(
+            "fmt::<Error as From<u8>>",
+            "From<u8>"
+        ));
+        assert!(!qualifier_matches_path(
+            "fmt::<Error as From<u8>>",
+            "From<u16>"
+        ));
+        // A query without arguments addresses every instantiation; spelled
+        // arguments match exactly.
+        assert!(qualifier_matches_path("fmt::<Error as From<u8>>", "From"));
+        assert!(qualifier_matches_path(
+            "alloc::<Vec<T> as IntoIterator>",
+            "Vec"
+        ));
+        assert!(qualifier_matches_path(
+            "alloc::<Vec<T> as IntoIterator>",
+            "IntoIterator"
+        ));
+        assert!(!qualifier_matches_path(
+            "alloc::<Vec<T> as IntoIterator>",
+            "Vec<u8>"
+        ));
+        assert!(!qualifier_matches_path("sync::arc::Arc", "sync::arc"));
+        let (bare, path) = split_qualified_name("Arc::new");
+        assert_eq!((bare, path), ("new", Some("Arc")));
+        let (bare, path) = split_qualified_name("a::Foo::new");
+        assert_eq!((bare, path), ("new", Some("a::Foo")));
+        let (bare, path) = split_qualified_name("new");
+        assert_eq!((bare, path), ("new", None));
+        let (bare, path) = split_qualified_name("::new");
+        assert_eq!((bare, path), ("::new", None));
     }
 
     #[test]

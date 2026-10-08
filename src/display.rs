@@ -376,7 +376,11 @@ pub fn display_function_to_writer_with_options(
         "=== Function Information ===".bold().green()
     )?;
 
-    writeln!(writer, "Name: {}", func.name.yellow())?;
+    writeln!(
+        writer,
+        "Name: {}",
+        crate::types::qualified_name(&func.name, func.qualifier.as_deref()).yellow()
+    )?;
     writeln!(writer, "File: {}", func.file_path.cyan())?;
     writeln!(writer, "Hash: {}", func.git_file_hash.bright_black())?;
     writeln!(writer, "Lines: {} - {}", func.line_start, func.line_end)?;
