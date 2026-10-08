@@ -29,6 +29,9 @@ pub(crate) struct FunctionMetadata {
     /// `None` at file scope. Stored as `""`, never null: the column is part
     /// of the merge key and a null key drops the row.
     pub guard: Option<String>,
+    /// The entity owning this definition. `None` where the name stands
+    /// alone. Stored as `""`, never null, for the same reason as `guard`.
+    pub qualifier: Option<String>,
 }
 
 pub struct FunctionStore {
@@ -45,20 +48,14 @@ pub struct FunctionStore {
 /// function in it, so the choice has to be made here. The first definition in
 /// the file wins, which is stable across runs.
 ///
-/// The key includes the guard: two arms of one name are two rows, not a
-/// duplicate, and the extractor keeps one row per name per arm, so several
-/// arms of one name routinely arrive here together.
+/// The key is the row's merge key: two arms of one name are two rows, not a
+/// duplicate, and so are two owners of one name. The extractor keeps one
+/// row per name per arm per owner, so several routinely arrive together.
 fn one_per_key(functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::with_capacity(functions.len());
     for function in functions {
-        let key = (
-            function.name.clone(),
-            function.file_path.clone(),
-            function.git_file_hash.clone(),
-            function.guard.clone(),
-        );
-        if seen.insert(key) {
+        if seen.insert(function.merge_key()) {
             kept.push(function.clone());
         }
     }
@@ -88,14 +85,7 @@ impl FunctionStore {
         }
         // A batch spanning commits holds the same file at the same hash twice,
         // and merge_insert refuses a batch with two source rows for one target.
-        let functions = crate::database::one_row_per_key(functions, |row| {
-            (
-                row.name.clone(),
-                row.file_path.clone(),
-                row.git_file_hash.clone(),
-                row.guard.clone(),
-            )
-        });
+        let functions = crate::database::one_row_per_key(functions, |row| row.merge_key());
 
         // Check for extremely large functions that might cause issues
         let max_body_size = 10 * 1024 * 1024; // 10MB limit per function
@@ -132,14 +122,7 @@ impl FunctionStore {
         }
         // A batch spanning commits holds the same file at the same hash twice,
         // and merge_insert refuses a batch with two source rows for one target.
-        let functions = crate::database::one_row_per_key(functions, |row| {
-            (
-                row.name.clone(),
-                row.file_path.clone(),
-                row.git_file_hash.clone(),
-                row.guard.clone(),
-            )
-        });
+        let functions = crate::database::one_row_per_key(functions, |row| row.merge_key());
 
         let table = self.connection.open_table("functions").execute().await?;
 
@@ -183,11 +166,13 @@ impl FunctionStore {
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
         let mut guard_builder = StringBuilder::new();
+        let mut qualifier_builder = StringBuilder::new();
 
         for func in functions {
             name_builder.append_value(&func.name);
             file_path_builder.append_value(&func.file_path);
             guard_builder.append_value(func.guard.as_deref().unwrap_or_default());
+            qualifier_builder.append_value(func.qualifier.as_deref().unwrap_or_default());
 
             line_start_builder.append_value(func.line_start as i64);
             line_end_builder.append_value(func.line_end as i64);
@@ -250,10 +235,15 @@ impl FunctionStore {
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
             ("guard", Arc::new(guard_builder.finish()) as ArrayRef),
+            (
+                "qualifier",
+                Arc::new(qualifier_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash", "guard"]);
+        let mut merge_insert =
+            table.merge_insert(&["name", "file_path", "git_file_hash", "guard", "qualifier"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -279,6 +269,7 @@ impl FunctionStore {
         let mut calls_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
         let mut guard_builder = StringBuilder::new();
+        let mut qualifier_builder = StringBuilder::new();
 
         for func in functions {
             name_builder.append_value(&func.name);
@@ -306,6 +297,7 @@ impl FunctionStore {
                 .unwrap_or_default();
             types_builder.append_value(&types_json);
             guard_builder.append_value(func.guard.as_deref().unwrap_or_default());
+            qualifier_builder.append_value(func.qualifier.as_deref().unwrap_or_default());
         }
 
         // Create body_hash StringArray (non-nullable for metadata-only)
@@ -350,10 +342,15 @@ impl FunctionStore {
             ("calls", Arc::new(calls_builder.finish()) as ArrayRef),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
             ("guard", Arc::new(guard_builder.finish()) as ArrayRef),
+            (
+                "qualifier",
+                Arc::new(qualifier_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash", "guard"]);
+        let mut merge_insert =
+            table.merge_insert(&["name", "file_path", "git_file_hash", "guard", "qualifier"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -520,6 +517,7 @@ impl FunctionStore {
                             calls: func_data.calls,
                             types: func_data.types,
                             guard: func_data.guard.clone(),
+                            qualifier: func_data.qualifier.clone(),
                         });
                     }
                 }
@@ -606,6 +604,7 @@ impl FunctionStore {
                 calls: func_data.calls,
                 types: func_data.types,
                 guard: func_data.guard.clone(),
+                qualifier: func_data.qualifier.clone(),
             });
         }
 
@@ -635,6 +634,11 @@ impl FunctionStore {
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
             .map(|array| array.value(row).to_string())
             .filter(|guard| !guard.is_empty());
+        let qualifier = batch
+            .column_by_name("qualifier")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .map(|array| array.value(row).to_string())
+            .filter(|qualifier| !qualifier.is_empty());
 
         let parameters: Vec<ParameterInfo> =
             serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
@@ -671,6 +675,7 @@ impl FunctionStore {
             calls,
             types,
             guard,
+            qualifier,
         }))
     }
 
@@ -736,6 +741,7 @@ impl FunctionStore {
                 calls: meta.calls,
                 types: meta.types,
                 guard: meta.guard.clone(),
+                qualifier: meta.qualifier.clone(),
             });
         }
 
@@ -850,6 +856,7 @@ impl FunctionStore {
             calls: func_data.calls,
             types: func_data.types,
             guard: func_data.guard.clone(),
+            qualifier: func_data.qualifier.clone(),
         }
     }
 }

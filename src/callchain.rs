@@ -1775,6 +1775,7 @@ mod tests {
             callees: calls.iter().map(|c| c.to_string()).collect(),
             is_definition: true,
             guard: Some(guard.to_string()),
+            qualifier: None,
         };
         let arms = vec![
             arm(7, "defined(CONFIG_PREEMPTION)", &["preemptible_side"]),

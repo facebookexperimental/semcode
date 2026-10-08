@@ -70,6 +70,10 @@ pub struct CalleeDefinition {
     /// The preprocessor arm the definition sits under; `None` at file scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
+    /// The entity owning this definition (`module::Type` for a Rust method);
+    /// `None` where the name stands alone, which is every C row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
 }
 
 /// Where one definition of a name was read.
@@ -80,6 +84,9 @@ pub struct DefinitionSite {
     /// The preprocessor arm the definition sits under; `None` at file scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
+    /// The entity owning this definition; `None` where the name stands alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
 }
 
 /// " under <guard>" for a definition inside a conditional, nothing at file
@@ -445,6 +452,17 @@ pub struct FunctionInfo {
     /// end. This is what tells the arms apart.
     #[serde(default)]
     pub guard: Option<String>,
+    /// The entity owning this definition: `module::Type` for a Rust inherent
+    /// method, `module::<Type as Trait<Args>>` for a trait impl method,
+    /// `module::Trait` for a trait declaration, `module` for a free
+    /// function. `None` where the name stands alone, which is every C row.
+    ///
+    /// Ten `fn new` in one file are ten definitions, not one. Stored under
+    /// the bare name the index kept whichever a length comparison preferred,
+    /// so nine owners vanished. This is what tells them apart; the name
+    /// column keeps the bare name so every existing consumer still matches.
+    #[serde(default)]
+    pub qualifier: Option<String>,
 }
 
 /// Parameters for creating FunctionInfo from a macro
@@ -499,7 +517,32 @@ impl FunctionInfo {
             calls,
             types,
             guard,
+            // A macro is reached by its bare name; no owner qualifies it.
+            qualifier: None,
         }
+    }
+
+    /// The row's identity in the store: the same columns the `functions`
+    /// table merges on. Every pre-merge dedup keys on this, so a column
+    /// added here and not there (or the reverse) silently drops rows.
+    pub fn merge_key(&self) -> (String, String, String, Option<String>, Option<String>) {
+        (
+            self.name.clone(),
+            self.file_path.clone(),
+            self.git_file_hash.clone(),
+            self.guard.clone(),
+            self.qualifier.clone(),
+        )
+    }
+
+    /// The row's identity within one file: what the extractor's dedup keys
+    /// on. The file and its hash are constant there, so they add nothing.
+    pub fn within_file_key(&self) -> (String, Option<String>, Option<String>) {
+        (
+            self.name.clone(),
+            self.guard.clone(),
+            self.qualifier.clone(),
+        )
     }
 }
 
@@ -1005,6 +1048,7 @@ mod ambiguity_note_tests {
             calls: None,
             types: None,
             guard: None,
+            qualifier: None,
         }
     }
 
@@ -1013,6 +1057,7 @@ mod ambiguity_note_tests {
             file_path: path.to_string(),
             line_start: line,
             guard: None,
+            qualifier: None,
         }
     }
 

@@ -40,7 +40,11 @@ pub enum OptimizeOutcome {
 ///    preprocessor arm a definition sits under, and the merge key includes
 ///    it, so two arms of one name coexist. A version 9 index holds one row
 ///    per name and cannot tell the arms apart.
-pub const SCHEMA_VERSION: u32 = 10;
+/// 11: a `qualifier` column on `functions` records the entity owning a
+///    definition (`module::Type` for a Rust method), and the merge key
+///    includes it, so ten owners of one name coexist. A version 10 index
+///    holds one row per name per arm and cannot tell the owners apart.
+pub const SCHEMA_VERSION: u32 = 11;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -57,9 +61,10 @@ impl SchemaManager {
         if !table_names.iter().any(|n| n == "functions") {
             self.create_functions_table().await?;
         } else {
-            // The merge key names `guard`: a table without it rejects every
-            // insert, so re-indexing could never bring it up to date.
-            self.recreate_without_columns("functions", &["guard"])
+            // The merge key names `guard` and `qualifier`: a table without
+            // either rejects every insert, so re-indexing could never bring
+            // it up to date.
+            self.recreate_without_columns("functions", &["guard", "qualifier"])
                 .await?;
         }
 
@@ -175,11 +180,15 @@ impl SchemaManager {
             Field::new("types", DataType::Utf8, true), // JSON array of type names used by this function
             // The preprocessor arm this definition sits under, as the file
             // writes it. Empty where no conditional holds it, which is most
-            // rows. Non-nullable and last: it is part of the merge key, and
-            // a null key column matches nothing, so the row would be
-            // dropped. Existing column order is frozen — readers in
-            // search.rs index this table positionally.
+            // rows. Non-nullable: it is part of the merge key, and a null
+            // key column matches nothing, so the row would be dropped.
             Field::new("guard", DataType::Utf8, false),
+            // The entity owning this definition, `module::Type` for a Rust
+            // method. Empty where the name stands alone, which is every C
+            // row. Non-nullable and last: part of the merge key, and
+            // existing column order is frozen — readers in search.rs index
+            // this table positionally.
+            Field::new("qualifier", DataType::Utf8, false),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());

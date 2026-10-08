@@ -2743,6 +2743,7 @@ impl DatabaseManager {
                         file_path: func.file_path.clone(),
                         line_start: func.line_start,
                         guard: func.guard.clone(),
+                        qualifier: func.qualifier.clone(),
                     })
                     .collect(),
             };
@@ -2771,6 +2772,7 @@ impl DatabaseManager {
                                 file_path: func.file_path,
                                 line_start: func.line_start,
                                 guard: func.guard,
+                                qualifier: func.qualifier,
                             }),
                     );
                     return Resolution::Chosen(Box::new(chosen));
@@ -2801,14 +2803,16 @@ impl DatabaseManager {
 
         // The language most definitions of this name are written in. Two
         // languages that give one name to two things are not one ambiguous
-        // name, and `Device::pr_warn` in rust/kernel/device.rs is stored under
-        // the bare name, so it competes with the C macro that 4,065 functions
-        // call. Ranking the minority language last answers the question the
-        // tree is mostly written in; where a name is defined in one language
-        // this decides nothing.
-        // Counted per file, not per row: a header that defines a name once
-        // per configuration is one definition site, and counting each arm
-        // would let one file's #if outvote the rest of the tree.
+        // name: `Device::pr_warn` in rust/kernel/device.rs is stored under
+        // the bare name by design, so it competes with the C macro that
+        // 4,065 functions call. Ranking the minority language last answers
+        // the question the tree is mostly written in; where a name is
+        // defined in one language this decides nothing.
+        // Counted per file, not per row, and a file majority at that: a
+        // header that defines a name once per configuration is one
+        // definition site, and counting each row would let one file's #if
+        // -- or one file's ten methods -- outvote the rest of the tree.
+        // What this measures is the tree's language, not the caller's.
         let mut by_language: HashMap<&str, usize> = HashMap::new();
         let files: HashSet<&str> = matches.iter().map(|m| m.file_path.as_str()).collect();
         for file in &files {
@@ -2820,9 +2824,9 @@ impl DatabaseManager {
         // merely more than any other language. Two definitions in two
         // languages have no majority, and picking the alphabetically later one
         // would decide a C tree's answer by the spelling of an extension. The
-        // rung is a stand-in for an extraction defect -- a Rust method stored
-        // under its bare name -- so it fires where the tree is nearly
-        // unanimous and stays out of the way otherwise.
+        // rung answers a tree where bare names are shared across languages
+        // by design, so it fires where the tree is nearly unanimous and
+        // stays out of the way otherwise.
         let highest = by_language.values().copied().max().unwrap_or_default();
         let unique_top = by_language
             .values()
@@ -2925,6 +2929,7 @@ impl DatabaseManager {
                 file_path: candidate.file_path,
                 line_start: candidate.line_start,
                 guard: candidate.guard,
+                qualifier: candidate.qualifier,
             })
             .collect();
         ChosenDefinition { function, others }
@@ -4305,6 +4310,7 @@ impl DatabaseManager {
                             &function.body,
                         ),
                         guard: function.guard.clone(),
+                        qualifier: function.qualifier.clone(),
                     })
                     .collect()
             })
@@ -5972,6 +5978,9 @@ impl DatabaseManager {
                 let guard_array = batch
                     .column_by_name("guard")
                     .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>());
+                let qualifier_array = batch
+                    .column_by_name("qualifier")
+                    .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>());
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
@@ -5979,6 +5988,9 @@ impl DatabaseManager {
                     let guard = guard_array
                         .map(|array| array.value(i).to_string())
                         .filter(|guard| !guard.is_empty());
+                    let qualifier = qualifier_array
+                        .map(|array| array.value(i).to_string())
+                        .filter(|qualifier| !qualifier.is_empty());
                     let body_hash = body_hash_array.and_then(|array| {
                         array
                             .is_valid(i)
@@ -6004,6 +6016,7 @@ impl DatabaseManager {
                                 calls,
                                 body_hash,
                                 guard,
+                                qualifier,
                             ));
                         }
                     }
@@ -6015,7 +6028,7 @@ impl DatabaseManager {
         // text decides, so it is read here -- for the handful of rows that
         // share one name, not for the table.
         let mut definitions: Vec<crate::types::CalleeDefinition> = Vec::new();
-        for (file_path, line_start, line_end, calls, body_hash, guard) in matches {
+        for (file_path, line_start, line_end, calls, body_hash, guard, qualifier) in matches {
             let text = match &body_hash {
                 Some(hash) => self.get_content(hash).await?.unwrap_or_default(),
                 None => String::new(),
@@ -6034,6 +6047,7 @@ impl DatabaseManager {
                 // commands reporting different numbers.
                 is_definition: !text.is_empty() && !crate::types::text_is_prototype(&text),
                 guard,
+                qualifier,
             });
         }
         // A stable order, so two runs and two readers see the same list.
@@ -8506,6 +8520,7 @@ mod tests {
             calls: Some(vec!["target".to_string()]),
             types: None,
             guard: None,
+            qualifier: None,
         }
     }
 
@@ -8946,6 +8961,7 @@ mod tests {
                 calls: Some(vec!["target".to_string()]),
                 types: Some(vec!["duplicate".to_string()]),
                 guard: None,
+                qualifier: None,
             },
             FunctionInfo {
                 name: "caller_two".to_string(),
@@ -8959,6 +8975,7 @@ mod tests {
                 calls: Some(vec!["target".to_string()]),
                 types: Some(vec!["duplicate".to_string()]),
                 guard: None,
+                qualifier: None,
             },
         ])
         .await

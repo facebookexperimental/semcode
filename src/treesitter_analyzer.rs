@@ -4044,6 +4044,9 @@ impl TreeSitterAnalyzer {
                     guard: function_node
                         .or(declaration_node)
                         .and_then(|node| Self::guard_of(node, ctx.source)),
+                    // The owner qualifier is computed by a later pass over
+                    // the impl and module context; see `impl_owner`.
+                    qualifier: None,
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -4157,6 +4160,8 @@ impl TreeSitterAnalyzer {
                     calls: (!calls.is_empty()).then_some(calls),
                     types: None,
                     guard: defined.guard.clone(),
+                    // A macro-opened C function has no owner to record.
+                    qualifier: None,
                 });
             }
         }
@@ -9854,6 +9859,7 @@ mod config_variant_tests {
             calls: None,
             types: None,
             guard: guard.map(str::to_string),
+            qualifier: None,
         }
     }
 
