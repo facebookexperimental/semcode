@@ -349,9 +349,19 @@ async fn show_callchain_with_limits(
             {
                 // One of several definitions, where the name has several. A
                 // row of a list has no other room to say so.
+                // One of several definitions, where the name has several.
+                // The owner says which one this is.
                 let marker = match chosen.others.len() {
                     0 => String::new(),
-                    others => format!(" [1 of {} definitions]", others + 1),
+                    others => format!(
+                        " [1 of {} definitions{}]",
+                        others + 1,
+                        chosen
+                            .function
+                            .qualifier
+                            .as_deref()
+                            .map_or_else(String::new, |owner| format!(": {owner}")),
+                    ),
                 };
                 let caller_func = chosen.function;
                 println!(
@@ -439,9 +449,19 @@ async fn show_callchain_with_limits(
                 .await
                 .map(|resolution| resolution.chosen())
             {
+                // One of several definitions, where the name has several.
+                // The owner says which one this is.
                 let marker = match chosen.others.len() {
                     0 => String::new(),
-                    others => format!(" [1 of {} definitions]", others + 1),
+                    others => format!(
+                        " [1 of {} definitions{}]",
+                        others + 1,
+                        chosen
+                            .function
+                            .qualifier
+                            .as_deref()
+                            .map_or_else(String::new, |owner| format!(": {owner}")),
+                    ),
                 };
                 let callee_func = chosen.function;
                 println!(

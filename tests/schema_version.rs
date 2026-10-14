@@ -141,23 +141,27 @@ async fn a_file_read_by_an_older_extractor_is_forgotten() {
 }
 
 #[tokio::test]
-async fn tables_written_before_the_guard_column_are_started_again() {
-    // A version 9 index has `functions` and `object_macros` without `guard`,
-    // and the merge key names it: every insert into such a table fails, so
-    // re-indexing, the one repair a user will try, could never succeed.
+async fn tables_written_before_the_key_columns_are_started_again() {
+    // An older index has `functions` without a merge-key column the merge
+    // key names (`guard` since version 10, `qualifier` since 11), and every
+    // insert into such a table fails, so re-indexing, the one repair a user
+    // will try, could never succeed. `object_macros` carries `guard` only.
     let dir = tempfile::tempdir().unwrap();
     let db = manager(dir.path()).await;
     db.record_branch_indexed("main", "cafe1234", None)
         .await
         .unwrap();
-    for name in ["functions", "object_macros"] {
+    for (name, missing) in [
+        ("functions", vec!["guard", "qualifier"]),
+        ("object_macros", vec!["guard"]),
+    ] {
         let table = db.connection().open_table(name).execute().await.unwrap();
         let schema = table.schema().await.unwrap();
         let older = std::sync::Arc::new(arrow_schema::Schema::new(
             schema
                 .fields()
                 .iter()
-                .filter(|field| field.name() != "guard")
+                .filter(|field| !missing.contains(&field.name().as_str()))
                 .cloned()
                 .collect::<Vec<_>>(),
         ));
@@ -171,13 +175,18 @@ async fn tables_written_before_the_guard_column_are_started_again() {
     drop(db);
 
     let db = manager(dir.path()).await;
-    for name in ["functions", "object_macros"] {
+    for (name, missing) in [
+        ("functions", vec!["guard", "qualifier"]),
+        ("object_macros", vec!["guard"]),
+    ] {
         let table = db.connection().open_table(name).execute().await.unwrap();
         let schema = table.schema().await.unwrap();
-        assert!(
-            schema.fields().iter().any(|field| field.name() == "guard"),
-            "{name} still lacks the guard column"
-        );
+        for column in missing {
+            assert!(
+                schema.fields().iter().any(|field| field.name() == column),
+                "{name} still lacks the {column} column"
+            );
+        }
     }
     // The branch's functions went with the table, so it is not current.
     assert!(!db.is_branch_current("main", "cafe1234").await.unwrap());
@@ -193,6 +202,7 @@ async fn tables_written_before_the_guard_column_are_started_again() {
         calls: None,
         types: None,
         guard: Some("defined(CONFIG_A)".to_string()),
+        qualifier: None,
     }])
     .await
     .unwrap();

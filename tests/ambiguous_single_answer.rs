@@ -99,9 +99,204 @@ async fn a_single_answer_names_the_definitions_it_set_aside() {
     let note = chosen
         .ambiguity_note(Surface::Repl)
         .unwrap_or_else(|| panic!("three definitions, so there is a choice to report"));
-    assert!(note.contains("defined 3 times"), "{note}");
+    // One of the three has an owner, so the note names owners, not files.
+    assert!(note.contains("has 2 owners"), "{note}");
     assert!(note.contains("arch/x86/tools/decoder_test.c"), "{note}");
     assert!(note.contains("rust/kernel/device.rs"), "{note}");
+    assert!(
+        note.contains("rust::kernel::device::Device::report"),
+        "{note}"
+    );
+    assert!(note.contains("ask for `Device::report`"), "{note}");
+}
+
+#[tokio::test]
+async fn a_spelled_owner_resolves_to_the_one_it_names() {
+    let (_dir, db, sha) = tree_shaped_like_pr_warn().await;
+
+    // The bare name answers all three definitions; the spelled path answers
+    // the one it addresses, with no choice left to report.
+    let bare = db
+        .find_all_functions_git_aware("report", &sha)
+        .await
+        .unwrap();
+    assert_eq!(bare.len(), 3, "{bare:?}");
+
+    let addressed = db
+        .find_all_functions_git_aware("Device::report", &sha)
+        .await
+        .unwrap();
+    assert_eq!(addressed.len(), 1, "{addressed:?}");
+    assert_eq!(addressed[0].file_path, "rust/kernel/device.rs");
+
+    let chosen = db
+        .find_function_git_aware_reporting("Device::report", &sha, semcode::domain::Context::Any)
+        .await
+        .unwrap()
+        .chosen()
+        .unwrap_or_else(|| panic!("Device::report should resolve"));
+    assert_eq!(chosen.function.file_path, "rust/kernel/device.rs");
+    assert!(chosen.others.is_empty(), "{:?}", chosen.others);
+    assert!(chosen.ambiguity_note(Surface::Repl).is_none());
+
+    // An owner that names nothing is not found, not the bare answer.
+    let missing = db
+        .find_all_functions_git_aware("Other::report", &sha)
+        .await
+        .unwrap();
+    assert!(missing.is_empty(), "{missing:?}");
+}
+
+/// One file, two owners of one name: coexisting definitions, not arms of
+/// one, so each competes for the answer on its own.
+async fn tree_with_two_owners_in_one_file() -> (tempfile::TempDir, Arc<DatabaseManager>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+
+    git_run(repo, &["init", "-q"]);
+    std::fs::create_dir_all(repo.join("rust/kernel")).unwrap();
+    std::fs::write(
+        repo.join("rust/kernel/alloc.rs"),
+        "struct A;\nstruct B;\nimpl A {\n    fn make() -> i32 {\n        1\n    }\n}\nimpl B {\n    fn make() -> i32 {\n        2\n    }\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "two owners in one file"]);
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["rs".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+
+    (dir, db, sha)
+}
+
+#[tokio::test]
+async fn two_owners_in_one_file_compete_rather_than_collapse() {
+    let (_dir, db, sha) = tree_with_two_owners_in_one_file().await;
+
+    let bare = db.find_all_functions_git_aware("make", &sha).await.unwrap();
+    assert_eq!(bare.len(), 2, "{bare:?}");
+
+    let chosen = db
+        .find_function_git_aware_reporting("make", &sha, semcode::domain::Context::Any)
+        .await
+        .unwrap()
+        .chosen()
+        .unwrap_or_else(|| panic!("make should resolve"));
+    // Both owners compete: the answer names the other as a choice, and the
+    // note says what tells them apart.
+    assert_eq!(chosen.others.len(), 1, "{:?}", chosen.others);
+    let note = chosen
+        .ambiguity_note(Surface::Repl)
+        .unwrap_or_else(|| panic!("two owners, so there is a choice to report"));
+    assert!(note.contains("has 2 owners"), "{note}");
+
+    // Each owner answers alone when spelled.
+    for owner in ["A::make", "B::make"] {
+        let addressed = db.find_all_functions_git_aware(owner, &sha).await.unwrap();
+        assert_eq!(addressed.len(), 1, "{owner}: {addressed:?}");
+    }
+}
+
+/// The shape of `complete` in Linux, reduced: a C definition and its
+/// prototype tie two Rust method definitions two-all in the language
+/// majority, and a trait in a fifth file declares the same method.
+/// The signature declares a method no bare call reaches, so its file
+/// must not vote -- counting it flipped 1,996 callers, nearly all C,
+/// from kernel/sched/completion.c to a Rust method.
+async fn tree_shaped_like_complete() -> (tempfile::TempDir, Arc<DatabaseManager>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+
+    git_run(repo, &["init", "-q"]);
+    std::fs::create_dir_all(repo.join("include/linux")).unwrap();
+    std::fs::create_dir_all(repo.join("kernel/sched")).unwrap();
+    std::fs::create_dir_all(repo.join("rust/kernel/subsys")).unwrap();
+
+    // What the tree's own code calls, and its prototype.
+    std::fs::write(
+        repo.join("kernel/sched/finish.c"),
+        "void finish(struct task *t)\n{\n\twake_up(t);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("include/linux/sched.h"),
+        "struct task;\nextern void finish(struct task *t);\n",
+    )
+    .unwrap();
+    // Two method definitions, stored under the bare name.
+    std::fs::write(
+        repo.join("rust/kernel/subsys/thing.rs"),
+        "pub struct Thing;\nimpl Thing {\n    pub fn finish(&self) {\n        self.done();\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("rust/kernel/subsys/other.rs"),
+        "pub struct Other;\nimpl Other {\n    fn finish(&self) {\n    }\n}\n",
+    )
+    .unwrap();
+    // A declaration of the method in a fifth file. It votes for nothing.
+    std::fs::write(
+        repo.join("rust/kernel/subsys/api.rs"),
+        "pub trait Api {\n    fn finish(&self);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(
+        repo,
+        &["commit", "-q", "-m", "a trait signature beside two methods"],
+    );
+    git_run(repo, &["branch", "-M", "main"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["c".to_string(), "h".to_string(), "rs".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+        .await
+        .unwrap();
+
+    (dir, db, sha)
+}
+
+#[tokio::test]
+async fn a_trait_signature_does_not_vote_for_its_language() {
+    let (_dir, db, sha) = tree_shaped_like_complete().await;
+
+    let chosen = db
+        .find_function_git_aware_reporting("finish", &sha, semcode::domain::Context::Any)
+        .await
+        .unwrap()
+        .chosen()
+        .unwrap_or_else(|| panic!("finish should resolve"));
+
+    // Two C files against two Rust files is no majority, so the `.c` file
+    // answers. If the trait signature voted, Rust would hold three files to
+    // two and a method would answer a C tree's question.
+    assert_eq!(
+        chosen.function.file_path, "kernel/sched/finish.c",
+        "chose {}:{}",
+        chosen.function.file_path, chosen.function.line_start
+    );
 }
 
 #[tokio::test]
@@ -441,7 +636,9 @@ async fn two_languages_one_definition_each_is_not_a_majority() {
     assert_eq!(first.function.file_path, again.function.file_path);
     assert_eq!(first.others.len(), 1, "{:?}", first.others);
     let note = first.ambiguity_note(Surface::Repl).unwrap();
-    assert!(note.contains("defined 2 times"), "{note}");
+    // Two languages, two owners: the note names the Rust spelling.
+    assert!(note.contains("has 2 owners"), "{note}");
+    assert!(note.contains("ask for `Thing::solo`"), "{note}");
 }
 
 /// A tree where one registrar name has two definitions, as `call_rcu` does.

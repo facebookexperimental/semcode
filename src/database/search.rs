@@ -173,10 +173,14 @@ impl SearchManager {
                 .downcast_ref::<StringArray>()
                 .unwrap();
 
-            // The arm a definition sits under; read by name, since it is the
-            // last column and older batches may not have it.
+            // The arm a definition sits under and the entity owning it; read
+            // by name, since they are the last columns and older batches may
+            // not have them.
             let guard_array = batch
                 .column_by_name("guard")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+            let qualifier_array = batch
+                .column_by_name("qualifier")
                 .and_then(|column| column.as_any().downcast_ref::<StringArray>());
             for i in 0..batch.num_rows() {
                 let parameters: Vec<ParameterInfo> =
@@ -210,6 +214,9 @@ impl SearchManager {
                     guard: guard_array
                         .map(|array| array.value(i).to_string())
                         .filter(|guard| !guard.is_empty()),
+                    qualifier: qualifier_array
+                        .map(|array| array.value(i).to_string())
+                        .filter(|qualifier| !qualifier.is_empty()),
                 });
             }
         }
@@ -359,10 +366,14 @@ impl SearchManager {
                     .downcast_ref::<StringArray>()
                     .unwrap();
 
-                // The arm a definition sits under; read by name, since it is the
-                // last column and older batches may not have it.
+                // The arm a definition sits under and the entity owning it; read
+                // by name, since they are the last columns and older batches may
+                // not have them.
                 let guard_array = batch
                     .column_by_name("guard")
+                    .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+                let qualifier_array = batch
+                    .column_by_name("qualifier")
                     .and_then(|column| column.as_any().downcast_ref::<StringArray>());
                 for i in 0..batch.num_rows() {
                     let parameters: Vec<ParameterInfo> =
@@ -396,6 +407,9 @@ impl SearchManager {
                         guard: guard_array
                             .map(|array| array.value(i).to_string())
                             .filter(|guard| !guard.is_empty()),
+                        qualifier: qualifier_array
+                            .map(|array| array.value(i).to_string())
+                            .filter(|qualifier| !qualifier.is_empty()),
                     });
                 }
             }
@@ -1577,10 +1591,14 @@ impl SearchManager {
                 .downcast_ref::<arrow::array::StringArray>()
                 .unwrap();
 
-            // The arm a definition sits under; read by name, since it is the
-            // last column and older batches may not have it.
+            // The arm a definition sits under and the entity owning it; read
+            // by name, since they are the last columns and older batches may
+            // not have them.
             let guard_array = batch
                 .column_by_name("guard")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+            let qualifier_array = batch
+                .column_by_name("qualifier")
                 .and_then(|column| column.as_any().downcast_ref::<StringArray>());
             for i in 0..batch.num_rows() {
                 let name = name_array.value(i);
@@ -1623,6 +1641,9 @@ impl SearchManager {
                     guard: guard_array
                         .map(|array| array.value(i).to_string())
                         .filter(|guard| !guard.is_empty()),
+                    qualifier: qualifier_array
+                        .map(|array| array.value(i).to_string())
+                        .filter(|qualifier| !qualifier.is_empty()),
                 });
             }
         }
@@ -1749,10 +1770,14 @@ impl SearchManager {
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
 
-                // The arm a definition sits under; read by name, since it is the
-                // last column and older batches may not have it.
+                // The arm a definition sits under and the entity owning it; read
+                // by name, since they are the last columns and older batches may
+                // not have them.
                 let guard_array = batch
                     .column_by_name("guard")
+                    .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+                let qualifier_array = batch
+                    .column_by_name("qualifier")
                     .and_then(|column| column.as_any().downcast_ref::<StringArray>());
                 for i in 0..batch.num_rows() {
                     let name = name_array.value(i);
@@ -1795,6 +1820,9 @@ impl SearchManager {
                         guard: guard_array
                             .map(|array| array.value(i).to_string())
                             .filter(|guard| !guard.is_empty()),
+                        qualifier: qualifier_array
+                            .map(|array| array.value(i).to_string())
+                            .filter(|qualifier| !qualifier.is_empty()),
                     });
                 }
             }
@@ -2323,6 +2351,7 @@ impl VectorSearchManager {
                     calls: meta.calls,
                     types: meta.types,
                     guard: meta.guard,
+                    qualifier: meta.qualifier,
                 },
                 similarity_score,
             });

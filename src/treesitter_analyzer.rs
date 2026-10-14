@@ -652,6 +652,14 @@ impl TreeSitterAnalyzer {
                 return_type: (_)? @return_type
                 body: (block)? @body
             ) @function
+
+            ; A trait method without a default body is a different node,
+            ; and without this pattern every bodiless declaration is missed.
+            (function_signature_item
+                name: (identifier) @function_name
+                parameters: (parameters) @parameters
+                return_type: (_)? @return_type
+            ) @declaration
         "#,
         )?;
 
@@ -4022,9 +4030,11 @@ impl TreeSitterAnalyzer {
                     ));
                 }
 
+                let defined_at = function_node.or(declaration_node);
+                let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
                 let func = FunctionInfo {
                     name: name.clone(),
-                    file_path: self.make_relative_path(ctx.file_path, ctx.source_root),
+                    file_path: relative_path.clone(),
                     git_file_hash: ctx.git_hash.to_string(),
                     line_start,
                     line_end,
@@ -4041,9 +4051,16 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(function_types)
                     },
-                    guard: function_node
-                        .or(declaration_node)
-                        .and_then(|node| Self::guard_of(node, ctx.source)),
+                    guard: defined_at.and_then(|node| Self::guard_of(node, ctx.source)),
+                    // The entity owning a Rust definition; every other
+                    // language leaves the name to stand alone.
+                    qualifier: if matches!(ctx.language, Language::Rust) {
+                        defined_at.and_then(|node| {
+                            Self::rust_owner_qualifier(node, ctx.source, &relative_path)
+                        })
+                    } else {
+                        None
+                    },
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -4157,6 +4174,8 @@ impl TreeSitterAnalyzer {
                     calls: (!calls.is_empty()).then_some(calls),
                     types: None,
                     guard: defined.guard.clone(),
+                    // A macro-opened C function has no owner to record.
+                    qualifier: None,
                 });
             }
         }
@@ -5195,6 +5214,109 @@ impl TreeSitterAnalyzer {
             }
             _ => None,
         }
+    }
+
+    /// The entity owning a Rust definition: the module path plus every
+    /// enclosing item, outermost first.
+    ///
+    /// `fn new` in `impl Arc<T>` in `mod sync` in `sync/arc.rs` is
+    /// `sync::arc::sync::Arc`, and the ten of them in one file are ten rows,
+    /// not one row the length comparison prefers. The module half comes from
+    /// the file path plus inline `mod`s; the owner half from the enclosing
+    /// `impl` or `trait`; a function declared inside another function adds
+    /// the outer one. `None` where the name stands alone: a free function in
+    /// a file with no path to name, which in practice is only a snippet with
+    /// no file.
+    fn rust_owner_qualifier(
+        node: tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+    ) -> Option<String> {
+        let text_of = |node: tree_sitter::Node| {
+            node.child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                .map(str::to_string)
+        };
+        let mut segments: Vec<String> = Vec::new();
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            let segment = match current.kind() {
+                "mod_item" | "trait_item" | "function_item" => text_of(current),
+                "impl_item" => Self::impl_owner(current, source),
+                _ => None,
+            };
+            segments.extend(segment);
+            parent = current.parent();
+        }
+        segments.reverse();
+        let mut qualified = Self::rust_module_of(file_path);
+        qualified.extend(segments);
+        if qualified.is_empty() {
+            return None;
+        }
+        Some(qualified.join("::"))
+    }
+
+    /// The module a file's items live in: its path with `/` as `::` and the
+    /// `.rs` gone, so `sync/arc.rs` is `sync::arc`.
+    ///
+    /// A trailing `mod` collapses: `sync/mod.rs` IS module `sync`, by the
+    /// language's own rule, and storing `sync::mod` would coin a module no
+    /// path in the tree can spell. `lib.rs` and `main.rs` are kept as
+    /// written: their module is the crate, whose name no file states.
+    ///
+    /// A file pulled in through `#[path = "..."]` keeps its path-derived
+    /// module: the attribute sits on the `mod` declaration in another file,
+    /// where this file's parse cannot see it. Qualified matching is by
+    /// suffix, so the true path still matches on its tail.
+    fn rust_module_of(file_path: &str) -> Vec<String> {
+        let without_extension = file_path.strip_suffix(".rs").unwrap_or(file_path);
+        let mut segments: Vec<String> = without_extension
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .map(str::to_string)
+            .collect();
+        if segments.last().is_some_and(|last| last == "mod") {
+            segments.pop();
+        }
+        segments
+    }
+
+    /// The owner an `impl` block lends the methods inside it: the full type
+    /// text for an inherent impl, `<Type as Trait<Args>>` for a trait impl.
+    ///
+    /// This is identity, not dispatch, so it shares nothing with
+    /// `rust_type_name`: that sees through `Arc` to `T` because a call
+    /// through a smart pointer dispatches on what it holds, but `Arc::new`
+    /// and `UniqueArc::new` are two methods and keyed on `T` they are one
+    /// row. The type keeps its full text, arguments included: `Split<&T>`
+    /// is not `Split<&mut T>`, and zerocopy, auxiliary, and regulator all
+    /// split inherent impls by concrete arguments. Dropping them collapsed
+    /// fourteen rows on the kernel tree. A call site writes the bare path,
+    /// and qualified matching strips arguments for a query that spells
+    /// none, so `Split::m` still finds every instantiation.
+    fn impl_owner(impl_node: tree_sitter::Node, source: &str) -> Option<String> {
+        let self_type = impl_node.child_by_field_name("type")?;
+        let text_of = |node: tree_sitter::Node| {
+            node.utf8_text(source.as_bytes())
+                .ok()
+                .map(Self::one_line_type)
+        };
+        match impl_node.child_by_field_name("trait") {
+            Some(trait_node) => Some(format!(
+                "<{} as {}>",
+                text_of(self_type)?,
+                text_of(trait_node)?
+            )),
+            None => text_of(self_type),
+        }
+    }
+
+    /// Type text on one line: runs of whitespace become single spaces. No
+    /// comment stripping: a lifetime (`&'a T`) is not a character constant,
+    /// and the guard text's treatment would eat it.
+    fn one_line_type(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// One predicate on one line: continuations go, comments go, and runs of
@@ -6351,22 +6473,24 @@ impl TreeSitterAnalyzer {
 
     /// Deduplicate functions within a single file (no threading issues).
     ///
-    /// One row per name **per preprocessor arm**: `_cond_resched()` is
-    /// defined four times in `sched.h`, once per configuration, and those are
-    /// four definitions, not four copies of one. Keyed on name alone, the
-    /// preference below kept `return 0;` and hid every route that reaches the
-    /// scheduler. Within one arm the preference is unchanged: definitions
-    /// over declarations, then longer span, longer body, more parameters.
+    /// One row per name **per preprocessor arm per owner**: `_cond_resched()`
+    /// is defined four times in `sched.h`, once per configuration, and ten
+    /// `fn new` in one Rust file are ten owners, and those are definitions,
+    /// not copies of one. Keyed on name alone, the preference below kept
+    /// `return 0;` and hid every route that reaches the scheduler. Within
+    /// one arm of one owner the preference is unchanged: definitions over
+    /// declarations, then longer span, longer body, more parameters.
     fn deduplicate_functions_within_file(
         &self,
         raw_functions: Vec<FunctionInfo>,
     ) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_functions = HashMap::<(String, Option<String>), FunctionInfo>::new();
+        let mut seen_functions =
+            HashMap::<(String, Option<String>, Option<String>), FunctionInfo>::new();
 
         for func in raw_functions {
-            let key = (func.name.clone(), func.guard.clone());
+            let key = func.within_file_key();
 
             if let Some(existing) = seen_functions.get(&key) {
                 // Skip if bodies are identical
@@ -8593,6 +8717,250 @@ mod rust_receiver_tests {
         );
     }
 
+    fn qualifiers_of(source: &str, path: &str) -> Vec<(String, Option<String>)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, Option<String>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.qualifier.clone()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn rust_definitions_carry_module_and_owner() {
+        // The qualifier contract in one file: inline modules nest under the
+        // file's module, the same type in two modules stays two owners, a
+        // trait lends its name to declarations and defaults alike, and a
+        // free function carries the module alone.
+        let found = qualifiers_of(
+            "mod a {\n\
+             \tmod b {\n\
+             \t\tstruct T;\n\
+             \t\timpl T {\n\
+             \t\t\tfn f() {}\n\
+             \t\t}\n\
+             \t}\n\
+             \tstruct Foo;\n\
+             \timpl Foo {\n\
+             \t\tfn f() {}\n\
+             \t}\n\
+             }\n\
+             mod b {\n\
+             \tstruct Foo;\n\
+             \timpl Foo {\n\
+             \t\tfn f() {}\n\
+             \t}\n\
+             }\n\
+             trait Tr {\n\
+             \tfn g(&self);\n\
+             \tfn h(&self) {}\n\
+             }\n\
+             fn free() {}\n",
+            "x.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("f".to_string(), Some("x::a::Foo".to_string())),
+                ("f".to_string(), Some("x::a::b::T".to_string())),
+                ("f".to_string(), Some("x::b::Foo".to_string())),
+                ("free".to_string(), Some("x".to_string())),
+                ("g".to_string(), Some("x::Tr".to_string())),
+                ("h".to_string(), Some("x::Tr".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn smart_pointer_methods_do_not_share_an_owner() {
+        // `Arc::new` and `UniqueArc::new` are two methods. Receiver typing
+        // sees both through to `T`, which is right for dispatch and wrong
+        // for identity: keyed on `T` they are one row. The type keeps its
+        // arguments, and matching strips them for a query that spells none.
+        let found = qualifiers_of(
+            "struct Arc<T>(T);\n\
+             struct UniqueArc<T>(T);\n\
+             impl<T> Arc<T> {\n\
+             \tfn new(contents: T) -> Self { Self(contents) }\n\
+             }\n\
+             impl<T> UniqueArc<T> {\n\
+             \tfn new(value: T) -> Self { Self(value) }\n\
+             }\n",
+            "arc.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("new".to_string(), Some("arc::Arc<T>".to_string())),
+                ("new".to_string(), Some("arc::UniqueArc<T>".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn inherent_impls_split_by_arguments_stay_apart() {
+        // `Regulator<Disabled>::get` and `Regulator<Enabled>::get` share the
+        // bare type; with arguments dropped they are one row. The kernel
+        // splits inherent impls this way (regulator, auxiliary, zerocopy),
+        // so the type keeps its full text.
+        let found = qualifiers_of(
+            "struct Regulator<S>(S);\n\
+             struct Disabled;\n\
+             struct Enabled;\n\
+             impl Regulator<Disabled> {\n\
+             \tfn get() {}\n\
+             }\n\
+             impl Regulator<Enabled> {\n\
+             \tfn get() {}\n\
+             }\n\
+             impl<'a, T> Split<&'a T> {\n\
+             \tfn via_unchecked() {}\n\
+             }\n\
+             impl<'a, T> Split<&'a mut T> {\n\
+             \tfn via_unchecked() {}\n\
+             }\n",
+            "reg.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "get".to_string(),
+                    Some("reg::Regulator<Disabled>".to_string())
+                ),
+                (
+                    "get".to_string(),
+                    Some("reg::Regulator<Enabled>".to_string())
+                ),
+                (
+                    "via_unchecked".to_string(),
+                    Some("reg::Split<&'a T>".to_string())
+                ),
+                (
+                    "via_unchecked".to_string(),
+                    Some("reg::Split<&'a mut T>".to_string())
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn trait_impls_carry_trait_and_type() {
+        // `Display::fmt` and `Debug::fmt` for one type share `module::Foo`,
+        // `From<u8>` shares the bare trait with `From<u16>`, and `Pointer
+        // for &T` shares trait and type name with `Pointer for &mut T`.
+        // Each pair is two definitions, so the qualifier carries both halves
+        // with their arguments.
+        let found = qualifiers_of(
+            "struct Foo;\n\
+             struct Error;\n\
+             impl Display for Foo {\n\
+             \tfn fmt(&self) {}\n\
+             }\n\
+             impl Debug for Foo {\n\
+             \tfn fmt(&self) {}\n\
+             }\n\
+             impl From<u8> for Error {\n\
+             \tfn from(_: u8) -> Self { Error }\n\
+             }\n\
+             impl From<u16> for Error {\n\
+             \tfn from(_: u16) -> Self { Error }\n\
+             }\n\
+             impl<T: ?Sized> Pointer for &T {\n\
+             \tfn fmt(&self) {}\n\
+             }\n\
+             impl<T: ?Sized> Pointer for &mut T {\n\
+             \tfn fmt(&self) {}\n\
+             }\n\
+             impl<T: ?Sized> Pointer for *const T {\n\
+             \tfn fmt(&self) {}\n\
+             }\n",
+            "fmt.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("fmt".to_string(), Some("fmt::<&T as Pointer>".to_string()),),
+                (
+                    "fmt".to_string(),
+                    Some("fmt::<&mut T as Pointer>".to_string()),
+                ),
+                (
+                    "fmt".to_string(),
+                    Some("fmt::<*const T as Pointer>".to_string()),
+                ),
+                ("fmt".to_string(), Some("fmt::<Foo as Debug>".to_string()),),
+                ("fmt".to_string(), Some("fmt::<Foo as Display>".to_string()),),
+                (
+                    "from".to_string(),
+                    Some("fmt::<Error as From<u16>>".to_string()),
+                ),
+                (
+                    "from".to_string(),
+                    Some("fmt::<Error as From<u8>>".to_string()),
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn nested_items_extend_the_qualifier() {
+        let found = qualifiers_of(
+            "fn outer() {\n\
+             \tfn inner() {}\n\
+             }\n",
+            "nest.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("inner".to_string(), Some("nest::outer".to_string())),
+                ("outer".to_string(), Some("nest".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn non_rust_definitions_have_no_owner() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "int add(int a, int b) { return a + b; }\n",
+                std::path::Path::new("add.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert_eq!(analysis.functions.len(), 1);
+        assert_eq!(analysis.functions[0].qualifier, None);
+    }
+
+    #[test]
+    fn mod_rs_is_its_parent_while_lib_rs_is_kept() {
+        assert_eq!(
+            TreeSitterAnalyzer::rust_module_of("sync/mod.rs"),
+            vec!["sync".to_string()]
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::rust_module_of("sync/arc.rs"),
+            vec!["sync".to_string(), "arc".to_string()]
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::rust_module_of("kernel/lib.rs"),
+            vec!["kernel".to_string(), "lib".to_string()]
+        );
+    }
+
     #[test]
     fn a_parameter_is_typed_from_its_declaration() {
         let sites = sites_of("fn show(fmt: &mut fmt::Formatter<'_>) { fmt.write_str(\"x\"); }\n");
@@ -9854,6 +10222,7 @@ mod config_variant_tests {
             calls: None,
             types: None,
             guard: guard.map(str::to_string),
+            qualifier: None,
         }
     }
 
