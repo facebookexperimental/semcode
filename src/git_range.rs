@@ -45,15 +45,28 @@ struct GitTupleResults {
 
 impl GitTupleResults {
     fn merge(&mut self, other: GitTupleResults) {
-        self.functions.extend(other.functions);
-        self.types.extend(other.types);
-        self.dispatch_sites.extend(other.dispatch_sites);
-        self.registrations.extend(other.registrations);
-        self.argument_functions.extend(other.argument_functions);
-        self.unresolved_edges.extend(other.unresolved_edges);
-        self.globals.extend(other.globals);
-        self.processed_files.extend(other.processed_files);
-        self.files_processed += other.files_processed;
+        // Destructured, not field-by-field: a new fact table that nobody
+        // extends here is data silently dropped, so it must fail to compile.
+        let GitTupleResults {
+            functions,
+            types,
+            dispatch_sites,
+            registrations,
+            argument_functions,
+            unresolved_edges,
+            globals,
+            processed_files,
+            files_processed,
+        } = other;
+        self.functions.extend(functions);
+        self.types.extend(types);
+        self.dispatch_sites.extend(dispatch_sites);
+        self.registrations.extend(registrations);
+        self.argument_functions.extend(argument_functions);
+        self.unresolved_edges.extend(unresolved_edges);
+        self.globals.extend(globals);
+        self.processed_files.extend(processed_files);
+        self.files_processed += files_processed;
     }
 }
 
@@ -450,6 +463,186 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
     }
 }
 
+/// Insert one batch of facts, then mark its files processed.
+///
+/// Both streaming inserters commit through here, so exactly one place
+/// decides when a file counts as read. The mark goes last, and only if
+/// every fact table accepted its rows: a file marked processed is never
+/// read again, so a mark written beside a failed insert is facts the index
+/// silently lacks. Every fact store merges on its key, so leaving a
+/// half-inserted batch unmarked heals where the next run re-reads the same
+/// blob at the same path and the failure does not repeat: the merge then
+/// completes what the failed run wrote. Three shapes escape that -- a blob
+/// read at a new path, a failure that fails the same way every run, a run
+/// whose input never contains the blob -- and those stay holes until the
+/// run learns to retry per file and to account for unmarked files.
+///
+/// A failed mark is the same shape: the facts are in, the file is not
+/// marked, the next run re-reads it and the merges change nothing.
+async fn insert_batch_and_mark(
+    db: &DatabaseManager,
+    batch: GitTupleResults,
+    inserter_id: usize,
+    functions_counter: &AtomicUsize,
+    types_counter: &AtomicUsize,
+    batches_inserted_counter: &AtomicUsize,
+    optimization_check_timer: &Arc<std::sync::Mutex<std::time::Instant>>,
+) {
+    // Exhaustive: a new fact table must be inserted and checked here, not
+    // silently left out of the batch the mark commits.
+    let GitTupleResults {
+        functions,
+        types,
+        dispatch_sites,
+        registrations,
+        argument_functions,
+        unresolved_edges,
+        globals,
+        processed_files,
+        files_processed: _,
+    } = batch;
+    let func_count = functions.len();
+    let type_count = types.len();
+
+    // Every fact table in parallel. processed_files is not among them: the
+    // mark is the batch's commit record, and a commit record written beside
+    // a failed insert is how a file gets skipped with its facts missing.
+    let (
+        func_result,
+        type_result,
+        dispatch_result,
+        registration_result,
+        argument_function_result,
+        unresolved_edge_result,
+        global_result,
+    ) = tokio::join!(
+        async {
+            if !functions.is_empty() {
+                db.insert_functions(functions).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if !types.is_empty() {
+                db.insert_types(types).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if !dispatch_sites.is_empty() {
+                db.insert_dispatch_sites(dispatch_sites).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if !registrations.is_empty() {
+                db.insert_registrations(registrations).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if !argument_functions.is_empty() {
+                db.insert_argument_functions(argument_functions).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if !unresolved_edges.is_empty() {
+                db.insert_unresolved_edges(unresolved_edges).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if !globals.is_empty() {
+                db.insert_globals(globals).await
+            } else {
+                Ok(())
+            }
+        },
+    );
+
+    // Check results and update counters
+    let mut insertion_successful = true;
+    if let Err(e) = func_result {
+        error!("Inserter {} failed to insert functions: {}", inserter_id, e);
+        insertion_successful = false;
+    } else {
+        functions_counter.fetch_add(func_count, Ordering::Relaxed);
+    }
+    if let Err(e) = type_result {
+        error!("Inserter {} failed to insert types: {}", inserter_id, e);
+        insertion_successful = false;
+    } else {
+        types_counter.fetch_add(type_count, Ordering::Relaxed);
+    }
+    if let Err(e) = dispatch_result {
+        error!(
+            "Inserter {} failed to insert dispatch sites: {}",
+            inserter_id, e
+        );
+        insertion_successful = false;
+    }
+    if let Err(e) = registration_result {
+        error!(
+            "Inserter {} failed to insert registrations: {}",
+            inserter_id, e
+        );
+        insertion_successful = false;
+    }
+    if let Err(e) = argument_function_result {
+        error!(
+            "Inserter {} failed to insert argument functions: {}",
+            inserter_id, e
+        );
+        insertion_successful = false;
+    }
+    if let Err(e) = unresolved_edge_result {
+        error!(
+            "Inserter {} failed to insert unresolved edges: {}",
+            inserter_id, e
+        );
+        insertion_successful = false;
+    }
+    if let Err(e) = global_result {
+        error!("Inserter {} failed to insert globals: {}", inserter_id, e);
+        insertion_successful = false;
+    }
+
+    // Only a batch whose facts all landed may claim its files. A file left
+    // unmarked is re-read next run; a file marked beside missing facts is
+    // skipped with the hole in place.
+    if insertion_successful && !processed_files.is_empty() {
+        if let Err(e) = db.mark_files_processed(processed_files).await {
+            error!(
+                "Inserter {} failed to insert processed_files: {}",
+                inserter_id, e
+            );
+            insertion_successful = false;
+        }
+    }
+    // Note: not tracking processed_files_count in a counter since it's not displayed
+
+    // Only increment batches_inserted if insertion was successful
+    if insertion_successful {
+        let total_batches = batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Periodic optimization check using shared function
+        crate::indexer::check_and_optimize_if_needed(
+            db,
+            inserter_id,
+            total_batches,
+            optimization_check_timer,
+        )
+        .await;
+    }
+}
+
 /// Process git file tuples using streaming pipeline with database inserters
 async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupleStats> {
     use std::sync::Mutex;
@@ -632,157 +825,16 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
 
                 match batch {
                     Ok(batch) => {
-                        let func_count = batch.functions.len();
-                        let type_count = batch.types.len();
-
-                        // Insert all three types in parallel
-                        let (
-                            func_result,
-                            type_result,
-                            dispatch_result,
-                            registration_result,
-                            argument_function_result,
-                            unresolved_edge_result,
-                            global_result,
-                            processed_files_result,
-                        ) = tokio::join!(
-                            async {
-                                if !batch.functions.is_empty() {
-                                    db_manager_clone.insert_functions(batch.functions).await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.types.is_empty() {
-                                    db_manager_clone.insert_types(batch.types).await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.dispatch_sites.is_empty() {
-                                    db_manager_clone
-                                        .insert_dispatch_sites(batch.dispatch_sites)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.registrations.is_empty() {
-                                    db_manager_clone
-                                        .insert_registrations(batch.registrations)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.argument_functions.is_empty() {
-                                    db_manager_clone
-                                        .insert_argument_functions(batch.argument_functions)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.unresolved_edges.is_empty() {
-                                    db_manager_clone
-                                        .insert_unresolved_edges(batch.unresolved_edges)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.globals.is_empty() {
-                                    db_manager_clone.insert_globals(batch.globals).await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.processed_files.is_empty() {
-                                    db_manager_clone
-                                        .mark_files_processed(batch.processed_files)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                        );
-
-                        // Check results and update counters
-                        let mut insertion_successful = true;
-                        if let Err(e) = func_result {
-                            error!("Inserter {} failed to insert functions: {}", inserter_id, e);
-                            insertion_successful = false;
-                        } else {
-                            functions_counter.fetch_add(func_count, Ordering::Relaxed);
-                        }
-                        if let Err(e) = type_result {
-                            error!("Inserter {} failed to insert types: {}", inserter_id, e);
-                            insertion_successful = false;
-                        } else {
-                            types_counter.fetch_add(type_count, Ordering::Relaxed);
-                        }
-                        if let Err(e) = dispatch_result {
-                            error!(
-                                "Inserter {} failed to insert dispatch sites: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = registration_result {
-                            error!(
-                                "Inserter {} failed to insert registrations: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = argument_function_result {
-                            error!(
-                                "Inserter {} failed to insert argument functions: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = unresolved_edge_result {
-                            error!(
-                                "Inserter {} failed to insert unresolved edges: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = global_result {
-                            error!("Inserter {} failed to insert globals: {}", inserter_id, e);
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = processed_files_result {
-                            error!(
-                                "Inserter {} failed to insert processed_files: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        // Note: not tracking processed_files_count in a counter since it's not displayed
-
-                        // Only increment batches_inserted if insertion was successful
-                        if insertion_successful {
-                            let total_batches =
-                                batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1;
-
-                            // Periodic optimization check using shared function
-                            crate::indexer::check_and_optimize_if_needed(
-                                &db_manager_clone,
-                                inserter_id,
-                                total_batches,
-                                &optimization_check_timer,
-                            )
-                            .await;
-                        }
+                        insert_batch_and_mark(
+                            &db_manager_clone,
+                            batch,
+                            inserter_id,
+                            &functions_counter,
+                            &types_counter,
+                            &batches_inserted_counter,
+                            &optimization_check_timer,
+                        )
+                        .await;
                     }
                     Err(_) => break, // Channel closed, exit task
                 }
@@ -1026,152 +1078,16 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
 
                 match batch {
                     Ok(batch) => {
-                        let func_count = batch.functions.len();
-                        let type_count = batch.types.len();
-
-                        let (
-                            func_result,
-                            type_result,
-                            dispatch_result,
-                            registration_result,
-                            argument_function_result,
-                            unresolved_edge_result,
-                            global_result,
-                            processed_files_result,
-                        ) = tokio::join!(
-                            async {
-                                if !batch.functions.is_empty() {
-                                    db_manager_clone.insert_functions(batch.functions).await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.types.is_empty() {
-                                    db_manager_clone.insert_types(batch.types).await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.dispatch_sites.is_empty() {
-                                    db_manager_clone
-                                        .insert_dispatch_sites(batch.dispatch_sites)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.registrations.is_empty() {
-                                    db_manager_clone
-                                        .insert_registrations(batch.registrations)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.argument_functions.is_empty() {
-                                    db_manager_clone
-                                        .insert_argument_functions(batch.argument_functions)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.unresolved_edges.is_empty() {
-                                    db_manager_clone
-                                        .insert_unresolved_edges(batch.unresolved_edges)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.globals.is_empty() {
-                                    db_manager_clone.insert_globals(batch.globals).await
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            async {
-                                if !batch.processed_files.is_empty() {
-                                    db_manager_clone
-                                        .mark_files_processed(batch.processed_files)
-                                        .await
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                        );
-
-                        let mut insertion_successful = true;
-                        if let Err(e) = func_result {
-                            error!("Inserter {} failed to insert functions: {}", inserter_id, e);
-                            insertion_successful = false;
-                        } else {
-                            functions_counter.fetch_add(func_count, Ordering::Relaxed);
-                        }
-                        if let Err(e) = type_result {
-                            error!("Inserter {} failed to insert types: {}", inserter_id, e);
-                            insertion_successful = false;
-                        } else {
-                            types_counter.fetch_add(type_count, Ordering::Relaxed);
-                        }
-                        if let Err(e) = dispatch_result {
-                            error!(
-                                "Inserter {} failed to insert dispatch sites: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = registration_result {
-                            error!(
-                                "Inserter {} failed to insert registrations: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = argument_function_result {
-                            error!(
-                                "Inserter {} failed to insert argument functions: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = unresolved_edge_result {
-                            error!(
-                                "Inserter {} failed to insert unresolved edges: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = global_result {
-                            error!("Inserter {} failed to insert globals: {}", inserter_id, e);
-                            insertion_successful = false;
-                        }
-                        if let Err(e) = processed_files_result {
-                            error!(
-                                "Inserter {} failed to insert processed_files: {}",
-                                inserter_id, e
-                            );
-                            insertion_successful = false;
-                        }
-
-                        if insertion_successful {
-                            let total_batches =
-                                batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1;
-
-                            crate::indexer::check_and_optimize_if_needed(
-                                &db_manager_clone,
-                                inserter_id,
-                                total_batches,
-                                &optimization_check_timer,
-                            )
-                            .await;
-                        }
+                        insert_batch_and_mark(
+                            &db_manager_clone,
+                            batch,
+                            inserter_id,
+                            &functions_counter,
+                            &types_counter,
+                            &batches_inserted_counter,
+                            &optimization_check_timer,
+                        )
+                        .await;
                     }
                     Err(_) => break,
                 }
@@ -1502,4 +1418,212 @@ pub async fn process_git_range(
     // but other parts could have been written by an older version of semcode.
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_batch() -> GitTupleResults {
+        GitTupleResults {
+            functions: vec![FunctionInfo {
+                name: "marked_only_on_success".to_string(),
+                file_path: "a.c".to_string(),
+                git_file_hash: "abc123".to_string(),
+                line_start: 1,
+                line_end: 3,
+                return_type: "int".to_string(),
+                parameters: Vec::new(),
+                body: "int marked_only_on_success(void) { return 0; }".to_string(),
+                calls: None,
+                types: None,
+                guard: None,
+                qualifier: None,
+            }],
+            types: vec![TypeInfo {
+                name: "a_struct".to_string(),
+                file_path: "a.c".to_string(),
+                git_file_hash: "abc123".to_string(),
+                line_start: 5,
+                kind: "struct".to_string(),
+                size: None,
+                members: Vec::new(),
+                definition: "struct a_struct { int x; };".to_string(),
+                types: None,
+            }],
+            dispatch_sites: vec![DispatchSite {
+                caller_name: "marked_only_on_success".to_string(),
+                file_path: "a.c".to_string(),
+                git_file_hash: "abc123".to_string(),
+                byte_start: 10,
+                line: 2,
+                member: "read".to_string(),
+                receiver_expr: Some("fop".to_string()),
+                receiver_type: None,
+                receiver_base_type: None,
+                receiver_field: None,
+                kind: crate::types::DispatchKind::MemberArrow,
+                target: None,
+            }],
+            registrations: vec![Registration {
+                container_type: "file_operations".to_string(),
+                member: "read".to_string(),
+                target: "marked_only_on_success".to_string(),
+                file_path: "a.c".to_string(),
+                git_file_hash: "abc123".to_string(),
+                byte_start: 40,
+                line: 8,
+                enclosing_function: String::new(),
+                kind: crate::types::RegistrationKind::DesignatedInit,
+                container_base_type: None,
+                container_field: None,
+            }],
+            argument_functions: vec![ArgumentFunction {
+                target: "marked_only_on_success".to_string(),
+                callee: "register".to_string(),
+                argument_index: 0,
+                taken_address: false,
+                subject_type: None,
+                subject_member: None,
+                file_path: "a.c".to_string(),
+                git_file_hash: "abc123".to_string(),
+                byte_start: 60,
+                line: 10,
+                enclosing_function: "setup".to_string(),
+            }],
+            unresolved_edges: vec![crate::types::UnresolvedEdge {
+                name: "marked_only_on_success".to_string(),
+                direction: "out".to_string(),
+                kind: "c:macro_parameter_call".to_string(),
+                evidence: "CALLBACK".to_string(),
+                locations: vec![crate::types::EdgeLocation {
+                    role: "invocation".to_string(),
+                    file_path: "a.c".to_string(),
+                    line: 12,
+                }],
+                file_path: "a.c".to_string(),
+                git_file_hash: "abc123".to_string(),
+                line: 12,
+            }],
+            globals: vec![GlobalVariable {
+                name: "a_global".to_string(),
+                type_name: "a_struct".to_string(),
+                file_path: "a.c".to_string(),
+                git_file_hash: "abc123".to_string(),
+                line: 4,
+            }],
+            processed_files: vec![ProcessedFileRecord {
+                file: "a.c".to_string(),
+                git_sha: None,
+                git_file_sha: "abc123".to_string(),
+                extractor_version: Some(crate::SCHEMA_VERSION),
+            }],
+            files_processed: 1,
+        }
+    }
+
+    fn test_counters() -> (
+        AtomicUsize,
+        AtomicUsize,
+        AtomicUsize,
+        Arc<std::sync::Mutex<std::time::Instant>>,
+    ) {
+        (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        )
+    }
+
+    async fn test_db() -> (tempfile::TempDir, DatabaseManager) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        (temp_dir, db)
+    }
+
+    /// A batch whose facts did not all land must not mark its files: a
+    /// marked file is never read again, so the mark used to run beside the
+    /// fact inserts and a failed insert left a hole the next run skipped.
+    /// Every fact table takes a turn being the broken one, so each table's
+    /// result check is exercised and none can be dropped silently.
+    #[tokio::test]
+    async fn a_failed_fact_table_leaves_its_files_unmarked() {
+        for table in [
+            "functions",
+            "types",
+            "dispatch_sites",
+            "registrations",
+            "argument_functions",
+            "unresolved_edges",
+            "globals",
+        ] {
+            let (_dir, db) = test_db().await;
+            db.connection().drop_table(table, &[]).await.unwrap();
+
+            let (functions, types_count, batches, timer) = test_counters();
+            insert_batch_and_mark(
+                &db,
+                test_batch(),
+                0,
+                &functions,
+                &types_count,
+                &batches,
+                &timer,
+            )
+            .await;
+            assert!(
+                !db.is_file_processed("abc123").await.unwrap(),
+                "{table} failing must leave the file unmarked"
+            );
+            assert_eq!(batches.load(Ordering::Relaxed), 0);
+
+            db.create_tables().await.unwrap();
+            insert_batch_and_mark(
+                &db,
+                test_batch(),
+                0,
+                &functions,
+                &types_count,
+                &batches,
+                &timer,
+            )
+            .await;
+            assert!(
+                db.is_file_processed("abc123").await.unwrap(),
+                "{table} healed must mark the file"
+            );
+            assert_eq!(batches.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    /// The retry a failed batch leaves behind merges onto the landed rows
+    /// instead of doubling them.
+    #[tokio::test]
+    async fn a_retried_batch_merges_onto_its_rows() {
+        let (_dir, db) = test_db().await;
+        let (functions, types_count, batches, timer) = test_counters();
+        for _ in 0..2 {
+            insert_batch_and_mark(
+                &db,
+                test_batch(),
+                0,
+                &functions,
+                &types_count,
+                &batches,
+                &timer,
+            )
+            .await;
+        }
+        let found = db.get_all_functions_metadata_only().await.unwrap();
+        assert_eq!(found.len(), 1);
+        let landed_types = db.get_all_types_metadata_only().await.unwrap();
+        assert_eq!(landed_types.len(), 1);
+    }
 }
