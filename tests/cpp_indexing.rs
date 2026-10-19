@@ -413,7 +413,7 @@ fn write_owners(repo: &Path) {
          public:\n\
          \tK &operator =(const K &o) { return *this; }\n\
          };\n\
-         K &K::operator=(const K &o) { return *this; }\n",
+         K &K::operator=(const K &o) { return *this; }\n         struct ops {\n         \tint (*read)(void);\n         };\n         namespace ns {\n         int my_read(void) { return 0; }\n         int handler(void) { return 1; }\n         int callback(void) { return 2; }\n         }\n         struct ops built = { .read = &ns::handler };\n         void install(struct ops *ops) { ops->read = ns::my_read; }\n         void cb(int (*fn)(void)) {}\n         void hand_over(void) { cb(ns::callback); }\n         class Q {\n         public:\n         \tQ &operator=(const Q &o);\n         };\n         Q &Q::operator=(const Q &o);\n         Q &operator+(const Q &o);\n         class P {\n         public:\n         \t~P();\n         };\n         P::~P() {}\n         void use_p(P *p) { p->~P(); }\n",
     )
     .unwrap();
 }
@@ -582,4 +582,151 @@ async fn operator_spellings_share_one_row_regardless_of_spacing() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].name, "operator=");
     assert_eq!(rows[0].qualifier.as_deref(), Some("K"));
+}
+
+#[tokio::test]
+async fn a_qualified_assignment_installs_its_bare_function() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_owners(dir.path()).await;
+
+    // `ops->read = ns::my_read` stores the bare target the row joins by
+    let registrations = db
+        .find_registrations_of_git_aware("my_read", &git_sha)
+        .await
+        .unwrap();
+    let row = registrations
+        .iter()
+        .find(|row| row.container_type == "ops" && row.member == "read")
+        .unwrap_or_else(|| panic!("the qualified assignment was not recorded: {registrations:?}"));
+    assert_eq!(row.target, "my_read");
+    assert_eq!(row.container_type, "ops");
+}
+
+#[tokio::test]
+async fn a_qualified_initializer_installs_its_bare_function() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_owners(dir.path()).await;
+
+    // `.read = &ns::handler` addresses the function the row joins by
+    let registrations = db
+        .find_registrations_of_git_aware("handler", &git_sha)
+        .await
+        .unwrap();
+    let row = registrations
+        .iter()
+        .find(|row| row.container_type == "ops" && row.member == "read")
+        .unwrap_or_else(|| panic!("the qualified initializer was not recorded: {registrations:?}"));
+    assert_eq!(row.target, "handler");
+}
+
+#[tokio::test]
+async fn a_qualified_argument_is_handed_over_by_its_bare_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _git_sha) = index_owners(dir.path()).await;
+
+    // `cb(ns::callback)` hands the callback over under its bare name
+    let handed = db.find_argument_functions_of("callback").await.unwrap();
+    let row = handed
+        .iter()
+        .find(|row| row.callee == "cb")
+        .unwrap_or_else(|| panic!("the qualified handover was not recorded: {handed:?}"));
+    assert_eq!(row.target, "callback");
+    assert!(!row.taken_address, "{row:?}");
+}
+
+#[tokio::test]
+async fn an_out_of_class_operator_prototype_records_a_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_owners(dir.path()).await;
+
+    // `Q &Q::operator=(const Q &o);` returns through a reference
+    let found = db
+        .find_function_git_aware("Q::operator=", &git_sha)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("Q::operator= was not indexed"));
+    assert_eq!(found.name, "operator=");
+    assert_eq!(found.qualifier.as_deref(), Some("Q"));
+
+    // a free operator prototype names itself at file scope
+    let free = db
+        .find_function_git_aware("operator+", &git_sha)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("operator+ was not indexed"));
+    assert_eq!(free.name, "operator+");
+    assert_eq!(free.qualifier, None);
+}
+
+#[tokio::test]
+async fn an_explicit_destructor_call_records_its_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_owners(dir.path()).await;
+
+    // `p->~P()` names the function it runs
+    let callees = db
+        .get_function_callees_git_aware("use_p", &git_sha)
+        .await
+        .unwrap();
+    assert_eq!(callees, vec!["~P".to_string()]);
+}
+
+#[tokio::test]
+async fn a_c_file_keeps_its_bare_targets_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("ops.c"),
+        "struct ops {\n\
+         \tint (*read)(void);\n\
+         };\n\
+         int handler(void) { return 0; }\n\
+         struct ops built = { .read = &handler };\n\
+         void install(struct ops *ops) { ops->read = handler; }\n\
+         void cb(int (*fn)(void)) {}\n\
+         void hand_over(void) { cb(handler); }\n",
+    )
+    .unwrap();
+    git_run(dir.path(), &["init", "-q"]);
+    git_run(dir.path(), &["add", "."]);
+    git_run(dir.path(), &["commit", "-q", "-m", "fixture"]);
+    let git_sha = git::get_git_sha(dir.path()).unwrap().unwrap();
+    let db = Arc::new(
+        DatabaseManager::new(
+            dir.path().join(".semcode.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    semcode::git_range::process_git_tree(
+        dir.path(),
+        &git_sha,
+        &["c".to_string()],
+        db.clone(),
+        false,
+        1,
+    )
+    .await
+    .unwrap();
+
+    // the C spellings store the same rows the C++ ones normalize to
+    let registrations = db
+        .find_registrations_of_git_aware("handler", &git_sha)
+        .await
+        .unwrap();
+    assert_eq!(registrations.len(), 2, "{registrations:?}");
+    assert!(
+        registrations
+            .iter()
+            .all(|row| row.target == "handler" && row.container_type == "ops"),
+        "{registrations:?}"
+    );
+    let handed = db.find_argument_functions_of("handler").await.unwrap();
+    assert!(
+        handed
+            .iter()
+            .any(|row| row.callee == "cb" && !row.taken_address),
+        "{handed:?}"
+    );
 }

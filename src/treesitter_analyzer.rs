@@ -738,17 +738,42 @@ impl TreeSitterAnalyzer {
                 ]
             ) @function_ptr
 
-            ; Declarations without bodies.
+            ; Declarations without bodies. A return written through a
+            ; reference or a pointer wraps the declarator, and an operator
+            ; names itself.
             (declaration
                 type: (_)? @return_type
-                declarator: (function_declarator
-                    declarator: [
-                        (identifier) @function_name
-                        (qualified_identifier) @function_name
-                        (destructor_name) @function_name
-                    ]
-                    parameters: (parameter_list) @parameters
-                )
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (identifier) @function_name
+                            (qualified_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        ))
+                    (pointer_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        ))
+                ]
             ) @declaration
         "#,
         )?;
@@ -850,6 +875,15 @@ impl TreeSitterAnalyzer {
                     field: (field_identifier) @member_name
                 )
             ) @method_call
+
+            ; an explicit `p->~T()` names the function it runs
+            (call_expression
+                function: (field_expression
+                    field: (destructor_name) @function_name
+                )
+            ) @call
+
+            ; an explicit `x.operator=(y)` is an ERROR in this grammar and stays uncaptured
 
             (call_expression
                 function: (parenthesized_expression
@@ -2223,12 +2257,15 @@ impl TreeSitterAnalyzer {
         }
 
         extraction.pointer_vars = Self::collect_pointer_vars(tree.root_node(), source_code);
-        extraction.registrations = Self::collect_registrations(tree.root_node(), source_code);
+        extraction.registrations =
+            Self::collect_registrations(tree.root_node(), source_code, language);
         extraction.argument_functions =
-            Self::collect_argument_functions(tree.root_node(), source_code);
-        extraction
-            .registrations
-            .extend(Self::collect_assignments(tree.root_node(), source_code));
+            Self::collect_argument_functions(tree.root_node(), source_code, language);
+        extraction.registrations.extend(Self::collect_assignments(
+            tree.root_node(),
+            source_code,
+            language,
+        ));
 
         // The shapes a declaration takes differ per language, so each gets
         // the pass that can read it.
@@ -2763,8 +2800,13 @@ impl TreeSitterAnalyzer {
 
         // Storing it in a member is what makes the caller's function
         // reachable, and that shape is already recognised.
-        let mut written = Self::collect_registrations(tree.root_node(), body);
-        written.extend(Self::collect_assignments(tree.root_node(), body));
+        // The body is parsed as C, so the collectors read C spellings.
+        let mut written = Self::collect_registrations(tree.root_node(), body, Language::C);
+        written.extend(Self::collect_assignments(
+            tree.root_node(),
+            body,
+            Language::C,
+        ));
         for registration in written {
             if registration.target == parameter {
                 fates.push(ParameterFate::StoredIn {
@@ -3044,6 +3086,7 @@ impl TreeSitterAnalyzer {
     fn collect_argument_functions(
         root: tree_sitter::Node,
         source: &str,
+        language: Language,
     ) -> Vec<RawArgumentFunction> {
         let bound = Self::value_names(root, source);
         let locals = Self::collect_local_struct_types(root, source);
@@ -3060,11 +3103,11 @@ impl TreeSitterAnalyzer {
             let Some(callee) = node.child_by_field_name("function") else {
                 continue;
             };
-            if callee.kind() != "identifier" {
+            if !matches!(callee.kind(), "identifier" | "qualified_identifier") {
                 continue;
             }
-            let callee_name = &source[callee.byte_range()];
-            if Self::names_without_handing_over(callee_name) {
+            let callee_name = Self::evidence_target_name(language, &source[callee.byte_range()]);
+            if Self::names_without_handing_over(&callee_name) {
                 continue;
             }
             let Some(arguments) = node.child_by_field_name("arguments") else {
@@ -3094,36 +3137,36 @@ impl TreeSitterAnalyzer {
 
             let mut cursor = arguments.walk();
             for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
-                let (identifier, taken_address) = match argument.kind() {
-                    "identifier" => (Some(argument), false),
+                let (target_node, taken_address) = match argument.kind() {
+                    "identifier" | "qualified_identifier" => (Some(argument), false),
                     "pointer_expression" => (
-                        argument
-                            .child_by_field_name("argument")
-                            .filter(|node| node.kind() == "identifier"),
+                        argument.child_by_field_name("argument").filter(|node| {
+                            matches!(node.kind(), "identifier" | "qualified_identifier")
+                        }),
                         true,
                     ),
                     _ => (None, false),
                 };
-                let Some(identifier) = identifier else {
+                let Some(target_node) = target_node else {
                     continue;
                 };
-                let name = &source[identifier.byte_range()];
+                let name = Self::evidence_target_name(language, &source[target_node.byte_range()]);
                 // A call naming itself is recursion, not a handover.
-                if name == callee_name || Self::is_c_keyword(name) {
+                if name == callee_name || Self::is_c_keyword(&name) {
                     continue;
                 }
-                if bound.contains(name, identifier.start_byte()) {
+                if bound.contains(&name, target_node.start_byte()) {
                     continue;
                 }
                 out.push(RawArgumentFunction {
                     callee: callee_name.to_string(),
-                    target: name.to_string(),
+                    target: name,
                     argument_index: index as u32,
                     taken_address,
                     subject_type: subject.as_ref().map(|(type_name, _)| type_name.clone()),
                     subject_member: subject.as_ref().map(|(_, member)| member.clone()),
-                    byte_start: identifier.start_byte(),
-                    line: identifier.start_position().row as u32 + 1,
+                    byte_start: target_node.start_byte(),
+                    line: target_node.start_position().row as u32 + 1,
                 });
             }
         }
@@ -3155,7 +3198,11 @@ impl TreeSitterAnalyzer {
             )
     }
 
-    fn collect_registrations(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
+    fn collect_registrations(
+        root: tree_sitter::Node,
+        source: &str,
+        language: Language,
+    ) -> Vec<RawRegistration> {
         let mut found = Vec::new();
         let mut stack = vec![root];
 
@@ -3200,12 +3247,13 @@ impl TreeSitterAnalyzer {
 
             for (member_node, value) in Self::initializer_members(node) {
                 let member = source[member_node.byte_range()].to_string();
-                // `.read = my_read` and `.read = &my_read` say the same thing.
+                // `.read = my_read`, `.read = &my_read` and, in C++,
+                // `.read = &ns::my_read` all say the same thing.
                 let target_node = match value.kind() {
-                    "identifier" => Some(value),
+                    "identifier" | "qualified_identifier" => Some(value),
                     "pointer_expression" => value
                         .child_by_field_name("argument")
-                        .filter(|a| a.kind() == "identifier"),
+                        .filter(|a| matches!(a.kind(), "identifier" | "qualified_identifier")),
                     _ => None,
                 };
                 // `.demod_attach = { demod_attach_stv0900, cineS2_probe }`
@@ -3227,7 +3275,8 @@ impl TreeSitterAnalyzer {
                     continue;
                 };
 
-                let target = source[target_node.byte_range()].to_string();
+                let target =
+                    Self::evidence_target_name(language, &source[target_node.byte_range()]);
                 if member.is_empty() || target.is_empty() {
                     continue;
                 }
@@ -3252,7 +3301,11 @@ impl TreeSitterAnalyzer {
     /// does. The type of `x` has to come from a declaration in this file:
     /// the struct is usually declared in a header the file does not contain,
     /// and a registration filed under a guessed type is worse than none.
-    fn collect_assignments(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
+    fn collect_assignments(
+        root: tree_sitter::Node,
+        source: &str,
+        language: Language,
+    ) -> Vec<RawRegistration> {
         let locals = Self::collect_local_struct_types(root, source);
         let mut found = Vec::new();
         let mut stack = vec![root];
@@ -3277,13 +3330,17 @@ impl TreeSitterAnalyzer {
                 continue;
             }
 
+            // `.read = my_read`, and in C++ `.read = ns::my_read`, install
+            // the same way; the spelling reduces to the bare function.
             let target = match right.kind() {
-                "identifier" => source[right.byte_range()].to_string(),
+                "identifier" | "qualified_identifier" => {
+                    Self::evidence_target_name(language, &source[right.byte_range()])
+                }
                 "pointer_expression" => match right
                     .child_by_field_name("argument")
-                    .filter(|a| a.kind() == "identifier")
+                    .filter(|a| matches!(a.kind(), "identifier" | "qualified_identifier"))
                 {
-                    Some(a) => source[a.byte_range()].to_string(),
+                    Some(a) => Self::evidence_target_name(language, &source[a.byte_range()]),
                     None => continue,
                 },
                 _ => continue,
@@ -4226,6 +4283,17 @@ impl TreeSitterAnalyzer {
     /// `operator =` and `operator=` name the same function.
     fn strip_operator_whitespace(name: &str) -> String {
         name.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The name an evidence target stores: a C++ spelling reduces to the
+    /// bare function it names, the way a call edge does; every other
+    /// language keeps the text as written.
+    fn evidence_target_name(language: Language, text: &str) -> String {
+        if matches!(language, Language::Cpp) {
+            Self::cpp_callee_name(text)
+        } else {
+            text.to_string()
+        }
     }
 
     /// Remove a trailing balanced `<...>` group; anything unbalanced or
@@ -6814,8 +6882,12 @@ impl TreeSitterAnalyzer {
         //
         // A bare `{ .run = fn }` states no type — the wrapper's type is the
         // wrapper's, not the macro's — so it registers nothing, as elsewhere.
-        let mut registrations = Self::collect_registrations(tree.root_node(), &wrapped);
-        registrations.extend(Self::collect_assignments(tree.root_node(), &wrapped));
+        let mut registrations = Self::collect_registrations(tree.root_node(), &wrapped, language);
+        registrations.extend(Self::collect_assignments(
+            tree.root_node(),
+            &wrapped,
+            language,
+        ));
         registrations.retain(|r| !r.container_type.starts_with("__semcode_"));
 
         // The wrapper sits on one line before the body, so a position maps
@@ -6836,7 +6908,8 @@ impl TreeSitterAnalyzer {
         //
         // Reading the handover only outside macros is why `callers _printk`
         // named four functions in a tree where 5,729 call it.
-        let mut argument_functions = Self::collect_argument_functions(tree.root_node(), &wrapped);
+        let mut argument_functions =
+            Self::collect_argument_functions(tree.root_node(), &wrapped, language);
         argument_functions.retain(|argument| {
             !argument.callee.starts_with("__semcode_")
                 && !argument.target.starts_with("__semcode_")
@@ -9534,7 +9607,8 @@ mod argument_subject_tests {
         let tree = parse(source);
         let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
         println!("locals: {locals:?}");
-        let found = TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source);
+        let found =
+            TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source, Language::C);
         println!("rows: {found:?}");
         let row = found.iter().find(|r| r.target == "i_callback").unwrap();
         assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
@@ -9568,7 +9642,8 @@ mod argument_subject_tests {
                       \tcall_rcu(&inode->i_rcu, i_callback);\n\
                       }\n";
         let tree = parse(source);
-        let found = TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source);
+        let found =
+            TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source, Language::C);
         let row = found
             .iter()
             .find(|row| row.target == "i_callback")
