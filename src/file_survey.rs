@@ -22,6 +22,7 @@ pub struct FileSurvey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurveyLanguage {
     C,
+    Cpp,
     Rust,
     Python,
     Zig,
@@ -30,9 +31,8 @@ enum SurveyLanguage {
 impl SurveyLanguage {
     fn from_path(path: &Path) -> Option<Self> {
         match path.extension()?.to_str()? {
-            "c" | "h" | "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => {
-                Some(Self::C)
-            }
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => Some(Self::Cpp),
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
             "zig" => Some(Self::Zig),
@@ -88,6 +88,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
     let mut parser = Parser::new();
     let grammar = match language {
         SurveyLanguage::C => tree_sitter_c::LANGUAGE.into(),
+        SurveyLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         SurveyLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
         SurveyLanguage::Python => tree_sitter_python::LANGUAGE.into(),
         SurveyLanguage::Zig => tree_sitter_zig::LANGUAGE.into(),
@@ -179,7 +180,9 @@ fn reference_type_name(name: &str) -> &str {
 fn is_basic_type(language: SurveyLanguage, name: &str) -> bool {
     let name = name.trim();
     match language {
-        SurveyLanguage::C => {
+        // C++ widens C's scalars with the same names; the basics of one
+        // are the basics of the other.
+        SurveyLanguage::C | SurveyLanguage::Cpp => {
             const C_SCALARS: &[&str] = &[
                 "void",
                 "char",
@@ -318,7 +321,10 @@ fn walk(node: Node<'_>, source: &[u8], language: SurveyLanguage, out: &mut Surve
     }
 
     match language {
-        SurveyLanguage::C => extract_c(node, source, out),
+        // tree-sitter-cpp shares tree-sitter-c's node kinds for these
+        // shapes and adds class_specifier, which the C grammar never
+        // produces.
+        SurveyLanguage::C | SurveyLanguage::Cpp => extract_c(node, source, out),
         SurveyLanguage::Rust => extract_rust(node, source, out),
         SurveyLanguage::Python => extract_python(node, source, out),
         SurveyLanguage::Zig => extract_zig(node, source, out),
@@ -338,10 +344,11 @@ fn extract_c(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
             }
         }
         "call_expression" => record_call(node, source, out),
-        "struct_specifier" | "union_specifier" | "enum_specifier" => {
+        "struct_specifier" | "union_specifier" | "enum_specifier" | "class_specifier" => {
             let prefix = match node.kind() {
                 "struct_specifier" => "struct",
                 "union_specifier" => "union",
+                "class_specifier" => "class",
                 _ => "enum",
             };
             if node.child_by_field_name("body").is_some() {
@@ -368,7 +375,12 @@ fn extract_c(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
             if !has_ancestor(node, "type_definition")
                 && !matches!(
                     node.parent().map(|p| p.kind()),
-                    Some("struct_specifier" | "union_specifier" | "enum_specifier")
+                    Some(
+                        "struct_specifier"
+                            | "union_specifier"
+                            | "enum_specifier"
+                            | "class_specifier"
+                    )
                 )
             {
                 if let Some(value) = text(node, source) {
@@ -558,7 +570,7 @@ fn function_name(node: Node<'_>, source: &[u8]) -> Option<String> {
 fn declarator_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     if matches!(
         node.kind(),
-        "identifier" | "field_identifier" | "type_identifier"
+        "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier"
     ) {
         return text(node, source);
     }
