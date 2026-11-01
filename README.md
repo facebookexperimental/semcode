@@ -357,5 +357,4 @@ https://developercertificate.org/
 If you'd like to use a DCO instead of completing the CLA on this repository, please
 send your pull request through:
 
-https://github.com/masoncl/semcode-devel
-
+https://github.com/rikvanriel/semcode
