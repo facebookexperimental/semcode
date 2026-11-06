@@ -4664,7 +4664,17 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(function_types)
                     },
-                    guard: defined_at.and_then(|node| Self::guard_of(node, ctx.source)),
+                    guard: defined_at.and_then(|node| match ctx.language {
+                        // Each language records its arms as written: the C
+                        // preprocessor, Rust attributes, Python conditions
+                        // and handlers, Zig comptime conditions. Opaque
+                        // everywhere but C: guards filter, never decide row
+                        // survival.
+                        Language::Rust => Self::rust_cfg_guard(node, ctx.source),
+                        Language::C | Language::Cpp => Self::guard_of(node, ctx.source),
+                        Language::Python => Self::python_guard(node, ctx.source),
+                        Language::Zig => Self::zig_guard(node, ctx.source),
+                    }),
                     qualifier: Self::owner_qualifier(
                         ctx.language,
                         defined_at,
@@ -5762,6 +5772,186 @@ impl TreeSitterAnalyzer {
         Some(terms.join(" && "))
     }
 
+    /// Whether one node holds another: the arm a definition sits in is the
+    /// child whose byte range covers it.
+    fn holds(ancestor: tree_sitter::Node, node: tree_sitter::Node) -> bool {
+        ancestor.start_byte() <= node.start_byte() && node.end_byte() <= ancestor.end_byte()
+    }
+
+    /// The `#[cfg]` predicates holding at a Rust definition, outermost
+    /// first, as written: `cfg(unix)`. Attributes attach to the item below
+    /// them, so each level reads its own preceding siblings, and an
+    /// enclosing item lends its predicates to everything inside it.
+    ///
+    /// Only `cfg` guards the item; `cfg_attr` lends an attribute or not but
+    /// compiles the item either way. Opaque to the compatibility filter,
+    /// which reads C-preprocessor CONFIG spellings only: a cfg predicate
+    /// contributes no facts, so it never filters -- survival is the merge
+    /// key's job now. A C/C++ guard naming CONFIG_* does filter.
+    fn rust_cfg_guard(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut terms = Vec::new();
+        let mut current = node;
+        loop {
+            let mut sibling = current.prev_sibling();
+            while let Some(candidate) = sibling {
+                match candidate.kind() {
+                    "attribute_item" => {
+                        if let Some(predicate) = Self::cfg_predicate(candidate, source) {
+                            terms.push(predicate);
+                        }
+                    }
+                    "line_comment" | "block_comment" => {}
+                    _ => break,
+                }
+                sibling = candidate.prev_sibling();
+            }
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent;
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        terms.reverse();
+        Some(terms.join(" && "))
+    }
+
+    /// The predicate of one `#[cfg(...)]` attribute: `cfg(unix)` for
+    /// `#[cfg(unix)]`. `None` for anything else, including documentation
+    /// and `cfg_attr`, which compile the item either way.
+    fn cfg_predicate(attribute: tree_sitter::Node, source: &str) -> Option<String> {
+        let inner = attribute.named_child(0)?;
+        if inner.kind() != "attribute" {
+            return None;
+        }
+        let head = inner.named_child(0)?;
+        if head.kind() != "identifier" {
+            return None;
+        }
+        if head.utf8_text(source.as_bytes()).ok()? != "cfg" {
+            return None;
+        }
+        let arguments = inner.child_by_field_name("arguments")?;
+        let text = arguments.utf8_text(source.as_bytes()).ok()?;
+        Some(format!("cfg{}", Self::one_line(text)))
+    }
+
+    /// The conditions holding at a Python definition, outermost first, as
+    /// written: `TYPE_CHECKING` for the `if` arm, `not (TYPE_CHECKING)` for
+    /// the `else` arm, `try` and `except ImportError` for `try`/`except`.
+    /// Opaque: never evaluated, so it never filters.
+    fn python_guard(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut terms = Vec::new();
+        let mut child = node;
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            match current.kind() {
+                "if_statement" => {
+                    let condition = current.child_by_field_name("condition")?;
+                    let text = Self::one_line(condition.utf8_text(source.as_bytes()).ok()?);
+                    let via_alternative = current
+                        .child_by_field_name("alternative")
+                        .is_some_and(|alternative| Self::holds(alternative, child));
+                    terms.push(if via_alternative {
+                        format!("not ({text})")
+                    } else {
+                        text
+                    });
+                }
+                "try_statement" => {
+                    terms.push(Self::python_try_arm(current, child, source));
+                }
+                _ => {}
+            }
+            child = current;
+            parent = current.parent();
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        terms.reverse();
+        Some(terms.join(" && "))
+    }
+
+    /// Which arm of a `try` a definition sits in: `try` for the body,
+    /// `except ImportError` for a handler, `else` and `finally` for those.
+    fn python_try_arm(
+        statement: tree_sitter::Node,
+        child: tree_sitter::Node,
+        source: &str,
+    ) -> String {
+        if statement
+            .child_by_field_name("body")
+            .is_some_and(|body| Self::holds(body, child))
+        {
+            return "try".to_string();
+        }
+        let mut cursor = statement.walk();
+        for branch in statement.named_children(&mut cursor) {
+            if !Self::holds(branch, child) {
+                continue;
+            }
+            return match branch.kind() {
+                "except_clause" => {
+                    let mut arm = "except".to_string();
+                    if let Some(value) = branch.child_by_field_name("value") {
+                        if let Ok(text) = value.utf8_text(source.as_bytes()) {
+                            arm.push(' ');
+                            arm.push_str(&Self::one_line(text));
+                        }
+                    }
+                    arm
+                }
+                "else_clause" => "else".to_string(),
+                "finally_clause" => "finally".to_string(),
+                _ => "try".to_string(),
+            };
+        }
+        "try".to_string()
+    }
+
+    /// The conditions holding at a Zig definition, outermost first, as
+    /// written: `comptime x == 1` for the `if` arm, `not (comptime x == 1)`
+    /// for the `else` arm. Opaque: never evaluated, so it never filters.
+    fn zig_guard(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut terms = Vec::new();
+        let mut child = node;
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            if matches!(current.kind(), "if_expression" | "if_statement") {
+                let condition = current
+                    .child_by_field_name("condition")
+                    .and_then(|condition| condition.utf8_text(source.as_bytes()).ok())
+                    .map(Self::one_line)
+                    .unwrap_or_default();
+                // The first non-condition branch is the consequent;
+                // anything after it is the alternative.
+                let mut order = current.walk();
+                let in_first = current
+                    .named_children(&mut order)
+                    .find(|branch| {
+                        current
+                            .child_by_field_name("condition")
+                            .is_none_or(|condition| condition.id() != branch.id())
+                    })
+                    .is_some_and(|first| Self::holds(first, child));
+                terms.push(if in_first {
+                    condition
+                } else {
+                    format!("not ({condition})")
+                });
+            }
+            child = current;
+            parent = current.parent();
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        terms.reverse();
+        Some(terms.join(" && "))
+    }
+
     /// Whether a conditional is the header's include guard: an `#ifndef X`
     /// (or `#if !defined(X)`) whose first line is `#define X`, with no
     /// `#else`, wrapping everything else in the file.
@@ -6307,19 +6497,29 @@ impl TreeSitterAnalyzer {
                     | "opaque_declaration"
                     | "error_set_declaration"
             ) {
-                // A container is named by the `const` that binds it: the
-                // struct's parent declares the name the file spells.
-                if let Some(binding) = current.parent() {
-                    if binding.kind() == "variable_declaration" {
-                        let mut cursor = binding.walk();
-                        let name = binding
-                            .named_children(&mut cursor)
-                            .find(|child| child.kind() == "identifier");
-                        if let Some(name) = name {
-                            if let Ok(text) = name.utf8_text(source.as_bytes()) {
-                                scopes.push(text.to_string());
+                // A container is named by the `const` that binds it. The
+                // binding is usually the parent, but an `if` arm sits
+                // between the container and its `const`, so see through
+                // conditions and blocks to find it.
+                let mut anchor = current.parent();
+                while let Some(binding) = anchor {
+                    match binding.kind() {
+                        "variable_declaration" => {
+                            let mut cursor = binding.walk();
+                            if let Some(name) = binding
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() == "identifier")
+                            {
+                                if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                                    scopes.push(text.to_string());
+                                }
                             }
+                            break;
                         }
+                        "if_expression" | "if_statement" | "block" => {
+                            anchor = binding.parent();
+                        }
+                        _ => break,
                     }
                 }
             }
@@ -10141,6 +10341,180 @@ mod rust_receiver_tests {
                     .any(|t| t.name == first_type && t.qualifier.is_some()),
                 "{path}: no qualified row for {first_type}: {:#?}",
                 analysis.types
+            );
+        }
+    }
+
+    /// The (name, guard, qualifier) of every function in a file, sorted.
+    fn guards_of(source: &str, path: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, Option<String>, Option<String>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.guard.clone(), f.qualifier.clone()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn rust_cfg_arms_record_their_predicates() {
+        // Rust records each configuration arm as written: one method per
+        // configuration reads its #[cfg], so the arms are two rows.
+        let found = guards_of(
+            "#[cfg(unix)]\n\
+             impl Handle {\n\
+             \tfn deref(&self) -> u32 { 1 }\n\
+             }\n\
+             #[cfg(windows)]\n\
+             impl Handle {\n\
+             \tfn deref(&self) -> u32 { 2 }\n\
+             }\n",
+            "lib.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "deref".to_string(),
+                    Some("cfg(unix)".to_string()),
+                    Some("lib::Handle".to_string()),
+                ),
+                (
+                    "deref".to_string(),
+                    Some("cfg(windows)".to_string()),
+                    Some("lib::Handle".to_string()),
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_preprocessor_arms_read_like_c() {
+        // C++ shares the C preprocessor node kinds, so its arms guard the
+        // same way.
+        let found = guards_of(
+            "#ifdef USE_FAST\n\
+             int get() { return 1; }\n\
+             #else\n\
+             int get() { return 0; }\n\
+             #endif\n",
+            "get.cpp",
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        let mut guards: Vec<Option<String>> =
+            found.iter().map(|(_, guard, _)| guard.clone()).collect();
+        guards.sort();
+        assert_eq!(
+            guards,
+            vec![
+                Some("!defined(USE_FAST)".to_string()),
+                Some("defined(USE_FAST)".to_string()),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn python_conditional_definitions_guard_opaquely() {
+        // TYPE_CHECKING and try-import arms record their condition as
+        // written; the names survive on their lines either way.
+        let found = guards_of(
+            "if TYPE_CHECKING:\n\
+             \tdef f():\n\
+             \t\tpass\n\
+             else:\n\
+             \tdef f():\n\
+             \t\tpass\n\
+             try:\n\
+             \tdef g():\n\
+             \t\tpass\n\
+             except ImportError:\n\
+             \tdef g():\n\
+             \t\tpass\n",
+            "pkg/mod.py",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "f".to_string(),
+                    Some("TYPE_CHECKING".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+                (
+                    "f".to_string(),
+                    Some("not (TYPE_CHECKING)".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+                (
+                    "g".to_string(),
+                    Some("except ImportError".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+                (
+                    "g".to_string(),
+                    Some("try".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn zig_comptime_arms_guard_opaquely() {
+        // Comptime arms record their condition as written.
+        let found = guards_of(
+            "const A = if (comptime x == 1) struct {\n\
+             \tpub fn init() void {}\n\
+             } else struct {\n\
+             \tpub fn init() void {}\n\
+             };\n",
+            "src/main.zig",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "init".to_string(),
+                    Some("comptime x == 1".to_string()),
+                    Some("src.main.A".to_string()),
+                ),
+                (
+                    "init".to_string(),
+                    Some("not (comptime x == 1)".to_string()),
+                    Some("src.main.A".to_string()),
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_guards_never_filter() {
+        // Guards filter only: a non-Kconfig guard contributes no facts and
+        // contradicts nothing, so Python, Zig and cfg arms never prune a
+        // chain the way a CONFIG arm can.
+        for guard in [
+            "TYPE_CHECKING",
+            "not (TYPE_CHECKING)",
+            "try",
+            "except ImportError",
+            "comptime x == 1",
+            "cfg(unix)",
+        ] {
+            assert!(
+                crate::guard::config_facts(guard).is_empty(),
+                "{guard} contributed facts"
+            );
+            assert!(
+                crate::guard::contradiction(&["defined(CONFIG_X)"], guard).is_none(),
+                "{guard} contradicted a held fact"
             );
         }
     }
