@@ -38,7 +38,10 @@ pub use database_utils::process_database_path;
 pub use git::{get_git_sha, get_git_sha_for_workdir};
 pub use hash::{compute_content_hash, compute_file_hash};
 pub use text_utils::preprocess_code;
-pub use treesitter_analyzer::{ParameterFate, TreeSitterAnalyzer};
+pub use treesitter_analyzer::{
+    extractor_version, extractor_version_for_file, extractor_versions, Language, ParameterFate,
+    TreeSitterAnalyzer, EXTRACTOR_VERSION,
+};
 pub use types::Handover;
 pub use types::{
     path_is_other_program, path_language, qualified_name, row_defines_the_function, under,

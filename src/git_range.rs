@@ -307,7 +307,13 @@ fn process_git_file_tuple_with_repo(
         file: tuple.file_path.to_string_lossy().to_string(),
         git_sha: Some(tuple.commit_sha.clone()),
         git_file_sha: tuple.file_sha.clone(),
-        extractor_version: Some(crate::SCHEMA_VERSION),
+        // The version of the language that read the file, so a grammar bump
+        // re-reads only its language. Headers record the language they were
+        // read as, which is what makes flipping the routing rescan them.
+        extractor_version: Some(crate::extractor_version_for_file(
+            &tuple.file_path,
+            ts_analyzer.headers_as_cpp(),
+        )),
     };
 
     let results = GitTupleResults {
@@ -1233,8 +1239,15 @@ pub async fn process_git_tree(
 
     // The index now holds what this version writes, for the extensions it was
     // told to read. Recorded last: an interrupted run leaves the older version
-    // in place and is re-read next time.
-    db_manager.record_index_build(extensions, no_macros).await?;
+    // in place and is re-read next time. Header routing is not configurable
+    // yet: the analyzer always reads `.h` as C (headers_as_cpp defaults to
+    // false and nothing sets it), so the record pins false, the same value
+    // the row versions consult. When the option is wired, plumb that value
+    // to both the analyzer and this record.
+    let headers_as_cpp = false;
+    db_manager
+        .record_index_build(extensions, no_macros, headers_as_cpp)
+        .await?;
 
     // The whole tree at this commit has been read, so record which commit it
     // was. Written last, after record_index_build, so an interrupted run
@@ -1517,7 +1530,7 @@ mod tests {
                 file: "a.c".to_string(),
                 git_sha: None,
                 git_file_sha: "abc123".to_string(),
-                extractor_version: Some(crate::SCHEMA_VERSION),
+                extractor_version: Some(crate::extractor_version(crate::Language::C)),
             }],
             files_processed: 1,
         }

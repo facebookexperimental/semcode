@@ -6801,7 +6801,7 @@ mod tests {
             file: "fs/old.c".to_string(),
             git_sha: None,
             git_file_sha: "cafe1234".to_string(),
-            extractor_version: Some(0),
+            extractor_version: Some("0+tree-sitter-c-0.0.0".to_string()),
         }])
         .await
         .unwrap();

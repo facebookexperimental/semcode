@@ -14,13 +14,69 @@ use crate::types::{
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     C,
     Cpp,
     Rust,
     Python,
     Zig,
+}
+
+/// Shared extraction logic: queries, tag encoding, qualifier and guard
+/// rules. A bump re-reads every language, so this rides along in each
+/// version below. A tree-sitter core bump changes what every grammar
+/// parses through, so it bumps this too.
+pub const EXTRACTOR_VERSION: u32 = 1;
+
+/// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
+/// A bump re-reads only its language: each file records the version of
+/// the language that read it, and staleness is per file, not per index.
+pub const TREE_SITTER_C_VERSION: &str = "0.24.2";
+pub const TREE_SITTER_CPP_VERSION: &str = "0.23.4";
+pub const TREE_SITTER_PYTHON_VERSION: &str = "0.25.0";
+pub const TREE_SITTER_RUST_VERSION: &str = "0.24.2";
+pub const TREE_SITTER_ZIG_VERSION: &str = "1.1.2";
+
+/// The extractor version that reads a language: shared logic plus the
+/// grammar that language parses through.
+pub fn extractor_version(language: Language) -> String {
+    let grammar = match language {
+        Language::C => format!("tree-sitter-c-{TREE_SITTER_C_VERSION}"),
+        Language::Cpp => format!("tree-sitter-cpp-{TREE_SITTER_CPP_VERSION}"),
+        Language::Python => format!("tree-sitter-python-{TREE_SITTER_PYTHON_VERSION}"),
+        Language::Rust => format!("tree-sitter-rust-{TREE_SITTER_RUST_VERSION}"),
+        Language::Zig => format!("tree-sitter-zig-{TREE_SITTER_ZIG_VERSION}"),
+    };
+    format!("{EXTRACTOR_VERSION}+{grammar}")
+}
+
+/// Every language's version, so a tree-sitter bump re-reads only its
+/// language: each language parses and queries only its own grammar, and
+/// versions move independently. The shared part moves them all together.
+pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
+    [
+        Language::C,
+        Language::Cpp,
+        Language::Rust,
+        Language::Python,
+        Language::Zig,
+    ]
+    .into_iter()
+    .map(|language| (language, extractor_version(language)))
+    .collect()
+}
+
+/// The version a file records: the version of the language that reads it.
+/// A header records C++'s when headers route there, so flipping the routing
+/// makes every header stale on its own account. An extension no language
+/// reads records the shared version alone: no grammar is involved, so a
+/// grammar bump must not re-read it while a shared bump must.
+pub fn extractor_version_for_file(path: &std::path::Path, headers_as_cpp: bool) -> String {
+    match Language::from_path_with_headers(path, headers_as_cpp) {
+        Some(language) => extractor_version(language),
+        None => EXTRACTOR_VERSION.to_string(),
+    }
 }
 
 impl Language {
@@ -452,6 +508,11 @@ impl TreeSitterAnalyzer {
     /// choice in `schema_meta` when it is built; the default is C.
     pub fn set_headers_as_cpp(&mut self, headers_as_cpp: bool) {
         self.headers_as_cpp = headers_as_cpp;
+    }
+
+    /// Whether this analyzer reads `.h` headers as C++, recorded per index.
+    pub fn headers_as_cpp(&self) -> bool {
+        self.headers_as_cpp
     }
 
     /// The language a path is read as by this analyzer.
@@ -10307,6 +10368,48 @@ mod rust_receiver_tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn grammar_versions_match_the_lockfile() {
+        // The per-language versions are only honest while the consts spell
+        // what Cargo resolved. A grammar bump that forgets its const would
+        // silently keep the old version and never re-read the language.
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock")).unwrap();
+        let mut versions = std::collections::HashMap::new();
+        let mut name: Option<String> = None;
+        for line in lock.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("name = ") {
+                name = Some(rest.trim_matches('"').to_string());
+            } else if let Some(rest) = line.strip_prefix("version = ") {
+                if let Some(name) = name.take() {
+                    versions.insert(name, rest.trim_matches('"').to_string());
+                }
+            }
+        }
+        for (krate, pinned) in [
+            ("tree-sitter-c", TREE_SITTER_C_VERSION),
+            ("tree-sitter-cpp", TREE_SITTER_CPP_VERSION),
+            ("tree-sitter-python", TREE_SITTER_PYTHON_VERSION),
+            ("tree-sitter-rust", TREE_SITTER_RUST_VERSION),
+            ("tree-sitter-zig", TREE_SITTER_ZIG_VERSION),
+        ] {
+            assert_eq!(
+                versions.get(krate).map(String::as_str),
+                Some(pinned),
+                "{krate} moved in Cargo.lock without its version const"
+            );
+        }
+        // Every language's version carries the shared part, so one bump
+        // re-reads them all.
+        for (_, version) in extractor_versions() {
+            assert!(
+                version.starts_with(&format!("{EXTRACTOR_VERSION}+")),
+                "{version} lost the shared part"
+            );
+        }
     }
 
     /// The (name, kind, qualifier) of every type in a file, sorted.

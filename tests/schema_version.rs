@@ -3,7 +3,7 @@
 // An index written by an older semcode does not hold what a newer one
 // extracts. It has to say so, or every later run trusts it and skips the
 // files that would have produced the missing rows.
-use semcode::{DatabaseManager, SCHEMA_VERSION};
+use semcode::{extractor_version, DatabaseManager, Language, SCHEMA_VERSION};
 
 async fn manager(dir: &std::path::Path) -> DatabaseManager {
     let db = DatabaseManager::new(
@@ -57,7 +57,7 @@ async fn an_index_without_a_mark_is_stamped_not_dropped() {
     );
 
     // Once the tree has been read again, it holds what this build writes.
-    db.record_index_build(&["c".to_string(), "h".to_string()], false)
+    db.record_index_build(&["c".to_string(), "h".to_string()], false, false)
         .await
         .unwrap();
     assert!(!db.index_predates_reader().await.unwrap());
@@ -73,7 +73,7 @@ async fn an_index_records_how_it_was_built() {
 
     assert_eq!(db.recorded_index_options().await.unwrap(), None);
 
-    db.record_index_build(&["c".to_string(), "h".to_string()], true)
+    db.record_index_build(&["c".to_string(), "h".to_string()], true, false)
         .await
         .unwrap();
     assert_eq!(
@@ -83,7 +83,7 @@ async fn an_index_records_how_it_was_built() {
 
     // Indexing again with other options replaces them rather than adding a
     // second answer.
-    db.record_index_build(&["rs".to_string()], false)
+    db.record_index_build(&["rs".to_string()], false, false)
         .await
         .unwrap();
     assert_eq!(
@@ -101,6 +101,7 @@ async fn a_file_read_by_this_extractor_may_be_skipped() {
         "fs/read_write.c".to_string(),
         Some("deadbeef".to_string()),
         "cafe1234".to_string(),
+        Language::C,
     )
     .await
     .unwrap();
@@ -129,6 +130,7 @@ async fn a_file_read_by_an_older_extractor_is_forgotten() {
         "fs/super.c".to_string(),
         Some("deadbeef".to_string()),
         "cafe1234".to_string(),
+        Language::C,
     )
     .await
     .unwrap();
@@ -143,10 +145,20 @@ async fn a_file_read_by_an_older_extractor_is_forgotten() {
 
     // A row from an older extractor goes, and the index stops calling itself
     // stale on the strength of it.
-    db.forget_processed_before(SCHEMA_VERSION + 1)
-        .await
-        .unwrap();
-    assert!(db.processed_by_this_extractor().await.unwrap().is_empty());
+    db.mark_files_processed(vec![semcode::ProcessedFileRecord {
+        file: "fs/older.c".to_string(),
+        git_sha: None,
+        git_file_sha: "cafe9999".to_string(),
+        extractor_version: Some("0+tree-sitter-c-0.0.0".to_string()),
+    }])
+    .await
+    .unwrap();
+    assert!(db.index_predates_reader().await.unwrap());
+    db.forget_older_processed_files().await.unwrap();
+    let skippable = db.processed_by_this_extractor().await.unwrap();
+    assert!(skippable.contains("cafe1234"), "{skippable:?}");
+    assert!(!skippable.contains("cafe9999"), "{skippable:?}");
+    assert!(!db.index_predates_reader().await.unwrap());
 }
 
 #[tokio::test]
@@ -264,7 +276,7 @@ async fn tables_are_started_again_across_the_v12_bump() {
         file: "box.cpp".to_string(),
         git_sha: None,
         git_file_sha: "abc".to_string(),
-        extractor_version: Some(11),
+        extractor_version: Some("11".to_string()),
     }])
     .await
     .unwrap();
@@ -316,7 +328,7 @@ async fn tables_are_started_again_across_the_v12_bump() {
         "an index holding version 11 rows was taken for a current one"
     );
     db.forget_older_processed_files().await.unwrap();
-    db.record_index_build(&["cpp".to_string()], false)
+    db.record_index_build(&["cpp".to_string()], false, false)
         .await
         .unwrap();
     assert!(!db.index_predates_reader().await.unwrap());
@@ -480,5 +492,202 @@ async fn a_real_v11_index_starts_functions_and_types_again() {
     assert_eq!(
         db.stored_schema_version().await.unwrap(),
         Some(SCHEMA_VERSION)
+    );
+}
+
+#[tokio::test]
+async fn the_index_records_how_its_headers_were_routed() {
+    // Headers default to C; the choice rides with the index so a later run
+    // reading them the other way knows they are not what it would write.
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    assert_eq!(db.recorded_headers_as_cpp().await.unwrap(), None);
+
+    db.record_index_build(&["c".to_string(), "h".to_string()], false, false)
+        .await
+        .unwrap();
+    assert_eq!(db.recorded_headers_as_cpp().await.unwrap(), Some(false));
+
+    // One opt-in path records the other choice.
+    db.record_index_build(&["c".to_string(), "h".to_string()], false, true)
+        .await
+        .unwrap();
+    assert_eq!(db.recorded_headers_as_cpp().await.unwrap(), Some(true));
+}
+
+#[tokio::test]
+async fn a_grammar_bump_re_reads_only_its_language() {
+    // Versions move per language: a stale Rust row makes the index predate
+    // the reader while the C row beside it stays skippable.
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    db.mark_files_processed(vec![
+        semcode::ProcessedFileRecord {
+            file: "fs/read_write.c".to_string(),
+            git_sha: None,
+            git_file_sha: "cafe1234".to_string(),
+            extractor_version: Some(extractor_version(Language::C)),
+        },
+        semcode::ProcessedFileRecord {
+            file: "src/older.rs".to_string(),
+            git_sha: None,
+            git_file_sha: "cafe9999".to_string(),
+            extractor_version: Some("0+tree-sitter-rust-0.0.0".to_string()),
+        },
+    ])
+    .await
+    .unwrap();
+
+    assert!(db.index_predates_reader().await.unwrap());
+    let skippable = db.processed_by_this_extractor().await.unwrap();
+    assert!(skippable.contains("cafe1234"), "{skippable:?}");
+    assert!(!skippable.contains("cafe9999"), "{skippable:?}");
+
+    db.forget_older_processed_files().await.unwrap();
+    assert!(!db.index_predates_reader().await.unwrap());
+}
+
+#[tokio::test]
+async fn flipping_the_header_routing_rescans_the_headers() {
+    // A header read as C is stale once the index routes headers as C++,
+    // while a C file beside it is untouched: the header recorded the
+    // version of the language that read it, not the file's extension.
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    db.mark_files_processed(vec![
+        semcode::ProcessedFileRecord {
+            file: "include/box.h".to_string(),
+            git_sha: None,
+            git_file_sha: "cafe1234".to_string(),
+            extractor_version: Some(extractor_version(Language::C)),
+        },
+        semcode::ProcessedFileRecord {
+            file: "src/get.c".to_string(),
+            git_sha: None,
+            git_file_sha: "cafe9999".to_string(),
+            extractor_version: Some(extractor_version(Language::C)),
+        },
+    ])
+    .await
+    .unwrap();
+    db.record_index_build(&["c".to_string(), "h".to_string()], false, false)
+        .await
+        .unwrap();
+    assert!(!db.index_predates_reader().await.unwrap());
+
+    // The same rows under the other routing: only the header is stale.
+    db.record_index_build(&["c".to_string(), "h".to_string()], false, true)
+        .await
+        .unwrap();
+    assert!(db.index_predates_reader().await.unwrap());
+    let skippable = db.processed_by_this_extractor().await.unwrap();
+    assert!(!skippable.contains("cafe1234"), "{skippable:?}");
+    assert!(skippable.contains("cafe9999"), "{skippable:?}");
+
+    // Read again as C++, and the index is current under the new routing.
+    db.mark_files_processed(vec![semcode::ProcessedFileRecord {
+        file: "include/box.h".to_string(),
+        git_sha: None,
+        git_file_sha: "cafe1234".to_string(),
+        extractor_version: Some(extractor_version(Language::Cpp)),
+    }])
+    .await
+    .unwrap();
+    assert!(!db.index_predates_reader().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_processed_table_with_integer_versions_is_started_again() {
+    // Commits before the per-language versions recorded integers. No row
+    // in that column can name the language that read its file, so opening
+    // such a table starts it again instead of trusting the old versions.
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    let table = db
+        .connection()
+        .open_table("processed_files")
+        .execute()
+        .await
+        .unwrap();
+    let schema = table.schema().await.unwrap();
+    let older = std::sync::Arc::new(arrow_schema::Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "extractor_version" {
+                    arrow_schema::Field::new(
+                        "extractor_version",
+                        arrow_schema::DataType::Int64,
+                        true,
+                    )
+                } else {
+                    (**field).clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    db.connection()
+        .drop_table("processed_files", &[])
+        .await
+        .unwrap();
+    db.connection()
+        .create_empty_table("processed_files", older.clone())
+        .execute()
+        .await
+        .unwrap();
+    let table = db
+        .connection()
+        .open_table("processed_files")
+        .execute()
+        .await
+        .unwrap();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        older,
+        vec![
+            std::sync::Arc::new(arrow::array::StringArray::from(vec!["fs/old.c"]))
+                as arrow::array::ArrayRef,
+            std::sync::Arc::new(arrow::array::StringArray::from(vec![None::<&str>]))
+                as arrow::array::ArrayRef,
+            std::sync::Arc::new(arrow::array::StringArray::from(vec!["cafe1234"]))
+                as arrow::array::ArrayRef,
+            std::sync::Arc::new(arrow::array::Int64Array::from(vec![Some(11)]))
+                as arrow::array::ArrayRef,
+        ],
+    )
+    .unwrap();
+    table.add(vec![batch]).execute().await.unwrap();
+    drop(db);
+
+    let db = manager(dir.path()).await;
+    let table = db
+        .connection()
+        .open_table("processed_files")
+        .execute()
+        .await
+        .unwrap();
+    let field = table
+        .schema()
+        .await
+        .unwrap()
+        .fields()
+        .iter()
+        .find(|field| field.name() == "extractor_version")
+        .unwrap()
+        .as_ref()
+        .clone();
+    assert_eq!(
+        field.data_type(),
+        &arrow_schema::DataType::Utf8,
+        "integer versions survived the migration"
+    );
+    assert_eq!(
+        table.count_rows(None).await.unwrap(),
+        0,
+        "rows no language can be named for survived the migration"
     );
 }

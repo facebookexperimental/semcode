@@ -502,9 +502,19 @@ impl SchemaManager {
     /// The options matter as much as the version: an index built for `c,h`
     /// does not hold what one built for `c,h,rs` holds, and rebuilding it
     /// with different options silently changes what a query can find.
-    pub async fn set_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
+    pub async fn set_index_build(
+        &self,
+        extensions: &[String],
+        no_macros: bool,
+        headers_as_cpp: bool,
+    ) -> Result<()> {
         let table = self.connection.open_table("schema_meta").execute().await?;
-        let keys = ["schema_version", "index:extensions", "index:macros"];
+        let keys = [
+            "schema_version",
+            "index:extensions",
+            "index:macros",
+            "index:headers_as_cpp",
+        ];
         for key in keys {
             table
                 .delete(&format!("key = '{key}'"))
@@ -516,6 +526,7 @@ impl SchemaManager {
             SCHEMA_VERSION.to_string(),
             extensions.join(","),
             if no_macros { "skipped" } else { "indexed" }.to_string(),
+            if headers_as_cpp { "true" } else { "false" }.to_string(),
         ];
 
         let schema = Arc::new(Schema::new(vec![
@@ -618,17 +629,34 @@ impl SchemaManager {
         if !has_column {
             return Ok(table.count_rows(None).await? > 0);
         }
+        let headers_as_cpp = self
+            .meta_value("index:headers_as_cpp")
+            .await?
+            .map(|value| value == "true")
+            .unwrap_or(false);
         let batches: Vec<arrow::record_batch::RecordBatch> =
             table.query().execute().await?.try_collect().await?;
         for batch in &batches {
-            let Some(versions) = batch
-                .column_by_name("extractor_version")
-                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
+            let Some(files) = batch
+                .column_by_name("file")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
             else {
                 continue;
             };
+            let versions = batch
+                .column_by_name("extractor_version")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>());
+            let Some(versions) = versions else {
+                // The column predates language versions: no row in it can
+                // name the language that read its file.
+                return Ok(table.count_rows(None).await? > 0);
+            };
             for row in 0..versions.len() {
-                if !versions.is_valid(row) || versions.value(row) != SCHEMA_VERSION as i64 {
+                let current = crate::extractor_version_for_file(
+                    std::path::Path::new(files.value(row)),
+                    headers_as_cpp,
+                );
+                if !versions.is_valid(row) || versions.value(row) != current {
                     return Ok(true);
                 }
             }
@@ -809,8 +837,10 @@ impl SchemaManager {
             // Which extractor read this file. Unchanged content is skipped on
             // a later run, which is right only when the reading would produce
             // what it produced before; after the extractor learns something,
-            // the row is stale even though the file is not.
-            Field::new("extractor_version", DataType::Int64, true),
+            // the row is stale even though the file is not. The version names
+            // the language that read the file, so a grammar bump re-reads
+            // only its language.
+            Field::new("extractor_version", DataType::Utf8, true),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -838,7 +868,26 @@ impl SchemaManager {
     /// settle it.
     async fn migrate_processed_files_table(&self) -> Result<()> {
         self.recreate_without_columns("processed_files", &["extractor_version"])
-            .await
+            .await?;
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+        let still_integers = table
+            .schema()
+            .await?
+            .fields()
+            .iter()
+            .filter(|f| f.name() == "extractor_version")
+            .all(|f| *f.data_type() != DataType::Utf8);
+        if still_integers {
+            tracing::info!(
+                "processed_files extractor_version predates language versions: starting the table again"
+            );
+            self.recreate_table("processed_files").await?;
+        }
+        Ok(())
     }
 
     /// Start a table again when this build writes columns it does not have.

@@ -176,7 +176,7 @@ Tracks which files have been processed for incremental indexing.
 file                (Utf8, NOT NULL)     - File path
 git_sha             (Utf8, nullable)     - Git commit SHA as hex string (for incremental processing)
 git_file_sha        (Utf8, NOT NULL)     - SHA-1 hash of specific file content as hex string
-extractor_version   (Int64, nullable)    - Schema version of the extractor that read the file
+extractor_version   (Utf8, nullable)     - Version of the language that read the file
 ```
 
 **Notes:**
@@ -185,7 +185,9 @@ extractor_version   (Int64, nullable)    - Schema version of the extractor that 
 - `git_file_sha` provides content-based deduplication
 - `extractor_version` decides whether the file has to be read again: unchanged
   content is skipped only when the extractor that read it is the one running
-  now. Absent on rows written before the column existed, which is why such a
+  now. It names the language that read the file, so a tree-sitter bump
+  re-reads only its language; a header names the language it was read as.
+  Absent on rows written before the column existed, which is why such a
   table is recreated rather than migrated in place
 
 **Indices:**

@@ -314,11 +314,21 @@ impl DatabaseManager {
     /// later run may skip. A file read by an older extractor is missing from
     /// it even though the file itself has not changed.
     pub async fn processed_by_this_extractor(&self) -> Result<std::collections::HashSet<String>> {
+        let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
         Ok(self
             .get_all_processed_files()
             .await?
             .into_iter()
-            .filter(|record| record.extractor_version == Some(crate::SCHEMA_VERSION))
+            .filter(|record| {
+                record.extractor_version.as_deref()
+                    == Some(
+                        crate::extractor_version_for_file(
+                            std::path::Path::new(&record.file),
+                            headers_as_cpp,
+                        )
+                        .as_str(),
+                    )
+            })
             .map(|record| record.git_file_sha)
             .collect())
     }
@@ -333,9 +343,17 @@ impl DatabaseManager {
     pub async fn index_predates_reader(&self) -> Result<bool> {
         let files = self.get_all_processed_files().await?;
         if !files.is_empty() {
-            return Ok(files
-                .iter()
-                .any(|record| record.extractor_version != Some(crate::SCHEMA_VERSION)));
+            let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
+            return Ok(files.iter().any(|record| {
+                record.extractor_version.as_deref()
+                    != Some(
+                        crate::extractor_version_for_file(
+                            std::path::Path::new(&record.file),
+                            headers_as_cpp,
+                        )
+                        .as_str(),
+                    )
+            }));
         }
 
         // No files to ask, so fall back to the mark on the database: an index
@@ -348,18 +366,32 @@ impl DatabaseManager {
     /// was built with.
     /// Forget files an older extractor read, after this one has read the tree.
     pub async fn forget_older_processed_files(&self) -> Result<usize> {
-        self.forget_processed_before(crate::SCHEMA_VERSION).await
-    }
-
-    /// The same, against a stated version, so a test can name one.
-    pub async fn forget_processed_before(&self, version: u32) -> Result<usize> {
-        self.processed_file_store.forget_older_than(version).await
-    }
-
-    pub async fn record_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
-        self.schema_manager
-            .set_index_build(extensions, no_macros)
+        let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
+        self.processed_file_store
+            .forget_not_current(|file| {
+                crate::extractor_version_for_file(std::path::Path::new(file), headers_as_cpp)
+            })
             .await
+    }
+
+    pub async fn record_index_build(
+        &self,
+        extensions: &[String],
+        no_macros: bool,
+        headers_as_cpp: bool,
+    ) -> Result<()> {
+        self.schema_manager
+            .set_index_build(extensions, no_macros, headers_as_cpp)
+            .await
+    }
+
+    /// How `.h` headers were routed when the index was built, if recorded.
+    pub async fn recorded_headers_as_cpp(&self) -> Result<Option<bool>> {
+        Ok(self
+            .schema_manager
+            .meta_value("index:headers_as_cpp")
+            .await?
+            .map(|value| value == "true"))
     }
 
     pub async fn record_tree_sha(&self, sha: &str) -> Result<()> {
@@ -4913,12 +4945,13 @@ impl DatabaseManager {
         file: String,
         git_sha: Option<String>,
         git_file_sha: String,
+        language: crate::Language,
     ) -> Result<()> {
         let record = ProcessedFileRecord {
             file,
             git_sha,
             git_file_sha,
-            extractor_version: Some(crate::SCHEMA_VERSION),
+            extractor_version: Some(crate::extractor_version(language)),
         };
         self.processed_file_store.insert(record).await
     }

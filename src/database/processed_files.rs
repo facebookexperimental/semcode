@@ -11,8 +11,9 @@ pub struct ProcessedFileRecord {
     pub file: String,
     pub git_sha: Option<String>, // Store as hex string
     pub git_file_sha: String,
-    /// The extractor that read it, absent when the row predates the column.
-    pub extractor_version: Option<u32>,
+    /// The extractor that read it: the version of the language that read
+    /// the file, absent when the row predates the column.
+    pub extractor_version: Option<String>,
 }
 
 // Separate struct for JSON serialization with hex strings
@@ -71,9 +72,12 @@ impl ProcessedFileStore {
         }
         let git_sha_array = git_sha_builder.finish();
 
-        let mut extractor_version_builder = arrow::array::Int64Builder::new();
+        let mut extractor_version_builder = StringBuilder::new();
         for record in &records {
-            extractor_version_builder.append_option(record.extractor_version.map(|v| v as i64));
+            match &record.extractor_version {
+                Some(version) => extractor_version_builder.append_value(version),
+                None => extractor_version_builder.append_null(),
+            }
         }
         let extractor_version_array = extractor_version_builder.finish();
 
@@ -189,18 +193,33 @@ impl ProcessedFileStore {
     /// it makes the index answer "older than this build" forever, so
     /// re-indexing never clears the refusal it is supposed to clear. Losing
     /// the row costs a re-read if that content ever comes back.
-    pub async fn forget_older_than(&self, version: u32) -> Result<usize> {
+    /// Drop every row that does not name the version this build would record
+    /// for that file. A row from any other extractor describes content read
+    /// under other rules, and keeping it makes the index answer "older than
+    /// this build" forever.
+    pub async fn forget_not_current(
+        &self,
+        current_for_file: impl Fn(&str) -> String,
+    ) -> Result<usize> {
         let table = self
             .connection
             .open_table("processed_files")
             .execute()
             .await?;
         let before = table.count_rows(None).await?;
-        table
-            .delete(&format!(
-                "extractor_version IS NULL OR extractor_version < {version}"
-            ))
-            .await?;
+        let records = self.get_all().await?;
+        for record in &records {
+            let current = current_for_file(&record.file);
+            if record.extractor_version.as_deref() != Some(current.as_str()) {
+                let escaped_file = record.file.replace('\'', "''");
+                let escaped_sha = record.git_file_sha.replace('\'', "''");
+                table
+                    .delete(&format!(
+                        "file = '{escaped_file}' AND git_file_sha = '{escaped_sha}'"
+                    ))
+                    .await?;
+            }
+        }
         Ok(before - table.count_rows(None).await?)
     }
 
@@ -568,13 +587,14 @@ impl ProcessedFileStore {
 
         let git_file_sha = git_file_sha_array.value(row).to_string();
 
-        // Absent in rows written before the column existed, which is exactly
-        // the population that has to be read again.
+        // Absent in rows written before the column existed, and unreadable
+        // in rows whose column still holds the old integers: both are
+        // populations that have to be read again.
         let extractor_version = batch
             .column_by_name("extractor_version")
-            .and_then(|column| column.as_any().downcast_ref::<arrow::array::Int64Array>())
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
             .filter(|versions| versions.is_valid(row))
-            .map(|versions| versions.value(row) as u32);
+            .map(|versions| versions.value(row).to_string());
 
         Ok(Some(ProcessedFileRecord {
             file,
