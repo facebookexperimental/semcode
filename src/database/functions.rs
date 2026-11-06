@@ -242,8 +242,14 @@ impl FunctionStore {
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert =
-            table.merge_insert(&["name", "file_path", "git_file_hash", "guard", "qualifier"]);
+        let mut merge_insert = table.merge_insert(&[
+            "name",
+            "file_path",
+            "git_file_hash",
+            "guard",
+            "qualifier",
+            "line_start",
+        ]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -349,8 +355,14 @@ impl FunctionStore {
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert =
-            table.merge_insert(&["name", "file_path", "git_file_hash", "guard", "qualifier"]);
+        let mut merge_insert = table.merge_insert(&[
+            "name",
+            "file_path",
+            "git_file_hash",
+            "guard",
+            "qualifier",
+            "line_start",
+        ]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows

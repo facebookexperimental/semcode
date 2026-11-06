@@ -6473,62 +6473,126 @@ impl TreeSitterAnalyzer {
 
     /// Deduplicate functions within a single file (no threading issues).
     ///
-    /// One row per name **per preprocessor arm per owner**: `_cond_resched()`
-    /// is defined four times in `sched.h`, once per configuration, and ten
-    /// `fn new` in one Rust file are ten owners, and those are definitions,
-    /// not copies of one. Keyed on name alone, the preference below kept
-    /// `return 0;` and hid every route that reaches the scheduler. Within
-    /// one arm of one owner the preference is unchanged: definitions over
-    /// declarations, then longer span, longer body, more parameters.
+    /// One row per name per preprocessor arm per owner per line:
+    /// `_cond_resched()` is defined four times in `sched.h`, once per
+    /// configuration, and ten `fn new` in one Rust file are ten owners, and
+    /// `Box::get()` beside `Box::get(int)` are two definitions, not copies
+    /// of one. A declaration folds into its same-key definition -- a
+    /// prototype and its body are one row, not two -- and two definitions
+    /// never merge: definitions at different lines are different rows even
+    /// when nothing else tells them apart. Only rows that truly coincide,
+    /// the same definition read twice at one line, still collapse, keeping
+    /// the longer span, longer body, or richer parameters. The fold never
+    /// compares parameters: no language here overloads, and names differ
+    /// between a prototype and its body anyway, so a declaration always
+    /// announces the one definition its key names.
     fn deduplicate_functions_within_file(
         &self,
         raw_functions: Vec<FunctionInfo>,
     ) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_functions =
-            HashMap::<(String, Option<String>, Option<String>), FunctionInfo>::new();
-
+        let mut groups: HashMap<(String, Option<String>, Option<String>), Vec<FunctionInfo>> =
+            HashMap::new();
         for func in raw_functions {
-            let key = func.within_file_key();
-
-            if let Some(existing) = seen_functions.get(&key) {
-                // Skip if bodies are identical
-                if existing.body == func.body {
-                    continue;
-                }
-
-                // Prefer definitions over declarations
-                let existing_span = existing.line_end.saturating_sub(existing.line_start);
-                let new_span = func.line_end.saturating_sub(func.line_start);
-
-                // Prefer functions with both parameters AND substantial body content
-                let existing_has_body = existing_span > 0
-                    && !existing.parameters.is_empty()
-                    && !existing.body.trim().is_empty();
-                let new_has_body =
-                    new_span > 0 && !func.parameters.is_empty() && !func.body.trim().is_empty();
-
-                let should_replace = if new_has_body && !existing_has_body {
-                    true // New has body, existing doesn't
-                } else if !new_has_body && existing_has_body {
-                    false // Existing has body, new doesn't
-                } else {
-                    // Both have bodies or both don't, prefer longer/more detailed one
-                    new_span > existing_span
-                        || (new_span == existing_span && func.body.len() > existing.body.len())
-                        || func.parameters.len() > existing.parameters.len()
-                };
-
-                if !should_replace {
-                    continue; // Keep existing
-                }
-            }
-
-            seen_functions.insert(key, func);
+            groups
+                .entry(func.declaration_fold_key())
+                .or_default()
+                .push(func);
         }
 
-        seen_functions.into_values().collect()
+        let mut kept = Vec::new();
+        for (_, rows) in groups {
+            let (definitions, declarations): (Vec<FunctionInfo>, Vec<FunctionInfo>) =
+                rows.into_iter().partition(|row| {
+                    crate::types::row_defines_the_function(&row.return_type, &row.body)
+                });
+            if definitions.is_empty() {
+                // No definition to fold into. No language here overloads, so
+                // every declaration announces the same definition to come:
+                // the group is one row however often the prototype repeats,
+                // keeping the longer span or the richer parameters.
+                if let Some(winner) =
+                    declarations.into_iter().reduce(
+                        |a, b| {
+                            if Self::new_row_wins(&a, &b) {
+                                b
+                            } else {
+                                a
+                            }
+                        },
+                    )
+                {
+                    kept.push(winner);
+                }
+                continue;
+            }
+            // Every definition survives. Same-line rows are the same
+            // definition read twice, which the merge below would refuse, so
+            // they collapse here by the old preference. Every declaration
+            // announces the one definition its key names and folds into it,
+            // whatever each side spells the parameters: C has no
+            // overloading, and a prototype spells `baz()` beside `baz(void)`
+            // anyway, so the declarations are dropped here.
+            let mut by_line: HashMap<u32, Vec<FunctionInfo>> = HashMap::new();
+            for definition in definitions {
+                by_line
+                    .entry(definition.line_start)
+                    .or_default()
+                    .push(definition);
+            }
+            let mut surviving_definitions = Vec::new();
+            for (_, coinciding) in by_line {
+                if let Some(winner) =
+                    coinciding
+                        .into_iter()
+                        .reduce(|a, b| if Self::new_row_wins(&a, &b) { b } else { a })
+                {
+                    surviving_definitions.push(winner);
+                }
+            }
+            // Same-line definitions read twice collapse to one row.
+            let mut by_line: HashMap<u32, Vec<FunctionInfo>> = HashMap::new();
+            for row in surviving_definitions {
+                by_line.entry(row.line_start).or_default().push(row);
+            }
+            for (_, coinciding) in by_line {
+                if let Some(winner) =
+                    coinciding
+                        .into_iter()
+                        .reduce(|a, b| if Self::new_row_wins(&a, &b) { b } else { a })
+                {
+                    kept.push(winner);
+                }
+            }
+        }
+
+        kept
+    }
+
+    /// Whether a new row replaces the kept one when two rows coincide: the
+    /// longer span first, then the longer body, then richer parameters.
+    fn new_row_wins(existing: &FunctionInfo, new: &FunctionInfo) -> bool {
+        let existing_span = existing.line_end.saturating_sub(existing.line_start);
+        let new_span = new.line_end.saturating_sub(new.line_start);
+
+        // Prefer functions with both parameters AND substantial body content
+        let existing_has_body = existing_span > 0
+            && !existing.parameters.is_empty()
+            && !existing.body.trim().is_empty();
+        let new_has_body =
+            new_span > 0 && !new.parameters.is_empty() && !new.body.trim().is_empty();
+
+        if new_has_body && !existing_has_body {
+            true // New has body, existing doesn't
+        } else if !new_has_body && existing_has_body {
+            false // Existing has body, new doesn't
+        } else {
+            // Both have bodies or both don't, prefer longer/more detailed one
+            new_span > existing_span
+                || (new_span == existing_span && new.body.len() > existing.body.len())
+                || new.parameters.len() > existing.parameters.len()
+        }
     }
 
     /// Deduplicate types within a single file
@@ -9443,6 +9507,145 @@ mod macro_defined_tests {
         );
     }
 
+    #[test]
+    fn cfg_arms_of_one_method_coexist() {
+        // One method defined once per configuration is two definitions,
+        // not one row the merge prefers. Guards are recorded as written;
+        // what matters here is that both lines
+        // survive with the same name and owner.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#[cfg(unix)]\n\
+                impl Handle {\n\
+                \tfn deref(&self) -> u32 { 1 }\n\
+                }\n\
+                #[cfg(windows)]\n\
+                impl Handle {\n\
+                \tfn deref(&self) -> u32 { 2 }\n\
+                }\n",
+                std::path::Path::new("lib.rs"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let mut derefs: Vec<u32> = functions
+            .iter()
+            .filter(|f| f.name == "deref")
+            .map(|f| f.line_start)
+            .collect();
+        derefs.sort();
+        assert_eq!(derefs.len(), 2, "{functions:#?}");
+        assert_ne!(derefs[0], derefs[1], "{functions:#?}");
+    }
+
+    #[test]
+    fn property_and_setter_coexist() {
+        // A @property and its @x.setter share the name and the owner, and
+        // differ only in line.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "class C:\n\
+                \t@property\n\
+                \tdef x(self):\n\
+                \t\treturn 1\n\
+                \t@x.setter\n\
+                \tdef x(self, v):\n\
+                \t\tpass\n",
+                std::path::Path::new("pkg/mod.py"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let mut xs: Vec<u32> = functions
+            .iter()
+            .filter(|f| f.name == "x")
+            .map(|f| f.line_start)
+            .collect();
+        xs.sort();
+        assert_eq!(xs.len(), 2, "{functions:#?}");
+        assert_ne!(xs[0], xs[1], "{functions:#?}");
+    }
+
+    #[test]
+    fn same_named_methods_of_sibling_types_coexist() {
+        // A.init and B.init share the name and differ in owner and line,
+        // so neither may swallow the other.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "const A = struct {\n\
+                \tpub fn init() void {}\n\
+                };\n\
+                const B = struct {\n\
+                \tpub fn init() void {}\n\
+                };\n",
+                std::path::Path::new("src/main.zig"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let mut inits: Vec<u32> = functions
+            .iter()
+            .filter(|f| f.name == "init")
+            .map(|f| f.line_start)
+            .collect();
+        inits.sort();
+        assert_eq!(inits.len(), 2, "{functions:#?}");
+        assert_ne!(inits[0], inits[1], "{functions:#?}");
+    }
+
+    #[test]
+    fn a_declaration_folds_into_its_definition() {
+        // A prototype and the body it announces are one row, not two: the
+        // definition survives with its own line.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "int get(void);\nint get(void)\n{\n\treturn 1;\n}\n",
+                std::path::Path::new("get.c"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let gets: Vec<&FunctionInfo> = functions.iter().filter(|f| f.name == "get").collect();
+        assert_eq!(gets.len(), 1, "{functions:#?}");
+        assert!(
+            crate::types::row_defines_the_function(&gets[0].return_type, &gets[0].body),
+            "{gets:#?}"
+        );
+    }
+
+    #[test]
+    fn c_prototypes_spelled_differently_still_fold() {
+        // C has no overloading: a prototype always announces the one
+        // definition its key names, however each side spells the
+        // parameters. `baz()` meets `baz(void)`, and `int a[]` meets
+        // `int *a`; comparing parameter types here would leave a ghost
+        // declaration beside every kernel-style prototype.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int baz();\nstatic int baz(void)\n{\n\treturn 0;\n}\nstatic int qux(int a[]);\nstatic int qux(int *a)\n{\n\treturn 0;\n}\n",
+                std::path::Path::new("decl.c"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        assert_eq!(functions.len(), 2, "{functions:#?}");
+        for func in &functions {
+            assert!(
+                crate::types::row_defines_the_function(&func.return_type, &func.body),
+                "{func:#?}"
+            );
+        }
+    }
     #[test]
     fn a_macro_opening_an_initializer_is_not_a_function() {
         // `define_machine(pseries) { .memory_block_size = ... }` is the same

@@ -65,6 +65,11 @@ calls               (Utf8, nullable)     - JSON array of function names called b
 types               (Utf8, nullable)     - JSON array of type names used by this function
 ```
 
+The `functions` merge key is `(name, file_path, git_file_hash, guard, qualifier, line_start)`.
+Two definitions at different lines never merge; a declaration folds into its same-key definition.
+Overloads sharing one line collapse to one row: the line is the only discriminator the
+key keeps until a signature column separates them.
+
 **Content Storage:**
 - Function bodies are stored in sharded content tables (content_0 through content_15), referenced by `body_hash`
 - Empty function bodies (declarations) have null `body_hash`

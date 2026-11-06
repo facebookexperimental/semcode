@@ -725,19 +725,41 @@ impl FunctionInfo {
     /// The row's identity in the store: the same columns the `functions`
     /// table merges on. Every pre-merge dedup keys on this, so a column
     /// added here and not there (or the reverse) silently drops rows.
-    pub fn merge_key(&self) -> (String, String, String, Option<String>, Option<String>) {
+    ///
+    /// `line_start` is in the key: two definitions at different lines are
+    /// two definitions, never one row the merge prefers. A declaration
+    /// folds into its same-key definition upstream of here, so by the time
+    /// rows merge the survivors are all definitions.
+    pub fn merge_key(&self) -> (String, String, String, Option<String>, Option<String>, u32) {
         (
             self.name.clone(),
             self.file_path.clone(),
             self.git_file_hash.clone(),
             self.guard.clone(),
             self.qualifier.clone(),
+            self.line_start,
         )
     }
 
     /// The row's identity within one file: what the extractor's dedup keys
     /// on. The file and its hash are constant there, so they add nothing.
-    pub fn within_file_key(&self) -> (String, Option<String>, Option<String>) {
+    /// `line_start` is in the key for the same reason it is in the merge
+    /// key: definitions at different lines never meet. A declaration folds
+    /// into the definition it announces, which shares everything but the
+    /// line, so the fold groups by the key without it.
+    pub fn within_file_key(&self) -> (String, Option<String>, Option<String>, u32) {
+        (
+            self.name.clone(),
+            self.guard.clone(),
+            self.qualifier.clone(),
+            self.line_start,
+        )
+    }
+
+    /// The row's identity for the declaration fold: a prototype shares this
+    /// with the definition it announces. Arms and owners stay distinct, so
+    /// only a declaration and its definition ever meet here.
+    pub fn declaration_fold_key(&self) -> (String, Option<String>, Option<String>) {
         (
             self.name.clone(),
             self.guard.clone(),

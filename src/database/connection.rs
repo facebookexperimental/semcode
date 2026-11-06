@@ -4299,6 +4299,7 @@ impl DatabaseManager {
                 &chosen.function.file_path,
                 chosen.function.line_start,
                 chosen.function.qualifier.as_deref(),
+                chosen.function.guard.as_deref(),
             ),
             None => Vec::new(),
         })
@@ -6160,6 +6161,7 @@ impl DatabaseManager {
             &chosen.function.file_path,
             chosen.function.line_start,
             chosen.function.qualifier.as_deref(),
+            chosen.function.guard.as_deref(),
         )))
     }
 
@@ -8470,7 +8472,11 @@ impl DatabaseManager {
 /// new` in one file are ten coexisting definitions, not ten arms of one,
 /// so they compete as ten candidates; the arms of one `#if` share their
 /// owner's qualifier and still collapse to one representative with the
-/// rest reported beside the choice.
+/// rest reported beside the choice. Same-guard rows -- overloads, property
+/// pairs -- collapse the same way: only one speaks, and the rest are
+/// reported beside it, never dropped. Which arm speaks for a file stays a
+/// question of line order, not body length, so a stub arm with a body never
+/// outranks the file's first definition at ranking time.
 fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo>) {
     let mut rows = rows;
     rows.sort_by(|a, b| {
@@ -8497,14 +8503,19 @@ fn one_per_file(rows: Vec<FunctionInfo>) -> (Vec<FunctionInfo>, Vec<FunctionInfo
 
 /// The definitions in `file` that a chain walks through: the chosen row at
 /// `line`, and every other row of the file that defines the name under the
-/// same owner -- the arms of its `#if`s. A prototype in the same file is
-/// not an arm, and neither is another owner's definition: merging ten
-/// `new`s' callees attributes every owner's calls to one.
+/// same owner but a different configuration -- the arms of its `#if`s. A
+/// prototype in the same file is not an arm, and neither is another
+/// definition under the same guard: overloads and property pairs coexist
+/// with the chosen row but no build selects between them, so they are not
+/// what the chosen row means under another configuration. Another owner's
+/// definition is not an arm either: merging ten `new`s' callees attributes
+/// every owner's calls to one.
 fn arms_beside(
     definitions: &[crate::types::CalleeDefinition],
     file: &str,
     line: u32,
     qualifier: Option<&str>,
+    guard: Option<&str>,
 ) -> Vec<crate::types::CalleeDefinition> {
     let mut arms: Vec<crate::types::CalleeDefinition> = definitions
         .iter()
@@ -8512,6 +8523,7 @@ fn arms_beside(
             definition.file_path == file
                 && definition.qualifier.as_deref() == qualifier
                 && (definition.is_definition || definition.line_start == line)
+                && (definition.line_start == line || definition.guard.as_deref() != guard)
         })
         .cloned()
         .collect();
