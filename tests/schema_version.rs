@@ -252,6 +252,7 @@ async fn tables_are_started_again_across_the_v12_bump() {
         members: Vec::new(),
         definition: "struct Box {};".to_string(),
         types: None,
+        qualifier: None,
     }])
     .await
     .unwrap();
@@ -381,6 +382,7 @@ async fn a_real_v11_index_starts_functions_and_types_again() {
         members: Vec::new(),
         definition: "struct Box {};".to_string(),
         types: None,
+        qualifier: None,
     }])
     .await
     .unwrap();

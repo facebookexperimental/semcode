@@ -9011,6 +9011,7 @@ mod tests {
                 members: Vec::new(),
                 definition: "struct duplicate { int a; };".to_string(),
                 types: None,
+                qualifier: None,
             },
             TypeInfo {
                 name: "duplicate".to_string(),
@@ -9022,6 +9023,7 @@ mod tests {
                 members: Vec::new(),
                 definition: "struct duplicate { long b; };".to_string(),
                 types: None,
+                qualifier: None,
             },
             TypeInfo {
                 name: "container".to_string(),
@@ -9033,6 +9035,7 @@ mod tests {
                 members: Vec::new(),
                 definition: "struct container { struct duplicate *value; };".to_string(),
                 types: Some(vec!["duplicate".to_string()]),
+                qualifier: None,
             },
         ])
         .await
@@ -9204,6 +9207,7 @@ mod anonymous_members {
             members,
             definition: String::new(),
             types: None,
+            qualifier: None,
         }
     }
 

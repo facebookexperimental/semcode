@@ -510,6 +510,7 @@ impl SearchManager {
                     members: fields,
                     definition,
                     types: None, // Not populated in search results
+                    qualifier: crate::database::optional_string_column(batch, i, "qualifier"),
                 });
             }
         }
@@ -682,6 +683,7 @@ impl SearchManager {
                         members: fields,
                         definition,
                         types: None, // Not populated in search results
+                        qualifier: crate::database::optional_string_column(batch, i, "qualifier"),
                     });
                 }
             }
@@ -767,6 +769,7 @@ impl SearchManager {
                     members: fields,
                     definition,
                     types: None, // Not populated in search results
+                    qualifier: crate::database::optional_string_column(batch, i, "qualifier"),
                 });
             }
         }
@@ -1126,6 +1129,7 @@ impl SearchManager {
                     members: fields,
                     definition,
                     types: None, // Not populated in search results
+                    qualifier: crate::database::optional_string_column(batch, i, "qualifier"),
                 });
             }
         }
@@ -1284,6 +1288,7 @@ impl SearchManager {
                         members: fields,
                         definition,
                         types: None,
+                        qualifier: crate::database::optional_string_column(batch, i, "qualifier"),
                     });
                 }
             }

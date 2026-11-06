@@ -63,6 +63,8 @@ parameters          (Utf8, NOT NULL)     - JSON-encoded parameter list
 body_hash           (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty bodies)
 calls               (Utf8, nullable)     - JSON array of function names called by this function
 types               (Utf8, nullable)     - JSON array of type names used by this function
+guard               (Utf8, NOT NULL)     - Preprocessor arm holding the definition, "" at file scope
+qualifier           (Utf8, NOT NULL)     - Owning entity (`module::Type` for a Rust method), "" where the name stands alone
 ```
 
 The `functions` merge key is `(name, file_path, git_file_hash, guard, qualifier, line_start)`.
@@ -107,7 +109,12 @@ size                (Int64, nullable)    - Size in bytes (if available)
 fields              (Utf8, NOT NULL)     - JSON string of field/member information
 definition_hash     (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty definitions)
 types               (Utf8, nullable)     - JSON array of type names referenced by this type
+qualifier           (Utf8, NOT NULL)     - Owning entity (`ns` for `ns::Box`), "" where nothing owns the type
 ```
+
+The `types` merge key is `(name, kind, file_path, git_file_hash, qualifier)`.
+A method's `functions.qualifier` joins as `types.qualifier` plus the separator
+plus `types.name` (`::` for Rust/C++, `.` for Python/Zig).
 
 **Content Storage:**
 - Type definitions are stored in sharded content tables, referenced by `definition_hash`

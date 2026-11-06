@@ -1450,6 +1450,7 @@ mod tests {
                 members: Vec::new(),
                 definition: "struct a_struct { int x; };".to_string(),
                 types: None,
+                qualifier: None,
             }],
             dispatch_sites: vec![DispatchSite {
                 caller_name: "marked_only_on_success".to_string(),

@@ -717,6 +717,12 @@ impl SchemaManager {
             Field::new("fields", DataType::Utf8, false),
             Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
+            // The entity owning this type, in the language's own spelling
+            // (`ns` for `ns::Box`). Empty where nothing owns it, which is
+            // every C row. Non-nullable and last: part of the merge key, and
+            // existing column order is frozen -- readers index this table
+            // positionally, so a new column is appended and read by name.
+            Field::new("qualifier", DataType::Utf8, false),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());

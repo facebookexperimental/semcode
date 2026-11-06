@@ -24,6 +24,7 @@ pub use connection::DatabaseManager;
 
 use anyhow::Result;
 use arrow::array::RecordBatch;
+use arrow::array::StringArray;
 
 /// One row per merge key, keeping the last.
 ///
@@ -53,6 +54,22 @@ pub fn one_row_per_key<T, K: std::hash::Hash + Eq>(rows: Vec<T>, key: impl Fn(&T
         .zip(keep)
         .filter_map(|(row, keep)| keep.then_some(row))
         .collect()
+}
+
+/// Look up an optional string column by name, tolerating tables written
+/// before it existed. New columns are appended and read this way: existing
+/// column order is frozen, and a missing column means an older row, not an
+/// error.
+pub(crate) fn optional_string_column(
+    batch: &RecordBatch,
+    row: usize,
+    name: &str,
+) -> Option<String> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .map(|array| array.value(row).to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Look up a column by name and downcast to the expected Arrow array type.

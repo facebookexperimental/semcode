@@ -4921,6 +4921,7 @@ impl TreeSitterAnalyzer {
             let mut line_start = 0;
             let mut type_start_byte = 0;
             let mut type_end_byte = 0;
+            let mut type_node = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -4939,6 +4940,8 @@ impl TreeSitterAnalyzer {
                         kind = "struct".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4947,6 +4950,8 @@ impl TreeSitterAnalyzer {
                         kind = "union".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4955,6 +4960,8 @@ impl TreeSitterAnalyzer {
                         kind = "enum".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4963,6 +4970,8 @@ impl TreeSitterAnalyzer {
                         kind = "class".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4971,6 +4980,8 @@ impl TreeSitterAnalyzer {
                         kind = "opaque".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4979,6 +4990,8 @@ impl TreeSitterAnalyzer {
                         kind = "error".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4987,6 +5000,8 @@ impl TreeSitterAnalyzer {
                         kind = "type".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -5008,9 +5023,10 @@ impl TreeSitterAnalyzer {
                 // Extract types referenced by this type's members
                 let referenced_types = self.extract_type_referenced_types(&members);
 
+                let relative_path = self.make_relative_path(file_path, source_root);
                 let type_info = TypeInfo {
                     name,
-                    file_path: self.make_relative_path(file_path, source_root),
+                    file_path: relative_path.clone(),
                     git_file_hash: git_hash.to_string(),
                     line_start,
                     kind,
@@ -5022,6 +5038,10 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(referenced_types)
                     },
+                    // The same owner function that writes
+                    // functions.qualifier: a method's qualifier joins this
+                    // with the type's name.
+                    qualifier: Self::owner_qualifier(language, type_node, source, &relative_path),
                 };
                 types.push(type_info);
             }
@@ -5138,6 +5158,8 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(referenced_types)
                     },
+                    // Typedefs are C-only, and C has no owners.
+                    qualifier: None,
                 };
                 typedef_types.push(type_info);
             }
@@ -7749,14 +7771,20 @@ impl TreeSitterAnalyzer {
     }
 
     /// Deduplicate types within a single file
-    /// Simple deduplication by (name, kind) - types should be unique within a file anyway
+    /// One row per name per kind per owner: `mod a`'s `Foo` and `mod b`'s
+    /// `Foo` coexist, and so do `ns1::Box` and `ns2::Box`. Within one owner
+    /// the preference is unchanged: more members or a longer definition wins.
     fn deduplicate_types_within_file(&self, raw_types: Vec<TypeInfo>) -> Vec<TypeInfo> {
         use std::collections::HashMap;
 
-        let mut seen_types = HashMap::<(String, String), TypeInfo>::new();
+        let mut seen_types = HashMap::<(String, String, Option<String>), TypeInfo>::new();
 
         for type_info in raw_types {
-            let key = (type_info.name.clone(), type_info.kind.clone());
+            let key = (
+                type_info.name.clone(),
+                type_info.kind.clone(),
+                type_info.qualifier.clone(),
+            );
 
             if let Some(existing) = seen_types.get(&key) {
                 // If definitions are identical, skip
@@ -9964,6 +9992,157 @@ mod rust_receiver_tests {
             .collect();
         found.sort();
         found
+    }
+
+    /// The (name, kind, qualifier) of every type in a file, sorted.
+    fn type_qualifiers_of(source: &str, path: &str) -> Vec<(String, String, Option<String>)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, String, Option<String>)> = analysis
+            .types
+            .iter()
+            .map(|t| (t.name.clone(), t.kind.clone(), t.qualifier.clone()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn same_named_types_in_one_file_coexist() {
+        // Same-named types in two modules stay apart: `mod a`'s `Foo`
+        // and `mod b`'s `Foo` are two rows, told apart by the qualifier
+        // the owner function writes.
+        let found = type_qualifiers_of(
+            "mod a {\n\
+             \tpub struct Foo;\n\
+             }\n\
+             mod b {\n\
+             \tpub struct Foo;\n\
+             }\n",
+            "x.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "Foo".to_string(),
+                    "struct".to_string(),
+                    Some("x::a".to_string())
+                ),
+                (
+                    "Foo".to_string(),
+                    "struct".to_string(),
+                    Some("x::b".to_string())
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn method_qualifiers_join_to_their_types() {
+        // Join contract: functions.qualifier is types.qualifier plus the
+        // separator plus types.name, in each language's own spelling.
+        // Without the types qualifier the two owners below collapse, and no
+        // receiver type can join to its methods' qualifier.
+        let cases = [
+            (
+                "mod a {\n\
+                 \tpub struct Foo;\n\
+                 \timpl Foo {\n\
+                 \t\tfn m(&self) {}\n\
+                 \t}\n\
+                 }\n\
+                 mod b {\n\
+                 \tpub struct Foo;\n\
+                 \timpl Foo {\n\
+                 \t\tfn m(&self) {}\n\
+                 \t}\n\
+                 }\n",
+                "x.rs",
+                "::",
+                "Foo",
+            ),
+            (
+                "namespace ns1 {\n\
+                 class Box {\n\
+                 public:\n\
+                 \tint get();\n\
+                 };\n\
+                 }\n\
+                 namespace ns2 {\n\
+                 class Box {\n\
+                 public:\n\
+                 \tint get();\n\
+                 };\n\
+                 }\n\
+                 int ns1::Box::get() { return 1; }\n\
+                 int ns2::Box::get() { return 2; }\n",
+                "box.cpp",
+                "::",
+                "Box",
+            ),
+            (
+                "class A:\n\
+                 \tdef m(self):\n\
+                 \t\tpass\n\
+                 class B:\n\
+                 \tdef m(self):\n\
+                 \t\tpass\n",
+                "pkg/mod.py",
+                ".",
+                "A",
+            ),
+            (
+                "const A = struct {\n\
+                 \tpub fn init() void {}\n\
+                 };\n\
+                 const B = struct {\n\
+                 \tpub fn init() void {}\n\
+                 };\n",
+                "src/main.zig",
+                ".",
+                "A",
+            ),
+        ];
+        for (source, path, separator, first_type) in cases {
+            let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+            let analysis = analyzer
+                .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+                .unwrap();
+            // Every method's qualifier joins from a type row in the file.
+            for function in &analysis.functions {
+                let Some(method_qualifier) = function.qualifier.as_deref() else {
+                    continue;
+                };
+                let joined = analysis
+                    .types
+                    .iter()
+                    .map(|t| match t.qualifier.as_deref() {
+                        Some(type_qualifier) => {
+                            format!("{type_qualifier}{separator}{}", t.name)
+                        }
+                        None => t.name.clone(),
+                    })
+                    .any(|joined| joined == method_qualifier);
+                assert!(
+                    joined,
+                    "{path}: {} has no type row joining to {method_qualifier}",
+                    function.name
+                );
+            }
+            // The fixture's first type keeps its own qualifier.
+            assert!(
+                analysis
+                    .types
+                    .iter()
+                    .any(|t| t.name == first_type && t.qualifier.is_some()),
+                "{path}: no qualified row for {first_type}: {:#?}",
+                analysis.types
+            );
+        }
     }
 
     #[test]

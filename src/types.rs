@@ -852,6 +852,13 @@ pub struct TypeInfo {
     pub definition: String, // Added to store raw type definition with comments
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names referenced by this type
+    /// The entity owning this type, in the language's own spelling: the
+    /// namespaces and modules above it, but not the type itself. A method's
+    /// qualifier joins this with the type's name, so without it two types
+    /// of one name in one file collapse. `None` where nothing owns the
+    /// type, which is every C row.
+    #[serde(default)]
+    pub qualifier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

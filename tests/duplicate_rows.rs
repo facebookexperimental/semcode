@@ -123,3 +123,36 @@ async fn two_definitions_at_different_lines_both_insert() {
         .collect::<Vec<_>>();
     assert_eq!(found.len(), 2, "{found:#?}");
 }
+
+#[tokio::test]
+async fn two_same_named_types_under_different_owners_both_insert() {
+    // Store level: `ns1::Box` and `ns2::Box` share every merge column
+    // but the qualifier, and neither insert may
+    // refuse the batch.
+    let (_dir, db) = database().await;
+
+    let definition = |qualifier: &str| semcode::TypeInfo {
+        name: "Box".into(),
+        file_path: "box.cpp".into(),
+        git_file_hash: "abc123".into(),
+        line_start: 3,
+        kind: "class".into(),
+        size: None,
+        members: Vec::new(),
+        definition: "class Box {};".into(),
+        types: None,
+        qualifier: Some(qualifier.into()),
+    };
+    db.insert_types(vec![definition("ns1"), definition("ns2")])
+        .await
+        .expect("two same-named types under different owners must both insert");
+
+    let found = db
+        .get_all_types()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.name == "Box" && t.file_path == "box.cpp")
+        .collect::<Vec<_>>();
+    assert_eq!(found.len(), 2, "{found:#?}");
+}
