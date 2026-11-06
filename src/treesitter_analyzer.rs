@@ -17,6 +17,7 @@ use crate::hash::compute_file_hash;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     C,
+    Cpp,
     Rust,
     Python,
     Zig,
@@ -28,9 +29,8 @@ impl Language {
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(|ext| match ext {
-                "c" | "h" | "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => {
-                    Some(Language::C)
-                }
+                "c" | "h" => Some(Language::C),
+                "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => Some(Language::Cpp),
                 "rs" => Some(Language::Rust),
                 "py" => Some(Language::Python),
                 "zig" => Some(Language::Zig),
@@ -343,10 +343,12 @@ fn collapse_whitespace(text: &str) -> String {
 
 pub struct TreeSitterAnalyzer {
     c_parser: Parser,
+    cpp_parser: Parser,
     rust_parser: Parser,
     python_parser: Parser,
     zig_parser: Parser,
     c_queries: &'static LanguageQueries,
+    cpp_queries: &'static LanguageQueries,
     rust_queries: &'static LanguageQueries,
     python_queries: &'static LanguageQueries,
     zig_queries: &'static LanguageQueries,
@@ -378,6 +380,13 @@ impl TreeSitterAnalyzer {
         let mut c_parser = Parser::new();
         c_parser.set_language(&c_language)?;
 
+        // Initialize C++ parser and queries; the C grammar cannot read
+        // qualified names, templates or classes, which is every second
+        // definition in a C++ file.
+        let cpp_language = tree_sitter_cpp::LANGUAGE.into();
+        let mut cpp_parser = Parser::new();
+        cpp_parser.set_language(&cpp_language)?;
+
         // Initialize Rust parser and queries
         let rust_language = tree_sitter_rust::LANGUAGE.into();
         let mut rust_parser = Parser::new();
@@ -396,16 +405,19 @@ impl TreeSitterAnalyzer {
         // Compiled once for the process, not once per analyzer: see
         // c_queries() below.
         let c_queries = Self::c_queries()?;
+        let cpp_queries = Self::cpp_queries()?;
         let rust_queries = Self::rust_queries()?;
         let python_queries = Self::python_queries()?;
         let zig_queries = Self::zig_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
+            cpp_parser,
             rust_parser,
             python_parser,
             zig_parser,
             c_queries,
+            cpp_queries,
             rust_queries,
             python_queries,
             zig_queries,
@@ -431,6 +443,18 @@ impl TreeSitterAnalyzer {
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("C queries: {e}"))
+    }
+
+    fn cpp_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_cpp_queries(&tree_sitter_cpp::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("C++ queries: {e}"))
     }
 
     fn rust_queries() -> Result<&'static LanguageQueries> {
@@ -619,6 +643,229 @@ impl TreeSitterAnalyzer {
                 function: (subscript_expression
                     argument: (_) @array_name
                     index: (_) @array_index
+                )
+            ) @array_call
+
+            (call_expression
+                function: (call_expression
+                    function: (identifier) @static_call_name
+                    arguments: (argument_list (identifier) @static_call_key)
+                )
+            ) @static_call_site
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: Some(typedef_query),
+            macro_query,
+            call_query,
+        })
+    }
+
+    /// Queries for C++. tree-sitter-cpp is a superset of tree-sitter-c,
+    /// so the comment and macro queries share C's shapes. A name may be
+    /// plain, qualified, an in-class field, a destructor or an operator;
+    /// a `template_declaration` wraps the function_definition it declares.
+    fn create_cpp_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        let function_query = Query::new(
+            language,
+            r#"
+            ; Function definitions with bodies; names may be plain,
+            ; qualified, fields, destructors or operators.
+            (function_definition
+                type: (_)? @return_type
+                declarator: (function_declarator
+                    declarator: [
+                        (identifier) @function_name
+                        (qualified_identifier) @function_name
+                        (field_identifier) @function_name
+                        (destructor_name) @function_name
+                        (operator_name) @function_name
+                    ]
+                    parameters: (parameter_list) @parameters
+                )
+                body: [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function
+
+            ; Definitions returning a pointer or a reference.
+            (function_definition
+                type: (_)? @return_type
+                declarator: [
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        ))
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        ))
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )))
+                ]
+                body: [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function_ptr
+
+            ; Declarations without bodies.
+            (declaration
+                type: (_)? @return_type
+                declarator: (function_declarator
+                    declarator: [
+                        (identifier) @function_name
+                        (qualified_identifier) @function_name
+                        (destructor_name) @function_name
+                    ]
+                    parameters: (parameter_list) @parameters
+                )
+            ) @declaration
+        "#,
+        )?;
+
+        // Query for comments
+        let comment_query = Query::new(
+            language,
+            r#"
+            (comment) @comment
+        "#,
+        )?;
+
+        // Query for struct/union/enum/class definitions
+        let type_query = Query::new(
+            language,
+            r#"
+            (struct_specifier
+                name: (_) @type_name
+                body: (field_declaration_list) @body
+            ) @struct
+
+            (union_specifier
+                name: (_) @type_name
+                body: (field_declaration_list) @body
+            ) @union
+
+            (enum_specifier
+                name: (_) @type_name
+                body: (enumerator_list) @body
+            ) @enum
+
+            (class_specifier
+                name: (_) @type_name
+                body: (field_declaration_list) @body
+            ) @class
+        "#,
+        )?;
+
+        // Query for typedefs and type aliases; C++ adds
+        // `using name = type;`.
+        let typedef_query = Query::new(
+            language,
+            r#"
+            (type_definition
+                type: (_) @underlying_type
+                declarator: (type_identifier) @typedef_name
+            ) @typedef
+
+            (type_definition
+                type: (_) @underlying_type
+                declarator: (function_declarator
+                    declarator: (parenthesized_declarator
+                        (pointer_declarator declarator: (type_identifier) @typedef_name)
+                    )
+                    parameters: (parameter_list) @pointer_params
+                )
+            ) @typedef
+
+            (alias_declaration
+                name: (type_identifier) @typedef_name
+                type: (type_descriptor) @underlying_type
+            ) @typedef
+        "#,
+        )?;
+
+        // Query for macro definitions
+        let macro_query = Query::new(
+            language,
+            r#"
+            (preproc_def
+                name: (identifier) @macro_name
+                value: (_)? @value
+            ) @macro
+
+            (preproc_function_def
+                name: (identifier) @macro_name
+                parameters: (preproc_params) @parameters
+                value: (_)? @value
+            ) @function_macro
+        "#,
+        )?;
+
+        // Query for function calls; a qualified callee stores under its
+        // text.
+        let call_query = Query::new(
+            language,
+            r#"
+            (call_expression
+                function: [
+                    (identifier) @function_name
+                    (qualified_identifier) @function_name
+                    (template_function) @function_name
+                ]
+            ) @call
+
+            (call_expression
+                function: (field_expression
+                    argument: (_) @receiver
+                    field: (field_identifier) @member_name
+                )
+            ) @method_call
+
+            (call_expression
+                function: (parenthesized_expression
+                    (pointer_expression argument: (_) @pointer_expr)
+                )
+            ) @deref_call
+
+            (call_expression
+                function: (identifier) @macro_name
+                arguments: (argument_list) @macro_args
+            ) @macro_call
+
+            (call_expression
+                function: (subscript_expression
+                    argument: (_) @array_name
+                    indices: (_) @array_index
                 )
             ) @array_call
 
@@ -928,6 +1175,7 @@ impl TreeSitterAnalyzer {
     fn get_parser(&mut self, language: Language) -> &mut Parser {
         match language {
             Language::C => &mut self.c_parser,
+            Language::Cpp => &mut self.cpp_parser,
             Language::Rust => &mut self.rust_parser,
             Language::Python => &mut self.python_parser,
             Language::Zig => &mut self.zig_parser,
@@ -938,6 +1186,7 @@ impl TreeSitterAnalyzer {
     fn get_queries(&self, language: Language) -> &LanguageQueries {
         match language {
             Language::C => self.c_queries,
+            Language::Cpp => self.cpp_queries,
             Language::Rust => self.rust_queries,
             Language::Python => self.python_queries,
             Language::Zig => self.zig_queries,
@@ -993,14 +1242,15 @@ impl TreeSitterAnalyzer {
             language,
         )?);
 
-        // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
-        if language == Language::C {
+        // Extract typedefs as TypeInfo with kind="typedef" and add to types (C and C++)
+        if matches!(language, Language::C | Language::Cpp) {
             raw_types.extend(self.extract_typedefs_as_typeinfo(
                 &tree,
                 &source_code,
                 file_path,
                 &git_hash,
                 source_root,
+                language,
             )?);
         }
 
@@ -1039,6 +1289,7 @@ impl TreeSitterAnalyzer {
                     file_path,
                     &git_hash,
                     source_root,
+                    language,
                 )?
                 .macros;
         }
@@ -1105,14 +1356,15 @@ impl TreeSitterAnalyzer {
             language,
         )?;
 
-        // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
-        if language == Language::C {
+        // Extract typedefs as TypeInfo with kind="typedef" and add to types (C and C++)
+        if matches!(language, Language::C | Language::Cpp) {
             raw_types.extend(self.extract_typedefs_as_typeinfo(
                 &tree,
                 source_code,
                 file_path,
                 git_hash,
                 source_root,
+                language,
             )?);
         }
 
@@ -1133,6 +1385,7 @@ impl TreeSitterAnalyzer {
                 file_path,
                 git_hash,
                 source_root,
+                language,
             )?;
             macros = grafted.macros;
             dispatch_sites.extend(grafted.dispatch_sites);
@@ -1170,7 +1423,7 @@ impl TreeSitterAnalyzer {
         // Most files parse whole, and for those the flag on the root is the
         // whole test: reserve the tree walk and the row scan for a file that
         // has an ERROR at all.
-        if language != Language::C || !tree.root_node().has_error() {
+        if !matches!(language, Language::C | Language::Cpp) || !tree.root_node().has_error() {
             return None;
         }
 
@@ -1234,6 +1487,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
+        language: Language,
     ) -> Result<GraftedMacros> {
         let (raw_healed, sites, registrations, arguments, edges) = self
             .extract_macros_with_embedded_data(
@@ -1242,7 +1496,7 @@ impl TreeSitterAnalyzer {
                 file_path,
                 git_hash,
                 source_root,
-                Language::C,
+                language,
             )?;
         // Losslessness: a healed parse that no longer reads a definition the
         // original read is a corrupted read of the file, not a recovery of
@@ -1690,9 +1944,9 @@ impl TreeSitterAnalyzer {
         registrations.extend(macro_registrations);
         argument_functions.extend(macro_arguments);
 
-        // Only C states a variable's aggregate this way; other languages get
-        // their receivers typed by their own pass.
-        let globals = if matches!(language, Language::C) {
+        // Only C and C++ state a variable's aggregate this way; other
+        // languages get their receivers typed by their own pass.
+        let globals = if matches!(language, Language::C | Language::Cpp) {
             Self::collect_file_scope_globals(tree.root_node(), source_code)
                 .into_iter()
                 .map(|raw| GlobalVariable {
@@ -1810,9 +2064,17 @@ impl TreeSitterAnalyzer {
             for capture in call_match.captures {
                 match queries.call_query.capture_names()[capture.index as usize] {
                     "function_name" => {
-                        if let Some(call) = Self::call_site_from_capture(capture.node, source_code)
+                        if let Some((name, start, end)) =
+                            Self::call_site_from_capture(capture.node, source_code)
                         {
-                            extraction.calls.push(call);
+                            // A C++ edge joins on the bare callee; see
+                            // cpp_callee_name.
+                            let name = if matches!(language, Language::Cpp) {
+                                Self::cpp_callee_name(&name)
+                            } else {
+                                name
+                            };
+                            extraction.calls.push((name, start, end));
                         }
                     }
                     "member_name" => member = Some(capture.node),
@@ -3790,6 +4052,208 @@ impl TreeSitterAnalyzer {
         Some((name.to_string(), node.start_byte(), node.end_byte()))
     }
 
+    /// The bare name a C++ function definition is stored under, and the
+    /// chain of namespaces and classes that owns it: `void A::f()` in
+    /// `namespace ns` stores name `f` under qualifier `ns::A`, the same
+    /// shape the Rust owner model uses. Template arguments are dropped
+    /// from the chain (`Box<T>::get` is name `get`, qualifier `Box`);
+    /// `None` where nothing owns the name.
+    fn cpp_definition_parts(
+        name_node: tree_sitter::Node,
+        source: &str,
+        text: &str,
+    ) -> (String, Option<String>) {
+        // A qualified spelling (`A::f`) writes its owner out of line; the
+        // walk adds the scopes written around the definition. The walk's
+        // scopes are outermost first and the written ones sit innermost,
+        // so the written owner lands at the end.
+        let mut scopes = Self::cpp_scope_chain(name_node, source);
+        let mut bare = match name_node.kind() {
+            "qualified_identifier" => {
+                // The spelling may re-state scopes the walk already holds
+                // (`namespace ns { void ns::f(){} }`): write each once.
+                let written = Self::cpp_written_scopes(text);
+                let overlap = (1..=written.len().min(scopes.len()))
+                    .rev()
+                    .find(|count| written[..*count] == scopes[scopes.len() - count..])
+                    .unwrap_or(0);
+                scopes.extend(written.into_iter().skip(overlap));
+                Self::cpp_bare_name(text)
+            }
+            _ => text.to_string(),
+        };
+        // An operator's canonical name carries no written spacing:
+        // `operator =` and `operator=` are one definition.
+        if name_node.kind() == "operator_name" || bare.starts_with("operator") {
+            bare = Self::strip_operator_whitespace(&bare);
+        }
+        let qualifier = (!scopes.is_empty()).then(|| scopes.join("::"));
+        (bare, qualifier)
+    }
+
+    /// The namespaces and enclosing classes written around a definition,
+    /// outermost first: `namespace a { class C { void m() } }` reads
+    /// `a::C`. An anonymous namespace or class contributes nothing; a
+    /// friend defines into the enclosing namespace, so classes above its
+    /// declaration own nothing. Any other node stops the walk, so a
+    /// definition behind a barrier the chain cannot spell reads only
+    /// what it writes itself.
+    fn cpp_scope_chain(name_node: tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut scopes: Vec<String> = Vec::new();
+        let mut through_friend = false;
+        let mut current = name_node.parent();
+        while let Some(node) = current {
+            match node.kind() {
+                // Declarator wrappers sit between a name and its owner.
+                "function_declarator"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "parenthesized_declarator"
+                | "function_definition"
+                | "declaration"
+                | "template_declaration"
+                | "field_declaration_list"
+                // A namespace body wraps what its definitions sit in.
+                | "declaration_list"
+                // A preprocessor arm wraps definitions but owns nothing.
+                | "preproc_if"
+                | "preproc_ifdef"
+                | "preproc_else"
+                | "preproc_elif"
+                | "preproc_elifdef"
+                // `extern "C"` spells linkage, not an owner.
+                | "linkage_specification" => current = node.parent(),
+                // A friend's definition lands in the namespace around it.
+                "friend_declaration" => {
+                    through_friend = true;
+                    current = node.parent();
+                }
+                "namespace_definition"
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier" => {
+                    // A class only owns what does not friend its way out.
+                    let owns = node.kind() == "namespace_definition" || !through_friend;
+                    if owns {
+                        if let Some(scope) = node
+                            .child_by_field_name("name")
+                            .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                        {
+                            scopes.push(scope.to_string());
+                        }
+                    }
+                    current = node.parent();
+                }
+                _ => break,
+            }
+        }
+
+        // The walk reads the innermost scope first; reverse to how a
+        // qualified identifier spells it.
+        scopes.reverse();
+        scopes
+    }
+
+    /// Split a qualified spelling at depth-zero `::` into its scopes and
+    /// bare last segment: template angles shield a separator, so
+    /// `Obj<a::b>::m` keeps `Obj<a::b>` whole. A leading `::` names the
+    /// global scope, which is no owner.
+    fn cpp_qualified_segments(name: &str) -> Vec<&str> {
+        let mut segments: Vec<&str> = Vec::new();
+        let mut start = 0;
+        let mut depth = 0usize;
+        let mut index = 0;
+        while index < name.len() {
+            let character = name[index..].chars().next().unwrap();
+            match character {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                ':' if depth == 0 && name[index + 1..].starts_with(':') => {
+                    segments.push(&name[start..index]);
+                    // The separator is two bytes; step over the second ':'.
+                    start = index + 2;
+                    index += 1;
+                }
+                _ => {}
+            }
+            index += character.len_utf8();
+        }
+        segments.push(&name[start..]);
+        segments
+    }
+
+    /// The last segment of a qualified spelling: `Box<T>::get` is `get`,
+    /// `E::~E` is `~E`, `::f` is `f`.
+    fn cpp_bare_name(text: &str) -> String {
+        let stripped = text.strip_prefix("::").unwrap_or(text);
+        let segments = Self::cpp_qualified_segments(stripped);
+        segments.last().copied().unwrap_or(stripped).to_string()
+    }
+
+    /// The owners a qualified spelling writes before its name, with
+    /// template arguments dropped: `Box<T>::get` writes the scope `Box`.
+    fn cpp_written_scopes(text: &str) -> Vec<String> {
+        let stripped = text.strip_prefix("::").unwrap_or(text);
+        let segments = Self::cpp_qualified_segments(stripped);
+        segments
+            .split_last()
+            .map(|(_, scopes)| {
+                scopes
+                    .iter()
+                    .map(|scope| Self::strip_scope_template_arguments(scope).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The callee a C++ call edge stores: the bare last segment of what
+    /// was written. `ns::g()` stores `g`, `ns::pick<int>(1, 2)` stores
+    /// `pick`, and a leading `::` names the global scope, which is no
+    /// owner: an edge joins on the name a definition can be found by.
+    fn cpp_callee_name(text: &str) -> String {
+        let stripped = text.strip_prefix("::").unwrap_or(text);
+        let segments = Self::cpp_qualified_segments(stripped);
+        let last = segments.last().copied().unwrap_or(stripped);
+        let last = Self::strip_scope_template_arguments(last);
+        // A spelled operator call stores the operator's canonical name.
+        if last.starts_with("operator") {
+            return Self::strip_operator_whitespace(last);
+        }
+        last.to_string()
+    }
+
+    /// The operator a name spells without its written spacing:
+    /// `operator =` and `operator=` name the same function.
+    fn strip_operator_whitespace(name: &str) -> String {
+        name.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Remove a trailing balanced `<...>` group; anything unbalanced or
+    /// not trailing is left whole.
+    fn strip_scope_template_arguments(segment: &str) -> &str {
+        let Some(open) = segment.find('<') else {
+            return segment;
+        };
+        let mut depth = 0usize;
+        for (offset, character) in segment[open..].char_indices() {
+            match character {
+                '<' => depth += 1,
+                '>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return if open + offset + character.len_utf8() == segment.len() {
+                            &segment[..open]
+                        } else {
+                            segment
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        segment
+    }
+
     /// Extract functions with pre-computed call data (avoids per-function tree traversals)
     fn extract_functions_with_calls(
         &self,
@@ -3829,6 +4293,9 @@ impl TreeSitterAnalyzer {
             // all the same; without it a declaration and the definition it
             // announces under one `#ifdef` read as two configurations.
             let mut declaration_node = None;
+            // The namespace and class chain a C++ definition is stored
+            // under; read where the name is, that is where the spelling is.
+            let mut cpp_qualifier = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -3837,7 +4304,17 @@ impl TreeSitterAnalyzer {
 
                 match capture_name {
                     "function_name" => {
-                        function_name = Some(text.to_string());
+                        // A C++ definition stores its bare name; the
+                        // namespace and class chain goes to the qualifier
+                        // column.
+                        if matches!(ctx.language, Language::Cpp) {
+                            let (bare, qualifier) =
+                                Self::cpp_definition_parts(node, ctx.source, text);
+                            function_name = Some(bare);
+                            cpp_qualifier = qualifier;
+                        } else {
+                            function_name = Some(text.to_string());
+                        }
                         line_start = node.start_position().row as u32 + 1;
                     }
                     "return_type" => {
@@ -4052,14 +4529,15 @@ impl TreeSitterAnalyzer {
                         Some(function_types)
                     },
                     guard: defined_at.and_then(|node| Self::guard_of(node, ctx.source)),
-                    // The entity owning a Rust definition; every other
-                    // language leaves the name to stand alone.
+                    // The entity owning a definition: Rust reads it from
+                    // module and impl, C++ from namespaces and classes;
+                    // every other language leaves the name to stand alone.
                     qualifier: if matches!(ctx.language, Language::Rust) {
                         defined_at.and_then(|node| {
                             Self::rust_owner_qualifier(node, ctx.source, &relative_path)
                         })
                     } else {
-                        None
+                        cpp_qualifier
                     },
                 };
 
@@ -4116,7 +4594,7 @@ impl TreeSitterAnalyzer {
 
         // A macro can open a function the query cannot match, and the body
         // that follows carries every call the function makes.
-        if matches!(ctx.language, Language::C) {
+        if matches!(ctx.language, Language::C | Language::Cpp) {
             for defined in Self::macro_defined_functions(ctx.tree.root_node(), ctx.source) {
                 // Already read by the query under this arm. Another arm of
                 // the same name is another definition, and is kept.
@@ -4426,9 +4904,9 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
+        language: Language,
     ) -> Result<Vec<TypeInfo>> {
-        // This is C-specific, so always use C queries
-        let queries = &self.c_queries;
+        let queries = self.get_queries(language);
         let typedef_query = queries
             .typedef_query
             .as_ref()
@@ -4572,9 +5050,14 @@ impl TreeSitterAnalyzer {
         source_root: Option<&Path>,
         language: Language,
     ) -> Result<ExtractedMacros> {
-        // Macro bodies are re-parsed as C; one parser serves the whole file.
+        // Macro bodies are re-parsed in the file's own grammar; C
+        // files keep the C parser.
+        let grammar = match language {
+            Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            _ => tree_sitter_c::LANGUAGE.into(),
+        };
         let mut body_parser = tree_sitter::Parser::new();
-        body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
+        body_parser.set_language(&grammar)?;
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
         let mut argument_functions: Vec<ArgumentFunction> = Vec::new();
@@ -4630,6 +5113,7 @@ impl TreeSitterAnalyzer {
                             &mut body_parser,
                             queries,
                             &source[body.byte_range()],
+                            language,
                         );
 
                         // Positions come back relative to the body; place them
@@ -6229,6 +6713,7 @@ impl TreeSitterAnalyzer {
         parser: &mut tree_sitter::Parser,
         queries: &LanguageQueries,
         body: &str,
+        language: Language,
     ) -> MacroBodyFacts {
         let body = body.trim();
         if body.is_empty() {
@@ -6252,8 +6737,17 @@ impl TreeSitterAnalyzer {
                 match queries.call_query.capture_names()[capture.index as usize] {
                     "function_name" => {
                         let name = &wrapped[capture.node.byte_range()];
+                        // A C++ edge joins on the bare callee; see
+                        // cpp_callee_name.
+                        let name = if matches!(language, Language::Cpp) {
+                            Self::cpp_callee_name(name)
+                        } else if !name.is_empty() {
+                            name.to_string()
+                        } else {
+                            String::new()
+                        };
                         if !name.is_empty() {
-                            calls.push(name.to_string());
+                            calls.push(name);
                         }
                     }
                     // A call that names no function is still a call, and
