@@ -3327,6 +3327,16 @@ impl McpServer {
     }
 
     async fn handle_initialize(&self, _params: &Value) -> Value {
+        let instructions = if self.lazy_mode {
+            "# semcode\n\n\
+             semcode provides git-aware code exploration, code search, git history archaeology, \
+             and lore.kernel.org mailing list search.\n\n\
+             Server is running in lazy mode. Use `list_categories` to discover tool categories, \
+             `get_tools` to inspect schemas for a category, and `call_tool` to execute them."
+        } else {
+            include_str!("../../docs/semcode-mcp.md")
+        };
+
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -3336,7 +3346,7 @@ impl McpServer {
                 "name": "semcode-mcp",
                 "version": "0.1.0"
             },
-            "instructions": include_str!("../../docs/semcode-mcp.md")
+            "instructions": instructions
         })
     }
 
@@ -7174,5 +7184,58 @@ mod tests {
 
         // Should return all 19 tools
         assert_eq!(tools.len(), 19, "Non-lazy mode should return all 19 tools");
+    }
+
+    #[tokio::test]
+    async fn test_lazy_mode_initialize_instructions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            database_path: String::new(),
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: true,
+        };
+
+        let init = server.handle_initialize(&json!({})).await;
+        let instructions = init["instructions"].as_str().unwrap();
+        assert!(instructions.contains("Server is running in lazy mode"));
+        assert!(instructions.contains("list_categories"));
+        assert!(!instructions.contains("## Recipes"));
+    }
+
+    #[tokio::test]
+    async fn test_non_lazy_mode_initialize_instructions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            database_path: String::new(),
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
+        };
+
+        let init = server.handle_initialize(&json!({})).await;
+        let instructions = init["instructions"].as_str().unwrap();
+        assert!(instructions.contains("# semcode usage guide"));
+        assert!(instructions.contains("## Recipes"));
     }
 }
