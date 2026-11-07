@@ -1387,12 +1387,20 @@ pub async fn write_indirect_reverse_chain(
         return Ok(0);
     }
 
+    // A member-name match with no receiver type reaches every call through a
+    // member of that name anywhere in the tree: the callers command reports
+    // those as a count, not as an answer, and this section does the same. A
+    // site that names the target outright counts as confident.
+    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
+        .iter()
+        .partition(|caller| caller.evidence.is_type_matched());
+
     // One entry per dispatching function: a function dispatching through the
     // same member twice is one way in, not two.
     let mut order: Vec<String> = Vec::new();
     let mut sites: HashMap<String, Vec<&crate::database::resolution::IndirectCaller>> =
         HashMap::new();
-    for caller in &indirect {
+    for caller in &confident {
         let key = if caller.caller_name.is_empty() {
             format!("{}:{}", caller.site_file, caller.site_line)
         } else {
@@ -1478,6 +1486,19 @@ pub async fn write_indirect_reverse_chain(
             "{}",
             format!("... and {} more dispatching sites", order.len() - shown).bright_black()
         )?;
+    }
+
+    if !by_name_only.is_empty() {
+        let further = if confident.is_empty() { "" } else { "further " };
+        let note = format!(
+            "\n{} {} {}call sites go through a member of the same name, \
+             but nothing says their receiver has the type the function was \
+             installed in.",
+            "Note:".yellow(),
+            by_name_only.len(),
+            further
+        );
+        writeln!(writer, "{note}")?;
     }
 
     Ok(shown)

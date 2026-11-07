@@ -807,6 +807,89 @@ async fn index_two_tables_fixture(repo: &Path) -> (Arc<DatabaseManager>, String)
     (db, git_sha)
 }
 
+/// A named member installed in one struct and dispatched through an
+/// undeclared receiver elsewhere: the kvm dispatch is typed to its table,
+/// the scsi dispatch only shares the member spelling.
+async fn index_named_member_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("kvm.c"),
+        "struct kvm_ops {\n\tint (*handle_exit)(void *);\n};\nint kvm_handle_invalid_op(void *vcpu)\n{\n\treturn 0;\n}\nstruct kvm_ops kvm_ops = {\n\t.handle_exit = kvm_handle_invalid_op,\n};\nint kvm_invoke(struct kvm_ops *ops, void *vcpu)\n{\n\treturn ops->handle_exit(vcpu);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("scsi.c"),
+        "int scsi_invoke(int i)\n{\n\treturn chip->handle_exit(i);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "named member"]);
+
+    let git_sha = git::get_git_sha(repo).unwrap().unwrap();
+    let db_path = repo.join(".semcode.db");
+    let db = Arc::new(
+        DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+
+    semcode::git_range::process_git_tree(
+        repo,
+        &git_sha,
+        &["c".to_string(), "h".to_string()],
+        db.clone(),
+        false,
+        1,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    (db, git_sha)
+}
+
+#[tokio::test]
+async fn a_weak_named_match_is_counted_not_answered() {
+    // The kvm struct dispatch is typed to its table; the scsi dispatch
+    // through an undeclared receiver only shares the member spelling. The
+    // chain must answer the first and count the second, the way `callers`
+    // already does: listing the scsi site as an answer is how bfa_msix and
+    // a sound codec ended up dispatching kvm_handle_invalid_op.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_named_member_fixture(dir.path()).await;
+
+    let mut rendered = Vec::new();
+    let shown = semcode::callchain::write_indirect_reverse_chain(
+        &db,
+        "kvm_handle_invalid_op",
+        &git_sha,
+        2,
+        10,
+        &mut rendered,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(rendered).unwrap();
+
+    assert_eq!(shown, 1, "one confident dispatcher: {text}");
+    assert!(
+        text.contains("kvm_invoke"),
+        "the typed dispatch is missing: {text}"
+    );
+    assert!(
+        !text.contains("scsi_invoke"),
+        "the weak dispatch is answered instead of counted: {text}"
+    );
+    assert!(
+        text.contains("1 call site") || text.contains("1 further call site"),
+        "the weak dispatch is not counted: {text}"
+    );
+}
+
 #[tokio::test]
 async fn an_unrelated_array_dispatch_is_not_a_caller() {
     let dir = tempfile::tempdir().unwrap();
