@@ -3449,10 +3449,10 @@ impl TreeSitterAnalyzer {
         let receiver = site.receiver_expr.as_deref()?;
         let is_self = match language {
             Language::Cpp => receiver == "this",
-            // A Rust `self` names the enclosing impl exactly the way a
-            // Python `self` names the enclosing class; without this arm
-            // every plain `self.method()` call fell through to the dispatch
-            // table and vanished from call tracing.
+            // `this`/`self` names the enclosing type (C++ class, Python
+            // class, Rust impl), so the call resolves against a known owner
+            // instead of falling through to the dispatch table, where a
+            // receiver of unknown type would vanish from call tracing.
             Language::Python | Language::Rust => receiver == "self",
             _ => return None,
         };
