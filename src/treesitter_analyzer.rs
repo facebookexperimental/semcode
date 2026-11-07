@@ -50,6 +50,16 @@ impl Language {
     }
 }
 
+/// One step of a C++ qualified-id's scope: a plain name, or a template
+/// with its arguments as written, for the primary-template strip.
+enum CppScopeSegment {
+    Plain(String),
+    Template {
+        name: String,
+        arguments: Vec<String>,
+    },
+}
+
 /// Context for extracting code elements from a parsed tree
 pub struct ExtractionContext<'a> {
     pub tree: &'a Tree,
@@ -4479,6 +4489,16 @@ impl TreeSitterAnalyzer {
             }
 
             if let Some(name) = function_name {
+                // C++ spells the owner in the declarator (`ns::Box::get`):
+                // the name column keeps the bare name, and the scope moves
+                // to the qualifier. The return type was already read against
+                // the qualified spelling above, which is what places it.
+                let mut name = name;
+                if ctx.language == Language::Cpp {
+                    if let Some((_, bare)) = name.rsplit_once("::") {
+                        name = bare.to_string();
+                    }
+                }
                 // Track which capture patterns were matched to determine if function has body
                 let mut matched_patterns = std::collections::HashSet::new();
                 for capture in m.captures {
@@ -4633,15 +4653,12 @@ impl TreeSitterAnalyzer {
                         Some(function_types)
                     },
                     guard: defined_at.and_then(|node| Self::guard_of(node, ctx.source)),
-                    // The entity owning a Rust definition; every other
-                    // language leaves the name to stand alone.
-                    qualifier: if matches!(ctx.language, Language::Rust) {
-                        defined_at.and_then(|node| {
-                            Self::rust_owner_qualifier(node, ctx.source, &relative_path)
-                        })
-                    } else {
-                        None
-                    },
+                    qualifier: Self::owner_qualifier(
+                        ctx.language,
+                        defined_at,
+                        ctx.source,
+                        &relative_path,
+                    ),
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -5894,11 +5911,403 @@ impl TreeSitterAnalyzer {
         }
     }
 
+    /// The entity owning a C++ definition: every enclosing namespace and
+    /// class, outermost first, in the file's own spelling.
+    ///
+    /// Out-of-line definitions take their scope from the qualified-id:
+    /// `int ns::Box::get()` is owned by `ns::Box`, not by the namespace the
+    /// definition happens to sit in. A scope the enclosing namespaces
+    /// already spell is not spelled twice. An explicit specialisation keeps
+    /// its arguments (`ns::Box<int>`), while a primary template's own
+    /// parameters are stripped, so the out-of-line definition shares its key
+    /// with the in-class declaration and folds into it.
+    ///
+    /// `None` where the name stands alone: a free function with no
+    /// namespace around it.
+    fn cpp_owner_qualifier(defined_at: tree_sitter::Node, source: &str) -> Option<String> {
+        if let Some((_, scope)) = Self::cpp_qualified_scope(defined_at, source) {
+            let params = Self::cpp_template_params(defined_at, source);
+            let stripped: Vec<String> = scope
+                .iter()
+                .map(|segment| Self::cpp_strip_primary_args(segment, &params))
+                .collect();
+            let mut qualified = Self::cpp_enclosing_scope(defined_at, source);
+            // A redundant qualification restates the enclosing namespaces;
+            // spelling them twice would coin an owner nothing writes.
+            if stripped.len() >= qualified.len() && stripped[..qualified.len()] == qualified[..] {
+                qualified = stripped;
+            } else {
+                qualified.extend(stripped);
+            }
+            if qualified.is_empty() {
+                return None;
+            }
+            return Some(qualified.join("::"));
+        }
+        let qualified = Self::cpp_enclosing_scope(defined_at, source);
+        if qualified.is_empty() {
+            return None;
+        }
+        Some(qualified.join("::"))
+    }
+
+    /// The bare name and the spelled scope of a C++ declarator: `get` and
+    /// `ns::Box` for `int ns::Box::get()`. `None` where the declarator names
+    /// no scope, which is every in-class and file-scope definition.
+    fn cpp_qualified_scope(
+        defined_at: tree_sitter::Node,
+        source: &str,
+    ) -> Option<(String, Vec<CppScopeSegment>)> {
+        let mut declarator = defined_at.child_by_field_name("declarator")?;
+        loop {
+            match declarator.kind() {
+                "function_declarator" => {
+                    declarator = declarator.child_by_field_name("declarator")?;
+                }
+                "pointer_declarator"
+                | "reference_declarator"
+                | "parenthesized_declarator"
+                | "attributed_declarator" => {
+                    // A reference hangs its function off no `declarator`
+                    // field (`S &self()`), so the positional child is the
+                    // fallback where the field is absent.
+                    declarator = declarator
+                        .child_by_field_name("declarator")
+                        .or_else(|| declarator.named_child(0))?;
+                }
+                _ => break,
+            }
+        }
+        if declarator.kind() != "qualified_identifier" {
+            return None;
+        }
+        // The scope nests outward: `a::b::C::m` is scope `a` of scope `b` of
+        // scope `C` of `m`, so the walk collects outermost first already.
+        let mut segments = Vec::new();
+        let mut current = declarator;
+        loop {
+            let scope = current.child_by_field_name("scope")?;
+            segments.push(Self::cpp_scope_segment(scope, source));
+            let name = current.child_by_field_name("name")?;
+            if name.kind() == "qualified_identifier" {
+                current = name;
+            } else {
+                let bare = name.utf8_text(source.as_bytes()).ok()?.to_string();
+                return Some((bare, segments));
+            }
+        }
+    }
+
+    /// One step of a spelled C++ scope: a plain name, or a template with its
+    /// arguments as written, for the primary-template strip to decide on.
+    fn cpp_scope_segment(node: tree_sitter::Node, source: &str) -> CppScopeSegment {
+        if node.kind() == "template_type" {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                .unwrap_or_default()
+                .to_string();
+            let arguments = node
+                .child_by_field_name("arguments")
+                .map(|arguments| {
+                    let mut cursor = arguments.walk();
+                    arguments
+                        .named_children(&mut cursor)
+                        .filter_map(|argument| {
+                            argument
+                                .utf8_text(source.as_bytes())
+                                .ok()
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return CppScopeSegment::Template { name, arguments };
+        }
+        CppScopeSegment::Plain(
+            node.utf8_text(source.as_bytes())
+                .ok()
+                .map(Self::one_line_type)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The template parameters a C++ definition is written under: every
+    /// enclosing `template<...>` head's declared names, outermost first.
+    fn cpp_template_params(defined_at: tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut params = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            if current.kind() == "template_declaration" {
+                if let Some(list) = current.child_by_field_name("parameters") {
+                    let mut cursor = list.walk();
+                    for parameter in list.named_children(&mut cursor) {
+                        if parameter.kind() == "template_parameter_list" {
+                            continue;
+                        }
+                        if let Some(name) = Self::cpp_parameter_name(parameter, source) {
+                            params.push(name);
+                        }
+                    }
+                }
+            }
+            parent = current.parent();
+        }
+        params
+    }
+
+    /// The name a template parameter declares: `T` in `typename T`, `N` in
+    /// `int N`, `Args` in `typename... Args`. A use of another name in a
+    /// default or a bound declares nothing, so only the declared position
+    /// is read.
+    fn cpp_parameter_name(node: tree_sitter::Node, source: &str) -> Option<String> {
+        if matches!(node.kind(), "type_identifier" | "identifier") {
+            return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+        }
+        if matches!(
+            node.kind(),
+            "type_parameter_declaration" | "variadic_type_parameter_declaration"
+        ) {
+            let mut cursor = node.walk();
+            return node
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "type_identifier" | "identifier"))
+                .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                .map(str::to_string);
+        }
+        if node.kind() == "parameter_declaration" {
+            let declarator = node.child_by_field_name("declarator")?;
+            return Self::cpp_parameter_name(declarator, source);
+        }
+        None
+    }
+
+    /// Strip a primary template's own parameters from a scope segment:
+    /// `Box<T>` under `template<typename T>` is `Box`, while `Box<int>`
+    /// stays. The arguments must name the enclosing parameters in order;
+    /// anything else is a specialisation and keeps its spelling.
+    fn cpp_strip_primary_args(segment: &CppScopeSegment, params: &[String]) -> String {
+        match segment {
+            CppScopeSegment::Plain(name) => name.clone(),
+            CppScopeSegment::Template { name, arguments } => {
+                let bare: Vec<&str> = arguments
+                    .iter()
+                    .map(|argument| {
+                        argument
+                            .trim()
+                            .strip_suffix("...")
+                            .unwrap_or(argument.trim())
+                    })
+                    .collect();
+                let is_primary = !params.is_empty()
+                    && bare.len() == params.len()
+                    && bare
+                        .iter()
+                        .zip(params.iter())
+                        .all(|(argument, param)| *argument == param);
+                if is_primary {
+                    name.clone()
+                } else {
+                    format!("{name}<{}>", arguments.join(", "))
+                }
+            }
+        }
+    }
+
+    /// The namespaces and classes enclosing a C++ definition, outermost
+    /// first, as written. Template declarations are transparent: the class
+    /// name carries its own arguments, or none for a primary template.
+    /// Anonymous scopes contribute no segment; nothing can spell them.
+    fn cpp_enclosing_scope(defined_at: tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut segments = Vec::new();
+        let mut parent = defined_at.parent();
+        // A friend is owned by nobody: `friend void swap(Box&, Box&)` in
+        // `ns::Box` is a free function of `ns`, and a hidden friend defined
+        // in the class body is a namespace-scope function all the same. The
+        // class the friend is written in therefore contributes no segment,
+        // while the namespaces around it still do. A friend written with a
+        // qualified-id takes its scope from that id, as out-of-line
+        // definitions already do, so only the enclosing walk skips.
+        let mut under_friend = false;
+        while let Some(current) = parent {
+            match current.kind() {
+                "friend_declaration" => {
+                    under_friend = true;
+                }
+                "namespace_definition" => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        let text = name
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(Self::one_line_type)
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            segments.push(text);
+                        }
+                    }
+                }
+                "class_specifier" | "struct_specifier" | "union_specifier" if !under_friend => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        let text = name
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(Self::one_line_type)
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            segments.push(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            parent = current.parent();
+        }
+        segments.reverse();
+        segments
+    }
+
+    /// The entity owning a Python definition: the module path plus every
+    /// enclosing class and function, in `__qualname__` spelling. A function
+    /// nested in a function adds `<locals>`, the way tracebacks spell it:
+    /// `outer.<locals>.inner` is owned by `pkg.mod.outer.<locals>`.
+    ///
+    /// The module is the file's path with `/` as `.` and the `.py` gone; a
+    /// package's `__init__` is the package itself. A free function carries
+    /// the module alone, the way a Rust free function carries its module.
+    fn python_owner_qualifier(
+        defined_at: tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+    ) -> Option<String> {
+        let mut qualified = Self::python_module_of(file_path);
+        let mut scopes = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            match current.kind() {
+                "class_definition" => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                            scopes.push(text.to_string());
+                        }
+                    }
+                }
+                "function_definition" => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                            scopes.push(format!("{text}.<locals>"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            parent = current.parent();
+        }
+        scopes.reverse();
+        qualified.extend(scopes);
+        if qualified.is_empty() {
+            return None;
+        }
+        Some(qualified.join("."))
+    }
+
+    /// The module a Python file's items live in: its path with `/` as `.`
+    /// and the `.py` gone, so `pkg/mod.py` is `pkg.mod`. A package's
+    /// `__init__` is the package itself, the way `mod.rs` is its module in
+    /// Rust, and `lib` and `main` stay as written.
+    fn python_module_of(file_path: &str) -> Vec<String> {
+        let without_extension = file_path.strip_suffix(".py").unwrap_or(file_path);
+        let mut segments: Vec<String> = without_extension
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .map(str::to_string)
+            .collect();
+        if segments.last().is_some_and(|last| last == "__init__") {
+            segments.pop();
+        }
+        segments
+    }
+
+    /// The entity owning a Zig definition: the module path plus every
+    /// enclosing container, outermost first. `init` in `const A = struct`
+    /// in `src/main.zig` is `src.main.A`, and a free function carries the
+    /// module alone.
+    fn zig_owner_qualifier(
+        defined_at: tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+    ) -> Option<String> {
+        let mut qualified: Vec<String> = file_path
+            .strip_suffix(".zig")
+            .unwrap_or(file_path)
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .map(str::to_string)
+            .collect();
+        let mut scopes = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            if matches!(
+                current.kind(),
+                "struct_declaration"
+                    | "enum_declaration"
+                    | "union_declaration"
+                    | "opaque_declaration"
+                    | "error_set_declaration"
+            ) {
+                // A container is named by the `const` that binds it: the
+                // struct's parent declares the name the file spells.
+                if let Some(binding) = current.parent() {
+                    if binding.kind() == "variable_declaration" {
+                        let mut cursor = binding.walk();
+                        let name = binding
+                            .named_children(&mut cursor)
+                            .find(|child| child.kind() == "identifier");
+                        if let Some(name) = name {
+                            if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                                scopes.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            parent = current.parent();
+        }
+        scopes.reverse();
+        qualified.extend(scopes);
+        if qualified.is_empty() {
+            return None;
+        }
+        Some(qualified.join("."))
+    }
+
     /// Type text on one line: runs of whitespace become single spaces. No
     /// comment stripping: a lifetime (`&'a T`) is not a character constant,
     /// and the guard text's treatment would eat it.
     fn one_line_type(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The entity owning a definition, in the language's own spelling.
+    ///
+    /// Rust keeps its module-and-owner qualifier, C++ its `ns::Class`,
+    /// Python its `pkg.mod.Class`, Zig its `mod.Struct`; C has no owners.
+    /// `None` where the name stands alone. The same function writes the
+    /// qualifier on types, so the join contract holds: a method's qualifier
+    /// is its type's qualifier plus the separator plus the type's name.
+    fn owner_qualifier(
+        language: Language,
+        defined_at: Option<tree_sitter::Node>,
+        source: &str,
+        file_path: &str,
+    ) -> Option<String> {
+        let node = defined_at?;
+        match language {
+            Language::Rust => Self::rust_owner_qualifier(node, source, file_path),
+            Language::Cpp => Self::cpp_owner_qualifier(node, source),
+            Language::Python => Self::python_owner_qualifier(node, source, file_path),
+            Language::Zig => Self::zig_owner_qualifier(node, source, file_path),
+            Language::C => None,
+        }
     }
 
     /// One predicate on one line: continuations go, comments go, and runs of
@@ -9393,6 +9802,184 @@ mod rust_receiver_tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn cpp_definitions_carry_namespace_and_class() {
+        // C++ owners use the language's own spelling: overloads,
+        // constructors and an operator share the class owner, and the
+        // out-of-line definitions
+        // fold into their in-class declarations, so each pair is one row.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             class Box {\n\
+             public:\n\
+             \tBox();\n\
+             \tint get();\n\
+             \tint get(int x);\n\
+             \tbool operator==(const Box& o);\n\
+             };\n\
+             }\n\
+             ns::Box::Box() {}\n\
+             int ns::Box::get() { return 1; }\n\
+             int ns::Box::get(int x) { return x; }\n\
+             bool ns::Box::operator==(const Box& o) { return true; }\n",
+            "box.cpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("Box".to_string(), Some("ns::Box".to_string())),
+                ("get".to_string(), Some("ns::Box".to_string())),
+                ("get".to_string(), Some("ns::Box".to_string())),
+                ("operator==".to_string(), Some("ns::Box".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_primary_template_strips_its_params_and_spec_keeps_them() {
+        // `Box<T>::conv` is owned by `ns::Box`, the key its in-class
+        // declaration carries, so the pair folds; `Box<int>::conv` keeps its
+        // arguments and stays apart.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             template <typename T>\n\
+             class Box {\n\
+             public:\n\
+             \tT conv(T v);\n\
+             };\n\
+             template <>\n\
+             class Box<int> {\n\
+             public:\n\
+             \tint conv(int v);\n\
+             };\n\
+             }\n\
+             template <typename T>\n\
+             T ns::Box<T>::conv(T v) { return v; }\n\
+             template <>\n\
+             int ns::Box<int>::conv(int v) { return v + 1; }\n",
+            "box.cpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("conv".to_string(), Some("ns::Box".to_string())),
+                ("conv".to_string(), Some("ns::Box<int>".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_struct_and_union_members_carry_their_owner() {
+        // Structs and unions own their in-class members exactly like
+        // classes: a template struct's method used to report only the
+        // namespace, which broke the functions.qualifier == types.qualifier
+        // + "::" + types.name join and let same-named methods
+        // of different structs share an owner. The member below is
+        // inline-bodied; the union one is declaration-only.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             template <typename T>\n\
+             struct Box {\n\
+             \tT conv(T v) { return v; }\n\
+             };\n\
+             union U {\n\
+             \tvoid clear();\n\
+             };\n\
+             }\n",
+            "box.cpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("clear".to_string(), Some("ns::U".to_string())),
+                ("conv".to_string(), Some("ns::Box".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+    #[test]
+    fn python_definitions_carry_module_and_owner() {
+        // Python owners use the language's own spelling: methods carry the
+        // class, nested functions spell `<locals>`, and free functions
+        // carry the module.
+        let found = qualifiers_of(
+            "class C:\n\
+             \tdef m(self):\n\
+             \t\tpass\n\
+             \t@property\n\
+             \tdef x(self):\n\
+             \t\treturn 1\n\
+             \t@x.setter\n\
+             \tdef x(self, v):\n\
+             \t\tpass\n\
+             def outer():\n\
+             \tdef inner():\n\
+             \t\tpass\n\
+             def free():\n\
+             \tpass\n",
+            "pkg/mod.py",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("free".to_string(), Some("pkg.mod".to_string())),
+                (
+                    "inner".to_string(),
+                    Some("pkg.mod.outer.<locals>".to_string())
+                ),
+                ("m".to_string(), Some("pkg.mod.C".to_string())),
+                ("outer".to_string(), Some("pkg.mod".to_string())),
+                ("x".to_string(), Some("pkg.mod.C".to_string())),
+                ("x".to_string(), Some("pkg.mod.C".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn zig_definitions_carry_module_and_container() {
+        // Zig owners use the language's own spelling: methods carry the
+        // struct, nested containers nest, and free functions carry the
+        // module.
+        let found = qualifiers_of(
+            "const A = struct {\n\
+             \tpub fn init() void {}\n\
+             };\n\
+             const B = struct {\n\
+             \tpub fn init() void {}\n\
+             };\n\
+             const O = struct {\n\
+             \tconst I = struct {\n\
+             \t\tpub fn m() void {}\n\
+             \t};\n\
+             };\n\
+             pub fn free() void {}\n",
+            "src/main.zig",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("free".to_string(), Some("src.main".to_string())),
+                ("init".to_string(), Some("src.main.A".to_string())),
+                ("init".to_string(), Some("src.main.B".to_string())),
+                ("m".to_string(), Some("src.main.O.I".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn c_definitions_stand_alone() {
+        // C has no owners: the qualifier stays empty.
+        let found = qualifiers_of(
+            "int get(void);\nint get(void)\n{\n\treturn 1;\n}\n",
+            "get.c",
+        );
+        assert_eq!(found, vec![("get".to_string(), None)], "{found:?}");
     }
 
     #[test]
