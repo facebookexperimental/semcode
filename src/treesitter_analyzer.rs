@@ -209,6 +209,24 @@ struct MacroBodyFacts {
     argument_functions: Vec<RawArgumentFunction>,
 }
 
+/// One function match with everything the attribution half needs, owned
+/// so matches can be ordered smallest-range first before any site is
+/// claimed. A range that contains another then claims nothing: the
+/// innermost holder always runs first.
+struct ParsedFunction<'a> {
+    name: String,
+    return_type: Option<String>,
+    parameters: Vec<ParameterInfo>,
+    line_start: u32,
+    line_end: u32,
+    function_start_byte: usize,
+    function_end_byte: usize,
+    body_start_byte: usize,
+    function_node: Option<tree_sitter::Node<'a>>,
+    declaration_node: Option<tree_sitter::Node<'a>>,
+    has_body: bool,
+}
+
 /// A designated initializer before it is attributed to a function.
 #[derive(Debug, Clone)]
 struct RawRegistration {
@@ -3322,7 +3340,7 @@ impl TreeSitterAnalyzer {
         start: usize,
         end: usize,
         pointer_call_sites: &mut Vec<RawDispatchSite>,
-    ) -> Vec<String> {
+    ) -> Vec<(String, usize)> {
         let pointers: HashMap<&str, &PointerVar> = extraction
             .pointer_vars
             .iter()
@@ -3330,7 +3348,7 @@ impl TreeSitterAnalyzer {
             .map(|var| (var.name.as_str(), var))
             .collect();
 
-        let mut calls: Vec<String> = Vec::new();
+        let mut calls: Vec<(String, usize)> = Vec::new();
         for (call_name, call_start, call_end) in &extraction.calls {
             if *call_start < start || *call_end > end {
                 continue;
@@ -3351,7 +3369,7 @@ impl TreeSitterAnalyzer {
                     line: ctx.source[..*call_start].lines().count() as u32,
                     target: var.target.clone(),
                 }),
-                None => calls.push(call_name.clone()),
+                None => calls.push((call_name.clone(), *call_start)),
             }
         }
 
@@ -4549,324 +4567,221 @@ impl TreeSitterAnalyzer {
         let mut registrations: Vec<Registration> = Vec::new();
         let mut covered_sites: std::collections::HashSet<usize> = Default::default();
         let mut covered_registrations: std::collections::HashSet<usize> = Default::default();
+        // A call site belongs to exactly one function: the innermost
+        // holder claims it first (matches run smallest-range first), and a
+        // range that contains another cannot claim what it holds.
+        let mut covered_calls: std::collections::HashSet<usize> = Default::default();
         let mut argument_functions: Vec<ArgumentFunction> = Vec::new();
         let mut covered_argument_functions: std::collections::HashSet<usize> = Default::default();
         let mut pointer_call_sites: Vec<RawDispatchSite> = Vec::new();
         let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
-        let mut captures = cursor.captures(
+        let mut matches = cursor.matches(
             &queries.function_query,
             ctx.tree.root_node(),
             ctx.source.as_bytes(),
         );
+        // Parse first, attribute second: matches stream in tree order, and
+        // a range that contains another would otherwise claim the inner
+        // one's sites first. Smallest span runs first, so each site belongs
+        // to exactly one function.
+        let mut parsed = Vec::new();
+        while let Some(m) = matches.next() {
+            if let Some(p) = self.parse_function_match(ctx, queries, m) {
+                parsed.push(p);
+            }
+        }
+        parsed.sort_by_key(|p| p.function_end_byte.saturating_sub(p.function_start_byte));
         let mut functions = Vec::new();
 
         // Extract all comments once (used by extract_function_with_comments)
         let comments = self.extract_comments(ctx.tree, ctx.source, ctx.language)?;
 
-        while let Some((m, _)) = captures.next() {
-            let mut function_name = None;
-            let mut return_type = None;
-            let mut parameters = Vec::new();
-            let mut line_start = 0;
-            let mut line_end = 0;
-            let mut function_start_byte = 0;
-            let mut function_end_byte = 0;
-            let mut body_start_byte = 0;
-            let mut function_node = None;
-            // A declaration has no definition node, but sits under an arm
-            // all the same; without it a declaration and the definition it
-            // announces under one `#ifdef` read as two configurations.
-            let mut declaration_node = None;
+        for parsed in parsed {
+            let ParsedFunction {
+                name,
+                return_type,
+                parameters,
+                line_start,
+                mut line_end,
+                function_start_byte,
+                mut function_end_byte,
+                body_start_byte,
+                function_node,
+                declaration_node,
+                has_body,
+            } = parsed;
 
-            for capture in m.captures {
-                let node = capture.node;
-                let text = &ctx.source[node.byte_range()];
-                let capture_name = queries.function_query.capture_names()[capture.index as usize];
-
-                match capture_name {
-                    "function_name" => {
-                        let mut text = text.to_string();
-                        if ctx.language == Language::Cpp && node.kind() == "operator_cast" {
-                            // A conversion spells its target with its
-                            // parameters (`operator bool() const`), and no
-                            // `operator_name` exists to capture instead: the
-                            // name keeps the target only, the way
-                            // `operator==` keeps its spelling.
-                            if let Some(index) = text.find('(') {
-                                text.truncate(index);
-                                text = text.trim_end().to_string();
-                            }
-                        }
-                        function_name = Some(text);
-                        line_start = node.start_position().row as u32 + 1;
+            // A body the parser stopped reading early ends at the break
+            // rather than at its closing brace, and the statements after
+            // it are reparented to file scope where they belong to nobody.
+            // Counting braces recovers the end, and the range is all the
+            // attribution below needs.
+            if has_body && body_start_byte > 0 {
+                if let Some(recovered) = Self::body_end_by_braces(
+                    ctx.source,
+                    body_start_byte,
+                    function_node.map_or(ctx.source.len(), Self::next_definition_start),
+                ) {
+                    if recovered > function_end_byte {
+                        function_end_byte = recovered;
+                        line_end = ctx.source[..recovered].lines().count() as u32;
                     }
-                    "return_type" => {
-                        return_type = Some(text.to_string());
-                    }
-                    "parameters" => {
-                        parameters = self.parse_parameters_from_node(node, ctx.source);
-                        if let Some(ref name) = function_name {
-                            if name == "btrfs_lookup_inode" {
-                                tracing::debug!(
-                                    "{}: parameters capture matched, parsed {} params",
-                                    name,
-                                    parameters.len()
-                                );
-                            }
-                        }
-                    }
-                    "body" => {
-                        line_end = node.end_position().row as u32 + 1;
-                        body_start_byte = node.start_byte();
-                    }
-                    "function" | "function_ptr" | "function_ptr2" => {
-                        // All function types with bodies - process fully
-                        function_start_byte = node.start_byte();
-                        function_end_byte = node.end_byte();
-                        function_node = Some(node);
-                        if line_end == 0 {
-                            line_end = node.end_position().row as u32 + 1;
-                        }
-                        if line_start == 0 {
-                            line_start = node.start_position().row as u32 + 1;
-                        }
-
-                        // Extract return type from the full function text if not already captured
-                        if return_type.is_none() {
-                            return_type = Some(self.extract_return_type_from_function(
-                                node,
-                                ctx.source,
-                                &function_name,
-                            ));
-                        }
-                    }
-                    "declaration" if function_start_byte == 0 => {
-                        // Function declaration without body - skip call/type extraction
-                        // Set minimal bounds for declaration-only functions
-                        declaration_node = Some(node);
-                        function_start_byte = node.start_byte();
-                        function_end_byte = node.end_byte();
-                        if line_end == 0 {
-                            line_end = node.end_position().row as u32 + 1;
-                        }
-                        if line_start == 0 {
-                            line_start = node.start_position().row as u32 + 1;
-                        }
-                    }
-                    _ => {}
                 }
             }
 
-            if let Some(name) = function_name {
-                // C++ spells the owner in the declarator (`ns::Box::get`):
-                // the name column keeps the bare name, and the scope moves
-                // to the qualifier. The return type was already read against
-                // the qualified spelling above, which is what places it.
-                let mut name = name;
-                if ctx.language == Language::Cpp {
-                    if let Some((_, bare)) = name.rsplit_once("::") {
-                        name = bare.to_string();
-                    }
-                }
-                // Track which capture patterns were matched to determine if function has body
-                let mut matched_patterns = std::collections::HashSet::new();
-                for capture in m.captures {
-                    let capture_name =
-                        queries.function_query.capture_names()[capture.index as usize];
-                    matched_patterns.insert(capture_name);
-                }
+            // Extract complete function text including top comments
+            let complete_body = self.extract_function_with_comments(
+                ctx.source,
+                function_start_byte,
+                function_end_byte,
+                line_start,
+                &comments,
+            );
 
-                // Fallback parameter extraction if TreeSitter query didn't capture them
-                if parameters.is_empty() && !matched_patterns.contains("parameters") {
-                    // Try to manually find parameter_list nodes in the function AST
-                    for capture in m.captures {
-                        let node = capture.node;
-                        if self.try_extract_parameters_from_node(node, ctx.source, &mut parameters)
-                        {
-                            if name == "btrfs_lookup_inode" {
-                                tracing::debug!(
-                                    "{}: Fallback parameter extraction found {} params",
-                                    name,
-                                    parameters.len()
-                                );
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                // Determine if this function has a body based on matched patterns
-                let has_body = matched_patterns.contains("body")
-                    || matched_patterns.contains("function")
-                    || matched_patterns.contains("function_ptr")
-                    || matched_patterns.contains("function_ptr2");
-
-                // A body the parser stopped reading early ends at the break
-                // rather than at its closing brace, and the statements after
-                // it are reparented to file scope where they belong to nobody.
-                // Counting braces recovers the end, and the range is all the
-                // attribution below needs.
-                if has_body && body_start_byte > 0 {
-                    if let Some(recovered) = Self::body_end_by_braces(
-                        ctx.source,
-                        body_start_byte,
-                        function_node.map_or(ctx.source.len(), Self::next_definition_start),
-                    ) {
-                        if recovered > function_end_byte {
-                            function_end_byte = recovered;
-                            line_end = ctx.source[..recovered].lines().count() as u32;
-                        }
-                    }
-                }
-
-                // Extract complete function text including top comments
-                let complete_body = self.extract_function_with_comments(
-                    ctx.source,
+            // Only extract calls and types for functions with bodies (not just declarations)
+            let (unique_calls, function_types) = if has_body {
+                // Extract calls within this function from pre-computed list (O(m) instead of O(n))
+                // Function pointers declared by this function: a call
+                // naming one of them dispatches through a value.
+                // Each site belongs to exactly one function: matches run
+                // smallest-range first, so the innermost holder claims
+                // its sites before any containing range sees them.
+                let unique_calls: Vec<String> = Self::calls_in_range(
+                    ctx,
+                    extraction,
                     function_start_byte,
                     function_end_byte,
-                    line_start,
-                    &comments,
-                );
+                    &mut pointer_call_sites,
+                )
+                .into_iter()
+                .filter(|(_, byte_start)| covered_calls.insert(*byte_start))
+                .map(|(name, _)| name)
+                .collect();
 
-                // Only extract calls and types for functions with bodies (not just declarations)
-                let (unique_calls, function_types) = if has_body {
-                    // Extract calls within this function from pre-computed list (O(m) instead of O(n))
-                    // Function pointers declared by this function: a call
-                    // naming one of them dispatches through a value.
-                    let unique_calls = Self::calls_in_range(
-                        ctx,
-                        extraction,
-                        function_start_byte,
-                        function_end_byte,
-                        &mut pointer_call_sites,
-                    );
+                // Extract types used by this function (parameters and return type)
+                let default_void = "void".to_string();
+                let return_type_str = return_type.as_ref().unwrap_or(&default_void);
+                let function_types = self.extract_function_types(return_type_str, &parameters);
 
-                    // Extract types used by this function (parameters and return type)
-                    let default_void = "void".to_string();
-                    let return_type_str = return_type.as_ref().unwrap_or(&default_void);
-                    let function_types = self.extract_function_types(return_type_str, &parameters);
+                (unique_calls, function_types)
+            } else {
+                // For declarations only, don't extract calls or types from body
+                (Vec::new(), Vec::new())
+            };
 
-                    (unique_calls, function_types)
-                } else {
-                    // For declarations only, don't extract calls or types from body
-                    (Vec::new(), Vec::new())
-                };
+            let defined_at = function_node.or(declaration_node);
+            let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
+            let qualifier =
+                Self::owner_qualifier(ctx.language, defined_at, ctx.source, &relative_path);
+            // Member calls through `this`/`self` name no path: the
+            // enclosing owner goes beside them as a tagged edge instead
+            // of a dispatch site, which could never resolve them.
+            let mut tagged = Vec::new();
 
-                let defined_at = function_node.or(declaration_node);
-                let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
-                let qualifier =
-                    Self::owner_qualifier(ctx.language, defined_at, ctx.source, &relative_path);
-                // Member calls through `this`/`self` name no path: the
-                // enclosing owner goes beside them as a tagged edge instead
-                // of a dispatch site, which could never resolve them.
-                let mut tagged = Vec::new();
-
-                for raw in extraction
-                    .member_sites
-                    .iter()
-                    .chain(pointer_call_sites.iter())
-                    .filter(|site| {
-                        site.byte_start >= function_start_byte
-                            && site.byte_start < function_end_byte
-                    })
+            for raw in extraction
+                .member_sites
+                .iter()
+                .chain(pointer_call_sites.iter())
+                .filter(|site| {
+                    site.byte_start >= function_start_byte && site.byte_start < function_end_byte
+                })
+            {
+                // The function query yields several captures per function,
+                // so a site can be reached more than once; a site is one
+                // row regardless.
+                if !covered_sites.insert(raw.byte_start) {
+                    continue;
+                }
+                if let Some(edge) =
+                    Self::enclosing_owner_edge(ctx.language, raw, qualifier.as_deref())
                 {
-                    // The function query yields several captures per function,
-                    // so a site can be reached more than once; a site is one
-                    // row regardless.
-                    if !covered_sites.insert(raw.byte_start) {
-                        continue;
-                    }
-                    if let Some(edge) =
-                        Self::enclosing_owner_edge(ctx.language, raw, qualifier.as_deref())
-                    {
-                        tagged.push(edge);
-                        continue;
-                    }
-                    dispatch_sites.push(raw.attribute(
-                        &name,
-                        &self.make_relative_path(ctx.file_path, ctx.source_root),
-                        ctx.git_hash,
-                    ));
+                    tagged.push(edge);
+                    continue;
                 }
-
-                for raw in extraction.registrations.iter().filter(|reg| {
-                    reg.byte_start >= function_start_byte && reg.byte_start < function_end_byte
-                }) {
-                    if !covered_registrations.insert(raw.byte_start) {
-                        continue;
-                    }
-                    registrations.push(raw.attribute(
-                        &name,
-                        &self.make_relative_path(ctx.file_path, ctx.source_root),
-                        ctx.git_hash,
-                    ));
-                }
-
-                for raw in extraction.argument_functions.iter().filter(|arg| {
-                    arg.byte_start >= function_start_byte && arg.byte_start < function_end_byte
-                }) {
-                    if !covered_argument_functions.insert(raw.byte_start) {
-                        continue;
-                    }
-                    argument_functions.push(raw.attribute(
-                        &name,
-                        &self.make_relative_path(ctx.file_path, ctx.source_root),
-                        ctx.git_hash,
-                    ));
-                }
-
-                let mut calls = Self::rewrite_self_calls(
-                    ctx.language,
-                    defined_at,
-                    unique_calls,
-                    ctx.source,
-                    qualifier.as_deref(),
-                );
-                // A bare call beside its `this`/`self` twin names the same
-                // edge twice; the store keeps one.
-                calls.extend(tagged);
-                calls.sort();
-                calls.dedup();
-                let func = FunctionInfo {
-                    name: name.clone(),
-                    file_path: relative_path.clone(),
-                    git_file_hash: ctx.git_hash.to_string(),
-                    line_start,
-                    line_end,
-                    return_type: return_type.unwrap_or_else(|| "void".to_string()),
-                    parameters: parameters.clone(),
-                    body: complete_body,
-                    calls: if calls.is_empty() { None } else { Some(calls) },
-                    types: if function_types.is_empty() {
-                        None
-                    } else {
-                        Some(function_types)
-                    },
-                    guard: defined_at.and_then(|node| match ctx.language {
-                        // Each language records its arms as written: the C
-                        // preprocessor, Rust attributes, Python conditions
-                        // and handlers, Zig comptime conditions. Opaque
-                        // everywhere but C: guards filter, never decide row
-                        // survival.
-                        Language::Rust => Self::rust_cfg_guard(node, ctx.source),
-                        Language::C | Language::Cpp => Self::guard_of(node, ctx.source),
-                        Language::Python => Self::python_guard(node, ctx.source),
-                        Language::Zig => Self::zig_guard(node, ctx.source),
-                    }),
-                    qualifier,
-                };
-
-                if name == "btrfs_lookup_inode" {
-                    tracing::debug!(
-                        "{}: FunctionInfo created with {} parameters",
-                        name,
-                        func.parameters.len()
-                    );
-                }
-
-                functions.push(func);
+                dispatch_sites.push(raw.attribute(
+                    &name,
+                    &self.make_relative_path(ctx.file_path, ctx.source_root),
+                    ctx.git_hash,
+                ));
             }
+
+            for raw in extraction.registrations.iter().filter(|reg| {
+                reg.byte_start >= function_start_byte && reg.byte_start < function_end_byte
+            }) {
+                if !covered_registrations.insert(raw.byte_start) {
+                    continue;
+                }
+                registrations.push(raw.attribute(
+                    &name,
+                    &self.make_relative_path(ctx.file_path, ctx.source_root),
+                    ctx.git_hash,
+                ));
+            }
+
+            for raw in extraction.argument_functions.iter().filter(|arg| {
+                arg.byte_start >= function_start_byte && arg.byte_start < function_end_byte
+            }) {
+                if !covered_argument_functions.insert(raw.byte_start) {
+                    continue;
+                }
+                argument_functions.push(raw.attribute(
+                    &name,
+                    &self.make_relative_path(ctx.file_path, ctx.source_root),
+                    ctx.git_hash,
+                ));
+            }
+
+            let mut calls = Self::rewrite_self_calls(
+                ctx.language,
+                defined_at,
+                unique_calls,
+                ctx.source,
+                qualifier.as_deref(),
+            );
+            // A bare call beside its `this`/`self` twin names the same
+            // edge twice; the store keeps one.
+            calls.extend(tagged);
+            calls.sort();
+            calls.dedup();
+            let func = FunctionInfo {
+                name: name.clone(),
+                file_path: relative_path.clone(),
+                git_file_hash: ctx.git_hash.to_string(),
+                line_start,
+                line_end,
+                return_type: return_type.unwrap_or_else(|| "void".to_string()),
+                parameters: parameters.clone(),
+                body: complete_body,
+                calls: if calls.is_empty() { None } else { Some(calls) },
+                types: if function_types.is_empty() {
+                    None
+                } else {
+                    Some(function_types)
+                },
+                guard: defined_at.and_then(|node| match ctx.language {
+                    // Each language records its arms as written: the C
+                    // preprocessor, Rust attributes, Python conditions
+                    // and handlers, Zig comptime conditions. Opaque
+                    // everywhere but C: guards filter, never decide row
+                    // survival.
+                    Language::Rust => Self::rust_cfg_guard(node, ctx.source),
+                    Language::C | Language::Cpp => Self::guard_of(node, ctx.source),
+                    Language::Python => Self::python_guard(node, ctx.source),
+                    Language::Zig => Self::zig_guard(node, ctx.source),
+                }),
+                qualifier,
+            };
+
+            if name == "btrfs_lookup_inode" {
+                tracing::debug!(
+                    "{}: FunctionInfo created with {} parameters",
+                    name,
+                    func.parameters.len()
+                );
+            }
+
+            functions.push(func);
         }
 
         // Most ops tables sit at file scope and belong to no function.
@@ -4921,13 +4836,17 @@ impl TreeSitterAnalyzer {
                 {
                     continue;
                 }
-                let calls = Self::calls_in_range(
+                let calls: Vec<String> = Self::calls_in_range(
                     ctx,
                     extraction,
                     defined.start_byte,
                     defined.end_byte,
                     &mut pointer_call_sites,
-                );
+                )
+                .into_iter()
+                .filter(|(_, byte_start)| covered_calls.insert(*byte_start))
+                .map(|(name, _)| name)
+                .collect();
 
                 for raw in extraction.registrations.iter().filter(|reg| {
                     reg.byte_start >= defined.start_byte && reg.byte_start < defined.end_byte
@@ -5827,6 +5746,163 @@ impl TreeSitterAnalyzer {
             sibling = current.next_sibling();
         }
         usize::MAX
+    }
+
+    /// Read one function match the way the loop always has; `None` when the
+    /// match names no function.
+    fn parse_function_match<'a>(
+        &self,
+        ctx: &ExtractionContext<'a>,
+        queries: &LanguageQueries,
+        m: &tree_sitter::QueryMatch<'_, 'a>,
+    ) -> Option<ParsedFunction<'a>> {
+        let mut function_name = None;
+        let mut return_type = None;
+        let mut parameters = Vec::new();
+        let mut line_start = 0;
+        let mut line_end = 0;
+        let mut function_start_byte = 0;
+        let mut function_end_byte = 0;
+        let mut body_start_byte = 0;
+        let mut function_node = None;
+        // A declaration has no definition node, but sits under an arm
+        // all the same; without it a declaration and the definition it
+        // announces under one `#ifdef` read as two configurations.
+        let mut declaration_node = None;
+
+        for capture in m.captures {
+            let node = capture.node;
+            let text = &ctx.source[node.byte_range()];
+            let capture_name = queries.function_query.capture_names()[capture.index as usize];
+
+            match capture_name {
+                "function_name" => {
+                    let mut text = text.to_string();
+                    if ctx.language == Language::Cpp && node.kind() == "operator_cast" {
+                        // A conversion spells its target with its
+                        // parameters (`operator bool() const`), and no
+                        // `operator_name` exists to capture instead: the
+                        // name keeps the target only, the way
+                        // `operator==` keeps its spelling.
+                        if let Some(index) = text.find('(') {
+                            text.truncate(index);
+                            text = text.trim_end().to_string();
+                        }
+                    }
+                    function_name = Some(text);
+                    line_start = node.start_position().row as u32 + 1;
+                }
+                "return_type" => {
+                    return_type = Some(text.to_string());
+                }
+                "parameters" => {
+                    parameters = self.parse_parameters_from_node(node, ctx.source);
+                    if let Some(ref name) = function_name {
+                        if name == "btrfs_lookup_inode" {
+                            tracing::debug!(
+                                "{}: parameters capture matched, parsed {} params",
+                                name,
+                                parameters.len()
+                            );
+                        }
+                    }
+                }
+                "body" => {
+                    line_end = node.end_position().row as u32 + 1;
+                    body_start_byte = node.start_byte();
+                }
+                "function" | "function_ptr" | "function_ptr2" => {
+                    // All function types with bodies - process fully
+                    function_start_byte = node.start_byte();
+                    function_end_byte = node.end_byte();
+                    function_node = Some(node);
+                    if line_end == 0 {
+                        line_end = node.end_position().row as u32 + 1;
+                    }
+                    if line_start == 0 {
+                        line_start = node.start_position().row as u32 + 1;
+                    }
+
+                    // Extract return type from the full function text if not already captured
+                    if return_type.is_none() {
+                        return_type = Some(self.extract_return_type_from_function(
+                            node,
+                            ctx.source,
+                            &function_name,
+                        ));
+                    }
+                }
+                "declaration" if function_start_byte == 0 => {
+                    // Function declaration without body - skip call/type extraction
+                    // Set minimal bounds for declaration-only functions
+                    declaration_node = Some(node);
+                    function_start_byte = node.start_byte();
+                    function_end_byte = node.end_byte();
+                    if line_end == 0 {
+                        line_end = node.end_position().row as u32 + 1;
+                    }
+                    if line_start == 0 {
+                        line_start = node.start_position().row as u32 + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut name = function_name?;
+        // C++ spells the owner in the declarator (`ns::Box::get`):
+        // the name column keeps the bare name, and the scope moves
+        // to the qualifier. The return type was already read against
+        // the qualified spelling above, which is what places it.
+        if ctx.language == Language::Cpp {
+            if let Some((_, bare)) = name.rsplit_once("::") {
+                name = bare.to_string();
+            }
+        }
+        // Track which capture patterns were matched to determine if function has body
+        let mut matched_patterns = std::collections::HashSet::new();
+        for capture in m.captures {
+            let capture_name = queries.function_query.capture_names()[capture.index as usize];
+            matched_patterns.insert(capture_name.to_string());
+        }
+
+        // Fallback parameter extraction if TreeSitter query didn't capture them
+        if parameters.is_empty() && !matched_patterns.contains("parameters") {
+            // Try to manually find parameter_list nodes in the function AST
+            for capture in m.captures {
+                let node = capture.node;
+                if self.try_extract_parameters_from_node(node, ctx.source, &mut parameters) {
+                    if name == "btrfs_lookup_inode" {
+                        tracing::debug!(
+                            "{}: Fallback parameter extraction found {} params",
+                            name,
+                            parameters.len()
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Determine if this function has a body based on matched patterns
+        let has_body = matched_patterns.contains("body")
+            || matched_patterns.contains("function")
+            || matched_patterns.contains("function_ptr")
+            || matched_patterns.contains("function_ptr2");
+
+        Some(ParsedFunction {
+            name,
+            return_type,
+            parameters,
+            line_start,
+            line_end,
+            function_start_byte,
+            function_end_byte,
+            body_start_byte,
+            function_node,
+            declaration_node,
+            has_body,
+        })
     }
 
     /// The closing brace of the block opening at `open`, found by counting
@@ -8632,6 +8708,47 @@ mod tests {
             !sites.iter().any(|s| s.kind == DispatchKind::MacroDeclared),
             "ordinary call treated as an indirect-call macro: {sites:?}"
         );
+    }
+
+    #[test]
+    fn a_call_in_a_nested_function_belongs_to_the_inner_one() {
+        // A range that contains another claimed the inner one's calls:
+        // `outer` listed `inner_mark`, which only `inner` calls. Matches
+        // run smallest-range first now, so each site belongs to exactly one.
+        let (functions, _sites) = analyze(
+            "int outer_mark(void) { return 1; }\n\
+             int inner_mark(void) { return 2; }\n\
+             void outer(void)\n\
+             {\n\
+             \tvoid inner(void)\n\
+             \t{\n\
+             \t\tinner_mark();\n\
+             \t}\n\
+             \touter_mark();\n\
+             \tinner();\n\
+             }\n",
+            "test.c",
+        );
+
+        let calls_of = |name: &str| {
+            functions
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| {
+                    let mut names: Vec<&str> = f
+                        .calls
+                        .iter()
+                        .flat_map(|v| v.iter())
+                        .map(|e| e.callee())
+                        .collect();
+                    names.sort_unstable();
+                    names
+                })
+                .unwrap()
+        };
+
+        assert_eq!(calls_of("inner"), vec!["inner_mark"]);
+        assert_eq!(calls_of("outer"), vec!["inner", "outer_mark"]);
     }
 
     #[test]
