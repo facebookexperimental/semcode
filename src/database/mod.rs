@@ -82,14 +82,28 @@ pub(crate) fn get_column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> 
         .ok_or_else(|| anyhow::anyhow!("column '{name}' has unexpected type"))
 }
 
-/// Parse the `calls` column: a JSON array of callee names.
+/// Parse the `calls` column to callee names: a JSON array mixing plain
+/// spellings and tagged edges. A tagged edge contributes its call text;
+/// the owner beside it is for owner-aware lookup, read by
+/// [`parse_call_edges`].
 ///
 /// An unparsable value is an error rather than an empty list. Callers used to
 /// discard the parse error, which turned a malformed or unrecognised value into
 /// a function that appears to call nothing, indistinguishable from one that
 /// really calls nothing.
 pub(crate) fn parse_call_list(json: &str) -> Result<Vec<String>> {
-    serde_json::from_str::<Vec<String>>(json).map_err(|e| {
+    parse_call_edges(json).map(|edges| {
+        edges
+            .into_iter()
+            .map(|edge| edge.callee().to_string())
+            .collect()
+    })
+}
+
+/// Parse the `calls` column to its edges, keeping the owner beside every
+/// tagged member call. Plain spellings carry no owner.
+pub(crate) fn parse_call_edges(json: &str) -> Result<Vec<crate::types::CallEdge>> {
+    serde_json::from_str::<Vec<crate::types::CallEdge>>(json).map_err(|e| {
         let preview: String = json.chars().take(120).collect();
         anyhow::anyhow!("call list is not a JSON array of names ({e}): {preview}")
     })

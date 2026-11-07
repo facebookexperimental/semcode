@@ -2420,7 +2420,7 @@ impl DatabaseManager {
         // A spelled path (`Arc::new`) names the owner as well as the
         // definition: the bare name drives every lookup below, and the rows
         // it finds are kept only where the path addresses their owner.
-        let (bare_name, owner_path) = crate::types::split_qualified_name(name);
+        let (bare_name, owner_path) = crate::types::split_callee_edge(name);
         // Step 1: Get candidate file paths from symbol_filename table
         let unique_file_paths = self
             .symbol_filename_store
@@ -2605,7 +2605,7 @@ impl DatabaseManager {
         // it finds are kept only where the path addresses their owner. A
         // bare name answers as before; the misses still report the name as
         // spelled.
-        let (bare_name, owner_path) = crate::types::split_qualified_name(name);
+        let (bare_name, owner_path) = crate::types::split_callee_edge(name);
         // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full function records)
         let unique_file_paths = self
             .symbol_filename_store
@@ -4217,9 +4217,13 @@ impl DatabaseManager {
         // Use the same smart selection logic to prefer implementations over declarations
         let best_match = self.select_best_function_match(all_matches);
 
-        // Get the calls from the best match (already deserialized as Vec<String>)
+        // Get the calls from the best match, projecting tagged edges to the
+        // callee they name.
         if let Some(ref calls_list) = best_match.calls {
-            return Ok(calls_list.clone());
+            return Ok(calls_list
+                .iter()
+                .map(|edge| edge.callee().to_string())
+                .collect());
         }
 
         Ok(Vec::new())
@@ -4311,7 +4315,7 @@ impl DatabaseManager {
         function_name: &str,
         git_sha: &str,
     ) -> Result<Vec<crate::types::CalleeDefinition>> {
-        let (bare_name, owner_path) = crate::types::split_qualified_name(function_name);
+        let (bare_name, owner_path) = crate::types::split_callee_edge(function_name);
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         let mut definitions = if git_manifest.is_empty() {
             Vec::new()
@@ -4367,7 +4371,13 @@ impl DatabaseManager {
                         file_path: function.file_path.clone(),
                         line_start: function.line_start,
                         line_end: function.line_end,
-                        callees: function.calls.clone().unwrap_or_default(),
+                        callees: function
+                            .calls
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|edge| edge.callee().to_string())
+                            .collect(),
                         is_definition: crate::types::row_defines_the_function(
                             &function.return_type,
                             &function.body,
@@ -8606,7 +8616,7 @@ mod tests {
             return_type: "int".to_string(),
             parameters: Vec::new(),
             body: format!("int {name}(void) {{ return 0; }}"),
-            calls: Some(vec!["target".to_string()]),
+            calls: Some(vec!["target".into()]),
             types: None,
             guard: None,
             qualifier: None,
@@ -9050,7 +9060,7 @@ mod tests {
                 return_type: "void".to_string(),
                 parameters: Vec::new(),
                 body: "void caller_one(void) { target(); }".to_string(),
-                calls: Some(vec!["target".to_string()]),
+                calls: Some(vec!["target".into()]),
                 types: Some(vec!["duplicate".to_string()]),
                 guard: None,
                 qualifier: None,
@@ -9064,7 +9074,7 @@ mod tests {
                 return_type: "void".to_string(),
                 parameters: Vec::new(),
                 body: "void caller_two(void) { target(); }".to_string(),
-                calls: Some(vec!["target".to_string()]),
+                calls: Some(vec!["target".into()]),
                 types: Some(vec!["duplicate".to_string()]),
                 guard: None,
                 qualifier: None,

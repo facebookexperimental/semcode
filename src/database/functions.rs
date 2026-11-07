@@ -23,7 +23,7 @@ pub(crate) struct FunctionMetadata {
     pub return_type: String,
     pub parameters: Vec<ParameterInfo>,
     pub body_hash: Option<String>,
-    pub calls: Option<Vec<String>>,
+    pub calls: Option<Vec<crate::types::CallEdge>>,
     pub types: Option<Vec<String>>,
     /// The preprocessor arm holding this definition, as the file writes it.
     /// `None` at file scope. Stored as `""`, never null: the column is part
@@ -666,7 +666,7 @@ impl FunctionStore {
         let calls = if calls_array.is_null(row) {
             None
         } else {
-            Some(crate::database::parse_call_list(calls_array.value(row))?)
+            Some(crate::database::parse_call_edges(calls_array.value(row))?)
         };
 
         let types = if types_array.is_null(row) {

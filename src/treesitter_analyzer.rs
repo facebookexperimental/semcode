@@ -7,9 +7,9 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
-    ArgumentFunction, DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry,
-    GlobalVariable, MacroParams, ParameterInfo, Registration, RegistrationKind, TypeInfo,
-    ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
+    ArgumentFunction, CallEdge, DispatchKind, DispatchSite, FieldInfo, FunctionInfo,
+    GlobalTypeRegistry, GlobalVariable, MacroParams, ParameterInfo, Registration, RegistrationKind,
+    TypeInfo, ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -1205,8 +1205,7 @@ impl TreeSitterAnalyzer {
             ) @call
 
             (call_expression
-                function: (template_function
-                    name: (identifier) @function_name)
+                function: (template_function) @function_name
             ) @call
 
             (call_expression
@@ -1285,7 +1284,9 @@ impl TreeSitterAnalyzer {
         "#,
         )?;
 
-        // Query for function calls
+        // Query for function calls. Scoped and generic calls keep their
+        // full spelling: `Arc::new`, `foo::<u8>`. What the path selects is
+        // resolved at query time.
         let call_query = Query::new(
             language,
             r#"
@@ -1299,6 +1300,14 @@ impl TreeSitterAnalyzer {
                     field: (field_identifier) @member_name
                 )
             ) @method_call
+
+            (call_expression
+                function: (scoped_identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (generic_function) @function_name
+            ) @call
         "#,
         )?;
 
@@ -4657,7 +4666,7 @@ impl TreeSitterAnalyzer {
                     calls: if unique_calls.is_empty() {
                         None
                     } else {
-                        Some(unique_calls)
+                        Some(unique_calls.into_iter().map(CallEdge::from).collect())
                     },
                     types: if function_types.is_empty() {
                         None
@@ -4792,7 +4801,8 @@ impl TreeSitterAnalyzer {
                     return_type: String::new(),
                     parameters: Vec::new(),
                     body: ctx.source[defined.start_byte..defined.end_byte].to_string(),
-                    calls: (!calls.is_empty()).then_some(calls),
+                    calls: (!calls.is_empty())
+                        .then_some(calls.into_iter().map(CallEdge::from).collect()),
                     types: None,
                     guard: defined.guard.clone(),
                     // A macro-opened C function has no owner to record.
@@ -5376,7 +5386,7 @@ impl TreeSitterAnalyzer {
                     calls: if macro_calls.is_empty() {
                         None
                     } else {
-                        Some(macro_calls)
+                        Some(macro_calls.into_iter().map(CallEdge::from).collect())
                     },
                     types: if macro_types.is_empty() {
                         None
@@ -8498,7 +8508,8 @@ mod tests {
             !go.calls
                 .clone()
                 .unwrap_or_default()
-                .contains(&"fp".to_string()),
+                .iter()
+                .any(|c| c == "fp"),
             "pointer variable recorded as a called function: {:?}",
             go.calls
         );
@@ -8545,6 +8556,9 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+            .into_iter()
+            .map(|edge| edge.callee().to_string())
+            .collect()
     }
 
     #[test]
@@ -9602,7 +9616,8 @@ mod tests {
             !go.calls
                 .clone()
                 .unwrap_or_default()
-                .contains(&"read".to_string()),
+                .iter()
+                .any(|c| c == "read"),
             "member name recorded as a called function: {:?}",
             go.calls
         );

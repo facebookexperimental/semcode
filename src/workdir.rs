@@ -474,8 +474,12 @@ impl WorkdirIndex {
             .flatten()
         {
             if let Some(calls) = &function.calls {
-                for target in calls.iter().filter(|name| function_names.contains(*name)) {
-                    *function_counts.entry(target.clone()).or_default() += 1;
+                for target in calls
+                    .iter()
+                    .map(|edge| edge.callee())
+                    .filter(|name| function_names.contains(*name))
+                {
+                    *function_counts.entry(target.to_string()).or_default() += 1;
                 }
             }
             if let Some(types) = &function.types {
@@ -528,7 +532,7 @@ impl WorkdirIndex {
         for funcs in all_funcs {
             for func in funcs {
                 if let Some(ref calls) = func.calls {
-                    if calls.iter().any(|c| c.to_lowercase() == target) {
+                    if calls.iter().any(|c| c.callee().to_lowercase() == target) {
                         results.push(func);
                     }
                 }
@@ -539,7 +543,14 @@ impl WorkdirIndex {
 
     /// Get the callees of a function in the dirty overlay.
     pub fn find_callees(&self, name: &str) -> Option<Vec<String>> {
-        self.find_function(name).and_then(|f| f.calls.clone())
+        self.find_function(name).and_then(|f| {
+            f.calls.clone().map(|calls| {
+                calls
+                    .into_iter()
+                    .map(|edge| edge.callee().to_string())
+                    .collect()
+            })
+        })
     }
 
     /// Check if a file path has uncommitted changes.
