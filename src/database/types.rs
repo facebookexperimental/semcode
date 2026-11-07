@@ -23,6 +23,9 @@ struct TypeMetadata {
     pub members: Vec<FieldInfo>,
     pub definition_hash: Option<String>,
     pub types: Option<Vec<String>>,
+    /// The entity owning this type. Stored as `""`, never null: the column
+    /// is part of the merge key.
+    pub qualifier: Option<String>,
 }
 
 pub struct TypeStore {
@@ -44,6 +47,7 @@ fn one_type_per_key(types: &[TypeInfo]) -> Vec<TypeInfo> {
             type_info.kind.clone(),
             type_info.file_path.clone(),
             type_info.git_file_hash.clone(),
+            type_info.qualifier.clone(),
         );
         if seen.insert(key) {
             kept.push(type_info.clone());
@@ -134,6 +138,7 @@ impl TypeStore {
         let mut size_builder = Int64Builder::new();
         let mut fields_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        let mut qualifier_builder = StringBuilder::new();
 
         for type_info in types {
             name_builder.append_value(&type_info.name);
@@ -141,6 +146,7 @@ impl TypeStore {
 
             line_builder.append_value(type_info.line_start as i64);
             kind_builder.append_value(&type_info.kind);
+            qualifier_builder.append_value(type_info.qualifier.as_deref().unwrap_or_default());
 
             if let Some(size) = type_info.size {
                 size_builder.append_value(size as i64);
@@ -203,10 +209,15 @@ impl TypeStore {
                 Arc::new(definition_hash_array) as ArrayRef,
             ),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            (
+                "qualifier",
+                Arc::new(qualifier_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "kind", "file_path", "git_file_hash"]);
+        let mut merge_insert =
+            table.merge_insert(&["name", "kind", "file_path", "git_file_hash", "qualifier"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -230,14 +241,15 @@ impl TypeStore {
         let mut size_builder = Int64Builder::new();
         let mut fields_builder = StringBuilder::new();
         let mut types_builder = StringBuilder::new();
+        let mut qualifier_builder = StringBuilder::new();
 
         for type_info in types {
             name_builder.append_value(&type_info.name);
             file_path_builder.append_value(&type_info.file_path);
             line_builder.append_value(type_info.line_start as i64);
             kind_builder.append_value(&type_info.kind);
+            qualifier_builder.append_value(type_info.qualifier.as_deref().unwrap_or_default());
             size_builder.append_value(type_info.size.unwrap_or(0) as i64);
-
             // Serialize members to JSON
             let fields_json = serde_json::to_string(&type_info.members).unwrap_or_default();
             fields_builder.append_value(&fields_json);
@@ -284,10 +296,15 @@ impl TypeStore {
                 Arc::new(definition_hash_array) as ArrayRef,
             ),
             ("types", Arc::new(types_builder.finish()) as ArrayRef),
+            (
+                "qualifier",
+                Arc::new(qualifier_builder.finish()) as ArrayRef,
+            ),
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "kind", "file_path", "git_file_hash"]);
+        let mut merge_insert =
+            table.merge_insert(&["name", "kind", "file_path", "git_file_hash", "qualifier"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -415,6 +432,7 @@ impl TypeStore {
                             members: type_data.members,
                             definition,
                             types: type_data.types,
+                            qualifier: type_data.qualifier.clone(),
                         });
                     }
                 }
@@ -504,6 +522,7 @@ impl TypeStore {
                 members: type_data.members,
                 definition,
                 types: type_data.types,
+                qualifier: type_data.qualifier.clone(),
             });
         }
 
@@ -593,6 +612,7 @@ impl TypeStore {
             members: fields,
             definition_hash,
             types,
+            qualifier: crate::database::optional_string_column(batch, row, "qualifier"),
         }))
     }
 
@@ -674,6 +694,7 @@ impl TypeStore {
                 members: type_data.members,
                 definition,
                 types: type_data.types,
+                qualifier: type_data.qualifier.clone(),
             };
 
             result.insert(type_data.name, type_info);
@@ -820,6 +841,7 @@ impl TypeStore {
             members: fields,
             definition,
             types,
+            qualifier: crate::database::optional_string_column(batch, row, "qualifier"),
         }))
     }
 }
@@ -857,6 +879,7 @@ impl TypedefStore {
                     members: Vec::new(),
                     definition: full_definition,
                     types: None, // Typedefs don't reference other types directly
+                    qualifier: None,
                 }
             })
             .collect();

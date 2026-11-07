@@ -44,7 +44,13 @@ pub enum OptimizeOutcome {
 ///    definition (`module::Type` for a Rust method), and the merge key
 ///    includes it, so ten owners of one name coexist. A version 10 index
 ///    holds one row per name per arm and cannot tell the owners apart.
-pub const SCHEMA_VERSION: u32 = 11;
+/// 12: `line_start` joins the `functions` merge key, so overloads, property
+///    pairs and same-name definitions under different guards coexist, and
+///    `types` gains a `qualifier` column in its merge key, so one file's
+///    `ns1::Box` and `ns2::Box` coexist. A version 11 index holds one row
+///    per name per arm per owner and cannot tell same-key definitions
+///    apart.
+pub const SCHEMA_VERSION: u32 = 12;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -58,6 +64,16 @@ impl SchemaManager {
     pub async fn create_all_tables(&self) -> Result<()> {
         let table_names = self.connection.table_names().execute().await?;
 
+        // Whether the processed records prove old rows are in the tables,
+        // decided before the migration below empties them: an Int64 column
+        // (or a missing one) with rows in it proves the index predates
+        // per-language versions, and after the migration that evidence is
+        // an empty table, which proves nothing.
+        let stale_before = match self.stored_schema_version().await? {
+            Some(written) if written >= SCHEMA_VERSION => false,
+            _ => self.has_stale_processed_rows().await?,
+        };
+
         if !table_names.iter().any(|n| n == "functions") {
             self.create_functions_table().await?;
         } else {
@@ -70,6 +86,9 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "types") {
             self.create_types_table().await?;
+        } else {
+            self.recreate_without_columns("types", &["qualifier"])
+                .await?;
         }
 
         if !table_names.iter().any(|n| n == "vectors") {
@@ -132,6 +151,31 @@ impl SchemaManager {
             // build writes, and nothing would ever re-read it.
             let preexisting = table_names.iter().any(|n| n == "functions");
             self.create_schema_meta_table_for(preexisting).await?;
+        }
+
+        // A version bump changed what a row means: the functions merge key
+        // and the types columns no longer match what an older build wrote,
+        // so rows that predate them cannot be merged correctly and start
+        // again. A current or newer mark means nothing changed under this
+        // build, so opening an index never drops rows on its own. Nor does
+        // an unknown mark on its own: the mark may have been lost while the
+        // rows and their processed records are current, and dropping those
+        // rows while their files count as read would leave holes no reindex
+        // fills. The drop happens only when a processed record still names
+        // an older extractor, which proves old rows are in the tables; those
+        // files are re-read on their own account, so nothing is lost.
+        match self.stored_schema_version().await? {
+            Some(written) if written >= SCHEMA_VERSION => {}
+            older => {
+                if stale_before || self.has_stale_processed_rows().await? {
+                    tracing::info!(
+                        "index written by version {older:?} predates {SCHEMA_VERSION}: starting functions and types again"
+                    );
+                    self.recreate_table("functions").await?;
+                    self.recreate_table("types").await?;
+                }
+                self.set_schema_version().await?;
+            }
         }
 
         if !table_names.iter().any(|n| n == "git_commits") {
@@ -458,9 +502,19 @@ impl SchemaManager {
     /// The options matter as much as the version: an index built for `c,h`
     /// does not hold what one built for `c,h,rs` holds, and rebuilding it
     /// with different options silently changes what a query can find.
-    pub async fn set_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
+    pub async fn set_index_build(
+        &self,
+        extensions: &[String],
+        no_macros: bool,
+        headers_as_cpp: bool,
+    ) -> Result<()> {
         let table = self.connection.open_table("schema_meta").execute().await?;
-        let keys = ["schema_version", "index:extensions", "index:macros"];
+        let keys = [
+            "schema_version",
+            "index:extensions",
+            "index:macros",
+            "index:headers_as_cpp",
+        ];
         for key in keys {
             table
                 .delete(&format!("key = '{key}'"))
@@ -472,6 +526,7 @@ impl SchemaManager {
             SCHEMA_VERSION.to_string(),
             extensions.join(","),
             if no_macros { "skipped" } else { "indexed" }.to_string(),
+            if headers_as_cpp { "true" } else { "false" }.to_string(),
         ];
 
         let schema = Arc::new(Schema::new(vec![
@@ -515,6 +570,98 @@ impl SchemaManager {
         )?;
         table.add(vec![batch]).execute().await?;
         Ok(())
+    }
+
+    /// Record that the index now holds what this version writes, after a
+    /// migration that dropped what an older one wrote. A new key in
+    /// `schema_meta`, not a new column, so no migration.
+    pub async fn set_schema_version(&self) -> Result<()> {
+        let table = self.connection.open_table("schema_meta").execute().await?;
+        table
+            .delete("key = 'schema_version'")
+            .await
+            .context("clearing schema_version")?;
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("key", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow::array::StringArray::from(vec!["schema_version"]))
+                    as arrow::array::ArrayRef,
+                std::sync::Arc::new(arrow::array::StringArray::from(vec![
+                    SCHEMA_VERSION.to_string()
+                ])) as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
+    /// Whether any processed record names an extractor older than this
+    /// build. Those files are re-read on their own account, so their rows
+    /// prove old content is in the tables. A table that predates the column
+    /// entirely is stale by the same token: every row in it was written by
+    /// an unknown older extractor.
+    async fn has_stale_processed_rows(&self) -> Result<bool> {
+        if !self
+            .connection
+            .table_names()
+            .execute()
+            .await?
+            .iter()
+            .any(|name| name == "processed_files")
+        {
+            return Ok(false);
+        }
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+        let has_column = table
+            .schema()
+            .await?
+            .fields()
+            .iter()
+            .any(|f| f.name() == "extractor_version");
+        if !has_column {
+            return Ok(table.count_rows(None).await? > 0);
+        }
+        let headers_as_cpp = self
+            .meta_value("index:headers_as_cpp")
+            .await?
+            .map(|value| value == "true")
+            .unwrap_or(false);
+        let batches: Vec<arrow::record_batch::RecordBatch> =
+            table.query().execute().await?.try_collect().await?;
+        for batch in &batches {
+            let Some(files) = batch
+                .column_by_name("file")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            else {
+                continue;
+            };
+            let versions = batch
+                .column_by_name("extractor_version")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>());
+            let Some(versions) = versions else {
+                // The column predates language versions: no row in it can
+                // name the language that read its file.
+                return Ok(table.count_rows(None).await? > 0);
+            };
+            for row in 0..versions.len() {
+                let current = crate::extractor_version_for_file(
+                    std::path::Path::new(files.value(row)),
+                    headers_as_cpp,
+                );
+                if !versions.is_valid(row) || versions.value(row) != current {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// The value recorded under a key, absent when the index does not say.
@@ -598,6 +745,12 @@ impl SchemaManager {
             Field::new("fields", DataType::Utf8, false),
             Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
             Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
+            // The entity owning this type, in the language's own spelling
+            // (`ns` for `ns::Box`). Empty where nothing owns it, which is
+            // every C row. Non-nullable and last: part of the merge key, and
+            // existing column order is frozen -- readers index this table
+            // positionally, so a new column is appended and read by name.
+            Field::new("qualifier", DataType::Utf8, false),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -684,8 +837,10 @@ impl SchemaManager {
             // Which extractor read this file. Unchanged content is skipped on
             // a later run, which is right only when the reading would produce
             // what it produced before; after the extractor learns something,
-            // the row is stale even though the file is not.
-            Field::new("extractor_version", DataType::Int64, true),
+            // the row is stale even though the file is not. The version names
+            // the language that read the file, so a grammar bump re-reads
+            // only its language.
+            Field::new("extractor_version", DataType::Utf8, true),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -713,7 +868,26 @@ impl SchemaManager {
     /// settle it.
     async fn migrate_processed_files_table(&self) -> Result<()> {
         self.recreate_without_columns("processed_files", &["extractor_version"])
-            .await
+            .await?;
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+        let still_integers = table
+            .schema()
+            .await?
+            .fields()
+            .iter()
+            .filter(|f| f.name() == "extractor_version")
+            .all(|f| *f.data_type() != DataType::Utf8);
+        if still_integers {
+            tracing::info!(
+                "processed_files extractor_version predates language versions: starting the table again"
+            );
+            self.recreate_table("processed_files").await?;
+        }
+        Ok(())
     }
 
     /// Start a table again when this build writes columns it does not have.
@@ -740,10 +914,21 @@ impl SchemaManager {
         }
 
         tracing::info!("{name} predates {missing:?}: starting the table again");
+        self.recreate_table(name).await
+    }
+
+    /// Drop a table and create it again empty, so rows an older build wrote
+    /// cannot be merged with what this one writes.
+    ///
+    /// Dropping is safe for these tables because every row in them is
+    /// derived from a file, and the schema version that goes with a column
+    /// change makes each file be read again.
+    async fn recreate_table(&self, name: &str) -> Result<()> {
         self.connection.drop_table(name, &[]).await?;
         match name {
             "processed_files" => self.create_processed_files_table().await,
             "functions" => self.create_functions_table().await,
+            "types" => self.create_types_table().await,
             "object_macros" => self.create_object_macros_table().await,
             "argument_functions" => self.create_argument_functions_table().await,
             "globals" => self.create_globals_table().await,

@@ -24,6 +24,7 @@ pub use connection::DatabaseManager;
 
 use anyhow::Result;
 use arrow::array::RecordBatch;
+use arrow::array::StringArray;
 
 /// One row per merge key, keeping the last.
 ///
@@ -55,6 +56,22 @@ pub fn one_row_per_key<T, K: std::hash::Hash + Eq>(rows: Vec<T>, key: impl Fn(&T
         .collect()
 }
 
+/// Look up an optional string column by name, tolerating tables written
+/// before it existed. New columns are appended and read this way: existing
+/// column order is frozen, and a missing column means an older row, not an
+/// error.
+pub(crate) fn optional_string_column(
+    batch: &RecordBatch,
+    row: usize,
+    name: &str,
+) -> Option<String> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .map(|array| array.value(row).to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Look up a column by name and downcast to the expected Arrow array type.
 pub(crate) fn get_column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
     batch
@@ -65,14 +82,28 @@ pub(crate) fn get_column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> 
         .ok_or_else(|| anyhow::anyhow!("column '{name}' has unexpected type"))
 }
 
-/// Parse the `calls` column: a JSON array of callee names.
+/// Parse the `calls` column to callee names: a JSON array mixing plain
+/// spellings and tagged edges. A tagged edge contributes its call text;
+/// the owner beside it is for owner-aware lookup, read by
+/// [`parse_call_edges`].
 ///
 /// An unparsable value is an error rather than an empty list. Callers used to
 /// discard the parse error, which turned a malformed or unrecognised value into
 /// a function that appears to call nothing, indistinguishable from one that
 /// really calls nothing.
 pub(crate) fn parse_call_list(json: &str) -> Result<Vec<String>> {
-    serde_json::from_str::<Vec<String>>(json).map_err(|e| {
+    parse_call_edges(json).map(|edges| {
+        edges
+            .into_iter()
+            .map(|edge| edge.callee().to_string())
+            .collect()
+    })
+}
+
+/// Parse the `calls` column to its edges, keeping the owner beside every
+/// tagged member call. Plain spellings carry no owner.
+pub(crate) fn parse_call_edges(json: &str) -> Result<Vec<crate::types::CallEdge>> {
+    serde_json::from_str::<Vec<crate::types::CallEdge>>(json).map_err(|e| {
         let preview: String = json.chars().take(120).collect();
         anyhow::anyhow!("call list is not a JSON array of names ({e}): {preview}")
     })
@@ -80,7 +111,7 @@ pub(crate) fn parse_call_list(json: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_call_list;
+    use super::{parse_call_edges, parse_call_list};
 
     #[test]
     fn parses_a_list_of_names() {
@@ -100,6 +131,18 @@ mod tests {
         // A future encoding that carries more than a name. Silently reporting
         // no calls for these is exactly the failure this rejects.
         assert!(parse_call_list(r#"[{"name":"read","kind":"member"}]"#).is_err());
+
+        // A tagged edge contributes its call text, and keeps its owner for
+        // owner-aware lookup.
+        assert_eq!(
+            parse_call_list(r#"["memcpy",{"call":"get","owner":"ns::Box"}]"#).unwrap(),
+            vec!["memcpy".to_string(), "get".to_string()]
+        );
+        let edges = parse_call_edges(r#"["memcpy",{"call":"get","owner":"ns::Box"}]"#).unwrap();
+        assert_eq!(
+            edges.iter().map(|edge| edge.owner()).collect::<Vec<_>>(),
+            vec![None, Some("ns::Box")]
+        );
     }
 
     #[test]

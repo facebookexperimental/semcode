@@ -101,14 +101,52 @@ pub fn qualified_name(name: &str, qualifier: Option<&str>) -> String {
     qualifier.map_or_else(|| name.to_string(), |owner| format!("{owner}::{name}"))
 }
 
-/// Split a spelled path (`Arc::new`) into its bare name and the owner path
-/// addressing it. A bare name has no path; so does a path with an empty
-/// half, which no row can match.
-pub fn split_qualified_name(name: &str) -> (&str, Option<&str>) {
-    match name.rsplit_once("::") {
-        Some((path, bare)) if !path.is_empty() && !bare.is_empty() => (bare, Some(path)),
-        _ => (name, None),
+/// Split a stored callee edge into the name to look up and the owner path
+/// addressing it. Arguments are optional on an edge: `f<int>` looks up
+/// `f`, while a spelled owner path keeps its arguments for the exact
+/// match. An `operator<` keeps its spelling: only a bracket that closes
+/// is an argument list. The split falls on the last `::` outside any
+/// argument list, so `std::make_shared<ns::Foo>` looks up `make_shared`
+/// under `std`, not `Foo>` under a truncated path.
+pub fn split_callee_edge(edge: &str) -> (&str, Option<&str>) {
+    let (bare, path) = match last_top_level_scope(edge) {
+        Some(at) => {
+            let (path, bare) = (&edge[..at], &edge[at + 2..]);
+            if path.is_empty() || bare.is_empty() {
+                (edge, None)
+            } else {
+                (bare, Some(path))
+            }
+        }
+        None => (edge, None),
+    };
+    let bare = match bare.find('<') {
+        Some(open) if bare[open..].contains('>') => bare[..open].trim_end(),
+        _ => bare,
+    };
+    (bare, path)
+}
+
+/// The byte index of the last `::` outside any `<...>` argument list, so
+/// a separator inside template arguments never splits the path.
+fn last_top_level_scope(edge: &str) -> Option<usize> {
+    let bytes = edge.as_bytes();
+    let mut depth = 0usize;
+    let mut found = None;
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        match bytes[at] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if bytes[at + 1] == b':' && depth == 0 => {
+                found = Some(at);
+                at += 1;
+            }
+            _ => {}
+        }
+        at += 1;
     }
+    found
 }
 
 /// Whether a stored qualifier is what a spelled owner path addresses.
@@ -134,7 +172,16 @@ pub fn qualifier_matches_path(qualifier: &str, path: &str) -> bool {
         return true;
     }
     if path.contains('<') {
-        return false;
+        // Spelled arguments missed above, so retry with the path's own
+        // arguments stripped: an implicit-instantiation edge such as
+        // `ns::Box<double>::conv` addresses the primary template's
+        // `ns::Box`, whose qualifier strips its parameters the same way.
+        // Plain comparison only: a spelled mismatch like `From<u16>`
+        // against `From<u8>` must keep missing, while the halves rule
+        // above already answers argument-less queries on its own terms.
+        let stripped_path = strip_instantiations(path);
+        return stripped_path != path
+            && (qualifier == stripped_path || qualifier.ends_with(&format!("::{stripped_path}")));
     }
     let stripped = strip_instantiations(qualifier);
     stripped != qualifier && (stripped == path || stripped.ends_with(&format!("::{path}")))
@@ -602,6 +649,22 @@ pub fn row_defines_the_function(return_type: &str, body: &str) -> bool {
 /// stores `extern ssize_t vfs_read(struct file *, ...);` and a definition
 /// stores its braces. Comments are removed first, since a brace inside one is
 /// prose, and a macro is a definition however it is written.
+///
+/// A C++ explicitly-defaulted or deleted function ends like a prototype
+/// but defines (or deletes) all the same: `Box(const Box&) = default;` and
+/// `Box& operator=(const Box&) = delete;` are definitions.
+///
+/// A brace inside the parameter list is a default argument (`= {}`,
+/// `Box{}`, `{1, 2}`), not a body: the declaration `int g(int n = {});`
+/// would otherwise read as a definition and leave a ghost row beside the
+/// real body. Parenthesised groups go away before the brace test; strings
+/// ride along untouched so a paren inside one cannot unbalance the scan.
+///
+/// A C++20 constrained declaration keeps its requirement body outside
+/// every parenthesis (`... requires requires(T x) { x.y; };`), so it reads
+/// as a definition. Constraints with requirement bodies are rare in indexed
+/// code; the row still folds by its key, and only the defines bit
+/// overstates, which a pin test in the C++ extractor records.
 pub fn text_is_prototype(body: &str) -> bool {
     let mut code = String::with_capacity(body.len());
     let bytes = body.as_bytes();
@@ -625,7 +688,120 @@ pub fn text_is_prototype(body: &str) -> bool {
         i += 1;
     }
     let code = code.trim();
-    !code.starts_with('#') && !code.contains('{') && code.ends_with(';')
+    if code.ends_with("= default;") || code.ends_with("= delete;") {
+        return false;
+    }
+    let flat = strip_parenthesised(code);
+    !code.starts_with('#') && !flat.contains('{') && code.ends_with(';')
+}
+
+/// The text with every parenthesised group removed: `int g(int n = {})`
+/// flattens to `int g`, while `int g(int n) { return n; }` keeps its
+/// braces. Strings and character literals are copied whole, so a paren
+/// inside one never opens or closes a group.
+fn strip_parenthesised(code: &str) -> String {
+    let mut flat = String::with_capacity(code.len());
+    let bytes = code.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                if depth == 0 {
+                    flat.push_str(&code[start..i.min(code.len())]);
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => {
+                if depth == 0 {
+                    flat.push(bytes[i] as char);
+                }
+                i += 1;
+            }
+        }
+    }
+    flat
+}
+
+/// One edge a function body calls: either the callee as written, or, for
+/// a call whose text names no scope, the call with the enclosing scope
+/// beside it.
+///
+/// A bare `get()` in `ns::Box::run` and `this->get()` beside it both mean
+/// the member, so both store `{"call":"get","owner":"ns::Box"}`; a bare
+/// `helper()` in `ns::free_fn` stores `{"call":"helper","owner":"ns"}`,
+/// the scope unqualified lookup searches first. A spelled
+/// `ns::Box::get_static()` stores as the plain string. Python tags only
+/// `self.x()`: a bare call never reaches a method there, so one stays
+/// plain. Readers that need
+/// only names project the tag away; owner-aware lookup reads both halves.
+/// The JSON column holds a mix of the two shapes with no schema change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(untagged)]
+pub enum CallEdge {
+    /// The callee as written: a bare name or a full path with arguments.
+    Plain(String),
+    /// A member call with its enclosing owner beside it.
+    Tagged { call: String, owner: String },
+}
+
+impl CallEdge {
+    /// The callee as written, without the tag.
+    pub fn callee(&self) -> &str {
+        match self {
+            CallEdge::Plain(callee) => callee,
+            CallEdge::Tagged { call, .. } => call,
+        }
+    }
+
+    /// The enclosing scope beside a tagged call, if there is one.
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            CallEdge::Plain(_) => None,
+            CallEdge::Tagged { owner, .. } => Some(owner),
+        }
+    }
+}
+
+impl From<String> for CallEdge {
+    fn from(callee: String) -> Self {
+        CallEdge::Plain(callee)
+    }
+}
+
+impl From<&str> for CallEdge {
+    fn from(callee: &str) -> Self {
+        CallEdge::Plain(callee.to_string())
+    }
+}
+
+/// Equality against a name compares the callee the edge names, ignoring
+/// any owner tag beside it: `edge == "get"` holds for a tagged member
+/// call as well as a plain one.
+impl PartialEq<str> for CallEdge {
+    fn eq(&self, other: &str) -> bool {
+        self.callee() == other
+    }
+}
+
+impl<'a> PartialEq<&'a str> for CallEdge {
+    fn eq(&self, other: &&'a str) -> bool {
+        self.callee() == *other
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,7 +815,7 @@ pub struct FunctionInfo {
     pub parameters: Vec<ParameterInfo>,
     pub body: String,
     #[serde(default)]
-    pub calls: Option<Vec<String>>, // Function names called by this function
+    pub calls: Option<Vec<CallEdge>>, // Calls this function makes, tagged or plain
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names used by this function
     /// The configuration this definition exists under: the condition of every
@@ -674,7 +850,7 @@ pub struct MacroParams {
     pub line_start: u32,
     pub parameters: Vec<String>,
     pub definition: String,
-    pub calls: Option<Vec<String>>,
+    pub calls: Option<Vec<CallEdge>>,
     pub types: Option<Vec<String>>,
     pub guard: Option<String>,
 }
@@ -725,19 +901,41 @@ impl FunctionInfo {
     /// The row's identity in the store: the same columns the `functions`
     /// table merges on. Every pre-merge dedup keys on this, so a column
     /// added here and not there (or the reverse) silently drops rows.
-    pub fn merge_key(&self) -> (String, String, String, Option<String>, Option<String>) {
+    ///
+    /// `line_start` is in the key: two definitions at different lines are
+    /// two definitions, never one row the merge prefers. A declaration
+    /// folds into its same-key definition upstream of here, so by the time
+    /// rows merge the survivors are all definitions.
+    pub fn merge_key(&self) -> (String, String, String, Option<String>, Option<String>, u32) {
         (
             self.name.clone(),
             self.file_path.clone(),
             self.git_file_hash.clone(),
             self.guard.clone(),
             self.qualifier.clone(),
+            self.line_start,
         )
     }
 
     /// The row's identity within one file: what the extractor's dedup keys
     /// on. The file and its hash are constant there, so they add nothing.
-    pub fn within_file_key(&self) -> (String, Option<String>, Option<String>) {
+    /// `line_start` is in the key for the same reason it is in the merge
+    /// key: definitions at different lines never meet. A declaration folds
+    /// into the definition it announces, which shares everything but the
+    /// line, so the fold groups by the key without it.
+    pub fn within_file_key(&self) -> (String, Option<String>, Option<String>, u32) {
+        (
+            self.name.clone(),
+            self.guard.clone(),
+            self.qualifier.clone(),
+            self.line_start,
+        )
+    }
+
+    /// The row's identity for the declaration fold: a prototype shares this
+    /// with the definition it announces. Arms and owners stay distinct, so
+    /// only a declaration and its definition ever meet here.
+    pub fn declaration_fold_key(&self) -> (String, Option<String>, Option<String>) {
         (
             self.name.clone(),
             self.guard.clone(),
@@ -768,6 +966,13 @@ pub struct TypeInfo {
     pub definition: String, // Added to store raw type definition with comments
     #[serde(default)]
     pub types: Option<Vec<String>>, // Type names referenced by this type
+    /// The entity owning this type, in the language's own spelling: the
+    /// namespaces and modules above it, but not the type itself. A method's
+    /// qualifier joins this with the type's name, so without it two types
+    /// of one name in one file collapse. `None` where nothing owns the
+    /// type, which is every C row.
+    #[serde(default)]
+    pub qualifier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1376,14 +1581,42 @@ mod ambiguity_note_tests {
         assert!(qualifier_matches_path("m::Foo<Bar::Baz>", "Foo"));
         assert!(!qualifier_matches_path("m::Foo<Bar::Baz>", "Baz"));
         assert!(!qualifier_matches_path("sync::arc::Arc", "sync::arc"));
-        let (bare, path) = split_qualified_name("Arc::new");
+        // An implicit-instantiation edge addresses the primary template,
+        // whose qualifier strips its parameters the same way.
+        assert!(qualifier_matches_path("ns::Box", "ns::Box<double>"));
+        assert!(!qualifier_matches_path("ns::Box<int>", "ns::Box<double>"));
+        // A bare name has no path; so does a path with an empty half,
+        // which no row can match.
+        let (bare, path) = split_callee_edge("Arc::new");
         assert_eq!((bare, path), ("new", Some("Arc")));
-        let (bare, path) = split_qualified_name("a::Foo::new");
+        let (bare, path) = split_callee_edge("a::Foo::new");
         assert_eq!((bare, path), ("new", Some("a::Foo")));
-        let (bare, path) = split_qualified_name("new");
+        let (bare, path) = split_callee_edge("new");
         assert_eq!((bare, path), ("new", None));
-        let (bare, path) = split_qualified_name("::new");
+        let (bare, path) = split_callee_edge("::new");
         assert_eq!((bare, path), ("::new", None));
+    }
+
+    #[test]
+    fn callee_edges_look_up_without_their_arguments() {
+        // Arguments are optional on an edge: the owner half keeps them for
+        // the exact match, while the name half looks up bare. An operator
+        // keeps its spelling.
+        let (bare, path) = split_callee_edge("f<int>");
+        assert_eq!((bare, path), ("f", None));
+        let (bare, path) = split_callee_edge("Box<int>::conv");
+        assert_eq!((bare, path), ("conv", Some("Box<int>")));
+        let (bare, path) = split_callee_edge("Box::conv<int>");
+        assert_eq!((bare, path), ("conv", Some("Box")));
+        let (bare, path) = split_callee_edge("ns::Box::operator<");
+        assert_eq!((bare, path), ("operator<", Some("ns::Box")));
+        let (bare, path) = split_callee_edge("Arc::new");
+        assert_eq!((bare, path), ("new", Some("Arc")));
+        // A `::` inside template arguments never splits the path.
+        let (bare, path) = split_callee_edge("std::make_shared<ns::Foo>");
+        assert_eq!((bare, path), ("make_shared", Some("std")));
+        let (bare, path) = split_callee_edge("ns::Box<double>::conv");
+        assert_eq!((bare, path), ("conv", Some("ns::Box<double>")));
     }
 
     #[test]

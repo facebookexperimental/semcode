@@ -6793,9 +6793,40 @@ mod tests {
         // A fresh index is current, so nothing is refused.
         assert!(server.refuse_stale_index().await.is_none());
 
-        // What an older semcode leaves: rows, and no idea what wrote them.
-        std::fs::remove_dir_all(temp_dir.path().join("db").join("schema_meta.lance")).unwrap();
-        db.create_tables().await.unwrap();
+        // What an older semcode leaves: rows read by an older extractor. The
+        // mark on its own proves nothing, so backdate it too: staleness is
+        // carried by the processed records, which still name the older
+        // extractor.
+        db.mark_files_processed(vec![semcode::ProcessedFileRecord {
+            file: "fs/old.c".to_string(),
+            git_sha: None,
+            git_file_sha: "cafe1234".to_string(),
+            extractor_version: Some("0+tree-sitter-c-0.0.0".to_string()),
+        }])
+        .await
+        .unwrap();
+        let table = db
+            .connection()
+            .open_table("schema_meta")
+            .execute()
+            .await
+            .unwrap();
+        table.delete("key = 'schema_version'").await.unwrap();
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("key", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("value", arrow_schema::DataType::Utf8, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow::array::StringArray::from(vec!["schema_version"]))
+                    as arrow::array::ArrayRef,
+                std::sync::Arc::new(arrow::array::StringArray::from(vec!["0"]))
+                    as arrow::array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        table.add(vec![batch]).execute().await.unwrap();
 
         let refusal = server
             .refuse_stale_index()

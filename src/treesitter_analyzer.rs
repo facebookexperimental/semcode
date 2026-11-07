@@ -7,36 +7,113 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
-    ArgumentFunction, DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry,
-    GlobalVariable, MacroParams, ParameterInfo, Registration, RegistrationKind, TypeInfo,
-    ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
+    ArgumentFunction, CallEdge, DispatchKind, DispatchSite, FieldInfo, FunctionInfo,
+    GlobalTypeRegistry, GlobalVariable, MacroParams, ParameterInfo, Registration, RegistrationKind,
+    TypeInfo, ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     C,
+    Cpp,
     Rust,
     Python,
     Zig,
 }
 
+/// Shared extraction logic: queries, tag encoding, qualifier and guard
+/// rules. A bump re-reads every language, so this rides along in each
+/// version below. A tree-sitter core bump changes what every grammar
+/// parses through, so it bumps this too.
+pub const EXTRACTOR_VERSION: u32 = 1;
+
+/// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
+/// A bump re-reads only its language: each file records the version of
+/// the language that read it, and staleness is per file, not per index.
+pub const TREE_SITTER_C_VERSION: &str = "0.24.2";
+pub const TREE_SITTER_CPP_VERSION: &str = "0.23.4";
+pub const TREE_SITTER_PYTHON_VERSION: &str = "0.25.0";
+pub const TREE_SITTER_RUST_VERSION: &str = "0.24.2";
+pub const TREE_SITTER_ZIG_VERSION: &str = "1.1.2";
+
+/// The extractor version that reads a language: shared logic plus the
+/// grammar that language parses through.
+pub fn extractor_version(language: Language) -> String {
+    let grammar = match language {
+        Language::C => format!("tree-sitter-c-{TREE_SITTER_C_VERSION}"),
+        Language::Cpp => format!("tree-sitter-cpp-{TREE_SITTER_CPP_VERSION}"),
+        Language::Python => format!("tree-sitter-python-{TREE_SITTER_PYTHON_VERSION}"),
+        Language::Rust => format!("tree-sitter-rust-{TREE_SITTER_RUST_VERSION}"),
+        Language::Zig => format!("tree-sitter-zig-{TREE_SITTER_ZIG_VERSION}"),
+    };
+    format!("{EXTRACTOR_VERSION}+{grammar}")
+}
+
+/// Every language's version, so a tree-sitter bump re-reads only its
+/// language: each language parses and queries only its own grammar, and
+/// versions move independently. The shared part moves them all together.
+pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
+    [
+        Language::C,
+        Language::Cpp,
+        Language::Rust,
+        Language::Python,
+        Language::Zig,
+    ]
+    .into_iter()
+    .map(|language| (language, extractor_version(language)))
+    .collect()
+}
+
+/// The version a file records: the version of the language that reads it.
+/// A header records C++'s when headers route there, so flipping the routing
+/// makes every header stale on its own account. An extension no language
+/// reads records the shared version alone: no grammar is involved, so a
+/// grammar bump must not re-read it while a shared bump must.
+pub fn extractor_version_for_file(path: &std::path::Path, headers_as_cpp: bool) -> String {
+    match Language::from_path_with_headers(path, headers_as_cpp) {
+        Some(language) => extractor_version(language),
+        None => EXTRACTOR_VERSION.to_string(),
+    }
+}
+
 impl Language {
-    /// Detect language from file extension
+    /// Detect language from file extension. A `.h` file defaults to C; the
+    /// per-index decision to read headers as C++ lives in
+    /// [`Self::from_path_with_headers`] and is recorded in `schema_meta`,
+    /// not guessed here.
     pub fn from_path(path: &Path) -> Option<Self> {
+        Self::from_path_with_headers(path, false)
+    }
+
+    /// Detect language from file extension, reading `.h` as C++ when the
+    /// index was built that way.
+    pub fn from_path_with_headers(path: &Path, headers_as_cpp: bool) -> Option<Self> {
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(|ext| match ext {
-                "c" | "h" | "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => {
-                    Some(Language::C)
-                }
+                "c" => Some(Language::C),
+                "h" if !headers_as_cpp => Some(Language::C),
+                "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => Some(Language::Cpp),
+                "h" => Some(Language::Cpp),
                 "rs" => Some(Language::Rust),
                 "py" => Some(Language::Python),
                 "zig" => Some(Language::Zig),
                 _ => None,
             })
     }
+}
+
+/// One step of a C++ qualified-id's scope: a plain name, or a template
+/// with its arguments as written, for the primary-template strip.
+enum CppScopeSegment {
+    Plain(String),
+    Template {
+        name: String,
+        arguments: Vec<String>,
+    },
 }
 
 /// Context for extracting code elements from a parsed tree
@@ -343,13 +420,19 @@ fn collapse_whitespace(text: &str) -> String {
 
 pub struct TreeSitterAnalyzer {
     c_parser: Parser,
+    cpp_parser: Parser,
     rust_parser: Parser,
     python_parser: Parser,
     zig_parser: Parser,
     c_queries: &'static LanguageQueries,
+    cpp_queries: &'static LanguageQueries,
     rust_queries: &'static LanguageQueries,
     python_queries: &'static LanguageQueries,
     zig_queries: &'static LanguageQueries,
+    /// Read `.h` files as C++ instead of the default C. Per-index state,
+    /// recorded in `schema_meta` when the index is built; off everywhere
+    /// else, including every test.
+    headers_as_cpp: bool,
 }
 
 /// A table of function pointers, and the typedef that hid that fact when the
@@ -378,6 +461,11 @@ impl TreeSitterAnalyzer {
         let mut c_parser = Parser::new();
         c_parser.set_language(&c_language)?;
 
+        // Initialize C++ parser and queries
+        let cpp_language = tree_sitter_cpp::LANGUAGE.into();
+        let mut cpp_parser = Parser::new();
+        cpp_parser.set_language(&cpp_language)?;
+
         // Initialize Rust parser and queries
         let rust_language = tree_sitter_rust::LANGUAGE.into();
         let mut rust_parser = Parser::new();
@@ -396,20 +484,44 @@ impl TreeSitterAnalyzer {
         // Compiled once for the process, not once per analyzer: see
         // c_queries() below.
         let c_queries = Self::c_queries()?;
+        let cpp_queries = Self::cpp_queries()?;
         let rust_queries = Self::rust_queries()?;
         let python_queries = Self::python_queries()?;
         let zig_queries = Self::zig_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
+            cpp_parser,
             rust_parser,
             python_parser,
             zig_parser,
             c_queries,
+            cpp_queries,
             rust_queries,
             python_queries,
             zig_queries,
+            headers_as_cpp: false,
         })
+    }
+
+    /// Read `.h` files as C++ for this analyzer. The index records the
+    /// choice in `schema_meta` when it is built; the default is C.
+    pub fn set_headers_as_cpp(&mut self, headers_as_cpp: bool) {
+        self.headers_as_cpp = headers_as_cpp;
+    }
+
+    /// Whether this analyzer reads `.h` headers as C++, recorded per index.
+    pub fn headers_as_cpp(&self) -> bool {
+        self.headers_as_cpp
+    }
+
+    /// The language a path is read as by this analyzer.
+    fn language_for(&self, file_path: &Path) -> Option<Language> {
+        if self.headers_as_cpp {
+            Language::from_path_with_headers(file_path, true)
+        } else {
+            Language::from_path(file_path)
+        }
     }
 
     /// Compiled queries for one language, built on first use and shared by
@@ -431,6 +543,18 @@ impl TreeSitterAnalyzer {
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("C queries: {e}"))
+    }
+
+    fn cpp_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_cpp_queries(&tree_sitter_cpp::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("C++ queries: {e}"))
     }
 
     fn rust_queries() -> Result<&'static LanguageQueries> {
@@ -641,6 +765,529 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    /// Queries for C++. The node kinds mirror the C ones wherever the two
+    /// grammars agree (preprocessor, calls, parameters), and add the shapes
+    /// only C++ has: qualified declarators for out-of-line definitions,
+    /// in-class declarations, and explicitly defaulted or deleted functions.
+    fn create_cpp_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // Function definitions with bodies, in and out of line. The name
+        // capture is the declarator as written, qualified or not; the name
+        // and the qualifier are split from it where the row is built.
+        let function_query = Query::new(
+            language,
+            r#"
+            ; Out-of-line and file-scope definitions with bodies. A declarator
+            ; returning a pointer or a reference wraps the function one or
+            ; two levels deep (`char *name()`, `char **dup()`, `S &self()`,
+            ; `int *&slot()`), so each arm repeats its declarator in all
+            ; five shapes: bare, single and double pointer, reference, and
+            ; reference-to-pointer. The name and the parameters are captured
+            ; the same way in each, so the row builder cannot tell the
+            ; shapes apart. A deeper tangle (`***`, `*&*`) has no arm and
+            ; stays unextracted, as does a parenthesized declarator
+            ; (`int (f())`); both are rare enough to name here rather than
+            ; to enumerate. A function-try-block body (`S::S() try {} catch
+            ; (...) {}`) is a `try_statement` child rather than a
+            ; `compound_statement`, so both arms below accept either; the
+            ; grammar also files the try under no `body:` field when the
+            ; definition has no return type, which the bare-child
+            ; alternation covers. Conversion operators (`operator bool`)
+            ; have no `operator_name`: their own arms below capture the
+            ; `operator_cast` itself.
+            (function_definition
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (identifier) @function_name
+                            (qualified_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                            (template_function name: (identifier) @function_name)
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                                (template_function name: (identifier) @function_name)
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                    (template_function name: (identifier) @function_name)
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                                (template_function name: (identifier) @function_name)
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                    (template_function name: (identifier) @function_name)
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+                [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function
+
+            ; In-class definitions: the body sits beside the declarator
+            (function_definition
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (field_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+                [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function
+
+            ; Explicitly defaulted and deleted functions define the name
+            ; without a body
+            (function_definition
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (identifier) @function_name
+                            (field_identifier) @function_name
+                            (qualified_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (field_identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (field_identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (field_identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (field_identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+                [
+                    (default_method_clause)
+                    (delete_method_clause)
+                ]
+            ) @function
+
+            ; Prototypes and in-class declarations without bodies. The
+            ; return type is captured: without it every prototype stores
+            ; the "void" default, while C prototypes record theirs.
+            (declaration
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (identifier) @function_name
+                            (qualified_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+            ) @declaration
+
+            (field_declaration
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (field_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+            ) @declaration
+
+            ; Conversion operators have no `operator_name`: the `operator_cast`
+            ; is the name, the target type is the return type, and the
+            ; parameter list (always empty: the language allows none) rides
+            ; along so the text fallback never runs on a parsed list. The
+            ; declaration arm below also matches a deleted conversion
+            ; (`operator bool() = delete;`), which the grammar files as a
+            ; `declaration` with a `default_value`: the `= delete` suffix
+            ; already reads as a definition where the row is built.
+            (declaration
+                declarator: [
+                    (operator_cast
+                        type: (_)? @return_type
+                        declarator: [
+                            (abstract_function_declarator
+                                parameters: (parameter_list) @parameters)
+                            (abstract_pointer_declarator
+                                declarator: (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                            (abstract_reference_declarator
+                                (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                        ]
+                    ) @function_name
+                ]
+            ) @declaration
+
+            ; Conversion definitions, inline and out of line. An out-of-line
+            ; conversion names no function: the qualified identifier wraps
+            ; the `operator_cast` directly, with no `function_declarator`
+            ; between them.
+            (function_definition
+                declarator: [
+                    (operator_cast
+                        type: (_)? @return_type
+                        declarator: [
+                            (abstract_function_declarator
+                                parameters: (parameter_list) @parameters)
+                            (abstract_pointer_declarator
+                                declarator: (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                            (abstract_reference_declarator
+                                (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                        ]
+                    ) @function_name
+                    (qualified_identifier
+                        name: (operator_cast
+                            type: (_)? @return_type
+                            declarator: [
+                                (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters)
+                                (abstract_pointer_declarator
+                                    declarator: (abstract_function_declarator
+                                        parameters: (parameter_list) @parameters))
+                                (abstract_reference_declarator
+                                    (abstract_function_declarator
+                                        parameters: (parameter_list) @parameters))
+                            ]
+                        ) @function_name
+                    )
+                ]
+                [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function
+        "#,
+        )?;
+
+        // Query for comments
+        let comment_query = Query::new(
+            language,
+            r#"
+            (comment) @comment
+        "#,
+        )?;
+
+        // Query for class/struct/union definitions
+        let type_query = Query::new(
+            language,
+            r#"
+            (class_specifier
+                name: (type_identifier) @type_name
+                body: (field_declaration_list) @body
+            ) @class
+
+            (class_specifier
+                name: (template_type) @type_name
+                body: (field_declaration_list) @body
+            ) @class
+
+            (struct_specifier
+                name: (type_identifier) @type_name
+                body: (field_declaration_list) @body
+            ) @struct
+
+            (union_specifier
+                name: (type_identifier) @type_name
+                body: (field_declaration_list) @body
+            ) @union
+
+            (enum_specifier
+                name: (type_identifier) @type_name
+                body: (enumerator_list) @body
+            ) @enum
+        "#,
+        )?;
+
+        // C++ macro definitions share the C preprocessor node kinds.
+        let macro_query = Query::new(
+            language,
+            r#"
+            (preproc_def
+                name: (identifier) @macro_name
+                value: (_)? @value
+            ) @macro
+
+            (preproc_function_def
+                name: (identifier) @macro_name
+                parameters: (preproc_params) @parameters
+                value: (_)? @value
+            ) @function_macro
+        "#,
+        )?;
+
+        // Query for function calls. Qualified calls keep their owner path;
+        // member calls keep the receiver beside them in the dispatch sites.
+        let call_query = Query::new(
+            language,
+            r#"
+            (call_expression
+                function: (identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (qualified_identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (template_function) @function_name
+            ) @call
+
+            (call_expression
+                function: (field_expression
+                    argument: (_) @receiver
+                    field: (field_identifier) @member_name
+                )
+            ) @method_call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None,
+            macro_query,
+            call_query,
+        })
+    }
+
     fn create_rust_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
         // Query for function definitions
         let function_query = Query::new(
@@ -698,7 +1345,10 @@ impl TreeSitterAnalyzer {
         "#,
         )?;
 
-        // Query for function calls
+        // Query for function calls. Scoped and generic calls keep their
+        // full spelling: `Arc::new`, `foo::<u8>`. What the path selects is
+        // resolved at query time; the sole rewrite is `Self::`, done where
+        // the row is built.
         let call_query = Query::new(
             language,
             r#"
@@ -712,6 +1362,14 @@ impl TreeSitterAnalyzer {
                     field: (field_identifier) @member_name
                 )
             ) @method_call
+
+            (call_expression
+                function: (scoped_identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (generic_function) @function_name
+            ) @call
         "#,
         )?;
 
@@ -928,6 +1586,7 @@ impl TreeSitterAnalyzer {
     fn get_parser(&mut self, language: Language) -> &mut Parser {
         match language {
             Language::C => &mut self.c_parser,
+            Language::Cpp => &mut self.cpp_parser,
             Language::Rust => &mut self.rust_parser,
             Language::Python => &mut self.python_parser,
             Language::Zig => &mut self.zig_parser,
@@ -938,6 +1597,7 @@ impl TreeSitterAnalyzer {
     fn get_queries(&self, language: Language) -> &LanguageQueries {
         match language {
             Language::C => self.c_queries,
+            Language::Cpp => self.cpp_queries,
             Language::Rust => self.rust_queries,
             Language::Python => self.python_queries,
             Language::Zig => self.zig_queries,
@@ -957,7 +1617,8 @@ impl TreeSitterAnalyzer {
         source_root: Option<&Path>,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         // Detect language from file extension
-        let language = Language::from_path(file_path)
+        let language = self
+            .language_for(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
 
         let source_code = std::fs::read_to_string(file_path)?;
@@ -1020,7 +1681,7 @@ impl TreeSitterAnalyzer {
         // Call relationships are now embedded in function/macro JSON columns during parsing
 
         // Perform intra-file deduplication (no thread contention since this is per-file)
-        let functions = self.deduplicate_functions_within_file(raw_functions);
+        let functions = self.deduplicate_functions_within_file(raw_functions, language);
         let types = self.deduplicate_types_within_file(raw_types);
         let mut macros = self.deduplicate_macros_within_file(raw_macros);
 
@@ -1072,7 +1733,8 @@ impl TreeSitterAnalyzer {
         source_root: Option<&Path>,
     ) -> Result<FileAnalysis> {
         // Detect language from file extension
-        let language = Language::from_path(file_path)
+        let language = self
+            .language_for(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
 
         let parser = self.get_parser(language);
@@ -1117,7 +1779,7 @@ impl TreeSitterAnalyzer {
         }
 
         // Perform intra-file deduplication (no thread contention since this is per-file)
-        let functions = self.deduplicate_functions_within_file(raw_functions);
+        let functions = self.deduplicate_functions_within_file(raw_functions, language);
         let types = self.deduplicate_types_within_file(raw_types);
         let mut macros = self.deduplicate_macros_within_file(raw_macros);
 
@@ -2698,6 +3360,89 @@ impl TreeSitterAnalyzer {
         calls
     }
 
+    /// Rewrite a function's call edges at index time: `Self::assoc` becomes
+    /// the enclosing impl's owner, and a bare C++ call gains the enclosing
+    /// scope beside it. Everything else stores verbatim.
+    ///
+    /// The `Self::` rewrite is the sole one allowed: Rust spells the
+    /// receiver through the impl, and no call site can address it. A bare
+    /// call in a C++ function prefers the enclosing scope at lookup, so the
+    /// scope rides along; a spelled path already carries its own, and a
+    /// bare Rust call reaches no method at all. Python tags nothing here:
+    /// it has no implicit self, so a bare call never reaches a method --
+    /// only `self.x()` tags, via the enclosing-owner edge beside this.
+    fn rewrite_self_calls(
+        language: Language,
+        defined_at: Option<tree_sitter::Node>,
+        calls: Vec<String>,
+        source: &str,
+        qualifier: Option<&str>,
+    ) -> Vec<CallEdge> {
+        let self_owner = if matches!(language, Language::Rust) {
+            defined_at.and_then(|node| Self::enclosing_impl_owner(node, source))
+        } else {
+            None
+        };
+        calls
+            .into_iter()
+            .map(|call| {
+                let call = match (&language, &self_owner) {
+                    (Language::Rust, Some(owner)) => match call.strip_prefix("Self::") {
+                        Some(rest) => format!("{owner}::{rest}"),
+                        None => call,
+                    },
+                    _ => call,
+                };
+                match (&language, qualifier) {
+                    (Language::Cpp, Some(owner)) if !call.contains("::") && !call.contains('<') => {
+                        CallEdge::Tagged {
+                            call,
+                            owner: (*owner).to_string(),
+                        }
+                    }
+                    _ => CallEdge::Plain(call),
+                }
+            })
+            .collect()
+    }
+
+    /// The `impl` block enclosing a definition, if any, as its owner spells
+    /// it: the head `Self::` resolves to.
+    fn enclosing_impl_owner(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            if current.kind() == "impl_item" {
+                return Self::impl_owner(current, source);
+            }
+            parent = current.parent();
+        }
+        None
+    }
+
+    /// A member call through `this` (C++) or `self` (Python) as a tagged
+    /// edge: the text names no owner, so the enclosing one goes beside it.
+    /// Anything else stays a dispatch site for receiver typing to resolve.
+    fn enclosing_owner_edge(
+        language: Language,
+        site: &RawDispatchSite,
+        qualifier: Option<&str>,
+    ) -> Option<CallEdge> {
+        let owner = qualifier?;
+        let receiver = site.receiver_expr.as_deref()?;
+        let is_self = match language {
+            Language::Cpp => receiver == "this",
+            Language::Python => receiver == "self",
+            _ => return None,
+        };
+        if !is_self || site.member.is_empty() {
+            return None;
+        }
+        Some(CallEdge::Tagged {
+            call: site.member.clone(),
+            owner: owner.to_string(),
+        })
+    }
+
     /// Names that a scope binds to a value rather than to a function.
     ///
     /// `min_t(u32, len, size)` names no function even where the tree defines
@@ -3837,7 +4582,19 @@ impl TreeSitterAnalyzer {
 
                 match capture_name {
                     "function_name" => {
-                        function_name = Some(text.to_string());
+                        let mut text = text.to_string();
+                        if ctx.language == Language::Cpp && node.kind() == "operator_cast" {
+                            // A conversion spells its target with its
+                            // parameters (`operator bool() const`), and no
+                            // `operator_name` exists to capture instead: the
+                            // name keeps the target only, the way
+                            // `operator==` keeps its spelling.
+                            if let Some(index) = text.find('(') {
+                                text.truncate(index);
+                                text = text.trim_end().to_string();
+                            }
+                        }
+                        function_name = Some(text);
                         line_start = node.start_position().row as u32 + 1;
                     }
                     "return_type" => {
@@ -3898,6 +4655,16 @@ impl TreeSitterAnalyzer {
             }
 
             if let Some(name) = function_name {
+                // C++ spells the owner in the declarator (`ns::Box::get`):
+                // the name column keeps the bare name, and the scope moves
+                // to the qualifier. The return type was already read against
+                // the qualified spelling above, which is what places it.
+                let mut name = name;
+                if ctx.language == Language::Cpp {
+                    if let Some((_, bare)) = name.rsplit_once("::") {
+                        name = bare.to_string();
+                    }
+                }
                 // Track which capture patterns were matched to determine if function has body
                 let mut matched_patterns = std::collections::HashSet::new();
                 for capture in m.captures {
@@ -3982,6 +4749,15 @@ impl TreeSitterAnalyzer {
                     (Vec::new(), Vec::new())
                 };
 
+                let defined_at = function_node.or(declaration_node);
+                let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
+                let qualifier =
+                    Self::owner_qualifier(ctx.language, defined_at, ctx.source, &relative_path);
+                // Member calls through `this`/`self` name no path: the
+                // enclosing owner goes beside them as a tagged edge instead
+                // of a dispatch site, which could never resolve them.
+                let mut tagged = Vec::new();
+
                 for raw in extraction
                     .member_sites
                     .iter()
@@ -3995,6 +4771,12 @@ impl TreeSitterAnalyzer {
                     // so a site can be reached more than once; a site is one
                     // row regardless.
                     if !covered_sites.insert(raw.byte_start) {
+                        continue;
+                    }
+                    if let Some(edge) =
+                        Self::enclosing_owner_edge(ctx.language, raw, qualifier.as_deref())
+                    {
+                        tagged.push(edge);
                         continue;
                     }
                     dispatch_sites.push(raw.attribute(
@@ -4030,8 +4812,18 @@ impl TreeSitterAnalyzer {
                     ));
                 }
 
-                let defined_at = function_node.or(declaration_node);
-                let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
+                let mut calls = Self::rewrite_self_calls(
+                    ctx.language,
+                    defined_at,
+                    unique_calls,
+                    ctx.source,
+                    qualifier.as_deref(),
+                );
+                // A bare call beside its `this`/`self` twin names the same
+                // edge twice; the store keeps one.
+                calls.extend(tagged);
+                calls.sort();
+                calls.dedup();
                 let func = FunctionInfo {
                     name: name.clone(),
                     file_path: relative_path.clone(),
@@ -4041,26 +4833,24 @@ impl TreeSitterAnalyzer {
                     return_type: return_type.unwrap_or_else(|| "void".to_string()),
                     parameters: parameters.clone(),
                     body: complete_body,
-                    calls: if unique_calls.is_empty() {
-                        None
-                    } else {
-                        Some(unique_calls)
-                    },
+                    calls: if calls.is_empty() { None } else { Some(calls) },
                     types: if function_types.is_empty() {
                         None
                     } else {
                         Some(function_types)
                     },
-                    guard: defined_at.and_then(|node| Self::guard_of(node, ctx.source)),
-                    // The entity owning a Rust definition; every other
-                    // language leaves the name to stand alone.
-                    qualifier: if matches!(ctx.language, Language::Rust) {
-                        defined_at.and_then(|node| {
-                            Self::rust_owner_qualifier(node, ctx.source, &relative_path)
-                        })
-                    } else {
-                        None
-                    },
+                    guard: defined_at.and_then(|node| match ctx.language {
+                        // Each language records its arms as written: the C
+                        // preprocessor, Rust attributes, Python conditions
+                        // and handlers, Zig comptime conditions. Opaque
+                        // everywhere but C: guards filter, never decide row
+                        // survival.
+                        Language::Rust => Self::rust_cfg_guard(node, ctx.source),
+                        Language::C | Language::Cpp => Self::guard_of(node, ctx.source),
+                        Language::Python => Self::python_guard(node, ctx.source),
+                        Language::Zig => Self::zig_guard(node, ctx.source),
+                    }),
+                    qualifier,
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -4115,8 +4905,9 @@ impl TreeSitterAnalyzer {
         }
 
         // A macro can open a function the query cannot match, and the body
-        // that follows carries every call the function makes.
-        if matches!(ctx.language, Language::C) {
+        // that follows carries every call the function makes. The node
+        // shapes this reads are the same in C++.
+        if matches!(ctx.language, Language::C | Language::Cpp) {
             for defined in Self::macro_defined_functions(ctx.tree.root_node(), ctx.source) {
                 // Already read by the query under this arm. Another arm of
                 // the same name is another definition, and is kept.
@@ -4171,7 +4962,8 @@ impl TreeSitterAnalyzer {
                     return_type: String::new(),
                     parameters: Vec::new(),
                     body: ctx.source[defined.start_byte..defined.end_byte].to_string(),
-                    calls: (!calls.is_empty()).then_some(calls),
+                    calls: (!calls.is_empty())
+                        .then_some(calls.into_iter().map(CallEdge::from).collect()),
                     types: None,
                     guard: defined.guard.clone(),
                     // A macro-opened C function has no owner to record.
@@ -4310,6 +5102,7 @@ impl TreeSitterAnalyzer {
             let mut line_start = 0;
             let mut type_start_byte = 0;
             let mut type_end_byte = 0;
+            let mut type_node = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -4328,6 +5121,8 @@ impl TreeSitterAnalyzer {
                         kind = "struct".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4336,6 +5131,8 @@ impl TreeSitterAnalyzer {
                         kind = "union".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4344,6 +5141,8 @@ impl TreeSitterAnalyzer {
                         kind = "enum".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4352,6 +5151,8 @@ impl TreeSitterAnalyzer {
                         kind = "class".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4360,6 +5161,8 @@ impl TreeSitterAnalyzer {
                         kind = "opaque".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4368,6 +5171,8 @@ impl TreeSitterAnalyzer {
                         kind = "error".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4376,6 +5181,8 @@ impl TreeSitterAnalyzer {
                         kind = "type".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
                         if line_start == 0 {
                             line_start = node.start_position().row as u32 + 1;
                         }
@@ -4397,9 +5204,10 @@ impl TreeSitterAnalyzer {
                 // Extract types referenced by this type's members
                 let referenced_types = self.extract_type_referenced_types(&members);
 
+                let relative_path = self.make_relative_path(file_path, source_root);
                 let type_info = TypeInfo {
                     name,
-                    file_path: self.make_relative_path(file_path, source_root),
+                    file_path: relative_path.clone(),
                     git_file_hash: git_hash.to_string(),
                     line_start,
                     kind,
@@ -4411,6 +5219,10 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(referenced_types)
                     },
+                    // The same owner function that writes
+                    // functions.qualifier: a method's qualifier joins this
+                    // with the type's name.
+                    qualifier: Self::owner_qualifier(language, type_node, source, &relative_path),
                 };
                 types.push(type_info);
             }
@@ -4527,6 +5339,8 @@ impl TreeSitterAnalyzer {
                     } else {
                         Some(referenced_types)
                     },
+                    // Typedefs are C-only, and C has no owners.
+                    qualifier: None,
                 };
                 typedef_types.push(type_info);
             }
@@ -4733,7 +5547,7 @@ impl TreeSitterAnalyzer {
                     calls: if macro_calls.is_empty() {
                         None
                     } else {
-                        Some(macro_calls)
+                        Some(macro_calls.into_iter().map(CallEdge::from).collect())
                     },
                     types: if macro_types.is_empty() {
                         None
@@ -4798,15 +5612,30 @@ impl TreeSitterAnalyzer {
 
         let mut parameters = Vec::new();
 
-        // Walk through the parameter_list node to find parameter_declaration children
+        // Walk through the parameter_list node to find parameter children.
+        // tree-sitter-cpp spells a defaulted parameter
+        // (`int x = 0`) as optional_parameter_declaration and a pack
+        // (`Args... args`) as variadic_parameter_declaration: only plain
+        // parameter_declaration would drop both, leaving a ghost
+        // declaration beside every defaulted body and wrong parameter
+        // data. The default value is not part of the type, and the pack
+        // keeps its `...` through the declarator, so every kind reads
+        // through the same single-parameter reader.
+        let mut saw_parameter = false;
         let mut cursor = node.walk();
 
         if cursor.goto_first_child() {
             loop {
                 let current_node = cursor.node();
 
-                // Look for parameter_declaration nodes
-                if current_node.kind() == "parameter_declaration" {
+                // Look for parameter nodes of every kind the grammar has
+                if matches!(
+                    current_node.kind(),
+                    "parameter_declaration"
+                        | "optional_parameter_declaration"
+                        | "variadic_parameter_declaration"
+                ) {
+                    saw_parameter = true;
                     let param_info = self.parse_single_parameter(current_node, source);
                     if let Some(param) = param_info {
                         parameters.push(param);
@@ -4819,8 +5648,12 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        // If no parameters found through normal parsing, try alternative approach
-        if parameters.is_empty() {
+        // If no parameter node was found through normal parsing, try the
+        // alternative approach. A list the tree parsed keeps what the
+        // tree said even when every parameter carries a default: the
+        // text fallback would re-read `int x = 0` as a type of `int x =`
+        // with a name of `0`.
+        if !saw_parameter {
             parameters = self.parse_parameters_alternative(node, source);
         }
 
@@ -5110,6 +5943,186 @@ impl TreeSitterAnalyzer {
         Some(terms.join(" && "))
     }
 
+    /// Whether one node holds another: the arm a definition sits in is the
+    /// child whose byte range covers it.
+    fn holds(ancestor: tree_sitter::Node, node: tree_sitter::Node) -> bool {
+        ancestor.start_byte() <= node.start_byte() && node.end_byte() <= ancestor.end_byte()
+    }
+
+    /// The `#[cfg]` predicates holding at a Rust definition, outermost
+    /// first, as written: `cfg(unix)`. Attributes attach to the item below
+    /// them, so each level reads its own preceding siblings, and an
+    /// enclosing item lends its predicates to everything inside it.
+    ///
+    /// Only `cfg` guards the item; `cfg_attr` lends an attribute or not but
+    /// compiles the item either way. Opaque to the compatibility filter,
+    /// which reads C-preprocessor CONFIG spellings only: a cfg predicate
+    /// contributes no facts, so it never filters -- survival is the merge
+    /// key's job now. A C/C++ guard naming CONFIG_* does filter.
+    fn rust_cfg_guard(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut terms = Vec::new();
+        let mut current = node;
+        loop {
+            let mut sibling = current.prev_sibling();
+            while let Some(candidate) = sibling {
+                match candidate.kind() {
+                    "attribute_item" => {
+                        if let Some(predicate) = Self::cfg_predicate(candidate, source) {
+                            terms.push(predicate);
+                        }
+                    }
+                    "line_comment" | "block_comment" => {}
+                    _ => break,
+                }
+                sibling = candidate.prev_sibling();
+            }
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent;
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        terms.reverse();
+        Some(terms.join(" && "))
+    }
+
+    /// The predicate of one `#[cfg(...)]` attribute: `cfg(unix)` for
+    /// `#[cfg(unix)]`. `None` for anything else, including documentation
+    /// and `cfg_attr`, which compile the item either way.
+    fn cfg_predicate(attribute: tree_sitter::Node, source: &str) -> Option<String> {
+        let inner = attribute.named_child(0)?;
+        if inner.kind() != "attribute" {
+            return None;
+        }
+        let head = inner.named_child(0)?;
+        if head.kind() != "identifier" {
+            return None;
+        }
+        if head.utf8_text(source.as_bytes()).ok()? != "cfg" {
+            return None;
+        }
+        let arguments = inner.child_by_field_name("arguments")?;
+        let text = arguments.utf8_text(source.as_bytes()).ok()?;
+        Some(format!("cfg{}", Self::one_line(text)))
+    }
+
+    /// The conditions holding at a Python definition, outermost first, as
+    /// written: `TYPE_CHECKING` for the `if` arm, `not (TYPE_CHECKING)` for
+    /// the `else` arm, `try` and `except ImportError` for `try`/`except`.
+    /// Opaque: never evaluated, so it never filters.
+    fn python_guard(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut terms = Vec::new();
+        let mut child = node;
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            match current.kind() {
+                "if_statement" => {
+                    let condition = current.child_by_field_name("condition")?;
+                    let text = Self::one_line(condition.utf8_text(source.as_bytes()).ok()?);
+                    let via_alternative = current
+                        .child_by_field_name("alternative")
+                        .is_some_and(|alternative| Self::holds(alternative, child));
+                    terms.push(if via_alternative {
+                        format!("not ({text})")
+                    } else {
+                        text
+                    });
+                }
+                "try_statement" => {
+                    terms.push(Self::python_try_arm(current, child, source));
+                }
+                _ => {}
+            }
+            child = current;
+            parent = current.parent();
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        terms.reverse();
+        Some(terms.join(" && "))
+    }
+
+    /// Which arm of a `try` a definition sits in: `try` for the body,
+    /// `except ImportError` for a handler, `else` and `finally` for those.
+    fn python_try_arm(
+        statement: tree_sitter::Node,
+        child: tree_sitter::Node,
+        source: &str,
+    ) -> String {
+        if statement
+            .child_by_field_name("body")
+            .is_some_and(|body| Self::holds(body, child))
+        {
+            return "try".to_string();
+        }
+        let mut cursor = statement.walk();
+        for branch in statement.named_children(&mut cursor) {
+            if !Self::holds(branch, child) {
+                continue;
+            }
+            return match branch.kind() {
+                "except_clause" => {
+                    let mut arm = "except".to_string();
+                    if let Some(value) = branch.child_by_field_name("value") {
+                        if let Ok(text) = value.utf8_text(source.as_bytes()) {
+                            arm.push(' ');
+                            arm.push_str(&Self::one_line(text));
+                        }
+                    }
+                    arm
+                }
+                "else_clause" => "else".to_string(),
+                "finally_clause" => "finally".to_string(),
+                _ => "try".to_string(),
+            };
+        }
+        "try".to_string()
+    }
+
+    /// The conditions holding at a Zig definition, outermost first, as
+    /// written: `comptime x == 1` for the `if` arm, `not (comptime x == 1)`
+    /// for the `else` arm. Opaque: never evaluated, so it never filters.
+    fn zig_guard(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut terms = Vec::new();
+        let mut child = node;
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            if matches!(current.kind(), "if_expression" | "if_statement") {
+                let condition = current
+                    .child_by_field_name("condition")
+                    .and_then(|condition| condition.utf8_text(source.as_bytes()).ok())
+                    .map(Self::one_line)
+                    .unwrap_or_default();
+                // The first non-condition branch is the consequent;
+                // anything after it is the alternative.
+                let mut order = current.walk();
+                let in_first = current
+                    .named_children(&mut order)
+                    .find(|branch| {
+                        current
+                            .child_by_field_name("condition")
+                            .is_none_or(|condition| condition.id() != branch.id())
+                    })
+                    .is_some_and(|first| Self::holds(first, child));
+                terms.push(if in_first {
+                    condition
+                } else {
+                    format!("not ({condition})")
+                });
+            }
+            child = current;
+            parent = current.parent();
+        }
+        if terms.is_empty() {
+            return None;
+        }
+        terms.reverse();
+        Some(terms.join(" && "))
+    }
+
     /// Whether a conditional is the header's include guard: an `#ifndef X`
     /// (or `#if !defined(X)`) whose first line is `#define X`, with no
     /// `#else`, wrapping everything else in the file.
@@ -5312,11 +6325,413 @@ impl TreeSitterAnalyzer {
         }
     }
 
+    /// The entity owning a C++ definition: every enclosing namespace and
+    /// class, outermost first, in the file's own spelling.
+    ///
+    /// Out-of-line definitions take their scope from the qualified-id:
+    /// `int ns::Box::get()` is owned by `ns::Box`, not by the namespace the
+    /// definition happens to sit in. A scope the enclosing namespaces
+    /// already spell is not spelled twice. An explicit specialisation keeps
+    /// its arguments (`ns::Box<int>`), while a primary template's own
+    /// parameters are stripped, so the out-of-line definition shares its key
+    /// with the in-class declaration and folds into it.
+    ///
+    /// `None` where the name stands alone: a free function with no
+    /// namespace around it.
+    fn cpp_owner_qualifier(defined_at: tree_sitter::Node, source: &str) -> Option<String> {
+        if let Some((_, scope)) = Self::cpp_qualified_scope(defined_at, source) {
+            let params = Self::cpp_template_params(defined_at, source);
+            let stripped: Vec<String> = scope
+                .iter()
+                .map(|segment| Self::cpp_strip_primary_args(segment, &params))
+                .collect();
+            let mut qualified = Self::cpp_enclosing_scope(defined_at, source);
+            // A redundant qualification restates the enclosing namespaces;
+            // spelling them twice would coin an owner nothing writes.
+            if stripped.len() >= qualified.len() && stripped[..qualified.len()] == qualified[..] {
+                qualified = stripped;
+            } else {
+                qualified.extend(stripped);
+            }
+            if qualified.is_empty() {
+                return None;
+            }
+            return Some(qualified.join("::"));
+        }
+        let qualified = Self::cpp_enclosing_scope(defined_at, source);
+        if qualified.is_empty() {
+            return None;
+        }
+        Some(qualified.join("::"))
+    }
+
+    /// The bare name and the spelled scope of a C++ declarator: `get` and
+    /// `ns::Box` for `int ns::Box::get()`. `None` where the declarator names
+    /// no scope, which is every in-class and file-scope definition.
+    fn cpp_qualified_scope(
+        defined_at: tree_sitter::Node,
+        source: &str,
+    ) -> Option<(String, Vec<CppScopeSegment>)> {
+        let mut declarator = defined_at.child_by_field_name("declarator")?;
+        loop {
+            match declarator.kind() {
+                "function_declarator" => {
+                    declarator = declarator.child_by_field_name("declarator")?;
+                }
+                "pointer_declarator"
+                | "reference_declarator"
+                | "parenthesized_declarator"
+                | "attributed_declarator" => {
+                    // A reference hangs its function off no `declarator`
+                    // field (`S &self()`), so the positional child is the
+                    // fallback where the field is absent.
+                    declarator = declarator
+                        .child_by_field_name("declarator")
+                        .or_else(|| declarator.named_child(0))?;
+                }
+                _ => break,
+            }
+        }
+        if declarator.kind() != "qualified_identifier" {
+            return None;
+        }
+        // The scope nests outward: `a::b::C::m` is scope `a` of scope `b` of
+        // scope `C` of `m`, so the walk collects outermost first already.
+        let mut segments = Vec::new();
+        let mut current = declarator;
+        loop {
+            let scope = current.child_by_field_name("scope")?;
+            segments.push(Self::cpp_scope_segment(scope, source));
+            let name = current.child_by_field_name("name")?;
+            if name.kind() == "qualified_identifier" {
+                current = name;
+            } else {
+                let bare = name.utf8_text(source.as_bytes()).ok()?.to_string();
+                return Some((bare, segments));
+            }
+        }
+    }
+
+    /// One step of a spelled C++ scope: a plain name, or a template with its
+    /// arguments as written, for the primary-template strip to decide on.
+    fn cpp_scope_segment(node: tree_sitter::Node, source: &str) -> CppScopeSegment {
+        if node.kind() == "template_type" {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                .unwrap_or_default()
+                .to_string();
+            let arguments = node
+                .child_by_field_name("arguments")
+                .map(|arguments| {
+                    let mut cursor = arguments.walk();
+                    arguments
+                        .named_children(&mut cursor)
+                        .filter_map(|argument| {
+                            argument
+                                .utf8_text(source.as_bytes())
+                                .ok()
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return CppScopeSegment::Template { name, arguments };
+        }
+        CppScopeSegment::Plain(
+            node.utf8_text(source.as_bytes())
+                .ok()
+                .map(Self::one_line_type)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The template parameters a C++ definition is written under: every
+    /// enclosing `template<...>` head's declared names, outermost first.
+    fn cpp_template_params(defined_at: tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut params = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            if current.kind() == "template_declaration" {
+                if let Some(list) = current.child_by_field_name("parameters") {
+                    let mut cursor = list.walk();
+                    for parameter in list.named_children(&mut cursor) {
+                        if parameter.kind() == "template_parameter_list" {
+                            continue;
+                        }
+                        if let Some(name) = Self::cpp_parameter_name(parameter, source) {
+                            params.push(name);
+                        }
+                    }
+                }
+            }
+            parent = current.parent();
+        }
+        params
+    }
+
+    /// The name a template parameter declares: `T` in `typename T`, `N` in
+    /// `int N`, `Args` in `typename... Args`. A use of another name in a
+    /// default or a bound declares nothing, so only the declared position
+    /// is read.
+    fn cpp_parameter_name(node: tree_sitter::Node, source: &str) -> Option<String> {
+        if matches!(node.kind(), "type_identifier" | "identifier") {
+            return node.utf8_text(source.as_bytes()).ok().map(str::to_string);
+        }
+        if matches!(
+            node.kind(),
+            "type_parameter_declaration" | "variadic_type_parameter_declaration"
+        ) {
+            let mut cursor = node.walk();
+            return node
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "type_identifier" | "identifier"))
+                .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                .map(str::to_string);
+        }
+        if node.kind() == "parameter_declaration" {
+            let declarator = node.child_by_field_name("declarator")?;
+            return Self::cpp_parameter_name(declarator, source);
+        }
+        None
+    }
+
+    /// Strip a primary template's own parameters from a scope segment:
+    /// `Box<T>` under `template<typename T>` is `Box`, while `Box<int>`
+    /// stays. The arguments must name the enclosing parameters in order;
+    /// anything else is a specialisation and keeps its spelling.
+    fn cpp_strip_primary_args(segment: &CppScopeSegment, params: &[String]) -> String {
+        match segment {
+            CppScopeSegment::Plain(name) => name.clone(),
+            CppScopeSegment::Template { name, arguments } => {
+                let bare: Vec<&str> = arguments
+                    .iter()
+                    .map(|argument| {
+                        argument
+                            .trim()
+                            .strip_suffix("...")
+                            .unwrap_or(argument.trim())
+                    })
+                    .collect();
+                let is_primary = !params.is_empty()
+                    && bare.len() == params.len()
+                    && bare
+                        .iter()
+                        .zip(params.iter())
+                        .all(|(argument, param)| *argument == param);
+                if is_primary {
+                    name.clone()
+                } else {
+                    format!("{name}<{}>", arguments.join(", "))
+                }
+            }
+        }
+    }
+
+    /// The namespaces and classes enclosing a C++ definition, outermost
+    /// first, as written. Template declarations are transparent: the class
+    /// name carries its own arguments, or none for a primary template.
+    /// Anonymous scopes contribute no segment; nothing can spell them.
+    fn cpp_enclosing_scope(defined_at: tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut segments = Vec::new();
+        let mut parent = defined_at.parent();
+        // A friend is owned by nobody: `friend void swap(Box&, Box&)` in
+        // `ns::Box` is a free function of `ns`, and a hidden friend defined
+        // in the class body is a namespace-scope function all the same. The
+        // class the friend is written in therefore contributes no segment,
+        // while the namespaces around it still do. A friend written with a
+        // qualified-id takes its scope from that id, as out-of-line
+        // definitions already do, so only the enclosing walk skips.
+        let mut under_friend = false;
+        while let Some(current) = parent {
+            match current.kind() {
+                "friend_declaration" => {
+                    under_friend = true;
+                }
+                "namespace_definition" => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        let text = name
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(Self::one_line_type)
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            segments.push(text);
+                        }
+                    }
+                }
+                "class_specifier" | "struct_specifier" | "union_specifier" if !under_friend => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        let text = name
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(Self::one_line_type)
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            segments.push(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            parent = current.parent();
+        }
+        segments.reverse();
+        segments
+    }
+
+    /// The entity owning a Python definition: the module path plus every
+    /// enclosing class and function, in `__qualname__` spelling. A function
+    /// nested in a function adds `<locals>`, the way tracebacks spell it:
+    /// `outer.<locals>.inner` is owned by `pkg.mod.outer.<locals>`.
+    ///
+    /// The module is the file's path with `/` as `.` and the `.py` gone; a
+    /// package's `__init__` is the package itself. A free function carries
+    /// the module alone, the way a Rust free function carries its module.
+    fn python_owner_qualifier(
+        defined_at: tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+    ) -> Option<String> {
+        let mut qualified = Self::python_module_of(file_path);
+        let mut scopes = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            match current.kind() {
+                "class_definition" => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                            scopes.push(text.to_string());
+                        }
+                    }
+                }
+                "function_definition" => {
+                    if let Some(name) = current.child_by_field_name("name") {
+                        if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                            scopes.push(format!("{text}.<locals>"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            parent = current.parent();
+        }
+        scopes.reverse();
+        qualified.extend(scopes);
+        if qualified.is_empty() {
+            return None;
+        }
+        Some(qualified.join("."))
+    }
+
+    /// The module a Python file's items live in: its path with `/` as `.`
+    /// and the `.py` gone, so `pkg/mod.py` is `pkg.mod`. A package's
+    /// `__init__` is the package itself, the way `mod.rs` is its module in
+    /// Rust, and `lib` and `main` stay as written.
+    fn python_module_of(file_path: &str) -> Vec<String> {
+        let without_extension = file_path.strip_suffix(".py").unwrap_or(file_path);
+        let mut segments: Vec<String> = without_extension
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .map(str::to_string)
+            .collect();
+        if segments.last().is_some_and(|last| last == "__init__") {
+            segments.pop();
+        }
+        segments
+    }
+
+    /// The entity owning a Zig definition: the module path plus every
+    /// enclosing container, outermost first. `init` in `const A = struct`
+    /// in `src/main.zig` is `src.main.A`, and a free function carries the
+    /// module alone.
+    fn zig_owner_qualifier(
+        defined_at: tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+    ) -> Option<String> {
+        let mut qualified: Vec<String> = file_path
+            .strip_suffix(".zig")
+            .unwrap_or(file_path)
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .map(str::to_string)
+            .collect();
+        let mut scopes = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            if matches!(
+                current.kind(),
+                "struct_declaration"
+                    | "enum_declaration"
+                    | "union_declaration"
+                    | "opaque_declaration"
+                    | "error_set_declaration"
+            ) {
+                // A container is named by the `const` that binds it. The
+                // binding is usually the parent, but an `if` arm sits
+                // between the container and its `const`, so see through
+                // conditions and blocks to find it.
+                let mut anchor = current.parent();
+                while let Some(binding) = anchor {
+                    match binding.kind() {
+                        "variable_declaration" => {
+                            let mut cursor = binding.walk();
+                            if let Some(name) = binding
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() == "identifier")
+                            {
+                                if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                                    scopes.push(text.to_string());
+                                }
+                            }
+                            break;
+                        }
+                        "if_expression" | "if_statement" | "block" => {
+                            anchor = binding.parent();
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            parent = current.parent();
+        }
+        scopes.reverse();
+        qualified.extend(scopes);
+        if qualified.is_empty() {
+            return None;
+        }
+        Some(qualified.join("."))
+    }
+
     /// Type text on one line: runs of whitespace become single spaces. No
     /// comment stripping: a lifetime (`&'a T`) is not a character constant,
     /// and the guard text's treatment would eat it.
     fn one_line_type(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The entity owning a definition, in the language's own spelling.
+    ///
+    /// Rust keeps its module-and-owner qualifier, C++ its `ns::Class`,
+    /// Python its `pkg.mod.Class`, Zig its `mod.Struct`; C has no owners.
+    /// `None` where the name stands alone. The same function writes the
+    /// qualifier on types, so the join contract holds: a method's qualifier
+    /// is its type's qualifier plus the separator plus the type's name.
+    fn owner_qualifier(
+        language: Language,
+        defined_at: Option<tree_sitter::Node>,
+        source: &str,
+        file_path: &str,
+    ) -> Option<String> {
+        let node = defined_at?;
+        match language {
+            Language::Rust => Self::rust_owner_qualifier(node, source, file_path),
+            Language::Cpp => Self::cpp_owner_qualifier(node, source),
+            Language::Python => Self::python_owner_qualifier(node, source, file_path),
+            Language::Zig => Self::zig_owner_qualifier(node, source, file_path),
+            Language::C => None,
+        }
     }
 
     /// One predicate on one line: continuations go, comments go, and runs of
@@ -5718,13 +7133,24 @@ impl TreeSitterAnalyzer {
 
     /// Follow a declarator down to the identifier it declares, without
     /// descending into a function declarator's parameters.
+    ///
+    /// tree-sitter-cpp hangs the identifier of a reference declarator
+    /// (`&o`) off no `declarator` field, so the generic arm bails and the
+    /// name stays glued to the type (`const Box &o` in the class against
+    /// `const Box & o` out of line, which no whitespace fold can join).
+    /// A parameter pack (`Args... args`) hangs its identifier off a
+    /// variadic_declarator the same way, so that node steps down to its
+    /// child too, leaving the `...` in the abstract shape beside the
+    /// name it declares.
     fn innermost_declarator_name(declarator: tree_sitter::Node) -> Option<tree_sitter::Node> {
         let mut node = declarator;
 
         loop {
             match node.kind() {
                 "field_identifier" | "identifier" | "type_identifier" => return Some(node),
-                "parenthesized_declarator" => node = node.named_child(0)?,
+                "parenthesized_declarator" | "reference_declarator" | "variadic_declarator" => {
+                    node = node.named_child(0)?
+                }
                 _ => node = node.child_by_field_name("declarator")?,
             }
         }
@@ -6471,75 +7897,265 @@ impl TreeSitterAnalyzer {
         calls
     }
 
+    /// Whether a declaration folds into one of the definitions beside it.
+    ///
+    /// Only C++ overloads, so only there is the declaration matched on its
+    /// parameter type sequence: names differ between a prototype and its
+    /// body, so only canonicalised types compare. Every other language
+    /// folds unconditionally; C has no overloading, so a prototype always
+    /// announces the one definition its key names, however each side spells
+    /// the parameters (`baz()` beside `baz(void)`, `int a[]` beside
+    /// `int *a`).
+    ///
+    /// The match compares parameter types only, not the trailing const
+    /// qualifier: a declaration folds whatever const each side carries.
+    /// Definitions at different lines still survive beside each other, so
+    /// the const and plain bodies of one name coexist as two rows.
+    fn declaration_matches_any_definition(
+        declaration: &FunctionInfo,
+        definitions: &[FunctionInfo],
+        match_parameters: bool,
+    ) -> bool {
+        if !match_parameters {
+            return !definitions.is_empty();
+        }
+        definitions.iter().any(|definition| {
+            Self::normalised_param_types(&declaration.parameters)
+                == Self::normalised_param_types(&definition.parameters)
+        })
+    }
+
+    /// One spelling for one type: `*`, `&` and `&&` bind with a space on
+    /// each side whatever the source wrote, so `const Box& o` meets
+    /// `const Box &o` and `void (**)(int)` meets itself. Whitespace
+    /// collapses with it, so this is the only normaliser the fold needs.
+    ///
+    /// A by-value parameter carries no top-level const or volatile in its
+    /// signature, so `int` meets `const int`. The strip applies only when
+    /// no pointer, reference, array or function shape is present: in
+    /// `const Box &` the const qualifies the pointee, not the parameter.
+    /// A trailing qualifier after the last `*` or `&` is top-level too,
+    /// so `char * const` meets `char *`.
+    fn canonical_param_type(raw: &str) -> String {
+        // `&&` first: spacing `&` apart would split the token in two.
+        const RREF: &str = "\u{1f}";
+        let squished = raw.replace("&&", RREF);
+        let spaced = squished.replace('*', " * ").replace('&', " & ");
+        let restored = spaced.replace(RREF, " && ");
+        let joined = restored.split_whitespace().collect::<Vec<_>>().join(" ");
+        if joined.contains(['*', '&', '[', '(']) {
+            let mut tokens: Vec<&str> = joined.split_whitespace().collect();
+            while tokens.len() > 1 {
+                let last = tokens[tokens.len() - 1];
+                if last != "const" && last != "volatile" {
+                    break;
+                }
+                if !tokens[..tokens.len() - 1]
+                    .iter()
+                    .any(|token| *token == "*" || *token == "&" || *token == "&&")
+                {
+                    break;
+                }
+                tokens.pop();
+            }
+            return tokens.join(" ");
+        }
+        joined
+            .split_whitespace()
+            .filter(|token| *token != "const" && *token != "volatile")
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Canonicalised parameter types, so `const Box& o` and
+    /// `const Box &o` compare equal while `int` and `const Box &` stay
+    /// apart.
+    fn normalised_param_types(parameters: &[crate::types::ParameterInfo]) -> Vec<String> {
+        parameters
+            .iter()
+            .map(|param| Self::canonical_param_type(&param.type_name))
+            .collect()
+    }
+
     /// Deduplicate functions within a single file (no threading issues).
     ///
-    /// One row per name **per preprocessor arm per owner**: `_cond_resched()`
-    /// is defined four times in `sched.h`, once per configuration, and ten
-    /// `fn new` in one Rust file are ten owners, and those are definitions,
-    /// not copies of one. Keyed on name alone, the preference below kept
-    /// `return 0;` and hid every route that reaches the scheduler. Within
-    /// one arm of one owner the preference is unchanged: definitions over
-    /// declarations, then longer span, longer body, more parameters.
+    /// One row per name per preprocessor arm per owner per line:
+    /// `_cond_resched()` is defined four times in `sched.h`, once per
+    /// configuration, and ten `fn new` in one Rust file are ten owners, and
+    /// `Box::get()` beside `Box::get(int)` are two definitions, not copies
+    /// of one. A declaration folds into the definition it announces -- a
+    /// prototype and its body are one row, not two -- and two definitions
+    /// never merge: definitions at different lines are different rows even
+    /// when nothing else tells them apart. Only rows that truly coincide,
+    /// the same definition read twice at one line, still collapse, keeping
+    /// the longer span, longer body, or richer parameters. Overloads that
+    /// happen to share one line collapse with them: the line is the only
+    /// discriminator the key keeps until a signature column separates them.
+    /// A declaration whose types match no definition in the group announces
+    /// an overload with no body in this file and survives as its own row.
+    /// With no definition in the group at all, only C++ keeps one row per
+    /// line: other languages have no overloading, so a repeated prototype
+    /// is one row however often it is written.
     fn deduplicate_functions_within_file(
         &self,
         raw_functions: Vec<FunctionInfo>,
+        language: Language,
     ) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_functions =
-            HashMap::<(String, Option<String>, Option<String>), FunctionInfo>::new();
+        // Only C++ overloads, so only there does a declaration have to
+        // announce the definition it folds into; elsewhere the key names
+        // the one definition and the prototype folds into it.
+        let match_parameters = language == Language::Cpp;
 
+        let mut groups: HashMap<(String, Option<String>, Option<String>), Vec<FunctionInfo>> =
+            HashMap::new();
         for func in raw_functions {
-            let key = func.within_file_key();
-
-            if let Some(existing) = seen_functions.get(&key) {
-                // Skip if bodies are identical
-                if existing.body == func.body {
-                    continue;
-                }
-
-                // Prefer definitions over declarations
-                let existing_span = existing.line_end.saturating_sub(existing.line_start);
-                let new_span = func.line_end.saturating_sub(func.line_start);
-
-                // Prefer functions with both parameters AND substantial body content
-                let existing_has_body = existing_span > 0
-                    && !existing.parameters.is_empty()
-                    && !existing.body.trim().is_empty();
-                let new_has_body =
-                    new_span > 0 && !func.parameters.is_empty() && !func.body.trim().is_empty();
-
-                let should_replace = if new_has_body && !existing_has_body {
-                    true // New has body, existing doesn't
-                } else if !new_has_body && existing_has_body {
-                    false // Existing has body, new doesn't
-                } else {
-                    // Both have bodies or both don't, prefer longer/more detailed one
-                    new_span > existing_span
-                        || (new_span == existing_span && func.body.len() > existing.body.len())
-                        || func.parameters.len() > existing.parameters.len()
-                };
-
-                if !should_replace {
-                    continue; // Keep existing
-                }
-            }
-
-            seen_functions.insert(key, func);
+            groups
+                .entry(func.declaration_fold_key())
+                .or_default()
+                .push(func);
         }
 
-        seen_functions.into_values().collect()
+        let mut kept = Vec::new();
+        for (_, rows) in groups {
+            let (definitions, declarations): (Vec<FunctionInfo>, Vec<FunctionInfo>) =
+                rows.into_iter().partition(|row| {
+                    crate::types::row_defines_the_function(&row.return_type, &row.body)
+                });
+            if definitions.is_empty() {
+                // No definition to fold into. Only C++ overloads, so only
+                // there are declarations at different lines different
+                // identities (the normal header shape): each line survives.
+                // Elsewhere every declaration announces the same definition
+                // to come, so the group is one row however often the
+                // prototype repeats, keeping the longer span or the richer
+                // parameters. Same-line copies are one declaration read
+                // twice, so they collapse here by the old preference.
+                if !match_parameters {
+                    if let Some(winner) = declarations.into_iter().reduce(|a, b| {
+                        if Self::new_row_wins(&a, &b) {
+                            b
+                        } else {
+                            a
+                        }
+                    }) {
+                        kept.push(winner);
+                    }
+                    continue;
+                }
+                let mut by_line: HashMap<u32, Vec<FunctionInfo>> = HashMap::new();
+                for declaration in declarations {
+                    by_line
+                        .entry(declaration.line_start)
+                        .or_default()
+                        .push(declaration);
+                }
+                for (_, coinciding) in by_line {
+                    if let Some(winner) = coinciding.into_iter().reduce(|a, b| {
+                        if Self::new_row_wins(&a, &b) {
+                            b
+                        } else {
+                            a
+                        }
+                    }) {
+                        kept.push(winner);
+                    }
+                }
+                continue;
+            }
+            // Every definition survives. Same-line rows are the same
+            // definition read twice, which the merge below would refuse, so
+            // they collapse here by the old preference. A declaration folds
+            // only into the definition whose parameter types it announces;
+            // any declaration matching no definition is an overload with no
+            // body in this file and survives beside the definitions.
+            let mut by_line: HashMap<u32, Vec<FunctionInfo>> = HashMap::new();
+            for definition in definitions {
+                by_line
+                    .entry(definition.line_start)
+                    .or_default()
+                    .push(definition);
+            }
+            let mut surviving_definitions = Vec::new();
+            for (_, coinciding) in by_line {
+                if let Some(winner) =
+                    coinciding
+                        .into_iter()
+                        .reduce(|a, b| if Self::new_row_wins(&a, &b) { b } else { a })
+                {
+                    surviving_definitions.push(winner);
+                }
+            }
+            for declaration in declarations {
+                if !Self::declaration_matches_any_definition(
+                    &declaration,
+                    &surviving_definitions,
+                    match_parameters,
+                ) {
+                    surviving_definitions.push(declaration);
+                }
+            }
+            // Same-line copies of one surviving declaration are one row;
+            // declarations at different lines are different overloads.
+            let mut by_line: HashMap<u32, Vec<FunctionInfo>> = HashMap::new();
+            for row in surviving_definitions {
+                by_line.entry(row.line_start).or_default().push(row);
+            }
+            for (_, coinciding) in by_line {
+                if let Some(winner) =
+                    coinciding
+                        .into_iter()
+                        .reduce(|a, b| if Self::new_row_wins(&a, &b) { b } else { a })
+                {
+                    kept.push(winner);
+                }
+            }
+        }
+
+        kept
+    }
+
+    /// Whether a new row replaces the kept one when two rows coincide: the
+    /// longer span first, then the longer body, then richer parameters.
+    fn new_row_wins(existing: &FunctionInfo, new: &FunctionInfo) -> bool {
+        let existing_span = existing.line_end.saturating_sub(existing.line_start);
+        let new_span = new.line_end.saturating_sub(new.line_start);
+
+        // Prefer functions with both parameters AND substantial body content
+        let existing_has_body = existing_span > 0
+            && !existing.parameters.is_empty()
+            && !existing.body.trim().is_empty();
+        let new_has_body =
+            new_span > 0 && !new.parameters.is_empty() && !new.body.trim().is_empty();
+
+        if new_has_body && !existing_has_body {
+            true // New has body, existing doesn't
+        } else if !new_has_body && existing_has_body {
+            false // Existing has body, new doesn't
+        } else {
+            // Both have bodies or both don't, prefer longer/more detailed one
+            new_span > existing_span
+                || (new_span == existing_span && new.body.len() > existing.body.len())
+                || new.parameters.len() > existing.parameters.len()
+        }
     }
 
     /// Deduplicate types within a single file
-    /// Simple deduplication by (name, kind) - types should be unique within a file anyway
+    /// One row per name per kind per owner: `mod a`'s `Foo` and `mod b`'s
+    /// `Foo` coexist, and so do `ns1::Box` and `ns2::Box`. Within one owner
+    /// the preference is unchanged: more members or a longer definition wins.
     fn deduplicate_types_within_file(&self, raw_types: Vec<TypeInfo>) -> Vec<TypeInfo> {
         use std::collections::HashMap;
 
-        let mut seen_types = HashMap::<(String, String), TypeInfo>::new();
+        let mut seen_types = HashMap::<(String, String, Option<String>), TypeInfo>::new();
 
         for type_info in raw_types {
-            let key = (type_info.name.clone(), type_info.kind.clone());
+            let key = (
+                type_info.name.clone(),
+                type_info.kind.clone(),
+                type_info.qualifier.clone(),
+            );
 
             if let Some(existing) = seen_types.get(&key) {
                 // If definitions are identical, skip
@@ -7053,7 +8669,8 @@ mod tests {
             !go.calls
                 .clone()
                 .unwrap_or_default()
-                .contains(&"fp".to_string()),
+                .iter()
+                .any(|c| c == "fp"),
             "pointer variable recorded as a called function: {:?}",
             go.calls
         );
@@ -7100,6 +8717,9 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+            .into_iter()
+            .map(|edge| edge.callee().to_string())
+            .collect()
     }
 
     #[test]
@@ -8157,7 +9777,8 @@ mod tests {
             !go.calls
                 .clone()
                 .unwrap_or_default()
-                .contains(&"read".to_string()),
+                .iter()
+                .any(|c| c == "read"),
             "member name recorded as a called function: {:?}",
             go.calls
         );
@@ -8590,6 +10211,24 @@ test "helper ok" {
             Some(Language::Rust)
         );
     }
+
+    #[test]
+    fn cpp_extensions_read_as_cpp_and_headers_default_to_c() {
+        for path in [
+            "box.cpp", "box.cc", "box.cxx", "box.c++", "box.hh", "box.hpp",
+        ] {
+            assert_eq!(
+                Language::from_path(Path::new(path)),
+                Some(Language::Cpp),
+                "{path}"
+            );
+        }
+        assert_eq!(Language::from_path(Path::new("box.h")), Some(Language::C));
+        assert_eq!(
+            Language::from_path_with_headers(Path::new("box.h"), true),
+            Some(Language::Cpp)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8729,6 +10368,1171 @@ mod rust_receiver_tests {
             .collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn grammar_versions_match_the_lockfile() {
+        // The per-language versions are only honest while the consts spell
+        // what Cargo resolved. A grammar bump that forgets its const would
+        // silently keep the old version and never re-read the language.
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock")).unwrap();
+        let mut versions = std::collections::HashMap::new();
+        let mut name: Option<String> = None;
+        for line in lock.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("name = ") {
+                name = Some(rest.trim_matches('"').to_string());
+            } else if let Some(rest) = line.strip_prefix("version = ") {
+                if let Some(name) = name.take() {
+                    versions.insert(name, rest.trim_matches('"').to_string());
+                }
+            }
+        }
+        for (krate, pinned) in [
+            ("tree-sitter-c", TREE_SITTER_C_VERSION),
+            ("tree-sitter-cpp", TREE_SITTER_CPP_VERSION),
+            ("tree-sitter-python", TREE_SITTER_PYTHON_VERSION),
+            ("tree-sitter-rust", TREE_SITTER_RUST_VERSION),
+            ("tree-sitter-zig", TREE_SITTER_ZIG_VERSION),
+        ] {
+            assert_eq!(
+                versions.get(krate).map(String::as_str),
+                Some(pinned),
+                "{krate} moved in Cargo.lock without its version const"
+            );
+        }
+        // Every language's version carries the shared part, so one bump
+        // re-reads them all.
+        for (_, version) in extractor_versions() {
+            assert!(
+                version.starts_with(&format!("{EXTRACTOR_VERSION}+")),
+                "{version} lost the shared part"
+            );
+        }
+    }
+
+    /// The (name, kind, qualifier) of every type in a file, sorted.
+    fn type_qualifiers_of(source: &str, path: &str) -> Vec<(String, String, Option<String>)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, String, Option<String>)> = analysis
+            .types
+            .iter()
+            .map(|t| (t.name.clone(), t.kind.clone(), t.qualifier.clone()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn same_named_types_in_one_file_coexist() {
+        // Same-named types in two modules stay apart: `mod a`'s `Foo`
+        // and `mod b`'s `Foo` are two rows, told apart by the qualifier
+        // the owner function writes.
+        let found = type_qualifiers_of(
+            "mod a {\n\
+             \tpub struct Foo;\n\
+             }\n\
+             mod b {\n\
+             \tpub struct Foo;\n\
+             }\n",
+            "x.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "Foo".to_string(),
+                    "struct".to_string(),
+                    Some("x::a".to_string())
+                ),
+                (
+                    "Foo".to_string(),
+                    "struct".to_string(),
+                    Some("x::b".to_string())
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn method_qualifiers_join_to_their_types() {
+        // Join contract: functions.qualifier is types.qualifier plus the
+        // separator plus types.name, in each language's own spelling.
+        // Without the types qualifier the two owners below collapse, and no
+        // receiver type can join to its methods' qualifier.
+        let cases = [
+            (
+                "mod a {\n\
+                 \tpub struct Foo;\n\
+                 \timpl Foo {\n\
+                 \t\tfn m(&self) {}\n\
+                 \t}\n\
+                 }\n\
+                 mod b {\n\
+                 \tpub struct Foo;\n\
+                 \timpl Foo {\n\
+                 \t\tfn m(&self) {}\n\
+                 \t}\n\
+                 }\n",
+                "x.rs",
+                "::",
+                "Foo",
+            ),
+            (
+                "namespace ns1 {\n\
+                 class Box {\n\
+                 public:\n\
+                 \tint get();\n\
+                 };\n\
+                 }\n\
+                 namespace ns2 {\n\
+                 class Box {\n\
+                 public:\n\
+                 \tint get();\n\
+                 };\n\
+                 }\n\
+                 int ns1::Box::get() { return 1; }\n\
+                 int ns2::Box::get() { return 2; }\n",
+                "box.cpp",
+                "::",
+                "Box",
+            ),
+            (
+                "class A:\n\
+                 \tdef m(self):\n\
+                 \t\tpass\n\
+                 class B:\n\
+                 \tdef m(self):\n\
+                 \t\tpass\n",
+                "pkg/mod.py",
+                ".",
+                "A",
+            ),
+            (
+                "const A = struct {\n\
+                 \tpub fn init() void {}\n\
+                 };\n\
+                 const B = struct {\n\
+                 \tpub fn init() void {}\n\
+                 };\n",
+                "src/main.zig",
+                ".",
+                "A",
+            ),
+        ];
+        for (source, path, separator, first_type) in cases {
+            let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+            let analysis = analyzer
+                .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+                .unwrap();
+            // Every method's qualifier joins from a type row in the file.
+            for function in &analysis.functions {
+                let Some(method_qualifier) = function.qualifier.as_deref() else {
+                    continue;
+                };
+                let joined = analysis
+                    .types
+                    .iter()
+                    .map(|t| match t.qualifier.as_deref() {
+                        Some(type_qualifier) => {
+                            format!("{type_qualifier}{separator}{}", t.name)
+                        }
+                        None => t.name.clone(),
+                    })
+                    .any(|joined| joined == method_qualifier);
+                assert!(
+                    joined,
+                    "{path}: {} has no type row joining to {method_qualifier}",
+                    function.name
+                );
+            }
+            // The fixture's first type keeps its own qualifier.
+            assert!(
+                analysis
+                    .types
+                    .iter()
+                    .any(|t| t.name == first_type && t.qualifier.is_some()),
+                "{path}: no qualified row for {first_type}: {:#?}",
+                analysis.types
+            );
+        }
+    }
+
+    /// The (name, guard, qualifier) of every function in a file, sorted.
+    fn guards_of(source: &str, path: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, Option<String>, Option<String>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.guard.clone(), f.qualifier.clone()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn rust_cfg_arms_record_their_predicates() {
+        // Rust records each configuration arm as written: one method per
+        // configuration reads its #[cfg], so the arms are two rows.
+        let found = guards_of(
+            "#[cfg(unix)]\n\
+             impl Handle {\n\
+             \tfn deref(&self) -> u32 { 1 }\n\
+             }\n\
+             #[cfg(windows)]\n\
+             impl Handle {\n\
+             \tfn deref(&self) -> u32 { 2 }\n\
+             }\n",
+            "lib.rs",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "deref".to_string(),
+                    Some("cfg(unix)".to_string()),
+                    Some("lib::Handle".to_string()),
+                ),
+                (
+                    "deref".to_string(),
+                    Some("cfg(windows)".to_string()),
+                    Some("lib::Handle".to_string()),
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_preprocessor_arms_read_like_c() {
+        // C++ shares the C preprocessor node kinds, so its arms guard the
+        // same way.
+        let found = guards_of(
+            "#ifdef USE_FAST\n\
+             int get() { return 1; }\n\
+             #else\n\
+             int get() { return 0; }\n\
+             #endif\n",
+            "get.cpp",
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        let mut guards: Vec<Option<String>> =
+            found.iter().map(|(_, guard, _)| guard.clone()).collect();
+        guards.sort();
+        assert_eq!(
+            guards,
+            vec![
+                Some("!defined(USE_FAST)".to_string()),
+                Some("defined(USE_FAST)".to_string()),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn python_conditional_definitions_guard_opaquely() {
+        // TYPE_CHECKING and try-import arms record their condition as
+        // written; the names survive on their lines either way.
+        let found = guards_of(
+            "if TYPE_CHECKING:\n\
+             \tdef f():\n\
+             \t\tpass\n\
+             else:\n\
+             \tdef f():\n\
+             \t\tpass\n\
+             try:\n\
+             \tdef g():\n\
+             \t\tpass\n\
+             except ImportError:\n\
+             \tdef g():\n\
+             \t\tpass\n",
+            "pkg/mod.py",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "f".to_string(),
+                    Some("TYPE_CHECKING".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+                (
+                    "f".to_string(),
+                    Some("not (TYPE_CHECKING)".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+                (
+                    "g".to_string(),
+                    Some("except ImportError".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+                (
+                    "g".to_string(),
+                    Some("try".to_string()),
+                    Some("pkg.mod".to_string()),
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn zig_comptime_arms_guard_opaquely() {
+        // Comptime arms record their condition as written.
+        let found = guards_of(
+            "const A = if (comptime x == 1) struct {\n\
+             \tpub fn init() void {}\n\
+             } else struct {\n\
+             \tpub fn init() void {}\n\
+             };\n",
+            "src/main.zig",
+        );
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "init".to_string(),
+                    Some("comptime x == 1".to_string()),
+                    Some("src.main.A".to_string()),
+                ),
+                (
+                    "init".to_string(),
+                    Some("not (comptime x == 1)".to_string()),
+                    Some("src.main.A".to_string()),
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_guards_never_filter() {
+        // Guards filter only: a non-Kconfig guard contributes no facts and
+        // contradicts nothing, so Python, Zig and cfg arms never prune a
+        // chain the way a CONFIG arm can.
+        for guard in [
+            "TYPE_CHECKING",
+            "not (TYPE_CHECKING)",
+            "try",
+            "except ImportError",
+            "comptime x == 1",
+            "cfg(unix)",
+        ] {
+            assert!(
+                crate::guard::config_facts(guard).is_empty(),
+                "{guard} contributed facts"
+            );
+            assert!(
+                crate::guard::contradiction(&["defined(CONFIG_X)"], guard).is_none(),
+                "{guard} contradicted a held fact"
+            );
+        }
+    }
+
+    /// The (name, calls) of every function in a file, sorted by name.
+    fn call_edges_of(source: &str, path: &str) -> Vec<(String, Vec<crate::types::CallEdge>)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, Vec<crate::types::CallEdge>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.calls.clone().unwrap_or_default()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn tagged(call: &str, owner: &str) -> crate::types::CallEdge {
+        crate::types::CallEdge::Tagged {
+            call: call.to_string(),
+            owner: owner.to_string(),
+        }
+    }
+
+    fn plain(call: &str) -> crate::types::CallEdge {
+        crate::types::CallEdge::Plain(call.to_string())
+    }
+
+    #[test]
+    fn rust_scoped_calls_store_verbatim_with_self_rewritten() {
+        // `Self::assoc` is the sole index-time rewrite: the head resolves
+        // to the enclosing impl's owner. Every other path stores verbatim,
+        // arguments included; what it selects is for query time.
+        let found = call_edges_of(
+            "mod m {\n\
+             struct H;\n\
+             impl H {\n\
+             \tfn new() -> u32 { Self::assoc() }\n\
+             \tfn assoc() -> u32 { 1 }\n\
+             }\n\
+             }\n\
+             fn free() -> u32 { Arc::new(1); crate::m::H::assoc(); foo::<u8>(); }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("new"), vec![plain("H::assoc")], "{found:?}");
+        assert!(get("assoc").is_empty(), "{found:?}");
+        assert_eq!(
+            get("free"),
+            vec![
+                plain("Arc::new"),
+                plain("crate::m::H::assoc"),
+                plain("foo::<u8>"),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_member_calls_carry_their_enclosing_owner() {
+        // A bare call in a member, and `this->` beside it, name the same
+        // edge: the enclosing owner goes beside the call. A spelled path
+        // already carries its own and stores verbatim.
+        let found = call_edges_of(
+            "namespace ns {\n\
+             class Box {\n\
+             public:\n\
+             \tstatic int get_static();\n\
+             \tint run();\n\
+             };\n\
+             int Box::get_static() { return 1; }\n\
+             int Box::run() { get_static(); return this->get_static(); }\n\
+             }\n\
+             int free() { return ns::Box::get_static(); }\n",
+            "box.cpp",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            get("run"),
+            vec![tagged("get_static", "ns::Box")],
+            "{found:?}"
+        );
+        assert!(get("get_static").is_empty(), "{found:?}");
+        assert_eq!(get("free"), vec![plain("ns::Box::get_static")], "{found:?}");
+    }
+
+    #[test]
+    fn python_self_calls_carry_their_enclosing_owner() {
+        // `self.helper()` names no path, so the enclosing class goes
+        // beside it; it stops being a dispatch site, which could never
+        // resolve it. A bare call stays plain: Python has no implicit
+        // self, so one never reaches a method.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "class C:\n\
+                 \tdef m(self):\n\
+                 \t\tself.helper()\n\
+                 \t\tbare()\n\
+                 \tdef helper(self):\n\
+                 \t\tpass\n",
+                std::path::Path::new("pkg/mod.py"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let m = analysis.functions.iter().find(|f| f.name == "m").unwrap();
+        assert_eq!(
+            m.calls.clone().unwrap_or_default(),
+            vec![plain("bare"), tagged("helper", "pkg.mod.C")],
+            "{:?}",
+            analysis.functions
+        );
+        assert!(
+            analysis.dispatch_sites.iter().all(
+                |site| site.member != "helper" || site.receiver_expr.as_deref() != Some("self")
+            ),
+            "{:#?}",
+            analysis.dispatch_sites
+        );
+    }
+
+    #[test]
+    fn callee_edges_with_arguments_look_up_bare() {
+        // A stored `f<int>` looks up `f`; a spelled owner keeps its
+        // arguments for the exact match.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "template <typename T> T f() { return T(); }\n\
+                 namespace ns {\n\
+                 template <typename T> struct Box { static T conv(); };\n\
+                 template <typename T> T Box<T>::conv() { return T(); }\n\
+                 }\n\
+                 int use() { auto x = f<int>(); auto y = ns::Box<int>::conv(); }\n",
+                std::path::Path::new("use.cpp"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let use_fn = analysis.functions.iter().find(|f| f.name == "use").unwrap();
+        assert_eq!(
+            use_fn.calls.clone().unwrap_or_default(),
+            vec![plain("f<int>"), plain("ns::Box<int>::conv")],
+            "{:?}",
+            analysis.functions
+        );
+    }
+
+    #[test]
+    fn cpp_definitions_carry_namespace_and_class() {
+        // C++ owners use the language's own spelling: overloads,
+        // constructors and an operator share the class owner, and the
+        // out-of-line definitions
+        // fold into their in-class declarations, so each pair is one row.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             class Box {\n\
+             public:\n\
+             \tBox();\n\
+             \tint get();\n\
+             \tint get(int x);\n\
+             \tbool operator==(const Box& o);\n\
+             };\n\
+             }\n\
+             ns::Box::Box() {}\n\
+             int ns::Box::get() { return 1; }\n\
+             int ns::Box::get(int x) { return x; }\n\
+             bool ns::Box::operator==(const Box& o) { return true; }\n",
+            "box.cpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("Box".to_string(), Some("ns::Box".to_string())),
+                ("get".to_string(), Some("ns::Box".to_string())),
+                ("get".to_string(), Some("ns::Box".to_string())),
+                ("operator==".to_string(), Some("ns::Box".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_primary_template_strips_its_params_and_spec_keeps_them() {
+        // `Box<T>::conv` is owned by `ns::Box`, the key its in-class
+        // declaration carries, so the pair folds; `Box<int>::conv` keeps its
+        // arguments and stays apart.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             template <typename T>\n\
+             class Box {\n\
+             public:\n\
+             \tT conv(T v);\n\
+             };\n\
+             template <>\n\
+             class Box<int> {\n\
+             public:\n\
+             \tint conv(int v);\n\
+             };\n\
+             }\n\
+             template <typename T>\n\
+             T ns::Box<T>::conv(T v) { return v; }\n\
+             template <>\n\
+             int ns::Box<int>::conv(int v) { return v + 1; }\n",
+            "box.cpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("conv".to_string(), Some("ns::Box".to_string())),
+                ("conv".to_string(), Some("ns::Box<int>".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_struct_and_union_members_carry_their_owner() {
+        // Structs and unions own their in-class members exactly like
+        // classes: a template struct's method used to report only the
+        // namespace, which broke the functions.qualifier == types.qualifier
+        // + "::" + types.name join and let same-named methods
+        // of different structs share an owner. The member below is
+        // inline-bodied; the union one is declaration-only.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             template <typename T>\n\
+             struct Box {\n\
+             \tT conv(T v) { return v; }\n\
+             };\n\
+             union U {\n\
+             \tvoid clear();\n\
+             };\n\
+             }\n",
+            "box.cpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("clear".to_string(), Some("ns::U".to_string())),
+                ("conv".to_string(), Some("ns::Box".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_declaration_only_overloads_all_survive() {
+        // The normal C++ header shape: two declarations, no definition.
+        // Different lines are different identities, so both survive; only
+        // same-line copies of one declaration collapse.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             class Box {\n\
+             public:\n\
+             \tint get();\n\
+             \tint get(int x);\n\
+             };\n\
+             }\n",
+            "box.hpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("get".to_string(), Some("ns::Box".to_string())),
+                ("get".to_string(), Some("ns::Box".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_undefined_overload_survives_beside_a_defined_sibling() {
+        // One in-class declaration announces the out-of-line body and folds
+        // into it; the sibling declaration announces an overload with no
+        // body in this file, so it survives beside the definition. Folding
+        // compares parameter types, since names differ between a prototype
+        // and its body.
+        let found = qualifiers_of(
+            "namespace ns {\n\
+             class Box {\n\
+             public:\n\
+             \tint get();\n\
+             \tint get(int x);\n\
+             };\n\
+             int Box::get() { return 1; }\n\
+             }\n",
+            "box.cpp",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("get".to_string(), Some("ns::Box".to_string())),
+                ("get".to_string(), Some("ns::Box".to_string())),
+            ],
+            "{found:?}"
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn cpp_reference_parameters_fold_whatever_the_spacing() {
+        // The declarator name is not part of the type: `const Box &o`
+        // in the class and `const Box& o` out of line are one row, and
+        // so are the unnamed `const Box&` prototype and its body. Without
+        // the strip the name stays glued to the type with the source's
+        // spacing, and every reference parameter leaves a ghost row.
+        let found = qualifiers_of(
+            "namespace ns {\nclass Box {\npublic:\n\tint set(const Box &o);\n\tint get(const Box&);\n};\nint Box::set(const Box& o) { return 0; }\nint Box::get(const Box& o) { return 0; }\n}\n",
+            "box.cpp",
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn overloads_sharing_one_line_collapse() {
+        // line_start is the only discriminator the key keeps, so two
+        // overloads written on one line are one row until a signature
+        // column separates them. Pin the count so nobody mistakes it
+        // for a dropped row later.
+        let found = qualifiers_of("class Box { int get(); int get(int x); };\n", "box.hpp");
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// The parameter types of the single `name` row in `functions`,
+    /// for folds where the qualifier alone cannot tell the story.
+    fn params_of_single_row(source: &str, path: &str, name: &str) -> Vec<String> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let functions = analysis.functions;
+        assert_eq!(functions.len(), 1, "{functions:#?}");
+        assert_eq!(functions[0].name, name, "{functions:#?}");
+        assert!(
+            crate::types::row_defines_the_function(&functions[0].return_type, &functions[0].body),
+            "{functions:#?}"
+        );
+        functions[0]
+            .parameters
+            .iter()
+            .map(|param| param.type_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn cpp_defaulted_parameters_fold_into_their_body() {
+        // A default argument is not part of the parameter: `get(int x = 0)`
+        // announces the same function `get(int x)` defines, and the stored
+        // parameter is the bare type rather than the source spelling.
+        let types = params_of_single_row(
+            "namespace ns {\nclass Box {\npublic:\n\tint get(int x = 0);\n};\nint Box::get(int x) { return x; }\n}\n",
+            "box.cpp",
+            "get",
+        );
+        assert_eq!(types, vec!["int".to_string()], "{types:?}");
+    }
+
+    #[test]
+    fn cpp_mixed_defaulted_parameters_still_count_every_parameter() {
+        // `f(int a, int b = 0)` declares two parameters, not one: the
+        // defaulted tail still counts, so the declaration meets the
+        // two-parameter body instead of leaving a ghost row beside it.
+        let types = params_of_single_row(
+            "int f(int a, int b = 0);\nint f(int a, int b) { return a + b; }\n",
+            "f.cpp",
+            "f",
+        );
+        assert_eq!(
+            types,
+            vec!["int".to_string(), "int".to_string()],
+            "{types:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_variadic_pack_parameter_folds_into_its_body() {
+        // The pack keeps its `...`: `emplace(Args... args)` stores one
+        // parameter spelling the pack, the same on both sides, so the
+        // in-class declaration folds into the out-of-line body.
+        let types = params_of_single_row(
+            "template<typename... Args>\nstruct T {\n\tvoid emplace(Args... args);\n};\ntemplate<typename... Args>\nvoid T<Args...>::emplace(Args... args) { }\n",
+            "t.cpp",
+            "emplace",
+        );
+        assert_eq!(types, vec!["Args ...".to_string()], "{types:?}");
+    }
+
+    #[test]
+    fn cpp_toplevel_const_on_by_value_parameters_folds() {
+        // `int` and `const int` declare the same function when the
+        // parameter is passed by value: the const qualifies nothing the
+        // caller can observe. The fold compares canonicalised types, while
+        // the surviving definition keeps its spelling as written.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "namespace ns {\nclass Box {\npublic:\n\tint get(int x);\n};\nint Box::get(const int x) { return x; }\n}\n",
+                std::path::Path::new("box.cpp"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        assert_eq!(functions.len(), 1, "{functions:#?}");
+        let types: Vec<String> = functions[0]
+            .parameters
+            .iter()
+            .map(|param| param.type_name.clone())
+            .collect();
+        assert_eq!(types, vec!["const int".to_string()], "{types:?}");
+    }
+
+    #[test]
+    fn cpp_const_and_plain_definitions_coexist() {
+        // The fold compares parameter types only, not the trailing const:
+        // each declaration folds whatever const each side carries, and the
+        // const and plain bodies survive on their lines as two rows.
+        let found = qualifiers_of(
+            "namespace ns {\nclass Box {\npublic:\n\tint at(int i) const;\n\tint at(int i);\n};\nint Box::at(int i) const { return 0; }\nint Box::at(int i) { return 1; }\n}\n",
+            "box.cpp",
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn cpp_destructors_and_defaults_belong_to_the_class() {
+        // `~Widget` keeps its spelling, and `= default` defines the
+        // constructor it announces.
+        let found = qualifiers_of(
+            "class Widget {\n\
+             public:\n\
+             \tWidget();\n\
+             \t~Widget();\n\
+             };\n\
+             Widget::Widget() = default;\n\
+             Widget::~Widget() {}\n",
+            "widget.cpp",
+        );
+        let analysis_functions = found;
+        assert_eq!(
+            analysis_functions,
+            vec![
+                ("Widget".to_string(), Some("Widget".to_string())),
+                ("~Widget".to_string(), Some("Widget".to_string())),
+            ],
+            "{analysis_functions:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_pointer_and_reference_returns_are_extracted() {
+        // A declarator returning a pointer or a reference wraps the
+        // function (`char *name()`, `S &self()`): without an arm for the
+        // wrapper no row is extracted at all, in any position. Each shape
+        // below is one row, and a declaration announcing a wrapped body
+        // folds into it.
+        let free = qualifiers_of("const char *name(int n) { return 0; }\n", "b.cpp");
+        assert_eq!(free, vec![("name".to_string(), None)], "{free:?}");
+        let double = qualifiers_of("char **dup(int n) { return 0; }\n", "b2.cpp");
+        assert_eq!(double, vec![("dup".to_string(), None)], "{double:?}");
+        let ooline = qualifiers_of("const char *S::name(int n) { return 0; }\n", "c.cpp");
+        assert_eq!(
+            ooline,
+            vec![("name".to_string(), Some("S".to_string()))],
+            "{ooline:?}"
+        );
+        let decl = qualifiers_of("struct S {\n  const char *name(int n);\n};\n", "d.cpp");
+        assert_eq!(
+            decl,
+            vec![("name".to_string(), Some("S".to_string()))],
+            "{decl:?}"
+        );
+        let inline = qualifiers_of(
+            "struct S {\n  const char *name(int n) { return 0; }\n};\n",
+            "e.cpp",
+        );
+        assert_eq!(
+            inline,
+            vec![("name".to_string(), Some("S".to_string()))],
+            "{inline:?}"
+        );
+        let folded = qualifiers_of(
+            "struct S {\n  S &self();\n};\nS &S::self() { return *this; }\n",
+            "f.cpp",
+        );
+        assert_eq!(
+            folded,
+            vec![("self".to_string(), Some("S".to_string()))],
+            "{folded:?}"
+        );
+        let namespaced = qualifiers_of(
+            "namespace ns {\nchar *dup(const char *s) { return 0; }\n}\n",
+            "g.cpp",
+        );
+        assert_eq!(
+            namespaced,
+            vec![("dup".to_string(), Some("ns".to_string()))],
+            "{namespaced:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_prototypes_record_their_return_type() {
+        // Both declaration arms capture the return type: without the
+        // capture every prototype stores the "void" default, leaving the
+        // normal header shape with wrong data in a stored column.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "struct S {\n  int g(int n = 0);\n  int h(int n);\n};\nint free_f(int n = 1);\n",
+                std::path::Path::new("d.cpp"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let mut returns: Vec<(&str, &str)> = analysis
+            .functions
+            .iter()
+            .map(|function| (function.name.as_str(), function.return_type.as_str()))
+            .collect();
+        returns.sort();
+        assert_eq!(
+            returns,
+            vec![("free_f", "int"), ("g", "int"), ("h", "int")],
+            "{returns:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_brace_default_arguments_do_not_define() {
+        // A brace inside the parameter list is a default argument, not a
+        // body: `= {}`, `Box{}` and `{1, 2}` each announce the function
+        // their body defines, so every pair is one row. A call inside a
+        // default (`h(1, 2)`) announces the same way.
+        let braced = params_of_single_row(
+            "int g(int n = {});\nint g(int n) { return n; }\n",
+            "a.cpp",
+            "g",
+        );
+        assert_eq!(braced, vec!["int".to_string()], "{braced:?}");
+        let constructed = params_of_single_row(
+            "int g(Box b = Box{});\nint g(Box b) { return 0; }\n",
+            "b.cpp",
+            "g",
+        );
+        assert_eq!(constructed, vec!["Box".to_string()], "{constructed:?}");
+        let listed = params_of_single_row(
+            "int g(std::vector<int> v = {1, 2});\nint g(std::vector<int> v) { return 0; }\n",
+            "c.cpp",
+            "g",
+        );
+        assert_eq!(listed, vec!["std::vector<int>".to_string()], "{listed:?}");
+        let called = params_of_single_row(
+            "int g(int n = h(1, 2));\nint g(int n) { return n; }\n",
+            "call.cpp",
+            "g",
+        );
+        assert_eq!(called, vec!["int".to_string()], "{called:?}");
+    }
+
+    #[test]
+    fn cpp_brace_default_declaration_only_declares() {
+        // A declaration-only header with a braced default is one row that
+        // declares rather than defines: the brace belongs to the default
+        // argument, so the prototype test still recognises the row.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "struct S {\n  int g(int n = {});\n};\n",
+                std::path::Path::new("d.cpp"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        assert_eq!(functions.len(), 1, "{functions:#?}");
+        assert!(
+            !crate::types::row_defines_the_function(&functions[0].return_type, &functions[0].body),
+            "{functions:#?}"
+        );
+    }
+
+    #[test]
+    fn cpp_const_pointer_parameter_folds() {
+        // A qualifier after the last `*` is top-level too: `char * const`
+        // declares the same function `char *` defines, so the pair is one
+        // row keeping the body's spelling.
+        let types = params_of_single_row(
+            "void f(char *p);\nvoid f(char * const p) { }\n",
+            "f.cpp",
+            "f",
+        );
+        assert_eq!(types, vec!["char * const".to_string()], "{types:?}");
+    }
+
+    #[test]
+    fn cpp_reference_to_pointer_returns_fold() {
+        // `int *&slot()` wraps the function in a pointer around a
+        // reference: without the fifth declarator shape the declaration
+        // never meets the body, leaving a ghost row beside it.
+        let types = params_of_single_row(
+            "struct S {\n  int *&slot();\n};\nint *&S::slot() { static int *p; return p; }\n",
+            "f.cpp",
+            "slot",
+        );
+        assert_eq!(types, Vec::<String>::new(), "{types:?}");
+    }
+
+    #[test]
+    fn cpp_friends_belong_to_the_namespace() {
+        // A friend is a non-member: the declaration in the class takes the
+        // enclosing namespace as its owner, so it meets the out-of-line
+        // definition it announces and the pair is one row. A hidden friend
+        // defined in the class body is a namespace-scope function too.
+        let declared = qualifiers_of(
+            "namespace ns {\nstruct Box {\n  friend std::ostream &operator<<(std::ostream &os, const Box &b);\n};\nstd::ostream &operator<<(std::ostream &os, const Box &b) { return os; }\n}\n",
+            "b.cpp",
+        );
+        assert_eq!(
+            declared,
+            vec![("operator<<".to_string(), Some("ns".to_string()))],
+            "{declared:?}"
+        );
+        let swapped = qualifiers_of(
+            "namespace ns {\nstruct Box {\n  friend void swap(Box &a, Box &b);\n};\nvoid swap(Box &a, Box &b) { }\n}\n",
+            "c.cpp",
+        );
+        assert_eq!(
+            swapped,
+            vec![("swap".to_string(), Some("ns".to_string()))],
+            "{swapped:?}"
+        );
+        let hidden = qualifiers_of(
+            "namespace ns {\nstruct Box {\n  friend bool operator==(const Box &a, const Box &b) { return true; }\n};\n}\n",
+            "a.cpp",
+        );
+        assert_eq!(
+            hidden,
+            vec![("operator==".to_string(), Some("ns".to_string()))],
+            "{hidden:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_conversion_operators_are_extracted() {
+        // A conversion has no `operator_name`: the `operator_cast` is the
+        // name and its target is the return type, so the in-class
+        // declaration carries the class owner and folds into the out-of-line
+        // definition. An inline conversion is one row on its own.
+        let converted = qualifiers_of(
+            "struct S {\n  operator bool() const;\n};\nS::operator bool() const { return true; }\n",
+            "j.cpp",
+        );
+        assert_eq!(
+            converted,
+            vec![("operator bool".to_string(), Some("S".to_string()))],
+            "{converted:?}"
+        );
+        let inline = qualifiers_of(
+            "struct S {\n  explicit operator bool() const { return true; }\n};\n",
+            "c.cpp",
+        );
+        assert_eq!(
+            inline,
+            vec![("operator bool".to_string(), Some("S".to_string()))],
+            "{inline:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_function_try_blocks_define() {
+        // A function-try-block is a body: the out-of-line `S::S() try {}`
+        // defines the constructor the in-class declaration announces, so
+        // the pair is one row that defines.
+        let types = params_of_single_row(
+            "struct S {\n  S();\n};\nS::S() try { } catch (...) { }\n",
+            "d.cpp",
+            "S",
+        );
+        assert_eq!(types, Vec::<String>::new(), "{types:?}");
+    }
+
+    #[test]
+    fn cpp_constrained_declaration_reads_as_a_definition() {
+        // Pinned limit: a C++20 constrained declaration carries its
+        // requirement body outside every parenthesis, so the prototype test
+        // cannot tell it from a definition. The row still folds by its key;
+        // only the defines bit overstates.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "template<typename T> void f(T t) requires requires(T x) { x.y; };\n",
+                std::path::Path::new("k.cpp"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        assert_eq!(functions.len(), 1, "{functions:#?}");
+        assert!(
+            crate::types::row_defines_the_function(&functions[0].return_type, &functions[0].body),
+            "{functions:#?}"
+        );
+    }
+
+    #[test]
+    fn python_definitions_carry_module_and_owner() {
+        // Python owners use the language's own spelling: methods carry the
+        // class, nested functions spell `<locals>`, and free functions
+        // carry the module.
+        let found = qualifiers_of(
+            "class C:\n\
+             \tdef m(self):\n\
+             \t\tpass\n\
+             \t@property\n\
+             \tdef x(self):\n\
+             \t\treturn 1\n\
+             \t@x.setter\n\
+             \tdef x(self, v):\n\
+             \t\tpass\n\
+             def outer():\n\
+             \tdef inner():\n\
+             \t\tpass\n\
+             def free():\n\
+             \tpass\n",
+            "pkg/mod.py",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("free".to_string(), Some("pkg.mod".to_string())),
+                (
+                    "inner".to_string(),
+                    Some("pkg.mod.outer.<locals>".to_string())
+                ),
+                ("m".to_string(), Some("pkg.mod.C".to_string())),
+                ("outer".to_string(), Some("pkg.mod".to_string())),
+                ("x".to_string(), Some("pkg.mod.C".to_string())),
+                ("x".to_string(), Some("pkg.mod.C".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn zig_definitions_carry_module_and_container() {
+        // Zig owners use the language's own spelling: methods carry the
+        // struct, nested containers nest, and free functions carry the
+        // module.
+        let found = qualifiers_of(
+            "const A = struct {\n\
+             \tpub fn init() void {}\n\
+             };\n\
+             const B = struct {\n\
+             \tpub fn init() void {}\n\
+             };\n\
+             const O = struct {\n\
+             \tconst I = struct {\n\
+             \t\tpub fn m() void {}\n\
+             \t};\n\
+             };\n\
+             pub fn free() void {}\n",
+            "src/main.zig",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("free".to_string(), Some("src.main".to_string())),
+                ("init".to_string(), Some("src.main.A".to_string())),
+                ("init".to_string(), Some("src.main.B".to_string())),
+                ("m".to_string(), Some("src.main.O.I".to_string())),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn c_definitions_stand_alone() {
+        // C has no owners: the qualifier stays empty.
+        let found = qualifiers_of(
+            "int get(void);\nint get(void)\n{\n\treturn 1;\n}\n",
+            "get.c",
+        );
+        assert_eq!(found, vec![("get".to_string(), None)], "{found:?}");
     }
 
     #[test]
@@ -9443,6 +12247,203 @@ mod macro_defined_tests {
         );
     }
 
+    #[test]
+    fn cfg_arms_of_one_method_coexist() {
+        // One method defined once per configuration is two definitions,
+        // not one row the merge prefers. Guards are recorded as written;
+        // what matters here is that both lines
+        // survive with the same name and owner.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#[cfg(unix)]\n\
+                impl Handle {\n\
+                \tfn deref(&self) -> u32 { 1 }\n\
+                }\n\
+                #[cfg(windows)]\n\
+                impl Handle {\n\
+                \tfn deref(&self) -> u32 { 2 }\n\
+                }\n",
+                std::path::Path::new("lib.rs"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let mut derefs: Vec<u32> = functions
+            .iter()
+            .filter(|f| f.name == "deref")
+            .map(|f| f.line_start)
+            .collect();
+        derefs.sort();
+        assert_eq!(derefs.len(), 2, "{functions:#?}");
+        assert_ne!(derefs[0], derefs[1], "{functions:#?}");
+    }
+
+    #[test]
+    fn property_and_setter_coexist() {
+        // A @property and its @x.setter share the name and the owner, and
+        // differ only in line.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "class C:\n\
+                \t@property\n\
+                \tdef x(self):\n\
+                \t\treturn 1\n\
+                \t@x.setter\n\
+                \tdef x(self, v):\n\
+                \t\tpass\n",
+                std::path::Path::new("pkg/mod.py"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let mut xs: Vec<u32> = functions
+            .iter()
+            .filter(|f| f.name == "x")
+            .map(|f| f.line_start)
+            .collect();
+        xs.sort();
+        assert_eq!(xs.len(), 2, "{functions:#?}");
+        assert_ne!(xs[0], xs[1], "{functions:#?}");
+    }
+
+    #[test]
+    fn same_named_methods_of_sibling_types_coexist() {
+        // A.init and B.init share the name and differ in owner and line,
+        // so neither may swallow the other.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "const A = struct {\n\
+                \tpub fn init() void {}\n\
+                };\n\
+                const B = struct {\n\
+                \tpub fn init() void {}\n\
+                };\n",
+                std::path::Path::new("src/main.zig"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let mut inits: Vec<u32> = functions
+            .iter()
+            .filter(|f| f.name == "init")
+            .map(|f| f.line_start)
+            .collect();
+        inits.sort();
+        assert_eq!(inits.len(), 2, "{functions:#?}");
+        assert_ne!(inits[0], inits[1], "{functions:#?}");
+    }
+
+    #[test]
+    fn a_declaration_folds_into_its_definition() {
+        // A prototype and the body it announces are one row, not two: the
+        // definition survives with its own line.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "int get(void);\nint get(void)\n{\n\treturn 1;\n}\n",
+                std::path::Path::new("get.c"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        let gets: Vec<&FunctionInfo> = functions.iter().filter(|f| f.name == "get").collect();
+        assert_eq!(gets.len(), 1, "{functions:#?}");
+        assert!(
+            crate::types::row_defines_the_function(&gets[0].return_type, &gets[0].body),
+            "{gets:#?}"
+        );
+    }
+
+    #[test]
+    fn c_prototypes_spelled_differently_still_fold() {
+        // C has no overloading: a prototype always announces the one
+        // definition its key names, however each side spells the
+        // parameters. `baz()` meets `baz(void)`, and `int a[]` meets
+        // `int *a`; comparing parameter types here would leave a ghost
+        // declaration beside every kernel-style prototype.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int baz();\nstatic int baz(void)\n{\n\treturn 0;\n}\nstatic int qux(int a[]);\nstatic int qux(int *a)\n{\n\treturn 0;\n}\n",
+                std::path::Path::new("decl.c"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        assert_eq!(functions.len(), 2, "{functions:#?}");
+        for func in &functions {
+            assert!(
+                crate::types::row_defines_the_function(&func.return_type, &func.body),
+                "{func:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_repeated_prototypes_without_a_body_are_one_row() {
+        // C has no overloading: two spellings of one prototype with no
+        // body anywhere announce the same definition to come, so the
+        // group is one row rather than one row per line.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "int foo(int a);\nint foo(int b);\n",
+                std::path::Path::new("foo.h"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let functions = analysis.functions;
+        assert_eq!(functions.len(), 1, "{functions:#?}");
+    }
+
+    #[test]
+    fn star_and_ampersand_spacing_canonicalises() {
+        // `&&` must survive as one token: spacing `&` apart first would
+        // split it in two.
+        assert_eq!(
+            TreeSitterAnalyzer::canonical_param_type("const Box&"),
+            "const Box &"
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::canonical_param_type("const Box &&o"),
+            "const Box && o"
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::canonical_param_type("void (**)(int)"),
+            "void ( * * )(int)"
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::canonical_param_type("char [16]"),
+            "char [16]"
+        );
+        // Top-level const on a by-value parameter is not part of the
+        // signature: `int get(int x)` and `get(const int x)` declare the
+        // same function. The strip stops at any pointer, reference,
+        // array or function shape, where the const qualifies what the
+        // parameter points at rather than the parameter itself.
+        assert_eq!(TreeSitterAnalyzer::canonical_param_type("const int"), "int");
+        assert_eq!(
+            TreeSitterAnalyzer::canonical_param_type("volatile unsigned int"),
+            "unsigned int"
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::canonical_param_type("const Box &"),
+            "const Box &"
+        );
+        assert_eq!(
+            TreeSitterAnalyzer::canonical_param_type("const char *"),
+            "const char *"
+        );
+    }
     #[test]
     fn a_macro_opening_an_initializer_is_not_a_function() {
         // `define_machine(pseries) { .memory_block_size = ... }` is the same
@@ -10231,11 +13232,14 @@ mod config_variant_tests {
         // Three arms of one name are three definitions: none of them is
         // collapsed into another, whatever their bodies.
         let analyzer = TreeSitterAnalyzer::new().unwrap();
-        let rows = analyzer.deduplicate_functions_within_file(vec![
-            arm(Some("defined(CONFIG_A)"), 100),
-            arm(Some("!defined(CONFIG_A) && defined(CONFIG_B)"), 50),
-            arm(Some("!defined(CONFIG_A) && !defined(CONFIG_B)"), 60),
-        ]);
+        let rows = analyzer.deduplicate_functions_within_file(
+            vec![
+                arm(Some("defined(CONFIG_A)"), 100),
+                arm(Some("!defined(CONFIG_A) && defined(CONFIG_B)"), 50),
+                arm(Some("!defined(CONFIG_A) && !defined(CONFIG_B)"), 60),
+            ],
+            Language::C,
+        );
         let mut guards: Vec<Option<String>> = rows.into_iter().map(|row| row.guard).collect();
         guards.sort();
         assert_eq!(
@@ -10254,12 +13258,15 @@ mod config_variant_tests {
         // genuine tie: two definitions under one arm still collapse to the
         // longer one, and file scope is an arm of its own.
         let analyzer = TreeSitterAnalyzer::new().unwrap();
-        let mut rows = analyzer.deduplicate_functions_within_file(vec![
-            arm(Some("defined(CONFIG_A)"), 10),
-            arm(Some("defined(CONFIG_A)"), 30),
-            arm(None, 5),
-            arm(None, 20),
-        ]);
+        let mut rows = analyzer.deduplicate_functions_within_file(
+            vec![
+                arm(Some("defined(CONFIG_A)"), 10),
+                arm(Some("defined(CONFIG_A)"), 30),
+                arm(None, 5),
+                arm(None, 20),
+            ],
+            Language::C,
+        );
         rows.sort_by_key(|row| row.body.len());
         let kept: Vec<(Option<&str>, usize)> = rows
             .iter()

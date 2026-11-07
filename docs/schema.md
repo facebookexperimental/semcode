@@ -61,9 +61,17 @@ line_end            (Int64, NOT NULL)    - Ending line number
 return_type         (Utf8, NOT NULL)     - Function return type
 parameters          (Utf8, NOT NULL)     - JSON-encoded parameter list
 body_hash           (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty bodies)
-calls               (Utf8, nullable)     - JSON array of function names called by this function
+calls               (Utf8, nullable)     - JSON array mixing plain callee spellings and tagged edges carrying the enclosing scope
+                                   (`"get"`, `{"call":"get","owner":"ns::Box"}`)
 types               (Utf8, nullable)     - JSON array of type names used by this function
+guard               (Utf8, NOT NULL)     - Preprocessor arm holding the definition, "" at file scope
+qualifier           (Utf8, NOT NULL)     - Owning entity (`module::Type` for a Rust method), "" where the name stands alone
 ```
+
+The `functions` merge key is `(name, file_path, git_file_hash, guard, qualifier, line_start)`.
+Two definitions at different lines never merge; a declaration folds into its same-key definition.
+Overloads sharing one line collapse to one row: the line is the only discriminator the
+key keeps until a signature column separates them.
 
 **Content Storage:**
 - Function bodies are stored in sharded content tables (content_0 through content_15), referenced by `body_hash`
@@ -102,7 +110,12 @@ size                (Int64, nullable)    - Size in bytes (if available)
 fields              (Utf8, NOT NULL)     - JSON string of field/member information
 definition_hash     (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty definitions)
 types               (Utf8, nullable)     - JSON array of type names referenced by this type
+qualifier           (Utf8, NOT NULL)     - Owning entity (`ns` for `ns::Box`), "" where nothing owns the type
 ```
+
+The `types` merge key is `(name, kind, file_path, git_file_hash, qualifier)`.
+A method's `functions.qualifier` joins as `types.qualifier` plus the separator
+plus `types.name` (`::` for Rust/C++, `.` for Python/Zig).
 
 **Content Storage:**
 - Type definitions are stored in sharded content tables, referenced by `definition_hash`
@@ -163,7 +176,7 @@ Tracks which files have been processed for incremental indexing.
 file                (Utf8, NOT NULL)     - File path
 git_sha             (Utf8, nullable)     - Git commit SHA as hex string (for incremental processing)
 git_file_sha        (Utf8, NOT NULL)     - SHA-1 hash of specific file content as hex string
-extractor_version   (Int64, nullable)    - Schema version of the extractor that read the file
+extractor_version   (Utf8, nullable)     - Version of the language that read the file
 ```
 
 **Notes:**
@@ -172,7 +185,9 @@ extractor_version   (Int64, nullable)    - Schema version of the extractor that 
 - `git_file_sha` provides content-based deduplication
 - `extractor_version` decides whether the file has to be read again: unchanged
   content is skipped only when the extractor that read it is the one running
-  now. Absent on rows written before the column existed, which is why such a
+  now. It names the language that read the file, so a tree-sitter bump
+  re-reads only its language; a header names the language it was read as.
+  Absent on rows written before the column existed, which is why such a
   table is recreated rather than migrated in place
 
 **Indices:**
