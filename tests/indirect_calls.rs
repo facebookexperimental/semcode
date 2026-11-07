@@ -759,3 +759,69 @@ async fn the_subject_survives_a_round_trip() {
         back[0]
     );
 }
+
+/// Two dispatch tables in two files, one target: the shape of
+/// kvm_handle_invalid_op installed in the KVM exit tables while an
+/// unrelated SCSI table dispatches the same way. An array subscript
+/// names no member, so the SCSI dispatch must not link to the KVM
+/// function without a receiver type tying it to the KVM table.
+async fn index_two_tables_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("kvm.c"),
+        "int kvm_handle_invalid_op(void *vcpu)\n{\n\treturn 0;\n}\nint (*kvm_exit_handlers[8])(void *) = {\n\t[3] = kvm_handle_invalid_op,\n};\nint kvm_invoke_exit(int n, void *vcpu)\n{\n\treturn kvm_exit_handlers[n](vcpu);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("scsi.c"),
+        "struct dev;\nint scsi_done(void)\n{\n\treturn 0;\n}\nint (*scsi_done_handlers[4])(void) = {\n\t[0] = scsi_done,\n};\nint scsi_invoke(int i)\n{\n\treturn chip->handlers[i](i);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "two tables"]);
+
+    let git_sha = git::get_git_sha(repo).unwrap().unwrap();
+    let db_path = repo.join(".semcode.db");
+    let db = Arc::new(
+        DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+
+    semcode::git_range::process_git_tree(
+        repo,
+        &git_sha,
+        &["c".to_string(), "h".to_string()],
+        db.clone(),
+        false,
+        1,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    (db, git_sha)
+}
+
+#[tokio::test]
+async fn an_unrelated_array_dispatch_is_not_a_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_two_tables_fixture(dir.path()).await;
+
+    let indirect = db
+        .find_indirect_callers("kvm_handle_invalid_op", &git_sha)
+        .await
+        .unwrap();
+    let scsi: Vec<_> = indirect
+        .iter()
+        .filter(|c| c.site_file == "scsi.c")
+        .collect();
+    assert!(
+        scsi.is_empty(),
+        "scsi dispatch linked to the kvm function: {scsi:?}"
+    );
+}
