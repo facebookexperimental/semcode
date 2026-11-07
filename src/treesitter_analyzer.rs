@@ -1286,7 +1286,8 @@ impl TreeSitterAnalyzer {
 
         // Query for function calls. Scoped and generic calls keep their
         // full spelling: `Arc::new`, `foo::<u8>`. What the path selects is
-        // resolved at query time.
+        // resolved at query time; the sole rewrite is `Self::`, done where
+        // the row is built.
         let call_query = Query::new(
             language,
             r#"
@@ -3298,6 +3299,89 @@ impl TreeSitterAnalyzer {
         calls
     }
 
+    /// Rewrite a function's call edges at index time: `Self::assoc` becomes
+    /// the enclosing impl's owner, and a bare C++ call gains the enclosing
+    /// scope beside it. Everything else stores verbatim.
+    ///
+    /// The `Self::` rewrite is the sole one allowed: Rust spells the
+    /// receiver through the impl, and no call site can address it. A bare
+    /// call in a C++ function prefers the enclosing scope at lookup, so the
+    /// scope rides along; a spelled path already carries its own, and a
+    /// bare Rust call reaches no method at all. Python tags nothing here:
+    /// it has no implicit self, so a bare call never reaches a method --
+    /// only `self.x()` tags, via the enclosing-owner edge beside this.
+    fn rewrite_self_calls(
+        language: Language,
+        defined_at: Option<tree_sitter::Node>,
+        calls: Vec<String>,
+        source: &str,
+        qualifier: Option<&str>,
+    ) -> Vec<CallEdge> {
+        let self_owner = if matches!(language, Language::Rust) {
+            defined_at.and_then(|node| Self::enclosing_impl_owner(node, source))
+        } else {
+            None
+        };
+        calls
+            .into_iter()
+            .map(|call| {
+                let call = match (&language, &self_owner) {
+                    (Language::Rust, Some(owner)) => match call.strip_prefix("Self::") {
+                        Some(rest) => format!("{owner}::{rest}"),
+                        None => call,
+                    },
+                    _ => call,
+                };
+                match (&language, qualifier) {
+                    (Language::Cpp, Some(owner)) if !call.contains("::") && !call.contains('<') => {
+                        CallEdge::Tagged {
+                            call,
+                            owner: (*owner).to_string(),
+                        }
+                    }
+                    _ => CallEdge::Plain(call),
+                }
+            })
+            .collect()
+    }
+
+    /// The `impl` block enclosing a definition, if any, as its owner spells
+    /// it: the head `Self::` resolves to.
+    fn enclosing_impl_owner(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            if current.kind() == "impl_item" {
+                return Self::impl_owner(current, source);
+            }
+            parent = current.parent();
+        }
+        None
+    }
+
+    /// A member call through `this` (C++) or `self` (Python) as a tagged
+    /// edge: the text names no owner, so the enclosing one goes beside it.
+    /// Anything else stays a dispatch site for receiver typing to resolve.
+    fn enclosing_owner_edge(
+        language: Language,
+        site: &RawDispatchSite,
+        qualifier: Option<&str>,
+    ) -> Option<CallEdge> {
+        let owner = qualifier?;
+        let receiver = site.receiver_expr.as_deref()?;
+        let is_self = match language {
+            Language::Cpp => receiver == "this",
+            Language::Python => receiver == "self",
+            _ => return None,
+        };
+        if !is_self || site.member.is_empty() {
+            return None;
+        }
+        Some(CallEdge::Tagged {
+            call: site.member.clone(),
+            owner: owner.to_string(),
+        })
+    }
+
     /// Names that a scope binds to a value rather than to a function.
     ///
     /// `min_t(u32, len, size)` names no function even where the tree defines
@@ -4604,6 +4688,15 @@ impl TreeSitterAnalyzer {
                     (Vec::new(), Vec::new())
                 };
 
+                let defined_at = function_node.or(declaration_node);
+                let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
+                let qualifier =
+                    Self::owner_qualifier(ctx.language, defined_at, ctx.source, &relative_path);
+                // Member calls through `this`/`self` name no path: the
+                // enclosing owner goes beside them as a tagged edge instead
+                // of a dispatch site, which could never resolve them.
+                let mut tagged = Vec::new();
+
                 for raw in extraction
                     .member_sites
                     .iter()
@@ -4617,6 +4710,12 @@ impl TreeSitterAnalyzer {
                     // so a site can be reached more than once; a site is one
                     // row regardless.
                     if !covered_sites.insert(raw.byte_start) {
+                        continue;
+                    }
+                    if let Some(edge) =
+                        Self::enclosing_owner_edge(ctx.language, raw, qualifier.as_deref())
+                    {
+                        tagged.push(edge);
                         continue;
                     }
                     dispatch_sites.push(raw.attribute(
@@ -4652,8 +4751,18 @@ impl TreeSitterAnalyzer {
                     ));
                 }
 
-                let defined_at = function_node.or(declaration_node);
-                let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
+                let mut calls = Self::rewrite_self_calls(
+                    ctx.language,
+                    defined_at,
+                    unique_calls,
+                    ctx.source,
+                    qualifier.as_deref(),
+                );
+                // A bare call beside its `this`/`self` twin names the same
+                // edge twice; the store keeps one.
+                calls.extend(tagged);
+                calls.sort();
+                calls.dedup();
                 let func = FunctionInfo {
                     name: name.clone(),
                     file_path: relative_path.clone(),
@@ -4663,11 +4772,7 @@ impl TreeSitterAnalyzer {
                     return_type: return_type.unwrap_or_else(|| "void".to_string()),
                     parameters: parameters.clone(),
                     body: complete_body,
-                    calls: if unique_calls.is_empty() {
-                        None
-                    } else {
-                        Some(unique_calls.into_iter().map(CallEdge::from).collect())
-                    },
+                    calls: if calls.is_empty() { None } else { Some(calls) },
                     types: if function_types.is_empty() {
                         None
                     } else {
@@ -4684,12 +4789,7 @@ impl TreeSitterAnalyzer {
                         Language::Python => Self::python_guard(node, ctx.source),
                         Language::Zig => Self::zig_guard(node, ctx.source),
                     }),
-                    qualifier: Self::owner_qualifier(
-                        ctx.language,
-                        defined_at,
-                        ctx.source,
-                        &relative_path,
-                    ),
+                    qualifier,
                 };
 
                 if name == "btrfs_lookup_inode" {
@@ -10532,6 +10632,165 @@ mod rust_receiver_tests {
                 "{guard} contradicted a held fact"
             );
         }
+    }
+
+    /// The (name, calls) of every function in a file, sorted by name.
+    fn call_edges_of(source: &str, path: &str) -> Vec<(String, Vec<crate::types::CallEdge>)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<(String, Vec<crate::types::CallEdge>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.calls.clone().unwrap_or_default()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn tagged(call: &str, owner: &str) -> crate::types::CallEdge {
+        crate::types::CallEdge::Tagged {
+            call: call.to_string(),
+            owner: owner.to_string(),
+        }
+    }
+
+    fn plain(call: &str) -> crate::types::CallEdge {
+        crate::types::CallEdge::Plain(call.to_string())
+    }
+
+    #[test]
+    fn rust_scoped_calls_store_verbatim_with_self_rewritten() {
+        // `Self::assoc` is the sole index-time rewrite: the head resolves
+        // to the enclosing impl's owner. Every other path stores verbatim,
+        // arguments included; what it selects is for query time.
+        let found = call_edges_of(
+            "mod m {\n\
+             struct H;\n\
+             impl H {\n\
+             \tfn new() -> u32 { Self::assoc() }\n\
+             \tfn assoc() -> u32 { 1 }\n\
+             }\n\
+             }\n\
+             fn free() -> u32 { Arc::new(1); crate::m::H::assoc(); foo::<u8>(); }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("new"), vec![plain("H::assoc")], "{found:?}");
+        assert!(get("assoc").is_empty(), "{found:?}");
+        assert_eq!(
+            get("free"),
+            vec![
+                plain("Arc::new"),
+                plain("crate::m::H::assoc"),
+                plain("foo::<u8>"),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_member_calls_carry_their_enclosing_owner() {
+        // A bare call in a member, and `this->` beside it, name the same
+        // edge: the enclosing owner goes beside the call. A spelled path
+        // already carries its own and stores verbatim.
+        let found = call_edges_of(
+            "namespace ns {\n\
+             class Box {\n\
+             public:\n\
+             \tstatic int get_static();\n\
+             \tint run();\n\
+             };\n\
+             int Box::get_static() { return 1; }\n\
+             int Box::run() { get_static(); return this->get_static(); }\n\
+             }\n\
+             int free() { return ns::Box::get_static(); }\n",
+            "box.cpp",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            get("run"),
+            vec![tagged("get_static", "ns::Box")],
+            "{found:?}"
+        );
+        assert!(get("get_static").is_empty(), "{found:?}");
+        assert_eq!(get("free"), vec![plain("ns::Box::get_static")], "{found:?}");
+    }
+
+    #[test]
+    fn python_self_calls_carry_their_enclosing_owner() {
+        // `self.helper()` names no path, so the enclosing class goes
+        // beside it; it stops being a dispatch site, which could never
+        // resolve it. A bare call stays plain: Python has no implicit
+        // self, so one never reaches a method.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "class C:\n\
+                 \tdef m(self):\n\
+                 \t\tself.helper()\n\
+                 \t\tbare()\n\
+                 \tdef helper(self):\n\
+                 \t\tpass\n",
+                std::path::Path::new("pkg/mod.py"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let m = analysis.functions.iter().find(|f| f.name == "m").unwrap();
+        assert_eq!(
+            m.calls.clone().unwrap_or_default(),
+            vec![plain("bare"), tagged("helper", "pkg.mod.C")],
+            "{:?}",
+            analysis.functions
+        );
+        assert!(
+            analysis.dispatch_sites.iter().all(
+                |site| site.member != "helper" || site.receiver_expr.as_deref() != Some("self")
+            ),
+            "{:#?}",
+            analysis.dispatch_sites
+        );
+    }
+
+    #[test]
+    fn callee_edges_with_arguments_look_up_bare() {
+        // A stored `f<int>` looks up `f`; a spelled owner keeps its
+        // arguments for the exact match.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "template <typename T> T f() { return T(); }\n\
+                 namespace ns {\n\
+                 template <typename T> struct Box { static T conv(); };\n\
+                 template <typename T> T Box<T>::conv() { return T(); }\n\
+                 }\n\
+                 int use() { auto x = f<int>(); auto y = ns::Box<int>::conv(); }\n",
+                std::path::Path::new("use.cpp"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let use_fn = analysis.functions.iter().find(|f| f.name == "use").unwrap();
+        assert_eq!(
+            use_fn.calls.clone().unwrap_or_default(),
+            vec![plain("f<int>"), plain("ns::Box<int>::conv")],
+            "{:?}",
+            analysis.functions
+        );
     }
 
     #[test]

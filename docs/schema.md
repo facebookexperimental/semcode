@@ -61,7 +61,8 @@ line_end            (Int64, NOT NULL)    - Ending line number
 return_type         (Utf8, NOT NULL)     - Function return type
 parameters          (Utf8, NOT NULL)     - JSON-encoded parameter list
 body_hash           (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty bodies)
-calls               (Utf8, nullable)     - JSON array of function names called by this function
+calls               (Utf8, nullable)     - JSON array mixing plain callee spellings and tagged edges carrying the enclosing scope
+                                   (`"get"`, `{"call":"get","owner":"ns::Box"}`)
 types               (Utf8, nullable)     - JSON array of type names used by this function
 guard               (Utf8, NOT NULL)     - Preprocessor arm holding the definition, "" at file scope
 qualifier           (Utf8, NOT NULL)     - Owning entity (`module::Type` for a Rust method), "" where the name stands alone

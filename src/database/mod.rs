@@ -111,7 +111,7 @@ pub(crate) fn parse_call_edges(json: &str) -> Result<Vec<crate::types::CallEdge>
 
 #[cfg(test)]
 mod tests {
-    use super::parse_call_list;
+    use super::{parse_call_edges, parse_call_list};
 
     #[test]
     fn parses_a_list_of_names() {
@@ -131,6 +131,18 @@ mod tests {
         // A future encoding that carries more than a name. Silently reporting
         // no calls for these is exactly the failure this rejects.
         assert!(parse_call_list(r#"[{"name":"read","kind":"member"}]"#).is_err());
+
+        // A tagged edge contributes its call text, and keeps its owner for
+        // owner-aware lookup.
+        assert_eq!(
+            parse_call_list(r#"["memcpy",{"call":"get","owner":"ns::Box"}]"#).unwrap(),
+            vec!["memcpy".to_string(), "get".to_string()]
+        );
+        let edges = parse_call_edges(r#"["memcpy",{"call":"get","owner":"ns::Box"}]"#).unwrap();
+        assert_eq!(
+            edges.iter().map(|edge| edge.owner()).collect::<Vec<_>>(),
+            vec![None, Some("ns::Box")]
+        );
     }
 
     #[test]
