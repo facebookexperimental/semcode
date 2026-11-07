@@ -76,7 +76,7 @@ async fn tree_shaped_like_pr_warn() -> (tempfile::TempDir, Arc<DatabaseManager>,
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string(), "rs".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 
@@ -175,7 +175,7 @@ async fn tree_with_two_owners_in_one_file() -> (tempfile::TempDir, Arc<DatabaseM
     );
     db.create_tables().await.unwrap();
     let extensions = ["rs".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 
@@ -271,7 +271,7 @@ async fn tree_shaped_like_complete() -> (tempfile::TempDir, Arc<DatabaseManager>
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string(), "rs".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 
@@ -490,7 +490,7 @@ async fn the_types_belong_to_the_definition_that_was_named() {
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
     let manifest = db.git_manifest_cached(&sha).await.unwrap();
@@ -555,7 +555,7 @@ async fn a_use_of_the_name_is_not_an_answer_about_it() {
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 
@@ -617,7 +617,7 @@ async fn two_languages_one_definition_each_is_not_a_majority() {
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string(), "rs".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 
@@ -693,7 +693,7 @@ async fn tree_with_two_registrars(
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
     (dir, db, sha)
@@ -815,7 +815,7 @@ async fn a_hop_with_many_definitions_does_not_starve_the_rest_of_the_walk() {
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 

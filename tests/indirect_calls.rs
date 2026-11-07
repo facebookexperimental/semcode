@@ -295,6 +295,7 @@ async fn index_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
         db.clone(),
         false,
         1,
+        &[],
     )
     .await
     .unwrap();
@@ -325,6 +326,7 @@ async fn index_argument_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
         db.clone(),
         false,
         1,
+        &[],
     )
     .await
     .unwrap();
