@@ -602,6 +602,22 @@ pub fn row_defines_the_function(return_type: &str, body: &str) -> bool {
 /// stores `extern ssize_t vfs_read(struct file *, ...);` and a definition
 /// stores its braces. Comments are removed first, since a brace inside one is
 /// prose, and a macro is a definition however it is written.
+///
+/// A C++ explicitly-defaulted or deleted function ends like a prototype
+/// but defines (or deletes) all the same: `Box(const Box&) = default;` and
+/// `Box& operator=(const Box&) = delete;` are definitions.
+///
+/// A brace inside the parameter list is a default argument (`= {}`,
+/// `Box{}`, `{1, 2}`), not a body: the declaration `int g(int n = {});`
+/// would otherwise read as a definition and leave a ghost row beside the
+/// real body. Parenthesised groups go away before the brace test; strings
+/// ride along untouched so a paren inside one cannot unbalance the scan.
+///
+/// A C++20 constrained declaration keeps its requirement body outside
+/// every parenthesis (`... requires requires(T x) { x.y; };`), so it reads
+/// as a definition. Constraints with requirement bodies are rare in indexed
+/// code; the row still folds by its key, and only the defines bit
+/// overstates, which a pin test in the C++ extractor records.
 pub fn text_is_prototype(body: &str) -> bool {
     let mut code = String::with_capacity(body.len());
     let bytes = body.as_bytes();
@@ -625,7 +641,53 @@ pub fn text_is_prototype(body: &str) -> bool {
         i += 1;
     }
     let code = code.trim();
-    !code.starts_with('#') && !code.contains('{') && code.ends_with(';')
+    if code.ends_with("= default;") || code.ends_with("= delete;") {
+        return false;
+    }
+    let flat = strip_parenthesised(code);
+    !code.starts_with('#') && !flat.contains('{') && code.ends_with(';')
+}
+
+/// The text with every parenthesised group removed: `int g(int n = {})`
+/// flattens to `int g`, while `int g(int n) { return n; }` keeps its
+/// braces. Strings and character literals are copied whole, so a paren
+/// inside one never opens or closes a group.
+fn strip_parenthesised(code: &str) -> String {
+    let mut flat = String::with_capacity(code.len());
+    let bytes = code.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                if depth == 0 {
+                    flat.push_str(&code[start..i.min(code.len())]);
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => {
+                if depth == 0 {
+                    flat.push(bytes[i] as char);
+                }
+                i += 1;
+            }
+        }
+    }
+    flat
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
