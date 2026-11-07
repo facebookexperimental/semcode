@@ -17,20 +17,31 @@ use crate::hash::compute_file_hash;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     C,
+    Cpp,
     Rust,
     Python,
     Zig,
 }
 
 impl Language {
-    /// Detect language from file extension
+    /// Detect language from file extension. A `.h` file defaults to C; the
+    /// per-index decision to read headers as C++ lives in
+    /// [`Self::from_path_with_headers`] and is recorded in `schema_meta`,
+    /// not guessed here.
     pub fn from_path(path: &Path) -> Option<Self> {
+        Self::from_path_with_headers(path, false)
+    }
+
+    /// Detect language from file extension, reading `.h` as C++ when the
+    /// index was built that way.
+    pub fn from_path_with_headers(path: &Path, headers_as_cpp: bool) -> Option<Self> {
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(|ext| match ext {
-                "c" | "h" | "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => {
-                    Some(Language::C)
-                }
+                "c" => Some(Language::C),
+                "h" if !headers_as_cpp => Some(Language::C),
+                "cpp" | "cc" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" => Some(Language::Cpp),
+                "h" => Some(Language::Cpp),
                 "rs" => Some(Language::Rust),
                 "py" => Some(Language::Python),
                 "zig" => Some(Language::Zig),
@@ -343,13 +354,19 @@ fn collapse_whitespace(text: &str) -> String {
 
 pub struct TreeSitterAnalyzer {
     c_parser: Parser,
+    cpp_parser: Parser,
     rust_parser: Parser,
     python_parser: Parser,
     zig_parser: Parser,
     c_queries: &'static LanguageQueries,
+    cpp_queries: &'static LanguageQueries,
     rust_queries: &'static LanguageQueries,
     python_queries: &'static LanguageQueries,
     zig_queries: &'static LanguageQueries,
+    /// Read `.h` files as C++ instead of the default C. Per-index state,
+    /// recorded in `schema_meta` when the index is built; off everywhere
+    /// else, including every test.
+    headers_as_cpp: bool,
 }
 
 /// A table of function pointers, and the typedef that hid that fact when the
@@ -378,6 +395,11 @@ impl TreeSitterAnalyzer {
         let mut c_parser = Parser::new();
         c_parser.set_language(&c_language)?;
 
+        // Initialize C++ parser and queries
+        let cpp_language = tree_sitter_cpp::LANGUAGE.into();
+        let mut cpp_parser = Parser::new();
+        cpp_parser.set_language(&cpp_language)?;
+
         // Initialize Rust parser and queries
         let rust_language = tree_sitter_rust::LANGUAGE.into();
         let mut rust_parser = Parser::new();
@@ -396,20 +418,39 @@ impl TreeSitterAnalyzer {
         // Compiled once for the process, not once per analyzer: see
         // c_queries() below.
         let c_queries = Self::c_queries()?;
+        let cpp_queries = Self::cpp_queries()?;
         let rust_queries = Self::rust_queries()?;
         let python_queries = Self::python_queries()?;
         let zig_queries = Self::zig_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
+            cpp_parser,
             rust_parser,
             python_parser,
             zig_parser,
             c_queries,
+            cpp_queries,
             rust_queries,
             python_queries,
             zig_queries,
+            headers_as_cpp: false,
         })
+    }
+
+    /// Read `.h` files as C++ for this analyzer. The index records the
+    /// choice in `schema_meta` when it is built; the default is C.
+    pub fn set_headers_as_cpp(&mut self, headers_as_cpp: bool) {
+        self.headers_as_cpp = headers_as_cpp;
+    }
+
+    /// The language a path is read as by this analyzer.
+    fn language_for(&self, file_path: &Path) -> Option<Language> {
+        if self.headers_as_cpp {
+            Language::from_path_with_headers(file_path, true)
+        } else {
+            Language::from_path(file_path)
+        }
     }
 
     /// Compiled queries for one language, built on first use and shared by
@@ -431,6 +472,18 @@ impl TreeSitterAnalyzer {
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("C queries: {e}"))
+    }
+
+    fn cpp_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_cpp_queries(&tree_sitter_cpp::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("C++ queries: {e}"))
     }
 
     fn rust_queries() -> Result<&'static LanguageQueries> {
@@ -636,6 +689,530 @@ impl TreeSitterAnalyzer {
             comment_query,
             type_query,
             typedef_query: Some(typedef_query),
+            macro_query,
+            call_query,
+        })
+    }
+
+    /// Queries for C++. The node kinds mirror the C ones wherever the two
+    /// grammars agree (preprocessor, calls, parameters), and add the shapes
+    /// only C++ has: qualified declarators for out-of-line definitions,
+    /// in-class declarations, and explicitly defaulted or deleted functions.
+    fn create_cpp_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // Function definitions with bodies, in and out of line. The name
+        // capture is the declarator as written, qualified or not; the name
+        // and the qualifier are split from it where the row is built.
+        let function_query = Query::new(
+            language,
+            r#"
+            ; Out-of-line and file-scope definitions with bodies. A declarator
+            ; returning a pointer or a reference wraps the function one or
+            ; two levels deep (`char *name()`, `char **dup()`, `S &self()`,
+            ; `int *&slot()`), so each arm repeats its declarator in all
+            ; five shapes: bare, single and double pointer, reference, and
+            ; reference-to-pointer. The name and the parameters are captured
+            ; the same way in each, so the row builder cannot tell the
+            ; shapes apart. A deeper tangle (`***`, `*&*`) has no arm and
+            ; stays unextracted, as does a parenthesized declarator
+            ; (`int (f())`); both are rare enough to name here rather than
+            ; to enumerate. A function-try-block body (`S::S() try {} catch
+            ; (...) {}`) is a `try_statement` child rather than a
+            ; `compound_statement`, so both arms below accept either; the
+            ; grammar also files the try under no `body:` field when the
+            ; definition has no return type, which the bare-child
+            ; alternation covers. Conversion operators (`operator bool`)
+            ; have no `operator_name`: their own arms below capture the
+            ; `operator_cast` itself.
+            (function_definition
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (identifier) @function_name
+                            (qualified_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                            (template_function name: (identifier) @function_name)
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                                (template_function name: (identifier) @function_name)
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                    (template_function name: (identifier) @function_name)
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                                (template_function name: (identifier) @function_name)
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                    (template_function name: (identifier) @function_name)
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+                [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function
+
+            ; In-class definitions: the body sits beside the declarator
+            (function_definition
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (field_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+                [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function
+
+            ; Explicitly defaulted and deleted functions define the name
+            ; without a body
+            (function_definition
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (identifier) @function_name
+                            (field_identifier) @function_name
+                            (qualified_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (field_identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (field_identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (field_identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (field_identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+                [
+                    (default_method_clause)
+                    (delete_method_clause)
+                ]
+            ) @function
+
+            ; Prototypes and in-class declarations without bodies. The
+            ; return type is captured: without it every prototype stores
+            ; the "void" default, while C prototypes record theirs.
+            (declaration
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (identifier) @function_name
+                            (qualified_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (identifier) @function_name
+                                (qualified_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (identifier) @function_name
+                                    (qualified_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+            ) @declaration
+
+            (field_declaration
+                type: (_)? @return_type
+                declarator: [
+                    (function_declarator
+                        declarator: [
+                            (field_identifier) @function_name
+                            (destructor_name) @function_name
+                            (operator_name) @function_name
+                        ]
+                        parameters: (parameter_list) @parameters
+                    )
+                    (pointer_declarator
+                        declarator: (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (pointer_declarator
+                            declarator: (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                    (reference_declarator
+                        (function_declarator
+                            declarator: [
+                                (field_identifier) @function_name
+                                (destructor_name) @function_name
+                                (operator_name) @function_name
+                            ]
+                            parameters: (parameter_list) @parameters
+                        )
+                    )
+                    (pointer_declarator
+                        declarator: (reference_declarator
+                            (function_declarator
+                                declarator: [
+                                    (field_identifier) @function_name
+                                    (destructor_name) @function_name
+                                    (operator_name) @function_name
+                                ]
+                                parameters: (parameter_list) @parameters
+                            )
+                        )
+                    )
+                ]
+            ) @declaration
+
+            ; Conversion operators have no `operator_name`: the `operator_cast`
+            ; is the name, the target type is the return type, and the
+            ; parameter list (always empty: the language allows none) rides
+            ; along so the text fallback never runs on a parsed list. The
+            ; declaration arm below also matches a deleted conversion
+            ; (`operator bool() = delete;`), which the grammar files as a
+            ; `declaration` with a `default_value`: the `= delete` suffix
+            ; already reads as a definition where the row is built.
+            (declaration
+                declarator: [
+                    (operator_cast
+                        type: (_)? @return_type
+                        declarator: [
+                            (abstract_function_declarator
+                                parameters: (parameter_list) @parameters)
+                            (abstract_pointer_declarator
+                                declarator: (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                            (abstract_reference_declarator
+                                (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                        ]
+                    ) @function_name
+                ]
+            ) @declaration
+
+            ; Conversion definitions, inline and out of line. An out-of-line
+            ; conversion names no function: the qualified identifier wraps
+            ; the `operator_cast` directly, with no `function_declarator`
+            ; between them.
+            (function_definition
+                declarator: [
+                    (operator_cast
+                        type: (_)? @return_type
+                        declarator: [
+                            (abstract_function_declarator
+                                parameters: (parameter_list) @parameters)
+                            (abstract_pointer_declarator
+                                declarator: (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                            (abstract_reference_declarator
+                                (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters))
+                        ]
+                    ) @function_name
+                    (qualified_identifier
+                        name: (operator_cast
+                            type: (_)? @return_type
+                            declarator: [
+                                (abstract_function_declarator
+                                    parameters: (parameter_list) @parameters)
+                                (abstract_pointer_declarator
+                                    declarator: (abstract_function_declarator
+                                        parameters: (parameter_list) @parameters))
+                                (abstract_reference_declarator
+                                    (abstract_function_declarator
+                                        parameters: (parameter_list) @parameters))
+                            ]
+                        ) @function_name
+                    )
+                ]
+                [
+                    (compound_statement) @body
+                    (try_statement) @body
+                ]
+            ) @function
+        "#,
+        )?;
+
+        // Query for comments
+        let comment_query = Query::new(
+            language,
+            r#"
+            (comment) @comment
+        "#,
+        )?;
+
+        // Query for class/struct/union definitions
+        let type_query = Query::new(
+            language,
+            r#"
+            (class_specifier
+                name: (type_identifier) @type_name
+                body: (field_declaration_list) @body
+            ) @class
+
+            (class_specifier
+                name: (template_type) @type_name
+                body: (field_declaration_list) @body
+            ) @class
+
+            (struct_specifier
+                name: (type_identifier) @type_name
+                body: (field_declaration_list) @body
+            ) @struct
+
+            (union_specifier
+                name: (type_identifier) @type_name
+                body: (field_declaration_list) @body
+            ) @union
+
+            (enum_specifier
+                name: (type_identifier) @type_name
+                body: (enumerator_list) @body
+            ) @enum
+        "#,
+        )?;
+
+        // C++ macro definitions share the C preprocessor node kinds.
+        let macro_query = Query::new(
+            language,
+            r#"
+            (preproc_def
+                name: (identifier) @macro_name
+                value: (_)? @value
+            ) @macro
+
+            (preproc_function_def
+                name: (identifier) @macro_name
+                parameters: (preproc_params) @parameters
+                value: (_)? @value
+            ) @function_macro
+        "#,
+        )?;
+
+        // Query for function calls. Qualified calls keep their owner path;
+        // member calls keep the receiver beside them in the dispatch sites.
+        let call_query = Query::new(
+            language,
+            r#"
+            (call_expression
+                function: (identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (qualified_identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (template_function
+                    name: (identifier) @function_name)
+            ) @call
+
+            (call_expression
+                function: (field_expression
+                    argument: (_) @receiver
+                    field: (field_identifier) @member_name
+                )
+            ) @method_call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None,
             macro_query,
             call_query,
         })
@@ -928,6 +1505,7 @@ impl TreeSitterAnalyzer {
     fn get_parser(&mut self, language: Language) -> &mut Parser {
         match language {
             Language::C => &mut self.c_parser,
+            Language::Cpp => &mut self.cpp_parser,
             Language::Rust => &mut self.rust_parser,
             Language::Python => &mut self.python_parser,
             Language::Zig => &mut self.zig_parser,
@@ -938,6 +1516,7 @@ impl TreeSitterAnalyzer {
     fn get_queries(&self, language: Language) -> &LanguageQueries {
         match language {
             Language::C => self.c_queries,
+            Language::Cpp => self.cpp_queries,
             Language::Rust => self.rust_queries,
             Language::Python => self.python_queries,
             Language::Zig => self.zig_queries,
@@ -957,7 +1536,8 @@ impl TreeSitterAnalyzer {
         source_root: Option<&Path>,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
         // Detect language from file extension
-        let language = Language::from_path(file_path)
+        let language = self
+            .language_for(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
 
         let source_code = std::fs::read_to_string(file_path)?;
@@ -1072,7 +1652,8 @@ impl TreeSitterAnalyzer {
         source_root: Option<&Path>,
     ) -> Result<FileAnalysis> {
         // Detect language from file extension
-        let language = Language::from_path(file_path)
+        let language = self
+            .language_for(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
 
         let parser = self.get_parser(language);
@@ -4115,8 +4696,9 @@ impl TreeSitterAnalyzer {
         }
 
         // A macro can open a function the query cannot match, and the body
-        // that follows carries every call the function makes.
-        if matches!(ctx.language, Language::C) {
+        // that follows carries every call the function makes. The node
+        // shapes this reads are the same in C++.
+        if matches!(ctx.language, Language::C | Language::Cpp) {
             for defined in Self::macro_defined_functions(ctx.tree.root_node(), ctx.source) {
                 // Already read by the query under this arm. Another arm of
                 // the same name is another definition, and is kept.
@@ -8652,6 +9234,24 @@ test "helper ok" {
         assert_eq!(
             Language::from_path(Path::new("src/main.rs")),
             Some(Language::Rust)
+        );
+    }
+
+    #[test]
+    fn cpp_extensions_read_as_cpp_and_headers_default_to_c() {
+        for path in [
+            "box.cpp", "box.cc", "box.cxx", "box.c++", "box.hh", "box.hpp",
+        ] {
+            assert_eq!(
+                Language::from_path(Path::new(path)),
+                Some(Language::Cpp),
+                "{path}"
+            );
+        }
+        assert_eq!(Language::from_path(Path::new("box.h")), Some(Language::C));
+        assert_eq!(
+            Language::from_path_with_headers(Path::new("box.h"), true),
+            Some(Language::Cpp)
         );
     }
 }
