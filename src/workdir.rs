@@ -527,12 +527,24 @@ impl WorkdirIndex {
     /// Find functions in dirty files that call the given function name.
     pub fn find_callers(&self, name: &str) -> Vec<&FunctionInfo> {
         let target = name.to_lowercase();
+        let (bare, owner_path) = crate::types::split_callee_edge(name);
         let mut results = Vec::new();
         let all_funcs = self.functions.values().chain(self.macros.values());
         for funcs in all_funcs {
             for func in funcs {
                 if let Some(ref calls) = func.calls {
-                    if calls.iter().any(|c| c.callee().to_lowercase() == target) {
+                    if calls.iter().any(|c| {
+                        // Verbatim spelling, exactly as before.
+                        c.callee().to_lowercase() == target
+                            // A qualified query also matches a tagged edge
+                            // whose owner the path names.
+                            || c.owner().is_some_and(|owner| {
+                                owner_path.is_some_and(|path| {
+                                    c.callee() == bare
+                                        && crate::types::qualifier_matches_path(owner, path)
+                                })
+                            })
+                    }) {
                         results.push(func);
                     }
                 }
