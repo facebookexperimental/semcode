@@ -89,6 +89,8 @@ struct StreamingConfig {
     git_range: String,
     extensions: Vec<String>,
     source_root: PathBuf,
+    /// Repo-relative path prefixes bounding enumeration. Empty = whole tree.
+    scope_prefixes: Vec<String>,
     no_macros: bool,
     processed_files: Arc<HashSet<String>>,
     num_workers: usize,
@@ -104,17 +106,75 @@ struct GitTupleStats {
     types_count: usize,
 }
 
+/// A repo-relative path prefix bounding enumeration scope.
+///
+/// Returns `Ok(None)` when the directory is the repo root itself (no bound
+/// needed) and `Err(())` when an absolute path lies outside the repository.
+/// Relative paths resolve against the repo root. Matching is by whole path
+/// segment (trailing `/` enforced), so `kernel` never matches `kernel-foo`.
+fn as_prefix(workdir: &std::path::Path, dir: &std::path::Path) -> Result<Option<String>, ()> {
+    let rel = if dir.is_absolute() {
+        dir.strip_prefix(workdir).map_err(|_| ())?
+    } else {
+        dir
+    };
+    let mut s = rel.to_string_lossy().replace('\\', "/");
+    s = s.trim_matches('/').to_string();
+    if s.is_empty() || s == "." {
+        return Ok(None);
+    }
+    s.push('/');
+    Ok(Some(s))
+}
+
+/// Repo-relative path prefixes bounding enumeration scope.
+///
+/// A source directory below the repo root contributes its own prefix; each
+/// `--include` dir contributes one more. An empty result means the whole
+/// tree is in scope.
+fn scope_prefixes(
+    workdir: &std::path::Path,
+    source_root: &std::path::Path,
+    includes: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    if let Ok(Some(p)) = as_prefix(workdir, source_root) {
+        prefixes.push(p);
+    }
+    for dir in includes {
+        match as_prefix(workdir, dir) {
+            Ok(Some(p)) => prefixes.push(p),
+            Ok(None) => {}
+            Err(()) => tracing::warn!(
+                "Ignoring --include outside the repository: {}",
+                dir.display()
+            ),
+        }
+    }
+    prefixes
+}
+
+/// True when the repo-relative path falls under any scope prefix.
+/// No prefixes means the whole tree is in scope.
+fn path_in_scope(relative_path: &str, prefixes: &[String]) -> bool {
+    prefixes.is_empty() || prefixes.iter().any(|p| relative_path.starts_with(p))
+}
 /// Get manifest of files from a specific git commit with a reused repository reference
 /// This version avoids repeated repository discovery for better performance
 fn get_git_commit_manifest_with_repo(
     repo: &gix::Repository,
     git_sha: &str,
     extensions: &[String],
+    scope_prefixes: &[String],
 ) -> Result<Vec<GitFileManifestEntry>> {
     let mut manifest = Vec::new();
 
     // Use shared tree traversal utility with extension filtering (with repo reuse)
     walk_tree_at_commit_with_repo(repo, git_sha, |relative_path, object_id| {
+        // Skip files outside the requested scope (source subdir, --include dirs)
+        if !path_in_scope(relative_path, scope_prefixes) {
+            return Ok(());
+        }
         // Check if file has one of the target extensions
         if let Some(ext) = std::path::Path::new(relative_path).extension() {
             if extensions.contains(&ext.to_string_lossy().to_string()) {
@@ -154,6 +214,7 @@ fn load_git_file_to_temp(
 }
 
 /// Stream git file tuples to a channel from a subset of commits (producer)
+#[allow(clippy::too_many_arguments)]
 fn stream_git_file_tuples_batch(
     generator_id: usize,
     repo_path: PathBuf,
@@ -162,6 +223,7 @@ fn stream_git_file_tuples_batch(
     tuple_tx: mpsc::Sender<GitFileTuple>,
     processed_files: Arc<HashSet<String>>,
     sent_in_this_run: Arc<DashSet<String>>,
+    scope_prefixes: Vec<String>,
 ) -> Result<()> {
     // Open repository ONCE per generator thread and reuse for all commits
     let repo = gix::discover(&repo_path)?;
@@ -173,7 +235,8 @@ fn stream_git_file_tuples_batch(
 
     for commit_sha in commit_batch.iter() {
         // Get all files from this commit using reused repo handle
-        let manifest = get_git_commit_manifest_with_repo(&repo, commit_sha, &extensions)?;
+        let manifest =
+            get_git_commit_manifest_with_repo(&repo, commit_sha, &extensions, &scope_prefixes)?;
 
         for manifest_entry in manifest {
             let file_sha = manifest_entry.object_id.to_string();
@@ -758,6 +821,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         let generator_tuple_tx = tuple_tx.clone();
         let generator_processed_files = config.processed_files.clone();
         let generator_sent_in_run = sent_in_this_run.clone();
+        let generator_scope = config.scope_prefixes.clone();
 
         let handle = thread::spawn(move || {
             if let Err(e) = stream_git_file_tuples_batch(
@@ -768,6 +832,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                 generator_tuple_tx,
                 generator_processed_files,
                 generator_sent_in_run,
+                generator_scope,
             ) {
                 tracing::error!("Generator {} failed: {}", generator_id, e);
             }
@@ -894,6 +959,8 @@ struct TreeStreamingConfig {
     commit_sha: String,
     extensions: Vec<String>,
     source_root: PathBuf,
+    /// Repo-relative path prefixes bounding enumeration. Empty = whole tree.
+    scope_prefixes: Vec<String>,
     no_macros: bool,
     processed_files: Arc<HashSet<String>>,
     num_workers: usize,
@@ -908,6 +975,7 @@ fn stream_tree_file_tuples(
     extensions: Vec<String>,
     tuple_tx: mpsc::Sender<GitFileTuple>,
     processed_files: Arc<HashSet<String>>,
+    scope_prefixes: Vec<String>,
 ) -> Result<usize> {
     use crate::git::walk_tree_at_commit;
 
@@ -916,6 +984,10 @@ fn stream_tree_file_tuples(
 
     // Walk the tree at the commit and send tuples for matching files
     walk_tree_at_commit(&repo_path, &commit_sha, |relative_path, object_id| {
+        // Skip files outside the requested scope (source subdir, --include dirs)
+        if !path_in_scope(relative_path, &scope_prefixes) {
+            return Ok(());
+        }
         // Check if file has one of the target extensions
         let path = std::path::Path::new(relative_path);
         let ext_matches = path
@@ -1023,6 +1095,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let generator_commit_sha = config.commit_sha.clone();
     let generator_extensions = config.extensions.clone();
     let generator_processed_files = config.processed_files.clone();
+    let generator_scope = config.scope_prefixes.clone();
 
     let generator_handle = thread::spawn(move || {
         if let Err(e) = stream_tree_file_tuples(
@@ -1031,6 +1104,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
             generator_extensions,
             tuple_tx,
             generator_processed_files,
+            generator_scope,
         ) {
             tracing::error!("Tree generator failed: {}", e);
         }
@@ -1148,6 +1222,7 @@ pub async fn process_git_tree(
     db_manager: Arc<DatabaseManager>,
     no_macros: bool,
     db_threads: usize,
+    includes: &[std::path::PathBuf],
 ) -> Result<()> {
     info!(
         "Processing git tree at {} using streaming pipeline",
@@ -1169,6 +1244,20 @@ pub async fn process_git_tree(
     );
     let processed_files = Arc::new(processed_files);
 
+    // Bound enumeration to the requested source subdir / --include dirs.
+    let scope: Vec<String> = match gix::discover(repo_path)
+        .ok()
+        .and_then(|repo| repo.workdir().map(|p| p.to_path_buf()))
+    {
+        Some(workdir) => scope_prefixes(&workdir, repo_path, includes),
+        None => Vec::new(),
+    };
+    if scope.is_empty() {
+        info!("Index scope: whole tree");
+    } else {
+        info!("Index scope restricted to: {}", scope.join(", "));
+    }
+
     // Determine number of workers
     let num_workers = num_cpus::get().max(1);
     info!(
@@ -1183,6 +1272,7 @@ pub async fn process_git_tree(
         commit_sha: commit_sha.to_string(),
         extensions: extensions.to_vec(),
         source_root: repo_path.to_path_buf(),
+        scope_prefixes: scope,
         no_macros,
         processed_files,
         num_workers,
@@ -1277,6 +1367,7 @@ pub async fn process_git_range(
     db_manager: Arc<DatabaseManager>,
     no_macros: bool,
     db_threads: usize,
+    includes: &[std::path::PathBuf],
 ) -> Result<()> {
     info!(
         "Processing git range {} using streaming file tuple pipeline",
@@ -1304,6 +1395,18 @@ pub async fn process_git_range(
     // Open repository and get list of commits in range
     let repo =
         gix::discover(repo_path).map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+
+    // Bound enumeration to the requested source subdir / --include dirs.
+    // Without bounds every run walks the whole repo tree at HEAD.
+    let scope: Vec<String> = match repo.workdir() {
+        Some(workdir) => scope_prefixes(workdir, repo_path, includes),
+        None => Vec::new(),
+    };
+    if scope.is_empty() {
+        info!("Index scope: whole tree");
+    } else {
+        info!("Index scope restricted to: {}", scope.join(", "));
+    }
     let commit_shas = list_shas_in_range(&repo, git_range)?;
     let commit_count = commit_shas.len();
 
@@ -1379,6 +1482,7 @@ pub async fn process_git_range(
         git_range: git_range.to_string(),
         extensions: extensions.to_vec(),
         source_root: repo_path.clone(),
+        scope_prefixes: scope,
         no_macros,
         processed_files,
         num_workers,
@@ -1639,5 +1743,57 @@ mod tests {
         assert_eq!(found.len(), 1);
         let landed_types = db.get_all_types_metadata_only().await.unwrap();
         assert_eq!(landed_types.len(), 1);
+    }
+
+    #[test]
+    fn scope_prefixes_empty_for_repo_root() {
+        let workdir = std::path::Path::new("/repo");
+        let source = std::path::Path::new("/repo");
+        let out = scope_prefixes(workdir, source, &[]);
+        assert!(out.is_empty());
+        assert!(path_in_scope("kernel/sched/core.c", &out));
+    }
+
+    #[test]
+    fn scope_prefixes_source_subdir() {
+        let workdir = std::path::Path::new("/repo");
+        let source = std::path::Path::new("/repo/rust/macros");
+        let out = scope_prefixes(workdir, source, &[]);
+        assert_eq!(out, vec!["rust/macros/".to_string()]);
+        assert!(path_in_scope("rust/macros/lib.rs", &out));
+        assert!(!path_in_scope("rust/kernel/lib.rs", &out));
+        assert!(!path_in_scope("rust/macros-extra/lib.rs", &out));
+    }
+
+    #[test]
+    fn scope_prefixes_includes_union_with_source() {
+        use std::path::PathBuf;
+        let workdir = std::path::Path::new("/repo");
+        let source = std::path::Path::new("/repo");
+        let includes = vec![PathBuf::from("/repo/rust/kernel")];
+        let out = scope_prefixes(workdir, source, &includes);
+        assert_eq!(out, vec!["rust/kernel/".to_string()]);
+        assert!(path_in_scope("rust/kernel/lib.rs", &out));
+        assert!(!path_in_scope("rust/macros/lib.rs", &out));
+    }
+
+    #[test]
+    fn scope_prefixes_relative_include_resolves_at_root() {
+        use std::path::PathBuf;
+        let workdir = std::path::Path::new("/repo");
+        let source = std::path::Path::new("/repo");
+        let includes = vec![PathBuf::from("rust/uapi")];
+        let out = scope_prefixes(workdir, source, &includes);
+        assert_eq!(out, vec!["rust/uapi/".to_string()]);
+    }
+
+    #[test]
+    fn scope_prefixes_outside_repo_ignored() {
+        use std::path::PathBuf;
+        let workdir = std::path::Path::new("/repo");
+        let source = std::path::Path::new("/repo");
+        let includes = vec![PathBuf::from("/elsewhere/x")];
+        let out = scope_prefixes(workdir, source, &includes);
+        assert!(out.is_empty());
     }
 }

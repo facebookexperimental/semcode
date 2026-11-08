@@ -64,7 +64,7 @@ async fn tree_with_one_definition_per_arch() -> (tempfile::TempDir, Arc<Database
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 
@@ -196,7 +196,7 @@ async fn a_caller_list_is_about_the_definition_not_the_name() {
     git_run(repo, &["commit", "-q", "-m", "one caller per arch"]);
     let sha2 = git::get_git_sha(repo).unwrap().unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha2, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha2, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
     let _ = sha;
@@ -257,7 +257,7 @@ async fn callees_come_from_one_definition_not_from_all_of_them() {
     git_run(repo, &["commit", "-q", "-m", "per-arch helpers"]);
     let sha2 = git::get_git_sha(repo).unwrap().unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha2, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha2, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
     let _ = sha;
@@ -342,7 +342,7 @@ async fn tree_with_no_architectures() -> (tempfile::TempDir, Arc<DatabaseManager
     );
     db.create_tables().await.unwrap();
     let extensions = ["rs".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 
@@ -397,7 +397,7 @@ async fn tree_whose_architectures_are_all_another_program(
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
 

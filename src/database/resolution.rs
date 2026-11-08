@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use crate::types::{DispatchSite, Registration};
+use crate::types::{DispatchSite, Registration, ARRAY_ELEMENT_MEMBER};
 
 /// A call site that can reach a function without naming it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +110,15 @@ pub fn indirect_callers(
                 }
                 None => false,
             };
+
+            // An array subscript names no member: `table[i](...)` in one
+            // driver spells exactly like `handlers[j](...)` in another, so a
+            // member-name match on `[]` links every dispatch table in the
+            // tree to every array-installed function. Without a receiver
+            // type tying the site to the table, that match is noise.
+            if !type_matched && site.member == ARRAY_ELEMENT_MEMBER {
+                continue;
+            }
 
             let key = (
                 site.caller_name.clone(),
@@ -583,6 +592,52 @@ mod tests {
                 // The site did not say what type its receiver had.
                 assert!(!type_matched);
             }
+            other => panic!("unexpected evidence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_untyped_array_subscript_matches_no_table() {
+        // `table[i](...)` in one driver spells exactly like
+        // `handlers[j](...)` in another: without a receiver type the
+        // member-name match links every dispatch table in the tree.
+        let sites = group_by_member(vec![site("[]", "bfa_msix", None)]);
+        let found = indirect_callers(
+            &[registration(
+                "svm_exit_handlers",
+                "[]",
+                "kvm_handle_invalid_op",
+            )],
+            &sites,
+            &[],
+        );
+
+        assert!(found.is_empty(), "unrelated driver linked: {found:?}");
+    }
+
+    #[test]
+    fn a_typed_array_subscript_still_resolves() {
+        // The receiver type ties the site to the table the function was
+        // installed in: the kvm exit-handler dispatch survives the cut.
+        let sites = group_by_member(vec![site(
+            "[]",
+            "svm_invoke_exit_handler",
+            Some("svm_exit_handlers"),
+        )]);
+        let found = indirect_callers(
+            &[registration(
+                "svm_exit_handlers",
+                "[]",
+                "kvm_handle_invalid_op",
+            )],
+            &sites,
+            &[],
+        );
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].caller_name, "svm_invoke_exit_handler");
+        match &found[0].evidence {
+            Evidence::Registered { type_matched, .. } => assert!(type_matched),
             other => panic!("unexpected evidence: {other:?}"),
         }
     }

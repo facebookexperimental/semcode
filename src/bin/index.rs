@@ -29,7 +29,9 @@ struct Args {
     #[arg(short, long, default_value_t = semcode::file_extensions::default_extensions_string())]
     extensions: String,
 
-    /// Include directories (can be specified multiple times)
+    /// Include directories (can be specified multiple times).
+    /// Only files under these dirs are indexed. Relative paths resolve
+    /// against the repository root; the source dir itself is always in scope.
     #[arg(short, long)]
     include: Vec<PathBuf>,
 
@@ -933,6 +935,7 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
                     db_manager.clone(),
                     args.no_macros,
                     args.db_threads,
+                    &args.include,
                 )
                 .await?;
             }
@@ -954,6 +957,7 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
                 db_manager.clone(),
                 args.no_macros,
                 args.db_threads,
+                &args.include,
             )
             .await?;
         }
@@ -1689,6 +1693,7 @@ async fn run_pipeline(args: Args) -> Result<()> {
                 db_manager.clone(),
                 args.no_macros,
                 args.db_threads,
+                &args.include,
             )
             .await?;
         } else {
@@ -1701,6 +1706,7 @@ async fn run_pipeline(args: Args) -> Result<()> {
                 db_manager.clone(),
                 args.no_macros,
                 args.db_threads,
+                &args.include,
             )
             .await?;
         }

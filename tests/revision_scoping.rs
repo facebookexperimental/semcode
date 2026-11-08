@@ -118,7 +118,7 @@ int topic_only(void)\n{\n\
         Indexed::MainOnly => vec![&main_sha],
     };
     for sha in revisions {
-        semcode::git_range::process_git_tree(repo, sha, &extensions, db.clone(), false, 1)
+        semcode::git_range::process_git_tree(repo, sha, &extensions, db.clone(), false, 1, &[])
             .await
             .unwrap();
     }

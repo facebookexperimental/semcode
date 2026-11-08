@@ -3868,11 +3868,37 @@ impl DatabaseManager {
         Ok((function_counts, type_counts))
     }
 
+    /// Whether a `calls` JSON column names `function_name`.
+    ///
+    /// The column mixes plain spellings (`"read"`, `"bindings::_printk"`)
+    /// with tagged member edges (`{"call":"read","owner":"…"}`). A bare
+    /// query keeps the old projection semantics (the tag reads as its call
+    /// text). A qualified query additionally matches a tagged edge whose
+    /// owner the path names; a plain edge never addresses a qualified
+    /// target, and a verbatim path edge matches only its full spelling,
+    /// exactly as before.
+    fn calls_json_names_function(calls_json: &str, function_name: &str) -> Result<bool> {
+        let (bare, owner_path) = crate::types::split_callee_edge(function_name);
+        let edges = crate::database::parse_call_edges(calls_json)?;
+        Ok(edges.iter().any(|edge| match edge {
+            crate::types::CallEdge::Plain(callee) => callee == function_name,
+            crate::types::CallEdge::Tagged { call, owner } => {
+                call == bare
+                    && match owner_path {
+                        None => true,
+                        Some(path) => crate::types::qualifier_matches_path(owner, path),
+                    }
+            }
+        }))
+    }
+
     pub async fn get_function_callers(&self, function_name: &str) -> Result<Vec<String>> {
         let total_start = std::time::Instant::now();
 
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
+        let (bare_name, owner_path) = crate::types::split_callee_edge(function_name);
+        let escaped_bare = bare_name.replace("'", "''");
 
         let open_table_start = std::time::Instant::now();
         let table = self.connection.open_table("functions").execute().await?;
@@ -3881,12 +3907,17 @@ impl DatabaseManager {
             open_table_start.elapsed()
         );
 
-        // Filter for functions whose calls column contains the exact function name
+        // Filter for functions whose calls column contains the target function name
         // Match as complete JSON array element: "name", or "name"]
         // This avoids false positives like "name_suffix" or "prefix_name"
-        let filter = format!(
-            "calls IS NOT NULL AND (calls LIKE '%\"{escaped_name}\",%' OR calls LIKE '%\"{escaped_name}\"]%')"
+        // A qualified query also matches the bare member spelling: tagged
+        // edges store {"call":"read",...}, never the qualified path.
+        let mut filter = format!(
+            "calls IS NOT NULL AND (calls LIKE '%\\\"{escaped_name}\\\",%' OR calls LIKE '%\\\"{escaped_name}\\\"]%')"
         );
+        if owner_path.is_some() && bare_name != function_name {
+            filter.push_str(&format!(" OR calls LIKE '%\\\"{escaped_bare}\\\",%'"));
+        }
 
         let query_start = std::time::Instant::now();
         let results = table
@@ -3929,10 +3960,9 @@ impl DatabaseManager {
                         let caller_name = name_array.value(i).to_string();
                         let calls_json = calls_array.value(i);
 
-                        // Parse JSON and verify it actually contains function_name
-                        // (the LIKE filter might have false positives)
-                        let calls_list = crate::database::parse_call_list(calls_json)?;
-                        if calls_list.contains(&function_name.to_string()) {
+                        // Parse JSON and verify it actually names our target
+                        // (the LIKE filter has false positives)
+                        if Self::calls_json_names_function(calls_json, function_name)? {
                             callers.insert(caller_name);
                         }
                     }
@@ -6304,10 +6334,17 @@ impl DatabaseManager {
     ) -> Result<Vec<(String, String)>> {
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
+        let (bare_name, owner_path) = crate::types::split_callee_edge(function_name);
+        let escaped_bare = bare_name.replace("'", "''");
         let table = self.connection.open_table("functions").execute().await?;
 
         // Filter for functions whose calls column contains the target function name
-        let filter = format!("calls IS NOT NULL AND calls LIKE '%\\\"{escaped_name}\\\"%%'");
+        // A qualified query also matches the bare member spelling: tagged
+        // edges store {"call":"read",...}, never the qualified path.
+        let mut filter = format!("calls IS NOT NULL AND calls LIKE '%\\\"{escaped_name}\\\"%%'");
+        if owner_path.is_some() && bare_name != function_name {
+            filter.push_str(&format!(" OR calls LIKE '%\\\"{escaped_bare}\\\",%'"));
+        }
         let results = table
             .query()
             .only_if(filter)
@@ -6357,11 +6394,10 @@ impl DatabaseManager {
                     // Fast manifest lookup instead of expensive git resolution
                     if let Some(expected_hash) = git_manifest.hash_of(file_path) {
                         if git_file_hash == expected_hash {
-                            // This function exists at the git SHA, verify it actually calls our target
+                            // This function exists at the git SHA, verify it actually names our target
                             if !calls_array.is_null(i) {
                                 let calls_json = calls_array.value(i);
-                                let calls_list = crate::database::parse_call_list(calls_json)?;
-                                if calls_list.contains(&function_name.to_string()) {
+                                if Self::calls_json_names_function(calls_json, function_name)? {
                                     callers.push((caller_name.to_string(), file_path.to_string()));
                                 }
                             }
@@ -9286,5 +9322,44 @@ mod anonymous_members {
 
         let names: Vec<&str> = types[0].members.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["u", "u.flags"]);
+    }
+
+    #[test]
+    fn callers_match_plain_and_verbatim_spellings() {
+        // Bare names and full paths behave exactly as before.
+        assert!(DatabaseManager::calls_json_names_function(r#"["read"]"#, "read").unwrap());
+        assert!(!DatabaseManager::calls_json_names_function(r#"["read"]"#, "write").unwrap());
+        assert!(DatabaseManager::calls_json_names_function(
+            r#"["bindings::_printk"]"#,
+            "bindings::_printk"
+        )
+        .unwrap());
+        assert!(!DatabaseManager::calls_json_names_function(
+            r#"["bindings::_printk"]"#,
+            "bindings::printk"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn callers_read_both_halves_of_a_tagged_edge() {
+        let tagged = r#"[{"call":"read","owner":"rust::kernel::io::Io"}]"#;
+        // A bare query reads the tag as its call text, as before.
+        assert!(DatabaseManager::calls_json_names_function(tagged, "read").unwrap());
+        // A qualified query matches the owner the path names...
+        assert!(DatabaseManager::calls_json_names_function(tagged, "Io::read").unwrap());
+        assert!(
+            DatabaseManager::calls_json_names_function(tagged, "rust::kernel::io::Io::read")
+                .unwrap()
+        );
+        // ...and nothing else.
+        assert!(!DatabaseManager::calls_json_names_function(tagged, "Other::read").unwrap());
+        assert!(!DatabaseManager::calls_json_names_function(tagged, "Io::write").unwrap());
+    }
+
+    #[test]
+    fn a_plain_edge_never_addresses_a_qualified_target() {
+        // "read" alone cannot reach Io::read; only its owner-tagged twin can.
+        assert!(!DatabaseManager::calls_json_names_function(r#"["read"]"#, "Io::read").unwrap());
     }
 }

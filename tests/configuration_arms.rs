@@ -93,7 +93,7 @@ static inline int which_side(void)\n{\n\treturn voluntary_side();\n}\n\
     );
     db.create_tables().await.unwrap();
     let extensions = ["c".to_string(), "h".to_string()];
-    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1)
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
         .await
         .unwrap();
     (dir, db, sha)

@@ -6212,6 +6212,7 @@ async fn index_current_commit_background(
         db_manager.clone(),
         false, // no_macros = false (index macros)
         4,     // db_threads
+        &[],
     )
     .await
     {

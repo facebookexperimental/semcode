@@ -145,6 +145,7 @@ async fn refuse_or_rebuild_stale_index(
         db_manager.clone(),
         no_macros,
         2,
+        &[],
     )
     .await
 }
@@ -224,6 +225,7 @@ async fn index_current_commit_if_needed(
         db_manager.clone(),
         false, // no_macros = false (index macros)
         4,     // db_threads
+        &[],
     )
     .await
     {
