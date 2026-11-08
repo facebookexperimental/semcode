@@ -626,8 +626,8 @@ async fn write_indirect_callers(
     if !by_name_only.is_empty() {
         writeln!(
             buffer,
-            "\nNote: {} further call sites go through a member of the same name, but nothing says their receiver has the type the function was installed in.",
-            by_name_only.len()
+            "\nNote: {}",
+            semcode::callchain::weak_dispatch_note(by_name_only.len(), true)
         )?;
     }
 
@@ -2053,7 +2053,7 @@ async fn mcp_show_callchain_with_limits(
             )
             .await?
         } else {
-            0
+            semcode::callchain::IndirectChainSummary::default()
         };
 
         // Show callers with depth and limit control
@@ -2248,11 +2248,19 @@ async fn mcp_show_callchain_with_limits(
         writeln!(buffer, "Total direct callers: {}", callers.len())?;
         writeln!(buffer, "Total direct callees: {}", callees.len())?;
 
-        if dispatched > 0 {
-            writeln!(buffer, "Dispatching sites that reach it: {dispatched}")?;
+        if dispatched.shown > 0 {
+            writeln!(
+                buffer,
+                "Dispatching sites that reach it: {}",
+                dispatched.shown
+            )?;
         }
 
-        if callers.is_empty() && callees.is_empty() && dispatched == 0 {
+        if callers.is_empty()
+            && callees.is_empty()
+            && dispatched.shown == 0
+            && dispatched.by_name_only == 0
+        {
             writeln!(
                 buffer,
                 "This function is isolated (no callers or callees{})",

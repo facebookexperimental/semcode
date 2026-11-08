@@ -857,14 +857,10 @@ fn show_indirect_callers(
     }
 
     if !by_name_only.is_empty() {
-        let further = if confident.is_empty() { "" } else { "further " };
         let note = format!(
-            "\n{} {} {}call sites go through a member of the same name, \
-             but nothing says their receiver has the type the function was \
-             installed in.",
+            "\n{} {}",
             "Note:".yellow(),
-            by_name_only.len(),
-            further
+            weak_dispatch_note(by_name_only.len(), !confident.is_empty())
         );
         writeln!(writer, "{note}")?;
     }
@@ -1374,6 +1370,30 @@ fn write_caller_above(
     Ok(())
 }
 
+/// What `write_indirect_reverse_chain` rendered and what it counted: the
+/// confident dispatchers shown as answers, and the member-name-only sites
+/// folded into a count line. Both matter to the callers of this section: a
+/// zero `shown` with a nonzero `by_name_only` is not an isolated function.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IndirectChainSummary {
+    pub shown: usize,
+    pub by_name_only: usize,
+}
+
+/// Shared wording for the member-name-only count line: sites that reach
+/// through a member of the target's name, where nothing says their receiver
+/// has the type the function was installed in.
+pub fn weak_dispatch_note(count: usize, further: bool) -> String {
+    format!(
+        "{} {}call site{} go through a member of the same name, \
+         but nothing says their receiver has the type the function was \
+         installed in.",
+        count,
+        if further { "further " } else { "" },
+        if count == 1 { "" } else { "s" }
+    )
+}
+
 pub async fn write_indirect_reverse_chain(
     db: &DatabaseManager,
     name: &str,
@@ -1381,10 +1401,10 @@ pub async fn write_indirect_reverse_chain(
     depth: usize,
     limit: usize,
     writer: &mut dyn Write,
-) -> Result<usize> {
+) -> Result<IndirectChainSummary> {
     let indirect = db.find_indirect_callers(name, git_sha).await?;
     if indirect.is_empty() {
-        return Ok(0);
+        return Ok(IndirectChainSummary::default());
     }
 
     // A member-name match with no receiver type reaches every call through a
@@ -1489,19 +1509,18 @@ pub async fn write_indirect_reverse_chain(
     }
 
     if !by_name_only.is_empty() {
-        let further = if confident.is_empty() { "" } else { "further " };
         let note = format!(
-            "\n{} {} {}call sites go through a member of the same name, \
-             but nothing says their receiver has the type the function was \
-             installed in.",
+            "\n{} {}",
             "Note:".yellow(),
-            by_name_only.len(),
-            further
+            weak_dispatch_note(by_name_only.len(), !confident.is_empty())
         );
         writeln!(writer, "{note}")?;
     }
 
-    Ok(shown)
+    Ok(IndirectChainSummary {
+        shown,
+        by_name_only: by_name_only.len(),
+    })
 }
 
 pub async fn show_callchain_to_writer(
@@ -1574,7 +1593,11 @@ pub async fn show_callchain_to_writer(
                 print_callchain_tree_to_writer(&forward_chain, 0, writer)?;
             }
 
-            if callers.is_empty() && callees.is_empty() && dispatched == 0 {
+            if callers.is_empty()
+                && callees.is_empty()
+                && dispatched.shown == 0
+                && dispatched.by_name_only == 0
+            {
                 let info_msg = format!(
                     "\n{} This function is isolated (no callers or callees)",
                     "Info:".yellow()
@@ -1817,7 +1840,7 @@ mod tests {
         let text = rendered(&[caller("vfs_read", false)]);
 
         assert!(text.contains("Indirect Callers"), "{text}");
-        assert!(text.contains("1 call sites"), "{text}");
+        assert!(text.contains("1 call site go"), "{text}");
         assert!(
             !text.contains("further"),
             "nothing was listed above the note: {text}"
@@ -1829,7 +1852,7 @@ mod tests {
         let text = rendered(&[caller("vfs_read", true), caller("loop_rw_iter", false)]);
 
         assert!(text.contains("1 call sites can reach it"), "{text}");
-        assert!(text.contains("1 further call sites"), "{text}");
+        assert!(text.contains("1 further call site go"), "{text}");
     }
 
     #[test]
