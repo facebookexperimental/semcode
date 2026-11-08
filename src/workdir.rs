@@ -112,10 +112,21 @@ impl WorkdirIndex {
             oid: gix::ObjectId,
         }
         let mut index_map: HashMap<String, IndexEntry> = HashMap::new();
+        // Committed links are not files to parse: the indexer skips
+        // non-blob entries, so the overlay must too. Keyed on the index
+        // mode, not the workdir file kind: on a core.symlinks=false
+        // checkout the link is a plain text file, and only the mode says
+        // it is a link. Recorded separately so a regular file committed
+        // over a link still counts as new content below.
+        let mut link_paths: HashSet<String> = HashSet::new();
         for entry in git_index.entries() {
             let path = entry.path_in(git_index.path_backing());
             if let Ok(path_str) = std::str::from_utf8(path) {
                 if is_supported_for_analysis(path_str) {
+                    if entry.mode == gix::index::entry::Mode::SYMLINK {
+                        link_paths.insert(path_str.to_string());
+                        continue;
+                    }
                     index_map.insert(
                         path_str.to_string(),
                         IndexEntry {
@@ -184,15 +195,9 @@ impl WorkdirIndex {
                 Ok(m) => m,
                 Err(_) => continue, // File doesn't exist on disk (deleted)
             };
-            let meta = match std::fs::metadata(&abs_path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let (mtime_secs, mtime_nanos) = mtime_from_metadata(&meta);
-            let size = meta.len();
-
-            // Fast path: check git index stat to skip clean tracked files
-            // If workdir stat matches index stat AND index OID matches HEAD OID → clean
+            // Fast path first: a no-follow lstat is all a clean file
+            // costs. The target stat and the content read wait for a file
+            // the fast path did not clear.
             let workdir_stat = gix::index::entry::Stat::from_fs(&gix_meta)?;
             if idx_entry.stat.matches(&workdir_stat, stat_options) {
                 if let Some(head_oid) = head_oids.get(rel_path) {
@@ -203,6 +208,15 @@ impl WorkdirIndex {
                 }
                 // Index stat matches but OID differs from HEAD → staged change, dirty
             }
+
+            // Slow path: the entry may be dirty, so stat the target now
+            // for the cache keys.
+            let meta = match std::fs::metadata(&abs_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let (mtime_secs, mtime_nanos) = mtime_from_metadata(&meta);
+            let size = meta.len();
 
             // Check if we can reuse the previous cache entry (mtime+size unchanged)
             if let Some(cached) = prev_cache.and_then(|c| c.get(rel_path)) {
@@ -232,7 +246,6 @@ impl WorkdirIndex {
                 Err(_) => continue,
             };
             files_read += 1;
-            let content_hash = compute_blake3_hash(&content);
 
             // Compare content hash against HEAD OID directly
             let is_dirty = if let Some(head_oid) = head_oids.get(rel_path) {
@@ -257,21 +270,48 @@ impl WorkdirIndex {
             };
 
             if is_dirty {
-                dirty_manifest.insert(rel_path.clone(), content_hash.clone());
-                dirty_files_to_analyze.push((rel_path.clone(), abs_path.clone()));
-                file_cache.insert(
-                    rel_path.clone(),
-                    FileCacheEntry {
-                        mtime_secs,
-                        mtime_nanos,
-                        size,
-                        content_hash,
-                        functions: Vec::new(),
-                        types: Vec::new(),
-                        macros: Vec::new(),
-                    },
+                mark_dirty_file(
+                    rel_path,
+                    &abs_path,
+                    &meta,
+                    content,
+                    &mut dirty_manifest,
+                    &mut dirty_files_to_analyze,
+                    &mut file_cache,
                 );
             }
+        }
+
+        // A committed link replaced by a regular file is new content under
+        // a path the DB never held: the index walk above skips links, so
+        // check the workdir kind directly. A link still a link is clean;
+        // a missing one removes nothing the DB held.
+        for rel_path in &link_paths {
+            let abs_path = workdir.join(rel_path);
+            let is_regular = std::fs::symlink_metadata(&abs_path)
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            if !is_regular {
+                continue;
+            }
+            let meta = match std::fs::metadata(&abs_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let content = match std::fs::read_to_string(&abs_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            files_read += 1;
+            mark_dirty_file(
+                rel_path,
+                &abs_path,
+                &meta,
+                content,
+                &mut dirty_manifest,
+                &mut dirty_files_to_analyze,
+                &mut file_cache,
+            );
         }
         tracing::info!(
             "workdir: classify files: {:?} (stat_clean={}, cache_hits={}, files_read={}, hash_dirty={}, hash_clean={}, dirty={})",
@@ -656,6 +696,38 @@ fn mtime_from_metadata(meta: &std::fs::Metadata) -> (u64, u32) {
     }
 }
 
+/// Record one dirty file: manifest entry, analyze-list slot and an empty
+/// cache entry the analysis pass fills in. Shared by the index walk and
+/// the committed-link typechange check so both classify identically.
+#[allow(clippy::too_many_arguments)]
+fn mark_dirty_file(
+    rel_path: &str,
+    abs_path: &std::path::Path,
+    meta: &std::fs::Metadata,
+    content: String,
+    dirty_manifest: &mut HashMap<String, String>,
+    dirty_files_to_analyze: &mut Vec<(String, std::path::PathBuf)>,
+    file_cache: &mut HashMap<String, FileCacheEntry>,
+) {
+    let (mtime_secs, mtime_nanos) = mtime_from_metadata(meta);
+    let size = meta.len();
+    let content_hash = compute_blake3_hash(&content);
+    dirty_manifest.insert(rel_path.to_string(), content_hash.clone());
+    dirty_files_to_analyze.push((rel_path.to_string(), abs_path.to_path_buf()));
+    file_cache.insert(
+        rel_path.to_string(),
+        FileCacheEntry {
+            mtime_secs,
+            mtime_nanos,
+            size,
+            content_hash,
+            functions: Vec::new(),
+            types: Vec::new(),
+            macros: Vec::new(),
+        },
+    );
+}
+
 /// Insert analysis results into the aggregated symbol maps.
 fn insert_symbols(
     file_functions: &[FunctionInfo],
@@ -689,6 +761,29 @@ fn insert_symbols(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Stage and commit everything, without inheriting the developer's git
+    /// configuration. Mirrors what create_test_repo does for its first commit.
+    fn git_commit(repo_path: &std::path::Path, message: &str) {
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(repo_path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+    }
 
     /// Helper to create a git repo in a temp directory with an initial commit
     fn create_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -843,6 +938,58 @@ int multiply(int a, int b) {
         assert!(!index.is_empty());
         assert!(index.is_deleted("test.c"));
         assert!(!index.is_dirty("test.c"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_symlink_is_not_a_dirty_file() {
+        // A committed symlink is not a file to parse: the index reader
+        // skips non-blob entries, so the overlay must too. Before the
+        // skip, the link fell into the "staged new file" branch and was
+        // re-parsed on every build.
+        let (_tmpdir, repo_path) = create_test_repo();
+        std::os::unix::fs::symlink("test.c", repo_path.join("link.c")).unwrap();
+        git_commit(&repo_path, "add link");
+
+        let index = WorkdirIndex::build(&repo_path).unwrap();
+        assert_eq!(
+            index.dirty_file_count(),
+            0,
+            "a committed link is clean, not parsed"
+        );
+        assert!(!index.is_dirty("link.c"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_replaced_by_a_link_is_dirty() {
+        // Typechange file -> link: the workdir no longer holds the
+        // committed content, so the overlay must re-read it.
+        let (_tmpdir, repo_path) = create_test_repo();
+        fs::remove_file(repo_path.join("test.c")).unwrap();
+        std::os::unix::fs::symlink("test.h", repo_path.join("test.c")).unwrap();
+
+        let index = WorkdirIndex::build(&repo_path).unwrap();
+        assert!(index.is_dirty("test.c"), "a link over a file is a change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_replaced_by_a_file_is_dirty() {
+        // Typechange link -> file: new content under a path the DB never
+        // held has to be read, even though committed links are skipped.
+        let (_tmpdir, repo_path) = create_test_repo();
+        std::os::unix::fs::symlink("test.c", repo_path.join("link.c")).unwrap();
+        git_commit(&repo_path, "add link");
+        fs::remove_file(repo_path.join("link.c")).unwrap();
+        fs::write(repo_path.join("link.c"), "int fresh(void) { return 1; }\n").unwrap();
+
+        let index = WorkdirIndex::build(&repo_path).unwrap();
+        assert!(
+            index.is_dirty("link.c"),
+            "a file over a link is new content"
+        );
+        assert!(index.find_function("fresh").is_some());
     }
 
     #[test]
