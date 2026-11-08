@@ -50,7 +50,11 @@ pub enum OptimizeOutcome {
 ///    `ns1::Box` and `ns2::Box` coexist. A version 11 index holds one row
 ///    per name per arm per owner and cannot tell same-key definitions
 ///    apart.
-pub const SCHEMA_VERSION: u32 = 12;
+/// 13: a `call_edges` table holds one row per parsed call edge, so reverse
+///    lookup is an indexed equality on `callee` instead of a full-column
+///    LIKE scan over serialized calls JSON. A version 12 index has no such
+///    table; it backfills from the functions rows on first open.
+pub const SCHEMA_VERSION: u32 = 13;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -135,6 +139,24 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "unresolved_edges") {
             self.create_unresolved_edges_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "call_edges") {
+            self.create_call_edges_table().await?;
+            // Indexes written before this table existed get their edges
+            // rebuilt from the functions rows once, here, where the
+            // creation is known. Fresh indexes write edges inline and
+            // never enter this branch.
+            if table_names.iter().any(|n| n == "functions") {
+                let functions = self.connection.open_table("functions").execute().await?;
+                if functions.count_rows(None).await? > 0 {
+                    let store =
+                        crate::database::call_edges::CallEdgeStore::new(self.connection.clone());
+                    let n = store.backfill_from_functions().await?;
+                    tracing::info!("Backfilled {n} call edges from functions rows");
+                    self.ensure_call_edges_index().await?;
+                }
+            }
         }
 
         if !table_names.iter().any(|n| n == "object_macros") {
@@ -434,6 +456,44 @@ impl SchemaManager {
                 .ok();
         }
 
+        Ok(())
+    }
+
+    pub async fn create_call_edges_table(&self) -> Result<()> {
+        // One row per parsed call edge. `callee` is the indexed lookup key
+        // for reverse search; `owner` is empty for plain edges. `caller_line`
+        // keeps overloads in one file distinct so one edge row matches one
+        // function row exactly. `caller_file_hash` lets readers apply the
+        // same manifest check the LIKE path applies, so rows from older file
+        // versions stay invisible without a delete.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("caller_name", DataType::Utf8, false),
+            Field::new("caller_file", DataType::Utf8, false),
+            Field::new("caller_line", DataType::Int64, false),
+            Field::new("caller_file_hash", DataType::Utf8, false),
+            Field::new("callee", DataType::Utf8, false),
+            Field::new("owner", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+
+        self.connection
+            .create_table("call_edges", vec![empty_batch])
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    /// BTree on `callee` for indexed reverse lookup. Built after data
+    /// lands — never on the empty table — because a Lance scalar index
+    /// does not cover rows added later. Rebuilding over existing data is
+    /// the same call; an up-to-date index reports success immediately.
+    pub async fn ensure_call_edges_index(&self) -> Result<()> {
+        let table = self.connection.open_table("call_edges").execute().await?;
+        self.try_create_index(&table, &["callee"], "BTree index on call_edges.callee")
+            .await;
         Ok(())
     }
 
@@ -1871,6 +1931,15 @@ impl SchemaManager {
 
         // Ensure scalar indices exist
         self.create_scalar_indices().await?;
+
+        // The edge table's callee index is built after data lands, not with
+        // the other scalar indices: those skip when the database already
+        // holds rows, which is exactly when a new edge table needs its
+        // index. Re-creating over an existing index reports it already
+        // exists; this runs at index end, not per query.
+        if table_names.iter().any(|n| n == "call_edges") {
+            self.ensure_call_edges_index().await?;
+        }
 
         Ok(())
     }

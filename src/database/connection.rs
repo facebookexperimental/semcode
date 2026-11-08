@@ -165,6 +165,7 @@ pub struct DatabaseManager {
     registration_store: crate::database::registrations::RegistrationStore,
     argument_function_store: crate::database::argument_functions::ArgumentFunctionStore,
     unresolved_edge_store: crate::database::unresolved_edges::UnresolvedEdgeStore,
+    call_edge_store: crate::database::call_edges::CallEdgeStore,
     global_store: crate::database::globals::GlobalStore,
     object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
@@ -240,6 +241,7 @@ impl DatabaseManager {
             unresolved_edge_store: crate::database::unresolved_edges::UnresolvedEdgeStore::new(
                 connection.clone(),
             ),
+            call_edge_store: crate::database::call_edges::CallEdgeStore::new(connection.clone()),
             global_store: crate::database::globals::GlobalStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             object_macro_store: crate::database::object_macros::ObjectMacroStore::new(
@@ -446,6 +448,14 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Build the call_edges callee index after data lands. Called
+    /// unconditionally at index end (fresh indexes skip the health-check
+    /// optimization pass that would otherwise build it) and after
+    /// backfill; re-creating over an existing index is a no-op.
+    pub async fn ensure_call_edges_index(&self) -> Result<()> {
+        self.schema_manager.ensure_call_edges_index().await
+    }
+
     /// Set the working directory index for overlaying uncommitted changes on queries.
     /// When set, all `_git_aware` methods will automatically merge results from the
     /// working directory overlay with database results.
@@ -474,6 +484,7 @@ impl DatabaseManager {
         for table_name in &[
             "functions",
             "types",
+            "call_edges",
             "vectors",
             "commit_vectors",
             "lore_vectors",
@@ -1877,8 +1888,21 @@ impl DatabaseManager {
             .collect();
         let object_macros = Self::object_macros_among(&functions);
 
+        // Normalized call edges for indexed reverse lookup, derived from
+        // the same parsed calls the functions rows serialize.
+        let edge_files: Vec<String> = {
+            let mut files: Vec<String> = functions.iter().map(|f| f.file_path.clone()).collect();
+            files.sort();
+            files.dedup();
+            files
+        };
+        let edges = crate::database::call_edges::CallEdgeStore::edges_for(&functions);
+
         // Insert functions
         self.function_store.insert_batch(functions).await?;
+        self.call_edge_store
+            .sync_for_files(&edge_files, edges)
+            .await?;
         self.object_macro_store.insert_batch(object_macros).await?;
 
         // Insert into symbol_filename table
@@ -3651,7 +3675,17 @@ impl DatabaseManager {
     // Metadata-only insertion methods (skip content storage for performance)
     async fn insert_functions_metadata_only(&self, functions: Vec<FunctionInfo>) -> Result<()> {
         // Insert functions metadata
+        let edge_files: Vec<String> = {
+            let mut files: Vec<String> = functions.iter().map(|f| f.file_path.clone()).collect();
+            files.sort();
+            files.dedup();
+            files
+        };
+        let edges = crate::database::call_edges::CallEdgeStore::edges_for(&functions);
         self.function_store.insert_metadata_only(functions).await?;
+        self.call_edge_store
+            .sync_for_files(&edge_files, edges)
+            .await?;
         Ok(())
     }
 
@@ -5096,8 +5130,7 @@ impl DatabaseManager {
         self.processed_file_store.get_all_file_git_sha_pairs().await
     }
 
-    // ==================== Branch Management ====================
-
+    // ==================== Branch Management =============
     /// Record that a branch has been indexed at a specific commit
     pub async fn record_branch_indexed(
         &self,
@@ -5168,8 +5201,7 @@ impl DatabaseManager {
         self.branch_store.count().await
     }
 
-    // ==================== End Branch Management ====================
-
+    // ==================== End Branch Management =============
     // ---- Revision reporting -----------------------------------------------
 
     /// Revisions that contain a file blob, via `processed_files`.
@@ -6373,81 +6405,42 @@ impl DatabaseManager {
                 return Ok(hit.clone());
             }
         }
-        // Use efficient filtering: find functions whose calls JSON contains the target function name
-        let escaped_name = function_name.replace("'", "''"); // SQL escape
+        // Indexed reverse lookup: candidate edge rows by callee equality,
+        // then the exact per-edge rule. This mirrors `calls_json_names_function`
+        // row for row: a plain edge matches the full query string, a tagged
+        // edge matches the bare member spelling plus the owner check — but
+        // the candidate set comes from the `callee` index instead of a
+        // full-column LIKE scan, and no calls JSON is parsed for non-matches.
         let (bare_name, owner_path) = crate::types::split_callee_edge(function_name);
-        let escaped_bare = bare_name.replace("'", "''");
-        let table = self.connection.open_table("functions").execute().await?;
-
-        // Filter for functions whose calls column contains the target function name
-        // A qualified query also matches the bare member spelling: tagged
-        // edges store {"call":"read",...}, never the qualified path.
-        let mut filter = format!("calls IS NOT NULL AND calls LIKE '%\\\"{escaped_name}\\\"%%'");
-        if owner_path.is_some() && bare_name != function_name {
-            filter.push_str(&format!(" OR calls LIKE '%\\\"{escaped_bare}\\\",%'"));
+        let mut wanted = vec![function_name.to_string()];
+        if bare_name != function_name {
+            wanted.push(bare_name.to_string());
         }
-        let results = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+        let rows = self.call_edge_store.rows_for_callees(&wanted).await?;
 
         let mut callers = Vec::new();
-
-        for batch in results {
-            if batch.num_rows() > 0 {
-                let name_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let file_path_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let git_file_hash_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-
-                // Find the calls column
-                let calls_column_idx = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == "calls")
-                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
-                let calls_array = batch
-                    .column(calls_column_idx)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-
-                for i in 0..batch.num_rows() {
-                    let caller_name = name_array.value(i);
-                    let file_path = file_path_array.value(i);
-                    let git_file_hash = git_file_hash_array.value(i).to_string();
-
-                    // Fast manifest lookup instead of expensive git resolution
-                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
-                        if git_file_hash == expected_hash {
-                            // This function exists at the git SHA, verify it actually names our target
-                            if !calls_array.is_null(i) {
-                                let calls_json = calls_array.value(i);
-                                if Self::calls_json_names_function(calls_json, function_name)? {
-                                    callers.push((caller_name.to_string(), file_path.to_string()));
-                                }
-                            }
+        for (caller_name, file_path, caller_file_hash, row_callee, row_owner, row_kind) in rows {
+            // Fast manifest lookup instead of expensive git resolution
+            if let Some(expected_hash) = git_manifest.hash_of(&file_path) {
+                if caller_file_hash != expected_hash {
+                    continue;
+                }
+                // This function exists at the git SHA; apply the exact
+                // per-edge rule the LIKE path applied per row.
+                let names_it = if row_kind == "plain" {
+                    row_callee == function_name
+                } else {
+                    row_callee == bare_name
+                        && match owner_path {
+                            None => true,
+                            Some(path) => crate::types::qualifier_matches_path(&row_owner, path),
                         }
-                    }
+                };
+                if names_it {
+                    callers.push((caller_name, file_path));
                 }
             }
         }
-
 
         if let Ok(mut memo) = self.callers_memo.write() {
             memo.insert(memo_key, callers.clone());
