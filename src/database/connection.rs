@@ -145,6 +145,11 @@ fn log_absence(kind: &str, name: &str, git_sha: &str, why: Absent, elsewhere: &s
     }
 }
 
+/// Key for the per-command caller/callee memo: the queried name, the
+/// revision it was resolved at, and the overlay generation (a REPL refresh
+/// moves the generation and drops every entry).
+type CallerMemoKey = (String, String, u64);
+
 pub struct DatabaseManager {
     connection: Connection,
     git_repo_path: String,
@@ -194,6 +199,13 @@ pub struct DatabaseManager {
     /// refreshed for. `u64::MAX` means "never built", so the first build on
     /// generation 0 is not mistaken for already-current.
     workdir_index_generation: AtomicU64,
+    /// Per-name caller/callee memo for one command: the reverse BFS, the
+    /// relationship load and the indirect walks ask about the same names.
+    /// Keyed by (name, revision, overlay generation); a REPL refresh moves
+    /// the generation and drops every entry. Output-identical: the same
+    /// scan, just not re-run.
+    callers_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<(String, String)>>>,
+    callees_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<String>>>,
 }
 
 impl DatabaseManager {
@@ -242,6 +254,8 @@ impl DatabaseManager {
             git_only: AtomicBool::new(false),
             workdir_command_generation: AtomicU64::new(0),
             workdir_index_generation: AtomicU64::new(u64::MAX),
+            callers_memo: std::sync::RwLock::new(HashMap::new()),
+            callees_memo: std::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -6214,6 +6228,16 @@ impl DatabaseManager {
         function_name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
+        let memo_key = (
+            function_name.to_string(),
+            git_manifest.revision().to_string(),
+            self.workdir_command_generation.load(Ordering::Relaxed),
+        );
+        if let Ok(memo) = self.callees_memo.read() {
+            if let Some(hit) = memo.get(&memo_key) {
+                return Ok(hit.clone());
+            }
+        }
         let definitions = self
             .get_function_callees_by_definition(function_name, git_manifest)
             .await?;
@@ -6225,17 +6249,24 @@ impl DatabaseManager {
             )
             .await?;
         let Some(chosen) = chosen.chosen() else {
+            if let Ok(mut memo) = self.callees_memo.write() {
+                memo.insert(memo_key, Vec::new());
+            }
             return Ok(Vec::new());
         };
         // Every arm of the chosen definition's file under its owner, not
         // only the chosen row: see `get_callee_arms_in`.
-        Ok(callees_of_arms(&arms_beside(
+        let result = callees_of_arms(&arms_beside(
             &definitions,
             &chosen.function.file_path,
             chosen.function.line_start,
             chosen.function.qualifier.as_deref(),
             chosen.function.guard.as_deref(),
-        )))
+        ));
+        if let Ok(mut memo) = self.callees_memo.write() {
+            memo.insert(memo_key, result.clone());
+        }
+        Ok(result)
     }
 
     /// Build a complete caller index from the database in ONE scan.
@@ -6332,6 +6363,16 @@ impl DatabaseManager {
         function_name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<(String, String)>> {
+        let memo_key = (
+            function_name.to_string(),
+            git_manifest.revision().to_string(),
+            self.workdir_command_generation.load(Ordering::Relaxed),
+        );
+        if let Ok(memo) = self.callers_memo.read() {
+            if let Some(hit) = memo.get(&memo_key) {
+                return Ok(hit.clone());
+            }
+        }
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
         let (bare_name, owner_path) = crate::types::split_callee_edge(function_name);
@@ -6407,6 +6448,10 @@ impl DatabaseManager {
             }
         }
 
+
+        if let Ok(mut memo) = self.callers_memo.write() {
+            memo.insert(memo_key, callers.clone());
+        }
         Ok(callers)
     }
 

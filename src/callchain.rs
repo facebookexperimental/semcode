@@ -48,44 +48,50 @@ impl CallRelationships {
         db: &DatabaseManager,
         function_names: &[String],
         git_sha: Option<&str>,
+        forward: bool,
     ) -> Result<Self> {
         let mut function_calls = HashMap::new();
         let mut function_callers = HashMap::new();
         let mut function_arms = HashMap::new();
 
-        // Load call relationships for all functions in the chain
+        // Load call relationships for all functions in the chain, in the
+        // direction being walked only: the forward walk never reads
+        // callers, and the reverse walk never reads calls or arms.
         for func_name in function_names {
-            let (callees, callers) = if let Some(sha) = git_sha {
-                // Use git-aware versions when git SHA is provided
-                let callees = db
-                    .get_function_callees_git_aware(func_name, sha)
-                    .await
-                    .unwrap_or_default();
-                let callers = db
-                    .get_function_callers_git_aware(func_name, sha)
-                    .await
-                    .unwrap_or_default();
-                (callees, callers)
+            if forward {
+                let callees = if let Some(sha) = git_sha {
+                    // Use git-aware versions when git SHA is provided
+                    db.get_function_callees_git_aware(func_name, sha)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    // Use regular versions when no git SHA
+                    db.get_function_callees(func_name).await.unwrap_or_default()
+                };
+                if !callees.is_empty() {
+                    function_calls.insert(func_name.clone(), callees);
+                }
+                if let Some(sha) = git_sha {
+                    let arms = db
+                        .get_callee_arms_in(func_name, sha, crate::domain::Context::Any)
+                        .await
+                        .unwrap_or_default();
+                    if arms.len() > 1 {
+                        function_arms.insert(func_name.clone(), arms);
+                    }
+                }
             } else {
-                // Use regular versions when no git SHA
-                let callees = db.get_function_callees(func_name).await.unwrap_or_default();
-                let callers = db.get_function_callers(func_name).await.unwrap_or_default();
-                (callees, callers)
-            };
-
-            if !callees.is_empty() {
-                function_calls.insert(func_name.clone(), callees);
-            }
-            if !callers.is_empty() {
-                function_callers.insert(func_name.clone(), callers);
-            }
-            if let Some(sha) = git_sha {
-                let arms = db
-                    .get_callee_arms_in(func_name, sha, crate::domain::Context::Any)
-                    .await
-                    .unwrap_or_default();
-                if arms.len() > 1 {
-                    function_arms.insert(func_name.clone(), arms);
+                let callers = if let Some(sha) = git_sha {
+                    // Use git-aware versions when git SHA is provided
+                    db.get_function_callers_git_aware(func_name, sha)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    // Use regular versions when no git SHA
+                    db.get_function_callers(func_name).await.unwrap_or_default()
+                };
+                if !callers.is_empty() {
+                    function_callers.insert(func_name.clone(), callers);
                 }
             }
         }
@@ -118,7 +124,8 @@ async fn build_forward_callchain_with_git(
         .await?;
     let function_names: Vec<String> = chain_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
-    let call_relationships = CallRelationships::new_with_git(db, &function_names, git_sha).await?;
+    let call_relationships =
+        CallRelationships::new_with_git(db, &function_names, git_sha, true).await?;
 
     let walk = Walk {
         function_map: &function_map,
@@ -147,7 +154,8 @@ async fn build_reverse_callchain_with_git(
         .await?;
     let function_names: Vec<String> = chain_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
-    let call_relationships = CallRelationships::new_with_git(db, &function_names, git_sha).await?;
+    let call_relationships =
+        CallRelationships::new_with_git(db, &function_names, git_sha, false).await?;
 
     let walk = Walk {
         function_map: &function_map,
@@ -1671,7 +1679,7 @@ pub async fn find_all_paths_to_writer(
     let function_names: Vec<String> = all_path_functions.iter().cloned().collect();
     let function_map = db.get_functions_by_names(&function_names).await?;
     let call_relationships =
-        CallRelationships::new_with_git(db, &function_names, Some(git_sha)).await?;
+        CallRelationships::new_with_git(db, &function_names, Some(git_sha), true).await?;
 
     let header = format!("{}", "=== Path Analysis ===".bold().green());
     writeln!(writer, "{header}")?;
