@@ -3378,6 +3378,29 @@ impl TreeSitterAnalyzer {
         calls
     }
 
+    /// Claim every call site in `[start, end]` for the function being built:
+    /// keep sites no range has claimed yet, then sort and dedup by name. Both
+    /// the query-matched path and the macro-defined path claim through here,
+    /// so a callee called N times yields one edge, not N.
+    fn claim_calls(
+        ctx: &ExtractionContext,
+        extraction: &CallExtraction,
+        start: usize,
+        end: usize,
+        pointer_call_sites: &mut Vec<RawDispatchSite>,
+        covered_calls: &mut HashSet<usize>,
+    ) -> Vec<String> {
+        let mut names: Vec<String> =
+            Self::calls_in_range(ctx, extraction, start, end, pointer_call_sites)
+                .into_iter()
+                .filter(|(_, byte_start)| covered_calls.insert(*byte_start))
+                .map(|(name, _)| name)
+                .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Rewrite a function's call edges at index time: `Self::assoc` becomes
     /// the enclosing impl's owner, and a bare C++ call gains the enclosing
     /// scope beside it. Everything else stores verbatim.
@@ -4647,17 +4670,14 @@ impl TreeSitterAnalyzer {
                 // Each site belongs to exactly one function: matches run
                 // smallest-range first, so the innermost holder claims
                 // its sites before any containing range sees them.
-                let unique_calls: Vec<String> = Self::calls_in_range(
+                let unique_calls: Vec<String> = Self::claim_calls(
                     ctx,
                     extraction,
                     function_start_byte,
                     function_end_byte,
                     &mut pointer_call_sites,
-                )
-                .into_iter()
-                .filter(|(_, byte_start)| covered_calls.insert(*byte_start))
-                .map(|(name, _)| name)
-                .collect();
+                    &mut covered_calls,
+                );
 
                 // Extract types used by this function (parameters and return type)
                 let default_void = "void".to_string();
@@ -4687,9 +4707,8 @@ impl TreeSitterAnalyzer {
                     site.byte_start >= function_start_byte && site.byte_start < function_end_byte
                 })
             {
-                // The function query yields several captures per function,
-                // so a site can be reached more than once; a site is one
-                // row regardless.
+                // Nested matches overlap, so one site can fall in several
+                // ranges; a site is one row regardless.
                 if !covered_sites.insert(raw.byte_start) {
                     continue;
                 }
@@ -4836,17 +4855,14 @@ impl TreeSitterAnalyzer {
                 {
                     continue;
                 }
-                let calls: Vec<String> = Self::calls_in_range(
+                let calls: Vec<String> = Self::claim_calls(
                     ctx,
                     extraction,
                     defined.start_byte,
                     defined.end_byte,
                     &mut pointer_call_sites,
-                )
-                .into_iter()
-                .filter(|(_, byte_start)| covered_calls.insert(*byte_start))
-                .map(|(name, _)| name)
-                .collect();
+                    &mut covered_calls,
+                );
 
                 for raw in extraction.registrations.iter().filter(|reg| {
                     reg.byte_start >= defined.start_byte && reg.byte_start < defined.end_byte
@@ -12339,6 +12355,36 @@ mod macro_defined_tests {
                 .is_some_and(|c| c.iter().any(|n| n == "two")),
             "{beta:?}"
         );
+    }
+
+    #[test]
+    fn a_macro_defined_body_dedups_repeated_callees() {
+        // A SYSCALL body calling bar() three times yields one bar edge,
+        // not three: claiming sorts and dedups by name.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "SYSCALL_DEFINE1(alpha, int, x)\n\
+                 {\n\
+                 \tbar(x);\n\
+                 \tbar(x);\n\
+                 \tbar(x);\n\
+                 \tbaz(x);\n\
+                 \treturn 0;\n\
+                 }\n",
+                std::path::Path::new("alpha.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let sys = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "sys_alpha")
+            .unwrap();
+        let calls = sys.calls.clone().unwrap_or_default();
+        let names: Vec<String> = calls.iter().map(|c| c.callee().to_string()).collect();
+        assert_eq!(names, vec!["SYSCALL_DEFINE1", "bar", "baz"], "{names:?}");
     }
 
     #[test]
