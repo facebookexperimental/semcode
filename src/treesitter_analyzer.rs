@@ -14,6 +14,30 @@ use crate::types::{
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
 
+// One cursor for a whole-tree walk, visiting nodes in stack-pop DFS
+// order (siblings reversed) exactly like the hand-rolled `stack` +
+// `node.walk()` loops this replaces, so emission order — and whichever
+// row `keep_innermost` keeps — does not change. The visitor returns
+// whether to descend: `false` prunes the subtree, matching a `continue`
+// placed before the children push; a `continue` after it maps to `true`
+// with the body skipped.
+fn preorder_prune<'t>(
+    root: tree_sitter::Node<'t>,
+    visit: &mut impl FnMut(tree_sitter::Node<'t>) -> bool,
+) {
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !visit(node) {
+            continue;
+        }
+        cursor.reset(node);
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     C,
@@ -197,6 +221,19 @@ struct CallExtraction {
     pointer_vars: Vec<PointerVar>,
     registrations: Vec<RawRegistration>,
     argument_functions: Vec<RawArgumentFunction>,
+    globals: Vec<RawGlobal>,
+}
+
+/// What one fused preorder over a file yields: every fact the four
+/// whole-tree consumer walks used to collect separately. One traversal
+/// feeds four vecs; each vec sees its nodes in the same preorder the
+/// dedicated walk produced, so emission order does not change.
+#[derive(Debug, Default)]
+struct WalkBFacts {
+    registrations: Vec<RawRegistration>,
+    argument_functions: Vec<RawArgumentFunction>,
+    pointer_vars: Vec<PointerVar>,
+    globals: Vec<RawGlobal>,
 }
 
 /// What a macro body yields once parsed.
@@ -2373,11 +2410,12 @@ impl TreeSitterAnalyzer {
         // Only C states a variable's aggregate this way; other languages get
         // their receivers typed by their own pass.
         let globals = if matches!(language, Language::C) {
-            Self::collect_file_scope_globals(tree.root_node(), source_code)
-                .into_iter()
+            extraction
+                .globals
+                .iter()
                 .map(|raw| GlobalVariable {
-                    name: raw.name,
-                    type_name: raw.type_name,
+                    name: raw.name.clone(),
+                    type_name: raw.type_name.clone(),
                     file_path: self.make_relative_path(file_path, source_root),
                     git_file_hash: git_hash.to_string(),
                     line: raw.line,
@@ -2640,13 +2678,13 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        extraction.pointer_vars = Self::collect_pointer_vars(tree.root_node(), source_code);
-        extraction.registrations = Self::collect_registrations(tree.root_node(), source_code);
-        extraction.argument_functions =
-            Self::collect_argument_functions(tree.root_node(), source_code);
-        extraction
-            .registrations
-            .extend(Self::collect_assignments(tree.root_node(), source_code));
+        let bound = Self::value_names(tree.root_node(), source_code);
+        let locals = Self::collect_local_struct_types(tree.root_node(), source_code);
+        let walk_b = Self::collect_walk_b_facts(tree.root_node(), source_code, &bound, &locals);
+        extraction.pointer_vars = walk_b.pointer_vars;
+        extraction.registrations = walk_b.registrations;
+        extraction.argument_functions = walk_b.argument_functions;
+        extraction.globals = walk_b.globals;
 
         // The shapes a declaration takes differ per language, so each gets
         // the pass that can read it.
@@ -2680,65 +2718,6 @@ impl TreeSitterAnalyzer {
         Ok(extraction)
     }
 
-    /// File-scope variables of aggregate type, declaration or definition.
-    ///
-    /// `extern struct machdep_calls ppc_md;` is what lets a call written as
-    /// `ppc_md.memory_block_size()` be typed, in a file that includes the
-    /// header rather than containing it.
-    fn collect_file_scope_globals(root: tree_sitter::Node, source: &str) -> Vec<RawGlobal> {
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            // A declaration inside a function is a local, and locals are
-            // typed by the pass that can see the scope.
-            if node.kind() == "function_definition" {
-                continue;
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-            if node.kind() != "declaration" {
-                continue;
-            }
-            let Some(type_node) = node.child_by_field_name("type") else {
-                continue;
-            };
-            let Some(type_name) = Self::aggregate_type_name(type_node, source) else {
-                continue;
-            };
-            let mut cursor = node.walk();
-            for declarator in node.children_by_field_name("declarator", &mut cursor) {
-                let mut current = declarator;
-                let mut is_function = false;
-                loop {
-                    if current.kind() == "function_declarator" {
-                        is_function = true;
-                    }
-                    if current.kind() == "identifier" {
-                        // A prototype names a function, not a variable.
-                        if !is_function {
-                            out.push(RawGlobal {
-                                name: source[current.byte_range()].to_string(),
-                                type_name: type_name.clone(),
-                                line: current.start_position().row as u32 + 1,
-                            });
-                        }
-                        break;
-                    }
-                    match current
-                        .child_by_field_name("declarator")
-                        .or_else(|| current.named_child(0))
-                    {
-                        Some(next) => current = next,
-                        None => break,
-                    }
-                }
-            }
-        }
-        out
-    }
-
     /// Give each Rust dispatch site the type of its receiver.
     ///
     /// Rust states the type of every parameter and of every annotated
@@ -2752,6 +2731,7 @@ impl TreeSitterAnalyzer {
         }
 
         let mut scopes: Vec<(usize, usize, HashMap<String, String>)> = Vec::new();
+        let mut cursor = root.walk();
         let mut stack = vec![(root, None::<String>)];
         while let Some((node, self_type)) = stack.pop() {
             // `impl Foo { ... }` is what `self` means inside.
@@ -2763,7 +2743,7 @@ impl TreeSitterAnalyzer {
                 self_type
             };
 
-            let mut cursor = node.walk();
+            cursor.reset(node);
             for child in node.children(&mut cursor) {
                 stack.push((child, self_type.clone()));
             }
@@ -2822,31 +2802,26 @@ impl TreeSitterAnalyzer {
         source: &str,
         out: &mut HashMap<String, String>,
     ) {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            let mut cursor = current.walk();
-            for child in current.children(&mut cursor) {
-                // A nested closure or item has its own bindings; the outer
-                // ones still apply, so keep walking.
-                stack.push(child);
-            }
+        let mut visit = |current: tree_sitter::Node| -> bool {
             if !matches!(current.kind(), "parameter" | "let_declaration") {
-                continue;
+                return true;
             }
             let (Some(pattern), Some(type_node)) = (
                 current.child_by_field_name("pattern"),
                 current.child_by_field_name("type"),
             ) else {
-                continue;
+                return true;
             };
             if pattern.kind() != "identifier" {
-                continue;
+                return true;
             }
             let Some(type_name) = Self::rust_type_name(type_node, source) else {
-                continue;
+                return true;
             };
             out.insert(source[pattern.byte_range()].to_string(), type_name);
-        }
+            true
+        };
+        preorder_prune(node, &mut visit);
     }
 
     /// The name a Rust type node denotes, with references, lifetimes and
@@ -2929,22 +2904,18 @@ impl TreeSitterAnalyzer {
         let file_scope = Self::declared_types_in(root, source, true);
 
         let mut scopes: Vec<(usize, usize, HashMap<String, Option<String>>)> = Vec::new();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-
+        let mut visit = |node: tree_sitter::Node| -> bool {
             if node.kind() != "function_definition" {
-                continue;
+                return true;
             }
             scopes.push((
                 node.start_byte(),
                 node.end_byte(),
                 Self::declared_types_in(node, source, false),
             ));
-        }
+            true
+        };
+        preorder_prune(root, &mut visit);
 
         for site in sites.iter_mut() {
             // A table that named itself already has its container: asking
@@ -3016,23 +2987,16 @@ impl TreeSitterAnalyzer {
         outer_only: bool,
     ) -> HashMap<String, Option<String>> {
         let mut declared: HashMap<String, Option<String>> = HashMap::new();
-        let mut stack = vec![node];
-
-        while let Some(node) = stack.pop() {
+        let mut visit = |node: tree_sitter::Node| -> bool {
             // File scope is what a function did not declare: parameters and
             // locals belong to one function, and reading them as file scope
             // types a receiver in a function that never declared it.
             if outer_only && node.kind() == "function_definition" {
-                continue;
-            }
-
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
+                return false;
             }
 
             if !matches!(node.kind(), "declaration" | "parameter_declaration") {
-                continue;
+                return true;
             }
 
             let type_name = node
@@ -3067,7 +3031,9 @@ impl TreeSitterAnalyzer {
                     })
                     .or_insert_with(|| type_name.clone());
             }
-        }
+            true
+        };
+        preorder_prune(node, &mut visit);
 
         declared
     }
@@ -3181,8 +3147,11 @@ impl TreeSitterAnalyzer {
 
         // Storing it in a member is what makes the caller's function
         // reachable, and that shape is already recognised.
-        let mut written = Self::collect_registrations(tree.root_node(), body);
-        written.extend(Self::collect_assignments(tree.root_node(), body));
+        let snippet_bound = Self::value_names(tree.root_node(), body);
+        let snippet_locals = Self::collect_local_struct_types(tree.root_node(), body);
+        let written =
+            Self::collect_walk_b_facts(tree.root_node(), body, &snippet_bound, &snippet_locals)
+                .registrations;
         for registration in written {
             if registration.target == parameter {
                 fates.push(ParameterFate::StoredIn {
@@ -3192,28 +3161,23 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
+        let mut visit = |node: tree_sitter::Node| -> bool {
             if node.kind() != "call_expression" {
-                continue;
+                return true;
             }
             let Some(callee) = node.child_by_field_name("function") else {
-                continue;
+                return true;
             };
             if callee.kind() == "identifier" && &body[callee.byte_range()] == parameter {
                 fates.push(ParameterFate::Invoked);
-                continue;
+                return true;
             }
             if callee.kind() != "identifier" {
-                continue;
+                return true;
             }
             let callee_name = body[callee.byte_range()].to_string();
             let Some(arguments) = node.child_by_field_name("arguments") else {
-                continue;
+                return true;
             };
             let mut cursor = arguments.walk();
             for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
@@ -3233,7 +3197,9 @@ impl TreeSitterAnalyzer {
                     argument_index: index as u32,
                 });
             }
-        }
+            true
+        };
+        preorder_prune(tree.root_node(), &mut visit);
 
         fates
     }
@@ -3496,10 +3462,11 @@ impl TreeSitterAnalyzer {
     fn value_names(root: tree_sitter::Node, source: &str) -> ValueNames {
         let mut file_scope = HashSet::new();
         let mut per_function: Vec<(usize, usize, HashSet<String>)> = Vec::new();
+        let mut cursor = root.walk();
         let mut stack = vec![(root, false)];
         while let Some((node, in_function)) = stack.pop() {
             let entering_function = node.kind() == "function_definition";
-            let mut cursor = node.walk();
+            cursor.reset(node);
             for child in node.children(&mut cursor) {
                 stack.push((child, in_function || entering_function));
             }
@@ -3522,14 +3489,9 @@ impl TreeSitterAnalyzer {
     /// Identifiers a declaration binds, skipping function prototypes: those
     /// name a function, which is what an argument is being tested against.
     fn declared_value_names(node: tree_sitter::Node, source: &str, out: &mut HashSet<String>) {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            let mut cursor = current.walk();
-            for child in current.children(&mut cursor) {
-                stack.push(child);
-            }
+        let mut visit = |current: tree_sitter::Node| -> bool {
             if !matches!(current.kind(), "declaration" | "parameter_declaration") {
-                continue;
+                return true;
             }
             let mut cursor = current.walk();
             for declarator in current.children_by_field_name("declarator", &mut cursor) {
@@ -3554,108 +3516,9 @@ impl TreeSitterAnalyzer {
                     }
                 }
             }
-        }
-    }
-
-    /// Calls that name an identifier as an argument.
-    ///
-    /// ```text
-    /// request_irq(irq, e1000_intr, flags, name, dev);
-    /// ```
-    ///
-    /// `e1000_intr` is handed to `request_irq`, which is the edge that makes
-    /// the handler reachable. Whether the callee stores it, calls it, or
-    /// merely names it cannot be decided here: the callee's body is usually
-    /// in another file. So every identifier argument the file does not bind
-    /// to a value is recorded, and the reader keeps those that name a
-    /// function.
-    fn collect_argument_functions(
-        root: tree_sitter::Node,
-        source: &str,
-    ) -> Vec<RawArgumentFunction> {
-        let bound = Self::value_names(root, source);
-        let locals = Self::collect_local_struct_types(root, source);
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-            if node.kind() != "call_expression" {
-                continue;
-            }
-            let Some(callee) = node.child_by_field_name("function") else {
-                continue;
-            };
-            if callee.kind() != "identifier" {
-                continue;
-            }
-            let callee_name = &source[callee.byte_range()];
-            if Self::names_without_handing_over(callee_name) {
-                continue;
-            }
-            let Some(arguments) = node.child_by_field_name("arguments") else {
-                continue;
-            };
-            // What the function is being attached to, if the call says so.
-            // `call_rcu(&inode->i_rcu, i_callback)` puts the callback in a
-            // member of an rcu_head, and only this argument records which
-            // inode holds that head.
-            let mut cursor = arguments.walk();
-            let subject = arguments.named_children(&mut cursor).find_map(|argument| {
-                let field = match argument.kind() {
-                    "field_expression" => argument,
-                    "pointer_expression" => argument
-                        .child_by_field_name("argument")
-                        .filter(|node| node.kind() == "field_expression")?,
-                    _ => return None,
-                };
-                let base = field.child_by_field_name("argument")?;
-                if base.kind() != "identifier" {
-                    return None;
-                }
-                let member = field.child_by_field_name("field")?;
-                let base_type = locals.get(&source[base.byte_range()])?;
-                Some((base_type.clone(), source[member.byte_range()].to_string()))
-            });
-
-            let mut cursor = arguments.walk();
-            for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
-                let (identifier, taken_address) = match argument.kind() {
-                    "identifier" => (Some(argument), false),
-                    "pointer_expression" => (
-                        argument
-                            .child_by_field_name("argument")
-                            .filter(|node| node.kind() == "identifier"),
-                        true,
-                    ),
-                    _ => (None, false),
-                };
-                let Some(identifier) = identifier else {
-                    continue;
-                };
-                let name = &source[identifier.byte_range()];
-                // A call naming itself is recursion, not a handover.
-                if name == callee_name || Self::is_c_keyword(name) {
-                    continue;
-                }
-                if bound.contains(name, identifier.start_byte()) {
-                    continue;
-                }
-                out.push(RawArgumentFunction {
-                    callee: callee_name.to_string(),
-                    target: name.to_string(),
-                    argument_index: index as u32,
-                    taken_address,
-                    subject_type: subject.as_ref().map(|(type_name, _)| type_name.clone()),
-                    subject_member: subject.as_ref().map(|(_, member)| member.clone()),
-                    byte_start: identifier.start_byte(),
-                    line: identifier.start_position().row as u32 + 1,
-                });
-            }
-        }
-        out
+            true
+        };
+        preorder_prune(node, &mut visit);
     }
 
     /// Callees that name a function without handing it anywhere.
@@ -3683,191 +3546,6 @@ impl TreeSitterAnalyzer {
             )
     }
 
-    fn collect_registrations(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
-        let mut found = Vec::new();
-        let mut stack = vec![root];
-
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-
-            if let Some(registration) = Self::initcall(node, source) {
-                found.push(registration);
-                continue;
-            }
-
-            if let Some(registration) = Self::static_call_install(node, source) {
-                found.push(registration);
-                continue;
-            }
-
-            if node.kind() != "initializer_list" {
-                continue;
-            }
-
-            // A table of function pointers names no type to fill and no
-            // member to fill it with. The table itself is the container, and
-            // every element is a way in.
-            if let Some(table) = Self::function_pointer_table(node, source) {
-                found.extend(Self::table_elements(node, source, &table));
-                continue;
-            }
-
-            let Some((outer_type, path)) = Self::initializer_container(node, source) else {
-                continue;
-            };
-            // An empty path means the list fills the type the file named, so
-            // the container is known outright.
-            let (container_type, container_base_type, container_field) = if path.is_empty() {
-                (outer_type, None, None)
-            } else {
-                (String::new(), Some(outer_type), Some(path.join(".")))
-            };
-
-            for (member_node, value) in Self::initializer_members(node) {
-                let member = source[member_node.byte_range()].to_string();
-                // `.read = my_read` and `.read = &my_read` say the same thing.
-                let target_node = match value.kind() {
-                    "identifier" => Some(value),
-                    "pointer_expression" => value
-                        .child_by_field_name("argument")
-                        .filter(|a| a.kind() == "identifier"),
-                    _ => None,
-                };
-                // `.demod_attach = { demod_attach_stv0900, cineS2_probe }`
-                // is a table the struct holds. The field is the container and
-                // every element is a way in, the same shape a standalone
-                // table has, so the key names both: a field holds one table
-                // per struct type, and the type alone would collide with
-                // every other struct that has a field of that name.
-                if value.kind() == "initializer_list" && !container_type.is_empty() {
-                    found.extend(Self::held_table_elements(
-                        value,
-                        source,
-                        &format!("{container_type}.{member}"),
-                    ));
-                    continue;
-                }
-
-                let Some(target_node) = target_node else {
-                    continue;
-                };
-
-                let target = source[target_node.byte_range()].to_string();
-                if member.is_empty() || target.is_empty() {
-                    continue;
-                }
-
-                found.push(RawRegistration {
-                    container_type: container_type.clone(),
-                    container_base_type: container_base_type.clone(),
-                    container_field: container_field.clone(),
-                    member,
-                    target,
-                    byte_start: member_node.start_byte(),
-                    line: member_node.start_position().row as u32 + 1,
-                    kind: RegistrationKind::DesignatedInit,
-                });
-            }
-        }
-
-        found
-    }
-
-    /// `x->handler = my_handler;` installs a function just as an initializer
-    /// does. The type of `x` has to come from a declaration in this file:
-    /// the struct is usually declared in a header the file does not contain,
-    /// and a registration filed under a guessed type is worse than none.
-    fn collect_assignments(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
-        let locals = Self::collect_local_struct_types(root, source);
-        let mut found = Vec::new();
-        let mut stack = vec![root];
-
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-
-            if node.kind() != "assignment_expression" {
-                continue;
-            }
-
-            let (Some(left), Some(right)) = (
-                node.child_by_field_name("left"),
-                node.child_by_field_name("right"),
-            ) else {
-                continue;
-            };
-            if left.kind() != "field_expression" {
-                continue;
-            }
-
-            let target = match right.kind() {
-                "identifier" => source[right.byte_range()].to_string(),
-                "pointer_expression" => match right
-                    .child_by_field_name("argument")
-                    .filter(|a| a.kind() == "identifier")
-                {
-                    Some(a) => source[a.byte_range()].to_string(),
-                    None => continue,
-                },
-                _ => continue,
-            };
-
-            let Some(member) = left
-                .child_by_field_name("field")
-                .map(|f| source[f.byte_range()].to_string())
-            else {
-                continue;
-            };
-
-            // Only a receiver that is a plain variable declared here can be
-            // typed without leaving the file.
-            let Some(receiver) = left.child_by_field_name("argument") else {
-                continue;
-            };
-            let receiver_text = collapse_whitespace(&source[receiver.byte_range()]);
-
-            // `x->member = f` names its container as soon as `x` is declared
-            // here. `s->s_shrink->scan_objects = f` does not: `s_shrink` is
-            // declared with struct super_block, in a header this file
-            // includes rather than contains. Record what is known — the type
-            // of the base and the path read from it — and let resolution
-            // finish it against the types table.
-            let (container_type, container_base_type, container_field) =
-                if receiver.kind() == "identifier" {
-                    match locals.get(&receiver_text) {
-                        Some(container) => (container.clone(), None, None),
-                        None => continue,
-                    }
-                } else {
-                    match field_path(&receiver_text) {
-                        Some((base, path)) => match locals.get(base) {
-                            Some(base_type) => (String::new(), Some(base_type.clone()), Some(path)),
-                            None => continue,
-                        },
-                        None => continue,
-                    }
-                };
-
-            found.push(RawRegistration {
-                container_type,
-                container_base_type,
-                container_field,
-                member,
-                target,
-                byte_start: node.start_byte(),
-                line: node.start_position().row as u32 + 1,
-                kind: RegistrationKind::Assignment,
-            });
-        }
-
-        found
-    }
-
     /// Variables in this file declared as a struct, union or typedef, by name.
     /// Shadowing is ignored: two locals of the same name in one file with
     /// different types are rare, and the cost is a registration filed under
@@ -3877,23 +3555,16 @@ impl TreeSitterAnalyzer {
         source: &str,
     ) -> std::collections::HashMap<String, String> {
         let mut types = std::collections::HashMap::new();
-        let mut stack = vec![root];
-
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
-            }
-
+        let mut visit = |node: tree_sitter::Node| -> bool {
             if !matches!(node.kind(), "declaration" | "parameter_declaration") {
-                continue;
+                return true;
             }
 
             let Some(type_node) = node.child_by_field_name("type") else {
-                continue;
+                return true;
             };
             let Some(type_name) = Self::aggregate_type_name(type_node, source) else {
-                continue;
+                return true;
             };
 
             let mut cursor = node.walk();
@@ -3914,7 +3585,9 @@ impl TreeSitterAnalyzer {
                     }
                 }
             }
-        }
+            true
+        };
+        preorder_prune(root, &mut visit);
 
         types
     }
@@ -4411,61 +4084,303 @@ impl TreeSitterAnalyzer {
         }
     }
 
-    /// Every function-pointer variable and parameter declared in the file.
-    /// A call naming one of these dispatches through a value; it is not a
-    /// call to a function of that name.
-    fn collect_pointer_vars(root: tree_sitter::Node, source: &str) -> Vec<PointerVar> {
-        let mut vars = Vec::new();
-        let mut stack = vec![root];
-
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                stack.push(child);
+    /// True when a declaration sits inside a function body: some ancestor
+    /// is a function definition. This replaces the prune the globals walk
+    /// used — the fused walk must still descend into function bodies for
+    /// the other collectors, so the test happens per node instead.
+    fn inside_function(mut node: tree_sitter::Node) -> bool {
+        while let Some(parent) = node.parent() {
+            if parent.kind() == "function_definition" {
+                return true;
             }
+            node = parent;
+        }
+        false
+    }
 
-            let is_parameter = match node.kind() {
-                "parameter_declaration" => true,
-                "declaration" => false,
-                _ => continue,
-            };
+    /// Registrations, handed-over arguments, pointer variables and
+    /// file-scope globals in a single preorder. `bound` and `locals` come
+    /// from walk A: a call may precede its declaration textually, so the
+    /// maps must be complete before any call is processed.
+    fn collect_walk_b_facts(
+        root: tree_sitter::Node,
+        source: &str,
+        bound: &ValueNames,
+        locals: &std::collections::HashMap<String, String>,
+    ) -> WalkBFacts {
+        let mut facts = WalkBFacts::default();
+        let mut visit = |node: tree_sitter::Node| -> bool {
+            // Registrations trigger on any node: the macro shapes probe
+            // their own kinds, and lists fill what their container names.
+            if let Some(registration) = Self::initcall(node, source) {
+                facts.registrations.push(registration);
+            } else if let Some(registration) = Self::static_call_install(node, source) {
+                facts.registrations.push(registration);
+            } else if node.kind() == "initializer_list" {
+                if let Some(table) = Self::function_pointer_table(node, source) {
+                    facts
+                        .registrations
+                        .extend(Self::table_elements(node, source, &table));
+                } else if let Some((outer_type, path)) = Self::initializer_container(node, source) {
+                    let (container_type, container_base_type, container_field) = if path.is_empty()
+                    {
+                        (outer_type, None, None)
+                    } else {
+                        (String::new(), Some(outer_type), Some(path.join(".")))
+                    };
 
-            let mut cursor = node.walk();
-            for declarator in node.children_by_field_name("declarator", &mut cursor) {
-                // `int (*fp)(void) = handler;` wraps the declarator in an
-                // init_declarator that also carries the initial value.
-                let (declarator, target) = if declarator.kind() == "init_declarator" {
-                    let value = declarator.child_by_field_name("value").and_then(|value| {
-                        (value.kind() == "identifier")
-                            .then(|| source[value.byte_range()].to_string())
-                    });
-                    match declarator.child_by_field_name("declarator") {
-                        Some(inner) => (inner, value),
-                        None => continue,
-                    }
-                } else {
-                    (declarator, None)
-                };
+                    for (member_node, value) in Self::initializer_members(node) {
+                        let member = source[member_node.byte_range()].to_string();
+                        let target_node = match value.kind() {
+                            "identifier" => Some(value),
+                            "pointer_expression" => value
+                                .child_by_field_name("argument")
+                                .filter(|a| a.kind() == "identifier"),
+                            _ => None,
+                        };
+                        if value.kind() == "initializer_list" && !container_type.is_empty() {
+                            facts.registrations.extend(Self::held_table_elements(
+                                value,
+                                source,
+                                &format!("{container_type}.{member}"),
+                            ));
+                            continue;
+                        }
 
-                if !Self::declares_function_pointer(declarator) {
-                    continue;
-                }
+                        let Some(target_node) = target_node else {
+                            continue;
+                        };
+                        let target = source[target_node.byte_range()].to_string();
+                        if member.is_empty() || target.is_empty() {
+                            continue;
+                        }
 
-                if let Some(name_node) = Self::innermost_declarator_name(declarator) {
-                    let name = source[name_node.byte_range()].to_string();
-                    if !name.is_empty() {
-                        vars.push(PointerVar {
-                            name,
-                            byte_start: node.start_byte(),
+                        facts.registrations.push(RawRegistration {
+                            container_type: container_type.clone(),
+                            container_base_type: container_base_type.clone(),
+                            container_field: container_field.clone(),
+                            member,
                             target,
-                            is_parameter,
+                            byte_start: member_node.start_byte(),
+                            line: member_node.start_position().row as u32 + 1,
+                            kind: RegistrationKind::DesignatedInit,
                         });
                     }
                 }
             }
-        }
 
-        vars
+            match node.kind() {
+                "call_expression" => {
+                    let Some(callee) = node.child_by_field_name("function") else {
+                        return true;
+                    };
+                    if callee.kind() != "identifier" {
+                        return true;
+                    }
+                    let callee_name = &source[callee.byte_range()];
+                    if Self::names_without_handing_over(callee_name) {
+                        return true;
+                    }
+                    let Some(arguments) = node.child_by_field_name("arguments") else {
+                        return true;
+                    };
+                    // What the function is being attached to, if the call says so.
+                    let mut cursor = arguments.walk();
+                    let subject = arguments.named_children(&mut cursor).find_map(|argument| {
+                        let field = match argument.kind() {
+                            "field_expression" => argument,
+                            "pointer_expression" => argument
+                                .child_by_field_name("argument")
+                                .filter(|node| node.kind() == "field_expression")?,
+                            _ => return None,
+                        };
+                        let base = field.child_by_field_name("argument")?;
+                        if base.kind() != "identifier" {
+                            return None;
+                        }
+                        let member = field.child_by_field_name("field")?;
+                        let base_type = locals.get(&source[base.byte_range()])?;
+                        Some((base_type.clone(), source[member.byte_range()].to_string()))
+                    });
+
+                    let mut cursor = arguments.walk();
+                    for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+                        let (identifier, taken_address) = match argument.kind() {
+                            "identifier" => (Some(argument), false),
+                            "pointer_expression" => (
+                                argument
+                                    .child_by_field_name("argument")
+                                    .filter(|node| node.kind() == "identifier"),
+                                true,
+                            ),
+                            _ => (None, false),
+                        };
+                        let Some(identifier) = identifier else {
+                            continue;
+                        };
+                        let name = &source[identifier.byte_range()];
+                        // A call naming itself is recursion, not a handover.
+                        if name == callee_name || Self::is_c_keyword(name) {
+                            continue;
+                        }
+                        if bound.contains(name, identifier.start_byte()) {
+                            continue;
+                        }
+                        facts.argument_functions.push(RawArgumentFunction {
+                            callee: callee_name.to_string(),
+                            target: name.to_string(),
+                            argument_index: index as u32,
+                            taken_address,
+                            subject_type: subject.as_ref().map(|(type_name, _)| type_name.clone()),
+                            subject_member: subject.as_ref().map(|(_, member)| member.clone()),
+                            byte_start: identifier.start_byte(),
+                            line: identifier.start_position().row as u32 + 1,
+                        });
+                    }
+                }
+                "assignment_expression" => {
+                    let (Some(left), Some(right)) = (
+                        node.child_by_field_name("left"),
+                        node.child_by_field_name("right"),
+                    ) else {
+                        return true;
+                    };
+                    if left.kind() != "field_expression" {
+                        return true;
+                    }
+
+                    let target = match right.kind() {
+                        "identifier" => source[right.byte_range()].to_string(),
+                        "pointer_expression" => match right
+                            .child_by_field_name("argument")
+                            .filter(|a| a.kind() == "identifier")
+                        {
+                            Some(a) => source[a.byte_range()].to_string(),
+                            None => return true,
+                        },
+                        _ => return true,
+                    };
+
+                    let Some(member) = left
+                        .child_by_field_name("field")
+                        .map(|f| source[f.byte_range()].to_string())
+                    else {
+                        return true;
+                    };
+
+                    let Some(receiver) = left.child_by_field_name("argument") else {
+                        return true;
+                    };
+                    let receiver_text = collapse_whitespace(&source[receiver.byte_range()]);
+
+                    let (container_type, container_base_type, container_field) =
+                        if receiver.kind() == "identifier" {
+                            match locals.get(&receiver_text) {
+                                Some(container) => (container.clone(), None, None),
+                                None => return true,
+                            }
+                        } else {
+                            match field_path(&receiver_text) {
+                                Some((base, path)) => match locals.get(base) {
+                                    Some(base_type) => {
+                                        (String::new(), Some(base_type.clone()), Some(path))
+                                    }
+                                    None => return true,
+                                },
+                                None => return true,
+                            }
+                        };
+
+                    facts.registrations.push(RawRegistration {
+                        container_type,
+                        container_base_type,
+                        container_field,
+                        member,
+                        target,
+                        byte_start: node.start_byte(),
+                        line: node.start_position().row as u32 + 1,
+                        kind: RegistrationKind::Assignment,
+                    });
+                }
+                "declaration" | "parameter_declaration" => {
+                    let is_parameter = node.kind() == "parameter_declaration";
+                    {
+                        let mut cursor = node.walk();
+                        for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                            let (declarator, target) = if declarator.kind() == "init_declarator" {
+                                let value =
+                                    declarator.child_by_field_name("value").and_then(|value| {
+                                        (value.kind() == "identifier")
+                                            .then(|| source[value.byte_range()].to_string())
+                                    });
+                                match declarator.child_by_field_name("declarator") {
+                                    Some(inner) => (inner, value),
+                                    None => continue,
+                                }
+                            } else {
+                                (declarator, None)
+                            };
+
+                            if !Self::declares_function_pointer(declarator) {
+                                continue;
+                            }
+
+                            if let Some(name_node) = Self::innermost_declarator_name(declarator) {
+                                let name = source[name_node.byte_range()].to_string();
+                                if !name.is_empty() {
+                                    facts.pointer_vars.push(PointerVar {
+                                        name,
+                                        byte_start: node.start_byte(),
+                                        target,
+                                        is_parameter,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if node.kind() == "declaration" && !Self::inside_function(node) {
+                        let Some(type_node) = node.child_by_field_name("type") else {
+                            return true;
+                        };
+                        let Some(type_name) = Self::aggregate_type_name(type_node, source) else {
+                            return true;
+                        };
+                        let mut cursor = node.walk();
+                        for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                            let mut current = declarator;
+                            let mut is_function = false;
+                            loop {
+                                if current.kind() == "function_declarator" {
+                                    is_function = true;
+                                }
+                                if current.kind() == "identifier" {
+                                    // A prototype names a function, not a variable.
+                                    if !is_function {
+                                        facts.globals.push(RawGlobal {
+                                            name: source[current.byte_range()].to_string(),
+                                            type_name: type_name.clone(),
+                                            line: current.start_position().row as u32 + 1,
+                                        });
+                                    }
+                                    break;
+                                }
+                                match current
+                                    .child_by_field_name("declarator")
+                                    .or_else(|| current.named_child(0))
+                                {
+                                    Some(next) => current = next,
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            true
+        };
+        preorder_prune(root, &mut visit);
+        facts
     }
 
     /// True for `int (*fp)(void)`: a function declarator whose own declarator
@@ -6931,19 +6846,19 @@ impl TreeSitterAnalyzer {
     /// Every arm is read. Which one a build takes is not knowable from the
     /// source, and a member declared in either is one the type can have.
     fn field_declarations<'tree>(body: tree_sitter::Node<'tree>) -> Vec<tree_sitter::Node<'tree>> {
+        let body_id = body.id();
         let mut declarations = Vec::new();
-        let mut stack = vec![body];
-
-        while let Some(node) = stack.pop() {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                match child.kind() {
-                    "field_declaration" => declarations.push(child),
-                    kind if Self::is_conditional_group(kind) => stack.push(child),
-                    _ => {}
-                }
+        let mut visit = |node: tree_sitter::Node<'tree>| -> bool {
+            // The walk descends only where the stack went: the body and
+            // conditional groups. Anything else is dropped unvisited, and a
+            // field is collected, not descended into.
+            if node.kind() == "field_declaration" {
+                declarations.push(node);
+                return false;
             }
-        }
+            node.id() == body_id || Self::is_conditional_group(node.kind())
+        };
+        preorder_prune(body, &mut visit);
 
         // A stack reverses each level; the source order is what a reader of
         // the type expects, and what an offset comparison needs.
@@ -7787,13 +7702,7 @@ impl TreeSitterAnalyzer {
         }
 
         let mut types = Vec::new();
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            let mut walker = node.walk();
-            for child in node.children(&mut walker) {
-                stack.push(child);
-            }
-
+        let mut visit = |node: tree_sitter::Node| -> bool {
             match node.kind() {
                 "struct_specifier" | "union_specifier" | "enum_specifier" => {
                     if let Some(name) = node.child_by_field_name("name") {
@@ -7803,7 +7712,9 @@ impl TreeSitterAnalyzer {
                 "type_identifier" => types.push(wrapped[node.byte_range()].to_string()),
                 _ => {}
             }
-        }
+            true
+        };
+        preorder_prune(tree.root_node(), &mut visit);
 
         // Plenty of bodies are fragments that are not valid C on their own —
         // `"prefix: " fmt` and friends — and parse into something with no call
@@ -7829,11 +7740,9 @@ impl TreeSitterAnalyzer {
         // A macro body dispatches like any other code: `((o)->run())` is a
         // call through a member wherever it is written. Positions are in the
         // wrapped text, and the caller maps them back to the file.
-        let mut sites =
-            match Self::extract_all_calls_optimized(queries, &tree, &wrapped, Language::C) {
-                Ok(extraction) => extraction.member_sites,
-                Err(_) => Vec::new(),
-            };
+        let extraction = Self::extract_all_calls_optimized(queries, &tree, &wrapped, Language::C)
+            .unwrap_or_default();
+        let mut sites = extraction.member_sites;
 
         // A macro body can install a function as well as call one, when it
         // declares the thing it initialises:
@@ -7842,8 +7751,9 @@ impl TreeSitterAnalyzer {
         //
         // A bare `{ .run = fn }` states no type — the wrapper's type is the
         // wrapper's, not the macro's — so it registers nothing, as elsewhere.
-        let mut registrations = Self::collect_registrations(tree.root_node(), &wrapped);
-        registrations.extend(Self::collect_assignments(tree.root_node(), &wrapped));
+        // The fused walk already collected these; the wrapper prefix is
+        // stripped below like the sites above.
+        let mut registrations = extraction.registrations;
         registrations.retain(|r| !r.container_type.starts_with("__semcode_"));
 
         // The wrapper sits on one line before the body, so a position maps
@@ -7864,7 +7774,7 @@ impl TreeSitterAnalyzer {
         //
         // Reading the handover only outside macros is why `callers _printk`
         // named four functions in a tree where 5,729 call it.
-        let mut argument_functions = Self::collect_argument_functions(tree.root_node(), &wrapped);
+        let mut argument_functions = extraction.argument_functions;
         argument_functions.retain(|argument| {
             !argument.callee.starts_with("__semcode_")
                 && !argument.target.starts_with("__semcode_")
@@ -7917,6 +7827,8 @@ impl TreeSitterAnalyzer {
                 continue;
             };
 
+            // Macro bodies are always parsed as C, whatever file they came
+            // from; the counter follows the tree that was walked.
             let errors = Self::count_parse_errors(tree.root_node());
             if errors == 0 {
                 return Some((tree, wrapped, prefix.len()));
@@ -7937,16 +7849,13 @@ impl TreeSitterAnalyzer {
         }
 
         let mut errors = 0;
-        let mut stack = vec![node];
-        while let Some(node) = stack.pop() {
+        let mut visit = |node: tree_sitter::Node| -> bool {
             if node.is_error() || node.is_missing() {
                 errors += 1;
             }
-            let mut walker = node.walk();
-            for child in node.children(&mut walker) {
-                stack.push(child);
-            }
-        }
+            true
+        };
+        preorder_prune(node, &mut visit);
 
         errors
     }
@@ -11981,7 +11890,10 @@ mod argument_subject_tests {
         let tree = parse(source);
         let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
         println!("locals: {locals:?}");
-        let found = TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source);
+        let bound = TreeSitterAnalyzer::value_names(tree.root_node(), source);
+        let found =
+            TreeSitterAnalyzer::collect_walk_b_facts(tree.root_node(), source, &bound, &locals)
+                .argument_functions;
         println!("rows: {found:?}");
         let row = found.iter().find(|r| r.target == "i_callback").unwrap();
         assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
@@ -12015,7 +11927,11 @@ mod argument_subject_tests {
                       \tcall_rcu(&inode->i_rcu, i_callback);\n\
                       }\n";
         let tree = parse(source);
-        let found = TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source);
+        let bound = TreeSitterAnalyzer::value_names(tree.root_node(), source);
+        let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
+        let found =
+            TreeSitterAnalyzer::collect_walk_b_facts(tree.root_node(), source, &bound, &locals)
+                .argument_functions;
         let row = found
             .iter()
             .find(|row| row.target == "i_callback")
