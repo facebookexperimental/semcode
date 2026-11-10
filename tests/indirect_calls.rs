@@ -673,7 +673,7 @@ async fn a_callback_reached_only_through_a_pointer_has_a_chain_above_it() {
     let (db, git_sha) = index_fixture(dir.path()).await;
 
     let mut rendered = Vec::new();
-    let shown = semcode::callchain::write_indirect_reverse_chain(
+    let summary = semcode::callchain::write_indirect_reverse_chain(
         &db,
         "super_cache_scan",
         &git_sha,
@@ -685,7 +685,7 @@ async fn a_callback_reached_only_through_a_pointer_has_a_chain_above_it() {
     .unwrap();
     let text = String::from_utf8(rendered).unwrap();
 
-    assert!(shown >= 1, "no dispatching site shown: {text}");
+    assert!(summary.shown >= 1, "no dispatching site shown: {text}");
     assert!(
         text.contains("do_shrink_slab"),
         "the dispatch is missing: {text}"
@@ -704,7 +704,7 @@ async fn a_function_with_ordinary_callers_gets_no_pointer_chain() {
     let (db, git_sha) = index_fixture(dir.path()).await;
 
     let mut rendered = Vec::new();
-    let shown = semcode::callchain::write_indirect_reverse_chain(
+    let summary = semcode::callchain::write_indirect_reverse_chain(
         &db,
         "do_shrink_slab",
         &git_sha,
@@ -715,7 +715,7 @@ async fn a_function_with_ordinary_callers_gets_no_pointer_chain() {
     .await
     .unwrap();
 
-    assert_eq!(shown, 0);
+    assert_eq!(summary.shown, 0);
     assert!(
         rendered.is_empty(),
         "{}",
@@ -863,7 +863,7 @@ async fn a_weak_named_match_is_counted_not_answered() {
     let (db, git_sha) = index_named_member_fixture(dir.path()).await;
 
     let mut rendered = Vec::new();
-    let shown = semcode::callchain::write_indirect_reverse_chain(
+    let summary = semcode::callchain::write_indirect_reverse_chain(
         &db,
         "kvm_handle_invalid_op",
         &git_sha,
@@ -875,7 +875,7 @@ async fn a_weak_named_match_is_counted_not_answered() {
     .unwrap();
     let text = String::from_utf8(rendered).unwrap();
 
-    assert_eq!(shown, 1, "one confident dispatcher: {text}");
+    assert_eq!(summary.shown, 1, "one confident dispatcher: {text}");
     assert!(
         text.contains("kvm_invoke"),
         "the typed dispatch is missing: {text}"
@@ -887,6 +887,102 @@ async fn a_weak_named_match_is_counted_not_answered() {
     assert!(
         text.contains("1 call site") || text.contains("1 further call site"),
         "the weak dispatch is not counted: {text}"
+    );
+}
+
+async fn index_all_weak_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
+    // The kvm table installs the target but nothing typed dispatches through
+    // it; a second struct declares the same member so the undeclared scsi
+    // receiver stays genuinely ambiguous and therefore weak.
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("kvm.c"),
+        "struct kvm_ops {\n\tint (*handle_exit)(void *);\n};\nint kvm_handle_invalid_op(void *vcpu)\n{\n\treturn 0;\n}\nstruct kvm_ops kvm_ops = {\n\t.handle_exit = kvm_handle_invalid_op,\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("scsi.c"),
+        "struct scsi_host {\n\tint (*handle_exit)(int);\n};\nint scsi_invoke(int i)\n{\n\treturn chip->handle_exit(i);\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "all weak"]);
+
+    let git_sha = git::get_git_sha(repo).unwrap().unwrap();
+    let db_path = repo.join(".semcode.db");
+    let db = Arc::new(
+        DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+
+    semcode::git_range::process_git_tree(
+        repo,
+        &git_sha,
+        &["c".to_string(), "h".to_string()],
+        db.clone(),
+        false,
+        1,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    (db, git_sha)
+}
+
+#[tokio::test]
+async fn an_all_weak_chain_counts_but_calls_nothing_isolated() {
+    // No confident dispatcher exists, only the weak scsi site. The section
+    // must count it and the chain must not then report the function as
+    // isolated: a counted way in is not no way in.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_all_weak_fixture(dir.path()).await;
+
+    let mut rendered = Vec::new();
+    let summary = semcode::callchain::write_indirect_reverse_chain(
+        &db,
+        "kvm_handle_invalid_op",
+        &git_sha,
+        2,
+        10,
+        &mut rendered,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(rendered).unwrap();
+
+    assert_eq!(summary.shown, 0, "no confident dispatcher exists: {text}");
+    assert_eq!(
+        summary.by_name_only, 1,
+        "the weak dispatch is not counted: {text}"
+    );
+    assert!(
+        text.contains("call site go through"),
+        "the weak dispatch has no count line: {text}"
+    );
+
+    let mut chain_rendered = Vec::new();
+    semcode::callchain::show_callchain_to_writer(
+        &db,
+        "kvm_handle_invalid_op",
+        &mut chain_rendered,
+        &git_sha,
+    )
+    .await
+    .unwrap();
+    let chain_text = String::from_utf8(chain_rendered).unwrap();
+    assert!(
+        chain_text.contains("call site go through"),
+        "the chain lost the count line: {chain_text}"
+    );
+    assert!(
+        !chain_text.contains("isolated"),
+        "a counted way in is reported as no way in: {chain_text}"
     );
 }
 

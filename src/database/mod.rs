@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pub mod argument_functions;
 pub mod branches;
+pub mod call_edges;
 pub mod calls;
 mod connection;
 pub mod content;

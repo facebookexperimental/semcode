@@ -1317,6 +1317,12 @@ pub async fn process_git_tree(
         }
     }
 
+    // The edge index must exist after data lands, whether or not the
+    // health check wanted a full optimization pass.
+    if let Err(e) = db_manager.ensure_call_edges_index().await {
+        error!("Failed to ensure call_edges index: {}", e);
+    }
+
     // The whole tree has been read with this build, so a file still recorded
     // against an older extractor is content the tree no longer holds. Left in
     // place it keeps the index answering "older than this build" for ever, so
@@ -1529,6 +1535,12 @@ pub async fn process_git_range(
         Err(e) => {
             error!("Failed to check database health: {}", e);
         }
+    }
+
+    // The edge index must exist after data lands, whether or not the
+    // health check wanted a full optimization pass.
+    if let Err(e) = db_manager.ensure_call_edges_index().await {
+        error!("Failed to ensure call_edges index: {}", e);
     }
 
     // Do not write a database version. Part of the database was updated here,
