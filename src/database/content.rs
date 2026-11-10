@@ -4,13 +4,27 @@ use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchIterator, StringArra
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use once_cell::sync::Lazy;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::hash;
 
 // Number of shards for the content store
 const NUM_SHARDS: u8 = 16;
+
+/// Process-global locks serializing same-shard content upserts.
+///
+/// Two inserters can upsert the same new hash into one shard at the same
+/// time: both open the table at the same version, both miss, both insert,
+/// and the hash keeps two rows. The locks must be process-global because
+/// several ContentStore instances share one database (connection, functions,
+/// types and search each hold one), so a per-instance lock would not
+/// serialize them. Only commits to the same shard wait on each other, and
+/// content upserts are a small part of insert time.
+static CONTENT_SHARD_LOCKS: Lazy<[Mutex<()>; NUM_SHARDS as usize]> =
+    Lazy::new(|| std::array::from_fn(|_| Mutex::new(())));
 
 #[derive(Debug, Clone)]
 pub struct ContentInfo {
@@ -91,6 +105,11 @@ impl ContentStore {
 
         // Process each shard
         for (shard, items) in shard_groups {
+            // Serialize same-shard upserts across all ContentStore instances:
+            // without this, two inserters upserting the same new hash race
+            // and the shard keeps a duplicate row. Held across open_table +
+            // merge_insert + commit, which is the whole shard write below.
+            let _shard_guard = CONTENT_SHARD_LOCKS[shard as usize].lock().await;
             let table_name = Self::get_shard_table_name(shard);
             let table = self.connection.open_table(&table_name).execute().await?;
 
@@ -407,5 +426,84 @@ impl From<ContentInfo> for ContentInfoJson {
             blake3_hash: content_info.blake3_hash, // Already a hex string
             content: content_info.content,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lancedb::connection::LanceFileVersion;
+    use lancedb::database::listing::ListingDatabaseOptions;
+
+    async fn fresh_store() -> (tempfile::TempDir, ContentStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("content-race.lancedb");
+        let options = ListingDatabaseOptions::builder()
+            .data_storage_version(LanceFileVersion::V2_2)
+            .build();
+        let connection = lancedb::connect(db_path.to_str().unwrap())
+            .database_options(&options)
+            .execute()
+            .await
+            .unwrap();
+        crate::database::schema::SchemaManager::new(connection.clone())
+            .create_all_tables()
+            .await
+            .unwrap();
+        (dir, ContentStore::new(connection))
+    }
+
+    /// One body hashing into `shard`, distinct for every (round, item).
+    fn body_for_shard(shard: u8, round: u32, item: u32) -> ContentInfo {
+        let mut nonce = 0u32;
+        loop {
+            let content = format!("race body round {round} item {item} nonce {nonce}");
+            let blake3_hash = crate::hash::compute_blake3_hash(&content);
+            if ContentStore::get_shard_number(&blake3_hash) == shard {
+                return ContentInfo {
+                    blake3_hash,
+                    content,
+                };
+            }
+            nonce += 1;
+        }
+    }
+
+    /// Two concurrent insert_batch calls with overlapping new hashes must not
+    /// leave duplicate rows: without the per-shard lock both commits miss
+    /// and both insert. Fresh hashes every round so one lucky round cannot
+    /// hide the race; everything lands in one shard for maximum overlap.
+    #[tokio::test]
+    async fn concurrent_same_shard_upserts_leave_no_duplicates() {
+        const ROUNDS: u32 = 40;
+        const PER_ROUND: u32 = 64;
+
+        let (_dir, store) = fresh_store().await;
+        let store = Arc::new(store);
+        let mut unique_hashes = std::collections::HashSet::new();
+
+        for round in 0..ROUNDS {
+            let items: Vec<ContentInfo> = (0..PER_ROUND)
+                .map(|item| body_for_shard(0, round, item))
+                .collect();
+            unique_hashes.extend(items.iter().map(|item| item.blake3_hash.clone()));
+
+            let (first, second) =
+                tokio::join!(store.insert_batch(items.clone()), store.insert_batch(items),);
+            first.unwrap();
+            second.unwrap();
+        }
+
+        assert_eq!(
+            unique_hashes.len(),
+            (ROUNDS * PER_ROUND) as usize,
+            "test bodies must hash distinctly"
+        );
+        let rows = store.get_all().await.unwrap();
+        assert_eq!(
+            rows.len(),
+            unique_hashes.len(),
+            "concurrent upserts of the same new hashes left duplicate rows"
+        );
     }
 }
