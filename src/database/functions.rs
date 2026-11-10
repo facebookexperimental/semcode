@@ -151,7 +151,8 @@ impl FunctionStore {
             }
         }
 
-        // Store content items without deduplication (for performance testing)
+        // Bodies upsert through the content store, which dedups within a
+        // batch and merges on blake3_hash.
         if !content_items.is_empty() {
             self.content_store.insert_batch(content_items).await?;
         }

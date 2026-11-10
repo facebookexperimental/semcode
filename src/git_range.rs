@@ -98,6 +98,15 @@ struct StreamingConfig {
     num_inserters: usize,
 }
 
+/// Depth of the extract-to-insert result channel, shared by both streaming
+/// pipelines below. Each queued batch parks full function bodies for its
+/// whole file window, so the depth is fixed instead of scaling with the
+/// extractor count. A blocked worker still holds the finished batch it
+/// cannot send, so the depth bounds only the queue: with W workers, a depth
+/// of two and two inserters, up to W + 2 + 2 body-heavy batches sit in
+/// flight at once.
+const RESULT_CHANNEL_DEPTH: usize = 2;
+
 /// Statistics from processing git file tuples (lightweight, no accumulated data)
 #[derive(Debug, Default, Clone)]
 struct GitTupleStats {
@@ -405,7 +414,13 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
         }
     };
 
-    const DB_BATCH_SIZE: usize = 2048; // Number of files required before processing begins
+    // Files per insert batch. Each batch holds full function bodies for
+    // every file in its window (about 94 MB of bodies per 512-file batch),
+    // so a smaller window bounds the transient peak behind the inserters.
+    // Batching is a pipeline detail only -- dedup is per file and every
+    // fact merge is idempotent -- so the smaller window cannot change
+    // indexed output.
+    const DB_BATCH_SIZE: usize = 512;
 
     loop {
         // Step 1: Acquire lock to ensure only one worker accumulates at a time
@@ -758,14 +773,12 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
 
     // Create channels with backpressure
     let (tuple_tx, tuple_rx) = mpsc::channel::<GitFileTuple>();
-    // Scale result channel size with number of workers to prevent blocking
-    // Allow 2 batches per worker in flight, with minimum of 4 and maximum of 64
-    // Each batch ~= 2048 files, so this provides buffering without excessive memory use
-    let result_channel_size = (config.num_workers * 2).clamp(4, 64);
-    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(result_channel_size);
+    // Fixed small depth: each queued batch parks full function bodies, so the
+    // channel must not grow with the worker count (see RESULT_CHANNEL_DEPTH).
+    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(RESULT_CHANNEL_DEPTH);
     tracing::info!(
-        "Result channel size: {} (scaled with {} workers)",
-        result_channel_size,
+        "Result channel size: {} (fixed bound, {} workers)",
+        RESULT_CHANNEL_DEPTH,
         config.num_workers
     );
 
@@ -1049,8 +1062,9 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
 
     // Create channels with backpressure
     let (tuple_tx, tuple_rx) = mpsc::channel::<GitFileTuple>();
-    let result_channel_size = (config.num_workers * 2).clamp(4, 64);
-    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(result_channel_size);
+    // Fixed small depth: each queued batch parks full function bodies, so the
+    // channel must not grow with the worker count (see RESULT_CHANNEL_DEPTH).
+    let (result_tx, result_rx) = mpsc::sync_channel::<GitTupleResults>(RESULT_CHANNEL_DEPTH);
 
     // Wrap receivers for shared access
     let shared_tuple_rx = Arc::new(Mutex::new(tuple_rx));
