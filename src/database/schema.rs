@@ -1721,18 +1721,7 @@ impl SchemaManager {
         // Prune orphaned index data left behind by drop_index().
         if dropped {
             tracing::info!("Pruning orphaned index data from lore table...");
-            if let Err(e) = table
-                .optimize(OptimizeAction::Prune {
-                    older_than: Some(
-                        lancedb::table::Duration::try_seconds(0).expect("valid duration"),
-                    ),
-                    delete_unverified: Some(true),
-                    error_if_tagged_old_versions: Some(false),
-                })
-                .await
-            {
-                tracing::warn!("Failed to prune lore table after FTS rebuild: {}", e);
-            }
+            Self::prune_old_versions(&table, "lore").await;
         }
 
         Ok(())
@@ -1796,13 +1785,25 @@ impl SchemaManager {
         // drives semcode-index into swap and gets it OOM-killed.
         // Query correctness is preserved regardless: unindexed rows
         // still fall back to a brute-force scan.
+        //
+        // Count only non-empty entries: pruning old versions deletes a
+        // superseded index's files but leaves its directory behind.
+        // Those empty directories accumulate, five per lore run; they
+        // cost a directory entry each and nothing else.
         const MAX_LORE_INDEX_FRAGMENTS: usize = 100;
         let uri = self.connection.uri();
         let indices_dir = std::path::Path::new(uri)
             .join("lore.lance")
             .join("_indices");
         if let Ok(rd) = std::fs::read_dir(&indices_dir) {
-            let count = rd.count();
+            let count = rd
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    std::fs::read_dir(entry.path())
+                        .map(|mut files| files.next().is_some())
+                        .unwrap_or(true)
+                })
+                .count();
             if count > MAX_LORE_INDEX_FRAGMENTS {
                 tracing::warn!(
                     "Skipping lore FTS index optimization: \
@@ -2050,19 +2051,24 @@ impl SchemaManager {
     /// the database, including code-index tables and content shards
     /// that a lore run never touches.  On memory-constrained systems
     /// the combined working set of those compactions triggers the OOM
-    /// killer.  This method limits work to the two lore tables and
+    /// killer.  This method limits work to the lore tables and
     /// processes them sequentially to keep peak memory low.
     pub async fn compact_lore_tables(&self) -> Result<()> {
         tracing::info!("Running compaction for lore tables...");
 
         let table_names = self.connection.table_names().execute().await?;
-        let lore_tables = ["lore", "lore_indexed_commits"];
+        let lore_tables = ["lore", "lore_indexed_commits", "lore_vectors"];
 
         for name in &lore_tables {
             if !table_names.iter().any(|n| n == name) {
                 continue;
             }
-            match Self::optimize_single_table(&self.connection, name).await {
+            let outcome = if *name == "lore" {
+                Self::prune_lore_table(&self.connection).await
+            } else {
+                Self::optimize_single_table(&self.connection, name).await
+            };
+            match outcome {
                 Ok(OptimizeOutcome::Optimized) => {
                     tracing::info!("Compacted table {}", name);
                 }
@@ -2079,6 +2085,51 @@ impl SchemaManager {
         }
 
         Ok(())
+    }
+
+    /// Delete every version of `table` but the latest, along with the
+    /// data and index files only those versions referenced.  Returns
+    /// false if the prune failed.
+    async fn prune_old_versions(table: &lancedb::table::Table, table_name: &str) -> bool {
+        match table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(lancedb::table::Duration::try_seconds(0).expect("valid duration")),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to prune old versions from table {}: {}",
+                    table_name,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// Prune old versions of the lore table, which optimize_single_table()
+    /// skips entirely.  Every lore run rewrites the FTS indices, and
+    /// unless old versions are pruned the superseded copies stay under
+    /// _indices/ until the count trips the guard in
+    /// optimize_lore_fts_indices() and FTS updates stop for good.  Prune
+    /// reads only each manifest's index metadata, not the index files,
+    /// so it avoids the memory cost of Compact.
+    ///
+    /// Only the lore run calls this, not optimize_database(): with
+    /// delete_unverified set, a prune can delete files that another
+    /// process writing to lore has not committed yet.  That also relies
+    /// on lore runs not overlapping, e.g. as a systemd oneshot unit ensures.
+    async fn prune_lore_table(connection: &Connection) -> Result<OptimizeOutcome> {
+        let table = connection.open_table("lore").execute().await?;
+        Ok(if Self::prune_old_versions(&table, "lore").await {
+            OptimizeOutcome::Optimized
+        } else {
+            OptimizeOutcome::PartialFailure
+        })
     }
 
     /// Optimize a single table - runs compact, prune, and index operations
@@ -2098,11 +2149,12 @@ impl SchemaManager {
         // the operation completes.  On memory-constrained systems the
         // resident set grows into swap and the OOM killer terminates
         // semcode-index before compaction finishes, leaving fresh
-        // delta fragments behind each time.  Skip the table entirely.
+        // delta fragments behind each time.  Skip the table entirely;
+        // compact_lore_tables() prunes its old versions.
         if table_name == "lore" {
             tracing::info!(
                 "Skipping generic optimization for lore table \
-                 (handled by optimize_lore_fts_indices)"
+                 (pruned by compact_lore_tables)"
             );
             return Ok(OptimizeOutcome::Skipped);
         }
@@ -2165,19 +2217,7 @@ impl SchemaManager {
         }
 
         // 2. Prune ALL old versions
-        if let Err(e) = table
-            .optimize(OptimizeAction::Prune {
-                older_than: Some(lancedb::table::Duration::try_seconds(0).expect("valid duration")),
-                delete_unverified: Some(true),
-                error_if_tagged_old_versions: Some(false),
-            })
-            .await
-        {
-            tracing::warn!(
-                "Failed to prune old versions from table {}: {}",
-                table_name,
-                e
-            );
+        if !Self::prune_old_versions(&table, table_name).await {
             success = false;
         }
 
