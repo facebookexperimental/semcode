@@ -8,18 +8,31 @@
 // this table is a derived acceleration structure holding the same facts.
 // Every row carries the caller's file hash so readers apply the same
 // manifest check the LIKE path applies, and stale rows from older file
-// versions stay invisible. Lifecycle follows the functions table: edges
-// are deleted per file and rewritten whenever that file's functions are
-// inserted, so a removed call's row cannot outlive its function row.
+// versions stay invisible. Lifecycle follows the functions table: a file
+// version's edges are deleted and rewritten whenever that version's
+// functions are inserted, so a removed call's row cannot outlive its
+// function row. Rows of the same path at other versions stay, and the
+// manifest check hides them from revisions that do not hold that version.
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, StringBuilder};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use once_cell::sync::Lazy;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::database::get_column;
 use crate::types::{CallEdge, FunctionInfo};
+
+/// Process-global lock serializing every write to `call_edges`.
+///
+/// Inserters write the table concurrently. Two deletes on it conflict and
+/// retry, and a delete racing an append of the same file version can leave
+/// that version's rows twice. Process-global because several
+/// `CallEdgeStore` instances share one database, so a per-instance lock
+/// would not serialize them.
+static CALL_EDGE_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 pub struct CallEdgeStore {
     connection: Connection,
@@ -108,21 +121,60 @@ impl CallEdgeStore {
         out
     }
 
-    /// Exact lifecycle: drop every edge credited to these files, then write
-    /// the fresh set. A removed call's row cannot survive its file's
-    /// re-index, and unchanged files are never touched.
-    pub async fn sync_for_files(&self, files: &[String], edges: Vec<StoredEdge>) -> Result<()> {
+    /// The (caller_file, caller_file_hash) pairs a batch of functions
+    /// covers, sorted and deduplicated: the file versions whose edges
+    /// [`Self::sync_for_versions`] replaces.
+    pub fn versions_of(functions: &[FunctionInfo]) -> Vec<(String, String)> {
+        let mut versions: Vec<(String, String)> = functions
+            .iter()
+            .map(|func| (func.file_path.clone(), func.git_file_hash.clone()))
+            .collect();
+        versions.sort();
+        versions.dedup();
+        versions
+    }
+
+    /// Exact lifecycle per file version: drop every edge credited to these
+    /// (caller_file, caller_file_hash) pairs, then write the fresh set. A
+    /// removed call's row cannot survive its version's re-index, and the
+    /// same path's rows at other versions are never touched.
+    pub async fn sync_for_versions(
+        &self,
+        versions: &[(String, String)],
+        edges: Vec<StoredEdge>,
+    ) -> Result<()> {
+        let _write_guard = CALL_EDGE_WRITE_LOCK.lock().await;
         let table = self.connection.open_table("call_edges").execute().await?;
-        if !files.is_empty() {
-            let list: Vec<String> = files
+        if !versions.is_empty() {
+            // One IN list over a `hash:path` key: a single hash-set probe
+            // per row, where an OR of per-version comparisons costs one
+            // comparison per version per row. The key is exact because the
+            // hash comes first and a git blob id holds no `:`, so the first
+            // `:` splits every key the same way whatever the path holds.
+            // File paths and hashes come from the index itself, not user
+            // input.
+            let keys: Vec<String> = versions
                 .iter()
-                .map(|f| format!("'{}'", f.replace('\'', "''")))
+                .map(|(file, hash)| {
+                    format!(
+                        "'{}:{}'",
+                        hash.replace('\'', "''"),
+                        file.replace('\'', "''")
+                    )
+                })
                 .collect();
-            // File paths come from the index itself, not user input.
             table
-                .delete(&format!("caller_file IN ({})", list.join(", ")))
+                .delete(&format!(
+                    "concat(caller_file_hash, ':', caller_file) IN ({})",
+                    keys.join(", ")
+                ))
                 .await?;
         }
+        Self::append_edges(&table, edges).await
+    }
+
+    /// Append edge rows. The caller holds [`CALL_EDGE_WRITE_LOCK`].
+    async fn append_edges(table: &lancedb::Table, edges: Vec<StoredEdge>) -> Result<()> {
         if edges.is_empty() {
             return Ok(());
         }
@@ -205,12 +257,12 @@ impl CallEdgeStore {
                 calls: Some(calls.clone()),
             })
             .collect();
-        let mut files: Vec<String> = sources.iter().map(|s| s.file.to_string()).collect();
-        files.sort();
-        files.dedup();
         let edges = Self::edges_for_sources(&sources);
         let n = edges.len();
-        self.sync_for_files(&files, edges).await?;
+        // The table is empty, so there is nothing to delete first.
+        let _write_guard = CALL_EDGE_WRITE_LOCK.lock().await;
+        let edges_table = self.connection.open_table("call_edges").execute().await?;
+        Self::append_edges(&edges_table, edges).await?;
         Ok(n)
     }
 
@@ -258,5 +310,330 @@ impl CallEdgeStore {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lancedb::connection::LanceFileVersion;
+    use lancedb::database::listing::ListingDatabaseOptions;
+
+    async fn fresh_store() -> (tempfile::TempDir, CallEdgeStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("call-edges.lancedb");
+        let options = ListingDatabaseOptions::builder()
+            .data_storage_version(LanceFileVersion::V2_2)
+            .build();
+        let connection = lancedb::connect(db_path.to_str().unwrap())
+            .database_options(&options)
+            .execute()
+            .await
+            .unwrap();
+        crate::database::schema::SchemaManager::new(connection.clone())
+            .create_all_tables()
+            .await
+            .unwrap();
+        (dir, CallEdgeStore::new(connection))
+    }
+
+    /// One plain edge from `caller` in `file` at blob `hash` to `callee`.
+    fn edge(file: &str, hash: &str, caller: &str, callee: &str) -> StoredEdge {
+        StoredEdge {
+            caller_name: caller.to_string(),
+            caller_file: file.to_string(),
+            caller_line: 1,
+            caller_file_hash: hash.to_string(),
+            callee: callee.to_string(),
+            owner: None,
+            kind: "plain",
+        }
+    }
+
+    fn version(file: &str, hash: &str) -> (String, String) {
+        (file.to_string(), hash.to_string())
+    }
+
+    /// Every row as (caller_file, caller_file_hash, caller_name, callee),
+    /// sorted, duplicates kept.
+    async fn all_rows(store: &CallEdgeStore) -> Vec<(String, String, String, String)> {
+        let table = store
+            .connection
+            .open_table("call_edges")
+            .execute()
+            .await
+            .unwrap();
+        let batches = table
+            .query()
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let col = |name: &str| -> &StringArray { get_column(batch, name).unwrap() };
+            let (file, hash, caller, callee) = (
+                col("caller_file"),
+                col("caller_file_hash"),
+                col("caller_name"),
+                col("callee"),
+            );
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    file.value(i).to_string(),
+                    hash.value(i).to_string(),
+                    caller.value(i).to_string(),
+                    callee.value(i).to_string(),
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    fn row(file: &str, hash: &str, caller: &str, callee: &str) -> (String, String, String, String) {
+        (
+            file.to_string(),
+            hash.to_string(),
+            caller.to_string(),
+            callee.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn syncing_a_second_version_keeps_the_first() {
+        let (_dir, store) = fresh_store().await;
+        store
+            .sync_for_versions(&[version("a.c", "h1")], vec![edge("a.c", "h1", "f", "g")])
+            .await
+            .unwrap();
+        store
+            .sync_for_versions(
+                &[version("a.c", "h2")],
+                vec![edge("a.c", "h2", "f", "g"), edge("a.c", "h2", "f", "h")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            all_rows(&store).await,
+            [
+                row("a.c", "h1", "f", "g"),
+                row("a.c", "h2", "f", "g"),
+                row("a.c", "h2", "f", "h"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resyncing_a_version_replaces_its_edges() {
+        let (_dir, store) = fresh_store().await;
+        store
+            .sync_for_versions(
+                &[version("a.c", "h1"), version("a.c", "h2")],
+                vec![
+                    edge("a.c", "h1", "f", "g"),
+                    edge("a.c", "h1", "f", "h"),
+                    edge("a.c", "h2", "f", "g"),
+                ],
+            )
+            .await
+            .unwrap();
+        // h1 again, without its call to h.
+        store
+            .sync_for_versions(&[version("a.c", "h1")], vec![edge("a.c", "h1", "f", "g")])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            all_rows(&store).await,
+            [row("a.c", "h1", "f", "g"), row("a.c", "h2", "f", "g")]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_blob_at_another_path_is_left_alone() {
+        let (_dir, store) = fresh_store().await;
+        store
+            .sync_for_versions(
+                &[version("a.c", "same"), version("b.c", "same")],
+                vec![edge("a.c", "same", "f", "g"), edge("b.c", "same", "f", "g")],
+            )
+            .await
+            .unwrap();
+        // a.c's version loses its edges; b.c holds the same blob and keeps
+        // its own.
+        store
+            .sync_for_versions(&[version("a.c", "same")], Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(all_rows(&store).await, [row("b.c", "same", "f", "g")]);
+    }
+
+    #[tokio::test]
+    async fn paths_and_hashes_with_quotes_are_matched_literally() {
+        let (_dir, store) = fresh_store().await;
+        store
+            .sync_for_versions(
+                &[version("it's.c", "h'1"), version("its.c", "h1")],
+                vec![
+                    edge("it's.c", "h'1", "f", "g"),
+                    edge("its.c", "h1", "f", "g"),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .sync_for_versions(&[version("it's.c", "h'1")], Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(all_rows(&store).await, [row("its.c", "h1", "f", "g")]);
+    }
+
+    /// A `:` in a path cannot make one version's key match another's,
+    /// because the hash before the first `:` holds none.
+    #[tokio::test]
+    async fn colons_in_paths_match_only_their_own_version() {
+        let (_dir, store) = fresh_store().await;
+        store
+            .sync_for_versions(
+                &[
+                    version("a.c", "h1"),
+                    version("dir:a.c", "h1"),
+                    version("a.c:x", "h1"),
+                ],
+                vec![
+                    edge("a.c", "h1", "f", "g"),
+                    edge("dir:a.c", "h1", "f", "g"),
+                    edge("a.c:x", "h1", "f", "g"),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .sync_for_versions(&[version("dir:a.c", "h1")], Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            all_rows(&store).await,
+            [row("a.c", "h1", "f", "g"), row("a.c:x", "h1", "f", "g")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_batch_of_versions_is_replaced_in_one_sync() {
+        let (_dir, store) = fresh_store().await;
+        // Past a `--git` batch's 512 files.
+        let count = 1025;
+        let versions: Vec<(String, String)> = (0..count)
+            .map(|i| version(&format!("f{i:04}.c"), "h1"))
+            .collect();
+        let edges_to = |callee: &str| -> Vec<StoredEdge> {
+            versions
+                .iter()
+                .map(|(file, hash)| edge(file, hash, "f", callee))
+                .collect()
+        };
+        store
+            .sync_for_versions(&versions, edges_to("old"))
+            .await
+            .unwrap();
+        store
+            .sync_for_versions(&versions, edges_to("new"))
+            .await
+            .unwrap();
+
+        let rows = all_rows(&store).await;
+        assert_eq!(rows.len(), count);
+        assert!(rows.iter().all(|(_, _, _, callee)| callee == "new"));
+    }
+
+    #[test]
+    fn versions_of_is_sorted_and_deduplicated() {
+        let function = |file: &str, hash: &str, name: &str| FunctionInfo {
+            name: name.to_string(),
+            file_path: file.to_string(),
+            git_file_hash: hash.to_string(),
+            line_start: 1,
+            line_end: 3,
+            return_type: "int".to_string(),
+            parameters: Vec::new(),
+            body: String::new(),
+            calls: None,
+            types: None,
+            guard: None,
+            qualifier: None,
+        };
+        let versions = CallEdgeStore::versions_of(&[
+            function("b.c", "h1", "x"),
+            function("a.c", "h2", "y"),
+            function("b.c", "h1", "z"),
+            function("a.c", "h1", "w"),
+        ]);
+        assert_eq!(
+            versions,
+            [
+                version("a.c", "h1"),
+                version("a.c", "h2"),
+                version("b.c", "h1")
+            ]
+        );
+    }
+
+    /// Two inserters syncing different versions of one path at once must
+    /// leave both versions' rows, each exactly once. Fresh versions every
+    /// round so one lucky interleaving cannot hide a lost or doubled row.
+    #[tokio::test]
+    async fn concurrent_syncs_of_different_versions_keep_every_row_once() {
+        const ROUNDS: usize = 20;
+        let (_dir, store) = fresh_store().await;
+        let mut expected = Vec::new();
+        for round in 0..ROUNDS {
+            let (h1, h2) = (format!("r{round}a"), format!("r{round}b"));
+            let edges = |hash: &str| vec![edge("a.c", hash, "f", "g"), edge("a.c", hash, "f", "h")];
+            for hash in [&h1, &h2] {
+                expected.push(row("a.c", hash, "f", "g"));
+                expected.push(row("a.c", hash, "f", "h"));
+            }
+            let (v1, v2) = ([version("a.c", &h1)], [version("a.c", &h2)]);
+            let (first, second) = tokio::join!(
+                store.sync_for_versions(&v1, edges(&h1)),
+                store.sync_for_versions(&v2, edges(&h2)),
+            );
+            first.unwrap();
+            second.unwrap();
+        }
+        expected.sort();
+        assert_eq!(all_rows(&store).await, expected);
+    }
+
+    /// Two syncs of the same version at once must leave its rows once.
+    /// Indexing sends each blob once per run, so this holds the store to
+    /// its own contract rather than relying on that: without the write
+    /// lock both deletes run before either append and both appends land.
+    #[tokio::test]
+    async fn concurrent_syncs_of_one_version_leave_no_duplicates() {
+        const ROUNDS: usize = 20;
+        let (_dir, store) = fresh_store().await;
+        let mut expected = Vec::new();
+        for round in 0..ROUNDS {
+            let hash = format!("r{round}");
+            let edges = || vec![edge("a.c", &hash, "f", "g")];
+            expected.push(row("a.c", &hash, "f", "g"));
+            let versions = [version("a.c", &hash)];
+            let (first, second) = tokio::join!(
+                store.sync_for_versions(&versions, edges()),
+                store.sync_for_versions(&versions, edges()),
+            );
+            first.unwrap();
+            second.unwrap();
+        }
+        expected.sort();
+        assert_eq!(all_rows(&store).await, expected);
     }
 }

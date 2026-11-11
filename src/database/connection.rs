@@ -1890,18 +1890,13 @@ impl DatabaseManager {
 
         // Normalized call edges for indexed reverse lookup, derived from
         // the same parsed calls the functions rows serialize.
-        let edge_files: Vec<String> = {
-            let mut files: Vec<String> = functions.iter().map(|f| f.file_path.clone()).collect();
-            files.sort();
-            files.dedup();
-            files
-        };
+        let edge_versions = crate::database::call_edges::CallEdgeStore::versions_of(&functions);
         let edges = crate::database::call_edges::CallEdgeStore::edges_for(&functions);
 
         // Insert functions
         self.function_store.insert_batch(functions).await?;
         self.call_edge_store
-            .sync_for_files(&edge_files, edges)
+            .sync_for_versions(&edge_versions, edges)
             .await?;
         self.object_macro_store.insert_batch(object_macros).await?;
 
@@ -3675,16 +3670,11 @@ impl DatabaseManager {
     // Metadata-only insertion methods (skip content storage for performance)
     async fn insert_functions_metadata_only(&self, functions: Vec<FunctionInfo>) -> Result<()> {
         // Insert functions metadata
-        let edge_files: Vec<String> = {
-            let mut files: Vec<String> = functions.iter().map(|f| f.file_path.clone()).collect();
-            files.sort();
-            files.dedup();
-            files
-        };
+        let edge_versions = crate::database::call_edges::CallEdgeStore::versions_of(&functions);
         let edges = crate::database::call_edges::CallEdgeStore::edges_for(&functions);
         self.function_store.insert_metadata_only(functions).await?;
         self.call_edge_store
-            .sync_for_files(&edge_files, edges)
+            .sync_for_versions(&edge_versions, edges)
             .await?;
         Ok(())
     }
