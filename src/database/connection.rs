@@ -8543,6 +8543,12 @@ impl DatabaseManager {
     }
 
     /// Record git commit SHAs that have been processed for lore indexing.
+    ///
+    /// This is a plain append, not a merge_insert.  The callers only pass
+    /// SHAs that were filtered against get_indexed_lore_commits(), and
+    /// readers treat the column as a set, so a rare duplicate row is
+    /// harmless.  merge_insert on this unindexed table hash-joins
+    /// against every existing row, so its cost grows with the table.
     pub async fn insert_lore_indexed_commits(&self, commit_shas: &[String]) -> Result<()> {
         use arrow::array::{ArrayRef, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -8561,21 +8567,14 @@ impl DatabaseManager {
 
         let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(commit_shas.to_vec()))];
 
-        let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let batches = vec![Ok(batch)];
-        let batch_iterator =
-            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+        let batch = RecordBatch::try_new(schema, columns)?;
 
         let table = self
             .connection
             .open_table("lore_indexed_commits")
             .execute()
             .await?;
-        let mut merge_insert = table.merge_insert(&["git_commit_sha"]);
-        merge_insert
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
-        merge_insert.execute(Box::new(batch_iterator)).await?;
+        table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
