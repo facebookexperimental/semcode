@@ -1790,8 +1790,11 @@ impl SchemaManager {
         //
         // Count only non-empty entries: pruning old versions deletes a
         // superseded index's files but leaves its directory behind.
-        // Those empty directories accumulate, five per lore run; they
-        // cost a directory entry each and nothing else.
+        // Those empty directories accumulate, one per FTS and BTree
+        // index each lore run; they cost a directory entry each and
+        // nothing else.  What stays non-empty is the current set of
+        // indices plus the BTree indices that compact_lore_tables()
+        // superseded earlier in this run, which the next run prunes.
         const MAX_LORE_INDEX_FRAGMENTS: usize = 100;
         let uri = self.connection.uri();
         let indices_dir = std::path::Path::new(uri)
@@ -2072,7 +2075,7 @@ impl SchemaManager {
                 continue;
             }
             let outcome = if *name == "lore" {
-                Self::prune_lore_table(&self.connection).await
+                Self::maintain_lore_table(&self.connection).await
             } else {
                 Self::optimize_single_table(&self.connection, name).await
             };
@@ -2125,25 +2128,128 @@ impl SchemaManager {
         }
     }
 
-    /// Prune old versions of the lore table, which optimize_single_table()
-    /// skips entirely.  Every lore run rewrites the FTS indices, and
-    /// unless old versions are pruned the superseded copies stay under
-    /// _indices/ until the count trips the guard in
-    /// optimize_lore_fts_indices() and FTS updates stop for good.  Prune
-    /// reads only each manifest's index metadata, not the index files,
-    /// so it avoids the memory cost of Compact.
+    /// Prune old versions of the lore table and rebuild the BTree indices
+    /// on its non-nullable columns: optimize_single_table() skips lore
+    /// entirely.
+    ///
+    /// Every lore run rewrites the FTS indices, and unless old versions
+    /// are pruned the superseded copies stay under _indices/ until the
+    /// count trips the guard in optimize_lore_fts_indices() and FTS
+    /// updates stop for good.  Prune reads only each manifest's index
+    /// metadata, not the index files, so it avoids the memory cost of
+    /// Compact.
+    ///
+    /// The BTree rebuild runs after the prune, so the BTree files it
+    /// supersedes stay until the next run prunes them.
     ///
     /// Only the lore run calls this, not optimize_database(): with
     /// delete_unverified set, a prune can delete files that another
     /// process writing to lore has not committed yet.  That also relies
     /// on lore runs not overlapping, e.g. as a systemd oneshot unit ensures.
-    async fn prune_lore_table(connection: &Connection) -> Result<OptimizeOutcome> {
+    async fn maintain_lore_table(connection: &Connection) -> Result<OptimizeOutcome> {
         let table = connection.open_table("lore").execute().await?;
-        Ok(if Self::prune_old_versions(&table, "lore").await {
+        let pruned = Self::prune_old_versions(&table, "lore").await;
+        let btrees_current = Self::rebuild_lore_btree_indices(&table).await;
+        Ok(if pruned && btrees_current {
             OptimizeOutcome::Optimized
         } else {
             OptimizeOutcome::PartialFailure
         })
+    }
+
+    /// Run one maintenance step on the lore table and report whether it
+    /// succeeded, logging why not.  The step runs as its own task: a lance
+    /// panic would otherwise end semcode-index before the FTS update, on
+    /// every run until the table is repaired by hand, and as a task it
+    /// becomes a JoinError.  The next run's prune deletes the files an
+    /// aborted step wrote.
+    async fn run_lore_task<T, F>(what: &str, step: F) -> bool
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = lancedb::Result<T>> + Send + 'static,
+    {
+        let start_time = std::time::Instant::now();
+        match tokio::spawn(step).await {
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    "Lore {} completed in {:.1}s",
+                    what,
+                    start_time.elapsed().as_secs_f64()
+                );
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Lore {} failed: {}", what, e);
+                false
+            }
+            Err(e) => {
+                tracing::warn!("Lore {} did not finish: {}", what, e);
+                false
+            }
+        }
+    }
+
+    /// Build the lore table's BTree indices on non-nullable columns again
+    /// from the whole table, under their existing names.  The BTrees are
+    /// created at schema setup, usually on an empty table, and a lookup by
+    /// message_id scans every row they do not cover.  Returns false, after
+    /// logging why, on failure; a table without such indices has nothing
+    /// to rebuild.
+    ///
+    /// A rebuild rather than lance's in-place update, which merges only
+    /// new rows: a rebuild depends on nothing but the table as it is now,
+    /// so no earlier failed run or rewrite of the table's fragments can
+    /// leave rows out of the result.
+    ///
+    /// BTrees on nullable columns (in_reply_to, references) are left as
+    /// they are: lance 4.0.0 writes a BTree over a nullable string column
+    /// with enough rows into pages it cannot decode.  Reading the index
+    /// back panics in lance-encoding, and so does any lookup that lands on
+    /// a bad page.  Rebuilding them would replace a stale but readable
+    /// index with an unreadable one.  Lift this once semcode moves to a
+    /// lance whose writer reads back its own output.
+    async fn rebuild_lore_btree_indices(table: &lancedb::table::Table) -> bool {
+        use lancedb::index::IndexType;
+
+        let (indices, schema) = match tokio::try_join!(table.list_indices(), table.schema()) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!("Failed to read indices of table lore: {}", e);
+                return false;
+            }
+        };
+        let non_nullable = |column: &String| {
+            schema
+                .field_with_name(column)
+                .is_ok_and(|field| !field.is_nullable())
+        };
+        let btrees: Vec<lancedb::index::IndexConfig> = indices
+            .into_iter()
+            .filter(|index| {
+                index.index_type == IndexType::BTree && index.columns.iter().all(non_nullable)
+            })
+            .collect();
+        if btrees.is_empty() {
+            return true;
+        }
+
+        tracing::info!("Rebuilding {} lore BTree indices...", btrees.len());
+        let table = table.clone();
+        Self::run_lore_task("BTree index rebuild", async move {
+            for index in btrees {
+                table
+                    .create_index(
+                        &index.columns,
+                        LanceIndex::BTree(BTreeIndexBuilder::default()),
+                    )
+                    .name(index.name)
+                    .replace(true)
+                    .execute()
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Optimize a single table - runs compact, prune, and index operations
@@ -2164,11 +2270,12 @@ impl SchemaManager {
         // resident set grows into swap and the OOM killer terminates
         // semcode-index before compaction finishes, leaving fresh
         // delta fragments behind each time.  Skip the table entirely;
-        // compact_lore_tables() prunes its old versions.
+        // compact_lore_tables() prunes its old versions and rebuilds the
+        // BTree indices on its non-nullable columns.
         if table_name == "lore" {
             tracing::info!(
                 "Skipping generic optimization for lore table \
-                 (pruned by compact_lore_tables)"
+                 (maintained by compact_lore_tables)"
             );
             return Ok(OptimizeOutcome::Skipped);
         }
@@ -2553,9 +2660,12 @@ impl SchemaManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::DatabaseManager;
+    use crate::types::LoreEmailInfo;
     use arrow::array::StringArray;
     use lancedb::connection::LanceFileVersion;
     use lancedb::database::listing::ListingDatabaseOptions;
+    use lancedb::index::IndexType;
 
     async fn fresh_schema_manager() -> (tempfile::TempDir, SchemaManager) {
         let dir = tempfile::tempdir().unwrap();
@@ -2624,6 +2734,138 @@ mod tests {
         assert_eq!(
             table.count_rows(None).await.unwrap(),
             FRAGMENTS * ROWS_PER_FRAGMENT
+        );
+    }
+
+    /// BTrees on non-nullable columns that every lore database carries:
+    /// each lore run brings them up to date.
+    const UPDATED_BTREES: [&str; 3] = ["message_id_idx", "git_commit_sha_idx", "date_idx"];
+
+    /// BTrees on nullable columns, which lance 4.0.0 cannot rewrite
+    /// readably: lore runs leave them as they were created, on the empty
+    /// table.
+    const NULLABLE_BTREES: [&str; 2] = ["in_reply_to_idx", "references_idx"];
+
+    async fn lore_database() -> (tempfile::TempDir, DatabaseManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("lore-btree.db");
+        let db = DatabaseManager::new(db_path.to_str().unwrap(), String::new())
+            .await
+            .unwrap();
+        db.create_tables().await.unwrap();
+        (dir, db)
+    }
+
+    /// Emails `first..first + count`, every second one a reply.
+    fn emails(first: usize, count: usize) -> Vec<LoreEmailInfo> {
+        (first..first + count)
+            .map(|i| LoreEmailInfo {
+                git_commit_sha: format!("{i:040x}"),
+                from: format!("Sender {i} <sender{i}@example.org>"),
+                date: "Tue, 10 Nov 2026 12:00:00 +0000".to_string(),
+                date_timestamp: 1_794_312_000 + i as i64,
+                message_id: format!("<msg{i}@example.org>"),
+                in_reply_to: (i % 2 == 1).then(|| format!("<msg{}@example.org>", i - 1)),
+                subject: format!("[PATCH] change {i}"),
+                references: (i % 2 == 1).then(|| format!("<msg{}@example.org>", i - 1)),
+                recipients: "list@example.org".to_string(),
+                body: format!("body {i}"),
+                symbols: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Inserts `batch` as a lore run does, against the message_ids already
+    /// stored, and asserts that every email was stored.
+    async fn insert_emails(db: &DatabaseManager, batch: &[LoreEmailInfo]) {
+        let known_ids = std::sync::Mutex::new(db.get_lore_message_ids().await.unwrap());
+        let failed = db.insert_lore_emails(batch, &known_ids).await.unwrap();
+        assert!(failed.is_empty(), "emails not stored: {failed:?}");
+    }
+
+    /// Every BTree index on lore as (name, indexed rows, unindexed rows).
+    async fn btree_coverage(db: &DatabaseManager) -> Vec<(String, usize, usize)> {
+        let table = db.connection().open_table("lore").execute().await.unwrap();
+        let mut coverage = Vec::new();
+        for index in table.list_indices().await.unwrap() {
+            if index.index_type != IndexType::BTree {
+                continue;
+            }
+            let stats = table.index_stats(&index.name).await.unwrap().unwrap();
+            coverage.push((index.name, stats.num_indexed_rows, stats.num_unindexed_rows));
+        }
+        coverage.sort();
+        coverage
+    }
+
+    /// Asserts that every BTree on a non-nullable column covers all `rows`
+    /// and that the nullable-column BTrees still cover none.
+    fn assert_covers(coverage: &[(String, usize, usize)], rows: usize) {
+        for name in UPDATED_BTREES.iter().chain(&NULLABLE_BTREES) {
+            assert!(
+                coverage.iter().any(|(n, _, _)| n == name),
+                "{name} missing from {coverage:?}"
+            );
+        }
+        for (name, indexed, unindexed) in coverage {
+            let expected = if NULLABLE_BTREES.contains(&name.as_str()) {
+                (0, rows)
+            } else {
+                (rows, 0)
+            };
+            assert_eq!(
+                (*indexed, *unindexed),
+                expected,
+                "{name}: indexed and unindexed rows"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lore_btree_indices_cover_new_rows() {
+        let (_dir, db) = lore_database().await;
+        insert_emails(&db, &emails(0, 50)).await;
+
+        assert!(db.compact_lore_tables().await.unwrap());
+
+        assert_covers(&btree_coverage(&db).await, 50);
+    }
+
+    /// A later run, with the FTS indices in place as every run after the
+    /// first has them: the BTrees take in the new rows and the FTS indices
+    /// are left as they were.
+    #[tokio::test]
+    async fn lore_btree_indices_stay_current_across_runs() {
+        let (_dir, db) = lore_database().await;
+        insert_emails(&db, &emails(0, 50)).await;
+        assert!(db.compact_lore_tables().await.unwrap());
+        db.ensure_lore_fts_indices().await.unwrap();
+        assert!(db.optimize_lore_fts_indices().await.unwrap());
+
+        insert_emails(&db, &emails(50, 30)).await;
+        assert!(db.compact_lore_tables().await.unwrap());
+
+        assert_covers(&btree_coverage(&db).await, 80);
+        let table = db.connection().open_table("lore").execute().await.unwrap();
+        let mut fts: Vec<(String, usize)> = Vec::new();
+        for index in table.list_indices().await.unwrap() {
+            if index.index_type == IndexType::FTS {
+                let stats = table.index_stats(&index.name).await.unwrap().unwrap();
+                fts.push((index.name, stats.num_indexed_rows));
+            }
+        }
+        fts.sort();
+        assert_eq!(
+            fts,
+            [
+                "body_idx",
+                "from_idx",
+                "recipients_idx",
+                "subject_idx",
+                "symbols_idx"
+            ]
+            .map(|name| (name.to_string(), 50))
+            .to_vec()
         );
     }
 }
