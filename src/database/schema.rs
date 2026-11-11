@@ -7,7 +7,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use lancedb::connection::Connection;
 use lancedb::index::{scalar::BTreeIndexBuilder, scalar::FtsIndexBuilder, Index as LanceIndex};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::table::{OptimizeAction, OptimizeOptions};
+use lancedb::table::{CompactionOptions, OptimizeAction, OptimizeOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -2128,19 +2128,19 @@ impl SchemaManager {
         }
     }
 
-    /// Prune old versions of the lore table and rebuild the BTree indices
-    /// on its non-nullable columns: optimize_single_table() skips lore
-    /// entirely.
+    /// Prune the lore table's old versions, merge its small fragments and
+    /// rebuild the BTree indices on its non-nullable columns:
+    /// optimize_single_table() skips lore entirely.
     ///
     /// Every lore run rewrites the FTS indices, and unless old versions
     /// are pruned the superseded copies stay under _indices/ until the
     /// count trips the guard in optimize_lore_fts_indices() and FTS
     /// updates stop for good.  Prune reads only each manifest's index
-    /// metadata, not the index files, so it avoids the memory cost of
-    /// Compact.
+    /// metadata, not the index files.
     ///
-    /// The BTree rebuild runs after the prune, so the BTree files it
-    /// supersedes stay until the next run prunes them.
+    /// The prune runs first, so the fragments a compaction replaces and the
+    /// BTree files the rebuild supersedes stay until the next run prunes
+    /// them, and a query still reading them is not cut off.
     ///
     /// Only the lore run calls this, not optimize_database(): with
     /// delete_unverified set, a prune can delete files that another
@@ -2149,12 +2149,77 @@ impl SchemaManager {
     async fn maintain_lore_table(connection: &Connection) -> Result<OptimizeOutcome> {
         let table = connection.open_table("lore").execute().await?;
         let pruned = Self::prune_old_versions(&table, "lore").await;
+        let compacted = Self::compact_lore_fragments(&table).await;
         let btrees_current = Self::rebuild_lore_btree_indices(&table).await;
-        Ok(if pruned && btrees_current {
+        Ok(if pruned && compacted && btrees_current {
             OptimizeOutcome::Optimized
         } else {
             OptimizeOutcome::PartialFailure
         })
+    }
+
+    /// Rewrite the lore table's small fragments into fragments of up to
+    /// LORE_TARGET_ROWS_PER_FRAGMENT rows once it has more than
+    /// LORE_COMPACT_FRAGMENTS.  Each lore run appends a few fragments, and
+    /// queries that scan lore pay per fragment.  Returns false, after
+    /// logging why, on failure.
+    ///
+    /// Fragments at or above the target are not candidates, and lance
+    /// 4.0.0 merges only fragments covered by the same set of indices, so
+    /// a compaction rewrites the fragments appended since the last one and
+    /// leaves an earlier compaction's output alone even when it is under
+    /// the target: one leftover fragment per compaction.
+    ///
+    /// Index remapping is deferred: lance records the old-to-new fragment
+    /// mapping in its fragment-reuse index and applies it when an index is
+    /// read, instead of rewriting every index now, which is what costs
+    /// memory on a table with large FTS indices.  The FTS update applies
+    /// the mapping too, but lance 4.0.0's BTree update does not: it drops
+    /// every row the index held in a rewritten fragment, while the index
+    /// statistics still report full coverage.  The BTrees are rebuilt
+    /// from the table as it is instead (rebuild_lore_btree_indices()), so
+    /// the mapping does not concern them.  lance 4.0.0 never trims the
+    /// fragment-reuse index, which gains a version of a few KB per
+    /// compaction; the fragment threshold keeps that to one compaction
+    /// every few hundred appended fragments.
+    ///
+    /// A table of nothing but small fragments, such as one built from
+    /// scratch, is rewritten whole on its first compaction, one task per
+    /// LORE_TARGET_ROWS_PER_FRAGMENT rows.  The tasks run one at a time:
+    /// each one in flight adds to peak memory, and a compaction this
+    /// large happens once per database.
+    async fn compact_lore_fragments(table: &lancedb::table::Table) -> bool {
+        const LORE_COMPACT_FRAGMENTS: usize = 256;
+        const LORE_TARGET_ROWS_PER_FRAGMENT: usize = 150_000;
+        const LORE_COMPACT_THREADS: usize = 1;
+
+        let fragments = match table.stats().await {
+            Ok(stats) => stats.fragment_stats.num_fragments,
+            Err(e) => {
+                tracing::warn!("Failed to read stats for table lore: {}", e);
+                return false;
+            }
+        };
+        if fragments <= LORE_COMPACT_FRAGMENTS {
+            return true;
+        }
+
+        tracing::info!("Compacting lore table ({} fragments)...", fragments);
+        let table = table.clone();
+        Self::run_lore_task("compaction", async move {
+            table
+                .optimize(OptimizeAction::Compact {
+                    options: CompactionOptions {
+                        target_rows_per_fragment: LORE_TARGET_ROWS_PER_FRAGMENT,
+                        defer_index_remap: true,
+                        num_threads: Some(LORE_COMPACT_THREADS),
+                        ..Default::default()
+                    },
+                    remap_options: None,
+                })
+                .await
+        })
+        .await
     }
 
     /// Run one maintenance step on the lore table and report whether it
@@ -2270,8 +2335,9 @@ impl SchemaManager {
         // resident set grows into swap and the OOM killer terminates
         // semcode-index before compaction finishes, leaving fresh
         // delta fragments behind each time.  Skip the table entirely;
-        // compact_lore_tables() prunes its old versions and rebuilds the
-        // BTree indices on its non-nullable columns.
+        // compact_lore_tables() prunes its old versions, compacts it
+        // without remapping its indices and rebuilds the BTree indices on
+        // its non-nullable columns.
         if table_name == "lore" {
             tracing::info!(
                 "Skipping generic optimization for lore table \
@@ -2665,7 +2731,9 @@ mod tests {
     use arrow::array::StringArray;
     use lancedb::connection::LanceFileVersion;
     use lancedb::database::listing::ListingDatabaseOptions;
+    use lancedb::index::scalar::FullTextSearchQuery;
     use lancedb::index::IndexType;
+    use lancedb::query::Select;
 
     async fn fresh_schema_manager() -> (tempfile::TempDir, SchemaManager) {
         let dir = tempfile::tempdir().unwrap();
@@ -2769,7 +2837,7 @@ mod tests {
                 subject: format!("[PATCH] change {i}"),
                 references: (i % 2 == 1).then(|| format!("<msg{}@example.org>", i - 1)),
                 recipients: "list@example.org".to_string(),
-                body: format!("body {i}"),
+                body: format!("body {i} {}", if i % 3 == 0 { "needle" } else { "hay" }),
                 symbols: Vec::new(),
             })
             .collect()
@@ -2867,5 +2935,211 @@ mod tests {
             .map(|name| (name.to_string(), 50))
             .to_vec()
         );
+    }
+
+    async fn lore_fragments(db: &DatabaseManager) -> usize {
+        let table = db.connection().open_table("lore").execute().await.unwrap();
+        table.stats().await.unwrap().fragment_stats.num_fragments
+    }
+
+    /// Adds emails `first..first + 2 * fragments` to lore as `fragments`
+    /// fragments of two rows, the layout many small appends leave, in one
+    /// commit, since an append per fragment makes the test slow.  The rows
+    /// are built by insert_lore_emails() in a scratch database and copied
+    /// over.
+    async fn append_lore_fragments(db: &DatabaseManager, first: usize, fragments: usize) {
+        let (_scratch_dir, scratch) = lore_database().await;
+        insert_emails(&scratch, &emails(first, 2 * fragments)).await;
+        let rows: Vec<RecordBatch> = scratch
+            .connection()
+            .open_table("lore")
+            .execute()
+            .await
+            .unwrap()
+            .query()
+            .execute()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        db.connection()
+            .open_table("lore")
+            .execute()
+            .await
+            .unwrap()
+            .add(rows)
+            .write_options(lancedb::table::WriteOptions {
+                lance_write_params: Some(lance::dataset::WriteParams {
+                    max_rows_per_file: 2,
+                    max_rows_per_group: 2,
+                    mode: lance::dataset::WriteMode::Append,
+                    ..Default::default()
+                }),
+            })
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    /// Sorted message_ids of the emails whose body FTS matches `needle`.
+    async fn needle_message_ids(db: &DatabaseManager) -> Vec<String> {
+        let table = db.connection().open_table("lore").execute().await.unwrap();
+        let query = FullTextSearchQuery::new("needle".to_string())
+            .with_column("body".to_string())
+            .unwrap();
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .full_text_search(query)
+            .select(Select::columns(&["message_id"]))
+            .limit(100_000)
+            .execute()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("message_id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..column.len()).map(|row| column.value(row).to_string())
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The message_ids `needle_message_ids()` must return once emails
+    /// `0..count` are stored.
+    fn expected_needles(count: usize) -> Vec<String> {
+        let mut ids: Vec<String> = (0..count)
+            .filter(|i| i % 3 == 0)
+            .map(|i| format!("<msg{i}@example.org>"))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Above the fragment threshold the lore table is compacted, queries
+    /// return the same rows through the indices built before it, and both
+    /// kinds of index keep taking in new rows afterwards.
+    #[tokio::test]
+    async fn compact_lore_merges_small_fragments() {
+        const FRAGMENTS: usize = 257;
+        let (_dir, db) = lore_database().await;
+        append_lore_fragments(&db, 0, FRAGMENTS).await;
+        db.ensure_lore_fts_indices().await.unwrap();
+        assert_eq!(lore_fragments(&db).await, FRAGMENTS);
+        assert_eq!(
+            needle_message_ids(&db).await,
+            expected_needles(2 * FRAGMENTS)
+        );
+
+        assert!(db.compact_lore_tables().await.unwrap());
+
+        assert!(lore_fragments(&db).await < 10);
+        let table = db.connection().open_table("lore").execute().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 2 * FRAGMENTS);
+        assert_eq!(
+            needle_message_ids(&db).await,
+            expected_needles(2 * FRAGMENTS)
+        );
+        assert_covers(&btree_coverage(&db).await, 2 * FRAGMENTS);
+        let found = db
+            .get_lore_email_by_message_id("<msg7@example.org>")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.subject, "[PATCH] change 7");
+
+        insert_emails(&db, &emails(2 * FRAGMENTS, 10)).await;
+        assert!(db.optimize_lore_fts_indices().await.unwrap());
+        assert!(db.compact_lore_tables().await.unwrap());
+        assert_eq!(
+            needle_message_ids(&db).await,
+            expected_needles(2 * FRAGMENTS + 10)
+        );
+        assert_covers(&btree_coverage(&db).await, 2 * FRAGMENTS + 10);
+    }
+
+    /// At or below the fragment threshold the lore table is not compacted,
+    /// so a run adds no version to lance's fragment-reuse index.
+    #[tokio::test]
+    async fn compact_lore_leaves_few_fragments_alone() {
+        let (_dir, db) = lore_database().await;
+        append_lore_fragments(&db, 0, 256).await;
+        assert_eq!(lore_fragments(&db).await, 256);
+
+        assert!(db.compact_lore_tables().await.unwrap());
+
+        assert_eq!(lore_fragments(&db).await, 256);
+    }
+
+    /// How many rows `column IN (values)` finds.  The column's BTree
+    /// serves the lookup, so a row the index lost is not found.
+    async fn rows_found(db: &DatabaseManager, column: &str, values: &[String]) -> usize {
+        let list = values
+            .iter()
+            .map(|value| format!("'{value}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let table = db.connection().open_table("lore").execute().await.unwrap();
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .only_if(format!("{column} IN ({list})"))
+            .select(Select::columns(&["message_id"]))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batches.iter().map(|batch| batch.num_rows()).sum()
+    }
+
+    /// Asserts that `message_id` and `git_commit_sha` lookups find each of
+    /// emails `0..count` exactly once.
+    async fn assert_lookups_find(db: &DatabaseManager, count: usize) {
+        let ids: Vec<String> = (0..count)
+            .map(|i| format!("<msg{i}@example.org>"))
+            .collect();
+        let shas: Vec<String> = (0..count).map(|i| format!("{i:040x}")).collect();
+        assert_eq!(rows_found(db, "message_id", &ids).await, count);
+        assert_eq!(rows_found(db, "git_commit_sha", &shas).await, count);
+    }
+
+    /// A compaction rewrites fragments the BTrees already index, as every
+    /// compaction after a database's first does.  Lookups through the
+    /// BTrees must still find those rows, in that run and the next.
+    #[tokio::test]
+    async fn compact_lore_keeps_indexed_rows_findable() {
+        let (_dir, db) = lore_database().await;
+        append_lore_fragments(&db, 0, 200).await;
+        assert!(db.compact_lore_tables().await.unwrap());
+        db.ensure_lore_fts_indices().await.unwrap();
+        assert_covers(&btree_coverage(&db).await, 400);
+        append_lore_fragments(&db, 400, 57).await;
+        assert_eq!(lore_fragments(&db).await, 257);
+
+        assert!(db.compact_lore_tables().await.unwrap());
+
+        assert!(lore_fragments(&db).await < 10);
+        assert_covers(&btree_coverage(&db).await, 514);
+        assert_lookups_find(&db, 514).await;
+
+        insert_emails(&db, &emails(514, 4)).await;
+        assert!(db.optimize_lore_fts_indices().await.unwrap());
+        assert!(db.compact_lore_tables().await.unwrap());
+
+        assert_covers(&btree_coverage(&db).await, 518);
+        assert_lookups_find(&db, 518).await;
+        assert_eq!(needle_message_ids(&db).await, expected_needles(518));
     }
 }
