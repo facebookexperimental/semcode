@@ -1233,7 +1233,8 @@ async fn async_main() -> Result<()> {
                 // combined working set triggers the OOM killer.
                 println!("\nCompacting lore tables...");
                 match db_manager.compact_lore_tables().await {
-                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Ok(true) => println!("Lore table compaction completed successfully"),
+                    Ok(false) => {}
                     Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
@@ -1247,7 +1248,8 @@ async fn async_main() -> Result<()> {
                     Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
                 }
                 match db_manager.optimize_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices updated successfully"),
+                    Ok(true) => println!("FTS indices updated successfully"),
+                    Ok(false) => {}
                     Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }
@@ -1411,7 +1413,8 @@ async fn async_main() -> Result<()> {
             if total_new_emails > 0 {
                 println!("\nCompacting lore tables...");
                 match db_manager.compact_lore_tables().await {
-                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Ok(true) => println!("Lore table compaction completed successfully"),
+                    Ok(false) => {}
                     Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
@@ -1421,7 +1424,8 @@ async fn async_main() -> Result<()> {
                     Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
                 }
                 match db_manager.optimize_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices updated successfully"),
+                    Ok(true) => println!("FTS indices updated successfully"),
+                    Ok(false) => {}
                     Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }

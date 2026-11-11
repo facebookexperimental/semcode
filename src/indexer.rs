@@ -999,10 +999,24 @@ pub async fn process_lore_commits_pipeline(
 
         let handle = tokio::spawn(async move {
             loop {
-                // Get next batch from shared receiver
+                // Get next batch from shared receiver.  A parser only
+                // sends a short batch when its input has run out, so
+                // keep receiving until the batch holds at least
+                // batch_size emails or every parser has finished.
+                // Otherwise each parser's last partial batch becomes
+                // its own small append, dozens of tiny fragments per
+                // archive on a refresh.
                 let batch = {
                     match result_rx_clone.lock() {
-                        Ok(rx) => rx.recv(),
+                        Ok(rx) => rx.recv().map(|mut emails| {
+                            while emails.len() < batch_size {
+                                match rx.recv() {
+                                    Ok(more) => emails.extend(more),
+                                    Err(_) => break,
+                                }
+                            }
+                            emails
+                        }),
                         Err(e) => {
                             error!("Inserter {} failed to lock receiver: {}", inserter_id, e);
                             break;
