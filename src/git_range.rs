@@ -113,6 +113,40 @@ struct GitTupleStats {
     files_processed: usize,
     functions_count: usize,
     types_count: usize,
+    /// Batches whose facts or mark were not all stored, counting the batch
+    /// a panicked inserter held, and the files they left unmarked.
+    failed_batches: usize,
+    failed_files: usize,
+}
+
+impl GitTupleStats {
+    /// The run's error if any batch was not stored. The run otherwise looks
+    /// complete, and only a later run over the same files reads them again.
+    fn unstored_batches_error(&self) -> Result<()> {
+        if self.failed_batches > 0 {
+            anyhow::bail!(
+                "{} not stored; indexing again reads them",
+                self.unstored_summary()
+            );
+        }
+        Ok(())
+    }
+
+    /// "N batches (M files)", for the summary and the error.
+    fn unstored_summary(&self) -> String {
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        format!(
+            "{} ({}) {}",
+            plural(self.failed_batches, "batch", "batches"),
+            plural(self.failed_files, "file", "files"),
+            if self.failed_batches == 1 {
+                "was"
+            } else {
+                "were"
+            }
+        )
+    }
 }
 
 /// A repo-relative path prefix bounding enumeration scope.
@@ -559,10 +593,16 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
 /// completes what the failed run wrote. Three shapes escape that -- a blob
 /// read at a new path, a failure that fails the same way every run, a run
 /// whose input never contains the blob -- and those stay holes until the
-/// run learns to retry per file and to account for unmarked files.
+/// run learns to retry per file. The run reports them as unstored files,
+/// so they are not silent.
 ///
 /// A failed mark is the same shape: the facts are in, the file is not
 /// marked, the next run re-reads it and the merges change nothing.
+///
+/// Returns the run's count of stored batches, this one included, when
+/// every fact table and the mark were stored, and `None` otherwise, so the
+/// run can report the files it left unmarked instead of claiming success.
+/// The caller runs the periodic optimization with that count.
 async fn insert_batch_and_mark(
     db: &DatabaseManager,
     batch: GitTupleResults,
@@ -570,8 +610,7 @@ async fn insert_batch_and_mark(
     functions_counter: &AtomicUsize,
     types_counter: &AtomicUsize,
     batches_inserted_counter: &AtomicUsize,
-    optimization_check_timer: &Arc<std::sync::Mutex<std::time::Instant>>,
-) {
+) -> Option<usize> {
     // Exhaustive: a new fact table must be inserted and checked here, not
     // silently left out of the batch the mark commits.
     let GitTupleResults {
@@ -713,18 +752,7 @@ async fn insert_batch_and_mark(
     // Note: not tracking processed_files_count in a counter since it's not displayed
 
     // Only increment batches_inserted if insertion was successful
-    if insertion_successful {
-        let total_batches = batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1;
-
-        // Periodic optimization check using shared function
-        crate::indexer::check_and_optimize_if_needed(
-            db,
-            inserter_id,
-            total_batches,
-            optimization_check_timer,
-        )
-        .await;
-    }
+    insertion_successful.then(|| batches_inserted_counter.fetch_add(1, Ordering::Relaxed) + 1)
 }
 
 /// Process git file tuples using streaming pipeline with database inserters
@@ -738,11 +766,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
 
     // Handle empty commit range early - return empty stats
     if commit_shas.is_empty() {
-        return Ok(GitTupleStats {
-            files_processed: 0,
-            functions_count: 0,
-            types_count: 0,
-        });
+        return Ok(GitTupleStats::default());
     }
 
     // Determine number of generator threads (up to 32, but not more than commits)
@@ -792,6 +816,8 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     let inserted_types = Arc::new(AtomicUsize::new(0));
     let batches_sent = Arc::new(AtomicUsize::new(0));
     let batches_inserted = Arc::new(AtomicUsize::new(0));
+    let failed_batches = Arc::new(AtomicUsize::new(0));
+    let failed_files = Arc::new(AtomicUsize::new(0));
 
     // Shared deduplication set across all generators (lock-free)
     let sent_in_this_run = Arc::new(DashSet::new());
@@ -897,7 +923,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         let functions_counter = inserted_functions.clone();
         let types_counter = inserted_types.clone();
         let batches_inserted_counter = batches_inserted.clone();
+        let failed_batches_counter = failed_batches.clone();
+        let failed_files_counter = failed_files.clone();
         let optimization_check_timer = last_optimization_check.clone();
+        // Files of the batch this inserter is storing, so a panic that
+        // loses the batch is counted with them.
+        let in_flight_files = Arc::new(AtomicUsize::new(0));
+        let in_flight = in_flight_files.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -909,23 +941,42 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
 
                 match batch {
                     Ok(batch) => {
-                        insert_batch_and_mark(
+                        let files = batch.processed_files.len();
+                        in_flight.store(files, Ordering::Relaxed);
+                        let stored = insert_batch_and_mark(
                             &db_manager_clone,
                             batch,
                             inserter_id,
                             &functions_counter,
                             &types_counter,
                             &batches_inserted_counter,
-                            &optimization_check_timer,
                         )
                         .await;
+                        // Marked or failed: a panic from here on loses no
+                        // batch.
+                        in_flight.store(0, Ordering::Relaxed);
+                        match stored {
+                            Some(total_batches) => {
+                                crate::indexer::check_and_optimize_if_needed(
+                                    &db_manager_clone,
+                                    inserter_id,
+                                    total_batches,
+                                    &optimization_check_timer,
+                                )
+                                .await;
+                            }
+                            None => {
+                                failed_batches_counter.fetch_add(1, Ordering::Relaxed);
+                                failed_files_counter.fetch_add(files, Ordering::Relaxed);
+                            }
+                        }
                     }
                     Err(_) => break, // Channel closed, exit task
                 }
             }
         });
 
-        inserter_handles.push(handle);
+        inserter_handles.push((handle, in_flight_files));
     }
 
     // Wait for all generators to complete
@@ -943,9 +994,11 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     }
 
     // Wait for all inserter tasks to finish
-    for (inserter_id, handle) in inserter_handles.into_iter().enumerate() {
+    for (inserter_id, (handle, in_flight_files)) in inserter_handles.into_iter().enumerate() {
         if let Err(e) = handle.await {
             tracing::error!("Inserter {} task failed: {:?}", inserter_id, e);
+            failed_batches.fetch_add(1, Ordering::Relaxed);
+            failed_files.fetch_add(in_flight_files.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
 
@@ -954,6 +1007,8 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         files_processed: processed_count.load(Ordering::Relaxed),
         functions_count: inserted_functions.load(Ordering::Relaxed),
         types_count: inserted_types.load(Ordering::Relaxed),
+        failed_batches: failed_batches.load(Ordering::Relaxed),
+        failed_files: failed_files.load(Ordering::Relaxed),
     };
 
     // Finish progress bar
@@ -1076,6 +1131,8 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let inserted_types = Arc::new(AtomicUsize::new(0));
     let batches_sent = Arc::new(AtomicUsize::new(0));
     let batches_inserted = Arc::new(AtomicUsize::new(0));
+    let failed_batches = Arc::new(AtomicUsize::new(0));
+    let failed_files = Arc::new(AtomicUsize::new(0));
 
     // Spawn progress updater thread
     let pb_clone = pb.clone();
@@ -1161,7 +1218,13 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
         let functions_counter = inserted_functions.clone();
         let types_counter = inserted_types.clone();
         let batches_inserted_counter = batches_inserted.clone();
+        let failed_batches_counter = failed_batches.clone();
+        let failed_files_counter = failed_files.clone();
         let optimization_check_timer = last_optimization_check.clone();
+        // Files of the batch this inserter is storing, so a panic that
+        // loses the batch is counted with them.
+        let in_flight_files = Arc::new(AtomicUsize::new(0));
+        let in_flight = in_flight_files.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1172,23 +1235,42 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
 
                 match batch {
                     Ok(batch) => {
-                        insert_batch_and_mark(
+                        let files = batch.processed_files.len();
+                        in_flight.store(files, Ordering::Relaxed);
+                        let stored = insert_batch_and_mark(
                             &db_manager_clone,
                             batch,
                             inserter_id,
                             &functions_counter,
                             &types_counter,
                             &batches_inserted_counter,
-                            &optimization_check_timer,
                         )
                         .await;
+                        // Marked or failed: a panic from here on loses no
+                        // batch.
+                        in_flight.store(0, Ordering::Relaxed);
+                        match stored {
+                            Some(total_batches) => {
+                                crate::indexer::check_and_optimize_if_needed(
+                                    &db_manager_clone,
+                                    inserter_id,
+                                    total_batches,
+                                    &optimization_check_timer,
+                                )
+                                .await;
+                            }
+                            None => {
+                                failed_batches_counter.fetch_add(1, Ordering::Relaxed);
+                                failed_files_counter.fetch_add(files, Ordering::Relaxed);
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
             }
         });
 
-        inserter_handles.push(handle);
+        inserter_handles.push((handle, in_flight_files));
     }
 
     // Wait for generator to complete
@@ -1204,9 +1286,11 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     }
 
     // Wait for all inserter tasks to finish
-    for (inserter_id, handle) in inserter_handles.into_iter().enumerate() {
+    for (inserter_id, (handle, in_flight_files)) in inserter_handles.into_iter().enumerate() {
         if let Err(e) = handle.await {
             tracing::error!("Inserter {} task failed: {:?}", inserter_id, e);
+            failed_batches.fetch_add(1, Ordering::Relaxed);
+            failed_files.fetch_add(in_flight_files.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
 
@@ -1215,6 +1299,8 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
         files_processed: processed_count.load(Ordering::Relaxed),
         functions_count: inserted_functions.load(Ordering::Relaxed),
         types_count: inserted_types.load(Ordering::Relaxed),
+        failed_batches: failed_batches.load(Ordering::Relaxed),
+        failed_files: failed_files.load(Ordering::Relaxed),
     };
 
     pb.finish_with_message(format!(
@@ -1307,7 +1393,12 @@ pub async fn process_git_tree(
 
     let total_time = start_time.elapsed();
 
-    println!("\n=== Git Tree Indexing Complete ===");
+    if stats.failed_batches > 0 {
+        println!("\n=== Git Tree Indexing Incomplete ===");
+        println!("Not stored: {}", stats.unstored_summary());
+    } else {
+        println!("\n=== Git Tree Indexing Complete ===");
+    }
     println!("Total time: {:.1}s", total_time.as_secs_f64());
     println!("Files processed: {}", stats.files_processed);
     println!("Functions indexed: {}", stats.functions_count);
@@ -1336,6 +1427,10 @@ pub async fn process_git_tree(
     if let Err(e) = db_manager.ensure_call_edges_index().await {
         error!("Failed to ensure call_edges index: {}", e);
     }
+
+    // A batch that was not stored leaves its files unread, so the coverage
+    // records below would claim a tree this run did not finish.
+    stats.unstored_batches_error()?;
 
     // The whole tree has been read with this build, so a file still recorded
     // against an older extractor is content the tree no longer holds. Left in
@@ -1526,7 +1621,12 @@ pub async fn process_git_range(
 
     let total_time = start_time.elapsed();
 
-    info!("\n=== Git Range Pipeline Complete ===");
+    if stats.failed_batches > 0 {
+        info!("\n=== Git Range Pipeline Incomplete ===");
+        info!("Not stored: {}", stats.unstored_summary());
+    } else {
+        info!("\n=== Git Range Pipeline Complete ===");
+    }
     info!("Total time: {:.1}s", total_time.as_secs_f64());
     info!("Commits indexed: {commit_count}");
     info!("Files processed: {}", stats.files_processed);
@@ -1560,7 +1660,7 @@ pub async fn process_git_range(
     // Do not write a database version. Part of the database was updated here,
     // but other parts could have been written by an older version of semcode.
 
-    Ok(())
+    stats.unstored_batches_error()
 }
 
 #[cfg(test)]
@@ -1666,17 +1766,11 @@ mod tests {
         }
     }
 
-    fn test_counters() -> (
-        AtomicUsize,
-        AtomicUsize,
-        AtomicUsize,
-        Arc<std::sync::Mutex<std::time::Instant>>,
-    ) {
+    fn test_counters() -> (AtomicUsize, AtomicUsize, AtomicUsize) {
         (
             AtomicUsize::new(0),
             AtomicUsize::new(0),
             AtomicUsize::new(0),
-            Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         )
     }
 
@@ -1711,17 +1805,13 @@ mod tests {
             let (_dir, db) = test_db().await;
             db.connection().drop_table(table, &[]).await.unwrap();
 
-            let (functions, types_count, batches, timer) = test_counters();
-            insert_batch_and_mark(
-                &db,
-                test_batch(),
-                0,
-                &functions,
-                &types_count,
-                &batches,
-                &timer,
-            )
-            .await;
+            let (functions, types_count, batches) = test_counters();
+            assert!(
+                insert_batch_and_mark(&db, test_batch(), 0, &functions, &types_count, &batches)
+                    .await
+                    .is_none(),
+                "{table} failing must report the batch as not stored"
+            );
             assert!(
                 !db.is_file_processed("abc123").await.unwrap(),
                 "{table} failing must leave the file unmarked"
@@ -1729,16 +1819,12 @@ mod tests {
             assert_eq!(batches.load(Ordering::Relaxed), 0);
 
             db.create_tables().await.unwrap();
-            insert_batch_and_mark(
-                &db,
-                test_batch(),
-                0,
-                &functions,
-                &types_count,
-                &batches,
-                &timer,
-            )
-            .await;
+            assert!(
+                insert_batch_and_mark(&db, test_batch(), 0, &functions, &types_count, &batches)
+                    .await
+                    == Some(1),
+                "{table} healed must report the batch as stored"
+            );
             assert!(
                 db.is_file_processed("abc123").await.unwrap(),
                 "{table} healed must mark the file"
@@ -1752,23 +1838,127 @@ mod tests {
     #[tokio::test]
     async fn a_retried_batch_merges_onto_its_rows() {
         let (_dir, db) = test_db().await;
-        let (functions, types_count, batches, timer) = test_counters();
+        let (functions, types_count, batches) = test_counters();
         for _ in 0..2 {
-            insert_batch_and_mark(
-                &db,
-                test_batch(),
-                0,
-                &functions,
-                &types_count,
-                &batches,
-                &timer,
-            )
-            .await;
+            insert_batch_and_mark(&db, test_batch(), 0, &functions, &types_count, &batches).await;
         }
         let found = db.get_all_functions_metadata_only().await.unwrap();
         assert_eq!(found.len(), 1);
         let landed_types = db.get_all_types_metadata_only().await.unwrap();
         assert_eq!(landed_types.len(), 1);
+    }
+
+    #[test]
+    fn unstored_batches_error_counts_batches_and_files() {
+        assert!(GitTupleStats::default().unstored_batches_error().is_ok());
+        let stats = |failed_batches, failed_files| GitTupleStats {
+            failed_batches,
+            failed_files,
+            ..Default::default()
+        };
+        assert_eq!(
+            stats(1, 1)
+                .unstored_batches_error()
+                .unwrap_err()
+                .to_string(),
+            "1 batch (1 file) was not stored; indexing again reads them"
+        );
+        assert_eq!(
+            stats(2, 512)
+                .unstored_batches_error()
+                .unwrap_err()
+                .to_string(),
+            "2 batches (512 files) were not stored; indexing again reads them"
+        );
+        // A panicked inserter that held no batch still fails the run.
+        assert_eq!(
+            stats(1, 0)
+                .unstored_batches_error()
+                .unwrap_err()
+                .to_string(),
+            "1 batch (0 files) was not stored; indexing again reads them"
+        );
+    }
+
+    /// A mark that fails after every fact landed still leaves the file
+    /// unread, so the batch is reported as not stored.
+    #[tokio::test]
+    async fn insert_batch_and_mark_reports_a_failed_mark() {
+        let (_dir, db) = test_db().await;
+        db.connection()
+            .drop_table("processed_files", &[])
+            .await
+            .unwrap();
+        let (functions, types_count, batches) = test_counters();
+        let stored =
+            insert_batch_and_mark(&db, test_batch(), 0, &functions, &types_count, &batches).await;
+        assert_eq!(stored, None);
+        assert_eq!(batches.load(Ordering::Relaxed), 0);
+    }
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            // Do not inherit developer's git configuration.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A tree or range run that could not store a batch fails, names the
+    /// unstored files, and records no tree coverage. Once the database
+    /// accepts the batch, the same runs succeed.
+    #[tokio::test]
+    async fn a_run_with_an_unstored_batch_fails() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_path_buf();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(
+            repo.join("a.c"),
+            "struct a_struct { int x; };\nint a_function(void)\n{\n\treturn 0;\n}\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "a.c"]);
+        git(&repo, &["commit", "-q", "-m", "a"]);
+        let head = crate::git::get_git_sha(&repo).unwrap().unwrap();
+        let extensions = crate::file_extensions::default_extensions();
+
+        let (_db_dir, db) = test_db().await;
+        let db = Arc::new(db);
+        db.connection().drop_table("types", &[]).await.unwrap();
+
+        let err = process_git_tree(&repo, &head, &extensions, db.clone(), false, 1, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("1 batch (1 file) was not stored"),
+            "{err}"
+        );
+        assert_eq!(db.recorded_tree_sha().await.unwrap(), None);
+
+        let err = process_git_range(&repo, "HEAD", &extensions, db.clone(), false, 1, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("1 batch (1 file) was not stored"),
+            "{err}"
+        );
+
+        db.create_tables().await.unwrap();
+        process_git_range(&repo, "HEAD", &extensions, db.clone(), false, 1, &[])
+            .await
+            .unwrap();
+        process_git_tree(&repo, &head, &extensions, db.clone(), false, 1, &[])
+            .await
+            .unwrap();
+        assert_eq!(db.recorded_tree_sha().await.unwrap(), Some(head));
     }
 
     #[test]
