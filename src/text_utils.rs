@@ -74,6 +74,36 @@ pub fn preprocess_code(code: &str) -> String {
     code.trim().to_string()
 }
 
+/// Whether `header` names `message_id` as a whole id.
+///
+/// Lore stores In-Reply-To and References as they arrived. A folded
+/// header keeps a leading space, In-Reply-To can carry a trailing
+/// "(X's message of ...)" comment, and References separates ids with
+/// spaces, commas or nothing at all (`<a@x><b@x>`). So `message_id` (its
+/// surrounding whitespace ignored) matches where it stands between those
+/// separators, and never inside a longer id: `<a@x>` is not named by
+/// `<a@x.y>`, nor `a@x` by `a@x.y`.
+pub fn header_names_message_id(header: &str, message_id: &str) -> bool {
+    let id = message_id.trim();
+    let Some(first) = id.chars().next() else {
+        return false;
+    };
+    let mut from = 0;
+    while let Some(offset) = header[from..].find(id) {
+        let start = from + offset;
+        let end = start + id.len();
+        let before = header[..start].chars().next_back();
+        let after = header[end..].chars().next();
+        if before.is_none_or(|c| c.is_whitespace() || c == ',' || c == '>')
+            && after.is_none_or(|c| c.is_whitespace() || c == ',' || c == '<')
+        {
+            return true;
+        }
+        from = start + first.len_utf8();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
