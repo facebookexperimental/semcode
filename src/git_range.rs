@@ -109,6 +109,16 @@ struct StreamingConfig {
 /// flight at once.
 const RESULT_CHANNEL_DEPTH: usize = 2;
 
+/// Most tuple workers a range or tree run starts. A worker parses its
+/// batch on the whole rayon pool, so a few workers keep every CPU busy;
+/// more only add finished batches waiting on the result channel.
+const MAX_TUPLE_WORKERS: usize = 8;
+
+/// Tuple workers for a range or tree run on a host with `cpus` CPUs.
+fn tuple_workers(cpus: usize) -> usize {
+    cpus.clamp(1, MAX_TUPLE_WORKERS)
+}
+
 /// Statistics from processing git file tuples (lightweight, no accumulated data)
 #[derive(Debug, Default, Clone)]
 struct GitTupleStats {
@@ -1280,7 +1290,7 @@ pub async fn process_git_tree(
     }
 
     // Determine number of workers
-    let num_workers = num_cpus::get().max(1);
+    let num_workers = tuple_workers(num_cpus::get());
     info!(
         "Starting tree streaming pipeline with {} worker threads",
         num_workers
@@ -1497,8 +1507,7 @@ pub async fn process_git_range(
     }
 
     // Step 2: Determine number of workers
-    // Since generators are I/O bound and workers are CPU bound, use a balanced approach
-    let num_workers = (num_cpus::get()).max(1);
+    let num_workers = tuple_workers(num_cpus::get());
     info!(
         "Starting streaming pipeline with up to 32 generator threads and {} worker threads",
         num_workers
@@ -1917,5 +1926,15 @@ mod tests {
         assert_eq!(sent, 2);
         assert_eq!(paths, [PathBuf::from("a.c"), PathBuf::from("b.c")]);
         assert_eq!(repo.objects.metrics().open_reachable_packs, 1);
+    }
+
+    #[test]
+    fn tuple_workers_follow_the_cpus_up_to_the_cap() {
+        assert_eq!(tuple_workers(0), 1);
+        assert_eq!(tuple_workers(1), 1);
+        assert_eq!(tuple_workers(7), 7);
+        assert_eq!(tuple_workers(MAX_TUPLE_WORKERS), 8);
+        assert_eq!(tuple_workers(9), 8);
+        assert_eq!(tuple_workers(316), 8);
     }
 }
