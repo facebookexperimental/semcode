@@ -3044,8 +3044,11 @@ impl VectorSearchManager {
                                         .map(|(_, text)| text.as_str())
                                         .collect();
 
-                                    let vector_results =
-                                        vectorizer_for_batch.vectorize_batch(&texts)?;
+                                    let vector_results = vectorize_in_chunks(
+                                        &texts,
+                                        LORE_VECTORIZE_CHUNK,
+                                        |part| vectorizer_for_batch.vectorize_batch(part),
+                                    )?;
 
                                     // Combine with message IDs
                                     let entries: Vec<VectorEntry> = emails_to_vectorize
@@ -3143,6 +3146,43 @@ impl VectorSearchManager {
 
         Ok(())
     }
+}
+
+/// Emails each `update_lore_vectors()` worker hands the model in one call.
+///
+/// The tokenizer keeps the full, untruncated encoding of every email in a call
+/// until it has pooled them all, and one worker runs per CPU, so peak memory
+/// grows with workers times this number rather than with the size of the
+/// RecordBatches the lore scan returns (up to 1,024 rows).  model2vec pools
+/// each email on its own, and the tokenizer of the model
+/// `scripts/nomic2vec.py` produces adds no batch padding, so the vectors do
+/// not depend on it.  `SEMCODE_BATCH_SIZE` (also set by `-j threads:batch`)
+/// still applies inside each call, so it can lower the effective chunk below
+/// this but not raise it.
+const LORE_VECTORIZE_CHUNK: usize = 64;
+
+/// Encode `texts` with `encode`, at most `chunk` texts per call, and return
+/// one vector per text in input order.
+///
+/// Fails if a call returns a different number of vectors than texts it was
+/// given: the results are concatenated by position, so a short chunk would
+/// pair every later vector with the wrong email.
+fn vectorize_in_chunks<F>(texts: &[&str], chunk: usize, mut encode: F) -> Result<Vec<Vec<f32>>>
+where
+    F: FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+{
+    let mut vectors = Vec::with_capacity(texts.len());
+    for part in texts.chunks(chunk) {
+        let part_vectors = encode(part)?;
+        anyhow::ensure!(
+            part_vectors.len() == part.len(),
+            "vectorizer returned {} vectors for {} texts",
+            part_vectors.len(),
+            part.len()
+        );
+        vectors.extend(part_vectors);
+    }
+    Ok(vectors)
 }
 
 /// Static helper for inserting lore vectors with a cached table handle
@@ -3742,5 +3782,78 @@ impl VectorSearchManager {
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic stand-in for the model: each text's vector depends on
+    /// that text alone, as model2vec's mean pooling does.
+    fn stub_vector(text: &str) -> Vec<f32> {
+        vec![text.len() as f32, text.bytes().map(f32::from).sum()]
+    }
+
+    fn texts(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("email {i}")).collect()
+    }
+
+    #[test]
+    fn lore_vectors_chunks_match_one_call_in_input_order() {
+        for n in [0, 1, 63, 64, 65, 128, 1000] {
+            let owned = texts(n);
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            let mut call_sizes = Vec::new();
+            let chunked = vectorize_in_chunks(&refs, 64, |part| {
+                call_sizes.push(part.len());
+                Ok(part.iter().map(|t| stub_vector(t)).collect())
+            })
+            .unwrap();
+            let whole: Vec<Vec<f32>> = refs.iter().map(|t| stub_vector(t)).collect();
+            assert_eq!(chunked, whole, "n = {n}");
+            assert_eq!(call_sizes.iter().sum::<usize>(), n, "n = {n}");
+            assert_eq!(call_sizes.len(), n.div_ceil(64), "n = {n}");
+            assert!(call_sizes.iter().all(|&s| (1..=64).contains(&s)), "n = {n}");
+        }
+    }
+
+    #[test]
+    fn lore_vectors_chunks_fail_on_short_result() {
+        let owned = texts(100);
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let err = vectorize_in_chunks(&refs, 64, |part| {
+            Ok(part.iter().skip(1).map(|t| stub_vector(t)).collect())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("63 vectors for 64 texts"), "{err}");
+    }
+
+    #[test]
+    fn lore_vectors_chunks_fail_on_long_result() {
+        let owned = texts(100);
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let err = vectorize_in_chunks(&refs, 64, |part| {
+            Ok((0..=part.len()).map(|_| stub_vector("extra")).collect())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("65 vectors for 64 texts"), "{err}");
+    }
+
+    #[test]
+    fn lore_vectors_chunks_propagate_encoder_error() {
+        let owned = texts(130);
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let mut calls = 0;
+        let err = vectorize_in_chunks(&refs, 64, |part| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("encoder failed");
+            }
+            Ok(part.iter().map(|t| stub_vector(t)).collect())
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "encoder failed");
+        assert_eq!(calls, 2);
     }
 }
