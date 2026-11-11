@@ -1776,7 +1776,9 @@ impl SchemaManager {
     /// brute-force fallback at query time, so queries remain correct
     /// even before this call.  Running optimize merges those rows
     /// into the inverted index structure, eliminating the scan cost.
-    pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+    ///
+    /// Returns false, after printing why, if it skipped the merge.
+    pub async fn optimize_lore_fts_indices(&self) -> Result<bool> {
         // Guard against running on a table with a large _indices/
         // backlog.  lance/index/append.rs opens every delta fragment
         // for a column before merging any, so peak memory scales
@@ -1805,15 +1807,14 @@ impl SchemaManager {
                 })
                 .count();
             if count > MAX_LORE_INDEX_FRAGMENTS {
-                tracing::warn!(
-                    "Skipping lore FTS index optimization: \
+                eprintln!(
+                    "Warning: Skipping lore FTS index optimization: \
                      {} _indices/ fragments exceeds {} threshold. \
                      Queries remain correct via brute-force fallback. \
                      Rebuild the lore table on a larger host to recover.",
-                    count,
-                    MAX_LORE_INDEX_FRAGMENTS
+                    count, MAX_LORE_INDEX_FRAGMENTS
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -1829,8 +1830,8 @@ impl SchemaManager {
             .collect();
 
         if fts_index_names.is_empty() {
-            tracing::warn!("Skipping lore FTS optimization: no FTS indices found");
-            return Ok(());
+            eprintln!("Warning: Skipping lore FTS index optimization: no FTS indices found");
+            return Ok(false);
         }
 
         let start_time = std::time::Instant::now();
@@ -1850,7 +1851,7 @@ impl SchemaManager {
             "Lore FTS index optimization completed in {:.1}s",
             elapsed.as_secs_f64()
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Shared helper: create all 5 FTS indices on an already-opened table.
@@ -2053,12 +2054,19 @@ impl SchemaManager {
     /// the combined working set of those compactions triggers the OOM
     /// killer.  This method limits work to the lore tables and
     /// processes them sequentially to keep peak memory low.
-    pub async fn compact_lore_tables(&self) -> Result<()> {
+    ///
+    /// Returns false, after printing the problem, if any table failed.
+    pub async fn compact_lore_tables(&self) -> Result<bool> {
         tracing::info!("Running compaction for lore tables...");
 
         let table_names = self.connection.table_names().execute().await?;
         let lore_tables = ["lore", "lore_indexed_commits", "lore_vectors"];
 
+        // Print problems to stderr: the tracing warnings carrying the
+        // details are filtered out below SEMCODE_DEBUG=warn, and a prune
+        // that fails silently lets _indices/ grow until lore FTS updates
+        // stop, as they did when lore was never pruned.
+        let mut all_ok = true;
         for name in &lore_tables {
             if !table_names.iter().any(|n| n == name) {
                 continue;
@@ -2076,15 +2084,21 @@ impl SchemaManager {
                     tracing::info!("Skipped table {} (too small)", name);
                 }
                 Ok(OptimizeOutcome::PartialFailure) => {
-                    tracing::warn!("Partial failure compacting table {}", name);
+                    eprintln!(
+                        "Warning: Partial failure compacting table {} \
+                         (set SEMCODE_DEBUG=warn for details)",
+                        name
+                    );
+                    all_ok = false;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to compact table {}: {}", name, e);
+                    eprintln!("Warning: Failed to compact table {}: {}", name, e);
+                    all_ok = false;
                 }
             }
         }
 
-        Ok(())
+        Ok(all_ok)
     }
 
     /// Delete every version of `table` but the latest, along with the
@@ -2205,6 +2219,9 @@ impl SchemaManager {
                     stats.fragment_stats.num_fragments,
                     MAX_COMPACT_FRAGMENTS
                 );
+                // Not compacting is not success: the fragment count only
+                // grows from here, and callers report the outcome.
+                success = false;
                 false
             }
             Ok(_) => true,
@@ -2599,7 +2616,7 @@ mod tests {
         let before = table.stats().await.unwrap().fragment_stats.num_fragments;
         assert_eq!(before, FRAGMENTS);
 
-        schema_manager.compact_lore_tables().await.unwrap();
+        assert!(schema_manager.compact_lore_tables().await.unwrap());
 
         table.checkout_latest().await.unwrap();
         let after = table.stats().await.unwrap().fragment_stats.num_fragments;

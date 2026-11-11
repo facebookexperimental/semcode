@@ -889,7 +889,8 @@ impl DatabaseManager {
         self.schema_manager.compact_and_cleanup().await
     }
 
-    pub async fn compact_lore_tables(&self) -> Result<()> {
+    /// Returns false, after printing the problem, if any table failed.
+    pub async fn compact_lore_tables(&self) -> Result<bool> {
         self.schema_manager.compact_lore_tables().await
     }
 
@@ -909,7 +910,8 @@ impl DatabaseManager {
     }
 
     /// Merge newly-inserted rows into existing lore FTS indices.
-    pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+    /// Returns false, after printing why, if the merge was skipped.
+    pub async fn optimize_lore_fts_indices(&self) -> Result<bool> {
         self.schema_manager.optimize_lore_fts_indices().await
     }
 
