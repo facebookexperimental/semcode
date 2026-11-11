@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use semcode::indexer::{
@@ -12,6 +12,16 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
+
+/// Upper bound on tokio worker threads and lore parser threads.  One
+/// thread per CPU (300+ on large hosts) spends more time in futex and
+/// allocator contention than it gains: lore indexing is limited by the
+/// database inserters, not by parsing.  The other modes do their CPU
+/// work on rayon, std threads or spawn_blocking, not tokio workers.
+/// The exception is lance's FTS index build, which tokenizes on tokio
+/// workers, so a full lore FTS (re)build is capped too; set
+/// TOKIO_WORKER_THREADS to lift the cap.
+const MAX_THREADS: usize = 32;
 
 #[derive(Parser, Debug)]
 #[command(name = "semcode-index")]
@@ -1012,8 +1022,21 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
 
 // ==================== End Branch Indexing Support ====================
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // #[tokio::main] starts one worker per CPU.  Cap it, but let
+    // TOKIO_WORKER_THREADS override as it does for the default runtime.
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        runtime.worker_threads(num_cpus::get().min(MAX_THREADS));
+    }
+    runtime
+        .build()
+        .context("failed to build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Suppress ORT verbose logging
     std::env::set_var("ORT_LOG_LEVEL", "ERROR");
 
@@ -1116,7 +1139,7 @@ async fn main() -> Result<()> {
 
             let start_time = std::time::Instant::now();
             let batch_size = 1024;
-            let num_workers = num_cpus::get();
+            let num_workers = num_cpus::get().min(MAX_THREADS);
 
             let mut total_new_emails = 0usize;
             let mut total_emails_all_archives = 0usize;
@@ -1298,7 +1321,7 @@ async fn main() -> Result<()> {
 
             let start_time = std::time::Instant::now();
             let batch_size = 1024;
-            let num_workers = num_cpus::get();
+            let num_workers = num_cpus::get().min(MAX_THREADS);
             let db_threads = args.db_threads;
             let total_archives = archives_with_names.len();
 
