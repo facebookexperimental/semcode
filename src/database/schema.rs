@@ -2181,11 +2181,22 @@ impl SchemaManager {
 
         let mut success = true;
 
-        // 1. Compact files
+        // 1. Compact files.  Tables above MAX_COMPACT_FRAGMENTS are left
+        // alone, as a guard against lance compaction spinning on thousands
+        // of small fragments.  lore_indexed_commits is exempt: it holds one
+        // 40-char SHA per row and no index, and a table of that shape
+        // compacts in seconds at 3,660 fragments on lance 4.0.0.  A cold
+        // lore build leaves it with one fragment per inserted batch, over a
+        // thousand for a full archive set, so the guard would keep it
+        // uncompacted.
         const MAX_COMPACT_FRAGMENTS: usize = 500;
+        let fragment_limit_applies = table_name != "lore_indexed_commits";
 
         let should_compact = match table.stats().await {
-            Ok(stats) if stats.fragment_stats.num_fragments > MAX_COMPACT_FRAGMENTS => {
+            Ok(stats)
+                if fragment_limit_applies
+                    && stats.fragment_stats.num_fragments > MAX_COMPACT_FRAGMENTS =>
+            {
                 tracing::warn!(
                     "Skipping compaction for table {} \
                      ({} fragments exceeds {} limit -- \
@@ -2519,5 +2530,83 @@ impl SchemaManager {
 
         tracing::info!("Drop and recreate complete for table {}", table_name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use lancedb::connection::LanceFileVersion;
+    use lancedb::database::listing::ListingDatabaseOptions;
+
+    async fn fresh_schema_manager() -> (tempfile::TempDir, SchemaManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema.lancedb");
+        let options = ListingDatabaseOptions::builder()
+            .data_storage_version(LanceFileVersion::V2_2)
+            .build();
+        let connection = lancedb::connect(db_path.to_str().unwrap())
+            .database_options(&options)
+            .execute()
+            .await
+            .unwrap();
+        (dir, SchemaManager::new(connection))
+    }
+
+    /// A cold lore build appends one lore_indexed_commits fragment per
+    /// batch.  600 two-row fragments put the table above
+    /// MAX_COMPACT_FRAGMENTS and above MIN_ROWS_FOR_OPTIMIZATION, so the
+    /// lore compaction has to compact it rather than skip it.  One write
+    /// capped at two rows per file builds them all in a single commit.
+    #[tokio::test]
+    async fn lore_indexed_commits_compacts_above_the_fragment_limit() {
+        const FRAGMENTS: usize = 600;
+        const ROWS_PER_FRAGMENT: usize = 2;
+
+        let (_dir, schema_manager) = fresh_schema_manager().await;
+        schema_manager
+            .create_lore_indexed_commits_table()
+            .await
+            .unwrap();
+        let table = schema_manager
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await
+            .unwrap();
+        let shas: Vec<String> = (0..FRAGMENTS * ROWS_PER_FRAGMENT)
+            .map(|row| format!("{row:040x}"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            table.schema().await.unwrap(),
+            vec![Arc::new(StringArray::from(shas))],
+        )
+        .unwrap();
+        table
+            .add(vec![batch])
+            .write_options(lancedb::table::WriteOptions {
+                lance_write_params: Some(lance::dataset::WriteParams {
+                    max_rows_per_file: ROWS_PER_FRAGMENT,
+                    max_rows_per_group: ROWS_PER_FRAGMENT,
+                    mode: lance::dataset::WriteMode::Append,
+                    ..Default::default()
+                }),
+            })
+            .execute()
+            .await
+            .unwrap();
+        let before = table.stats().await.unwrap().fragment_stats.num_fragments;
+        assert_eq!(before, FRAGMENTS);
+
+        schema_manager.compact_lore_tables().await.unwrap();
+
+        table.checkout_latest().await.unwrap();
+        let after = table.stats().await.unwrap().fragment_stats.num_fragments;
+        assert!(after < 10, "{after} fragments left after compaction");
+        assert_eq!(
+            table.count_rows(None).await.unwrap(),
+            FRAGMENTS * ROWS_PER_FRAGMENT
+        );
     }
 }
