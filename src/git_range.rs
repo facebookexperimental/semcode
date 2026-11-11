@@ -75,7 +75,9 @@ struct TupleWorkerContext {
     worker_id: usize,
     shared_tuple_rx: Arc<std::sync::Mutex<mpsc::Receiver<GitFileTuple>>>,
     result_tx: mpsc::SyncSender<GitTupleResults>,
-    repo_path: PathBuf,
+    /// The pipeline's one object store, shared with its generators and
+    /// every other worker (see `stream_git_file_tuples_batch`).
+    repo: gix::ThreadSafeRepository,
     source_root: PathBuf,
     no_macros: bool,
     processed_count: Arc<AtomicUsize>,
@@ -223,10 +225,15 @@ fn load_git_file_to_temp(
 }
 
 /// Stream git file tuples to a channel from a subset of commits (producer)
+///
+/// `repo` is the pipeline's one object store, shared by every generator and
+/// worker. Each store maps the pack files on its own, and `VmRSS` counts a
+/// mapped page once per mapping, so a store per thread counts the
+/// repository's packs once per thread.
 #[allow(clippy::too_many_arguments)]
 fn stream_git_file_tuples_batch(
     generator_id: usize,
-    repo_path: PathBuf,
+    repo: gix::ThreadSafeRepository,
     commit_batch: Vec<String>,
     extensions: Vec<String>,
     tuple_tx: mpsc::Sender<GitFileTuple>,
@@ -234,8 +241,7 @@ fn stream_git_file_tuples_batch(
     sent_in_this_run: Arc<DashSet<String>>,
     scope_prefixes: Vec<String>,
 ) -> Result<()> {
-    // Open repository ONCE per generator thread and reuse for all commits
-    let repo = gix::discover(&repo_path)?;
+    let repo = repo.to_thread_local();
 
     let mut total_files = 0;
     let mut sent_files = 0;
@@ -405,14 +411,7 @@ fn process_git_file_tuple_with_repo(
 
 /// Worker function that processes tuples from a shared channel and sends batches to inserters
 fn tuple_worker_shared(ctx: TupleWorkerContext) {
-    // Open repository ONCE per worker and convert to thread-safe version for sharing across rayon threads
-    let thread_safe_repo = match gix::discover(&ctx.repo_path) {
-        Ok(repo) => repo.into_sync(),
-        Err(e) => {
-            tracing::error!("Worker {} failed to open repository: {}", ctx.worker_id, e);
-            return;
-        }
-    };
+    let thread_safe_repo = &ctx.repo;
 
     // Files per insert batch. Each batch holds full function bodies for
     // every file in its window (about 94 MB of bodies per 512-file batch),
@@ -826,10 +825,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         }
     });
 
+    // One object store for every generator and worker of the pipeline.
+    let repo = repo.into_sync();
+
     // Spawn generator threads
     let mut generator_handles = Vec::new();
     for (generator_id, commit_chunk) in commit_chunks.into_iter().enumerate() {
-        let generator_repo_path = config.repo_path.clone();
+        let generator_repo = repo.clone();
         let generator_extensions = config.extensions.clone();
         let generator_tuple_tx = tuple_tx.clone();
         let generator_processed_files = config.processed_files.clone();
@@ -839,7 +841,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         let handle = thread::spawn(move || {
             if let Err(e) = stream_git_file_tuples_batch(
                 generator_id,
-                generator_repo_path,
+                generator_repo,
                 commit_chunk,
                 generator_extensions,
                 generator_tuple_tx,
@@ -867,7 +869,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
             worker_id,
             shared_tuple_rx: shared_tuple_rx.clone(),
             result_tx: result_tx.clone(),
-            repo_path: config.repo_path.clone(),
+            repo: repo.clone(),
             source_root: config.source_root.clone(),
             no_macros: config.no_macros,
             processed_count: processed_count.clone(),
@@ -983,20 +985,19 @@ struct TreeStreamingConfig {
 
 /// Stream git file tuples from a tree at a specific commit (producer for tree-based indexing)
 fn stream_tree_file_tuples(
-    repo_path: PathBuf,
+    repo: gix::ThreadSafeRepository,
     commit_sha: String,
     extensions: Vec<String>,
     tuple_tx: mpsc::Sender<GitFileTuple>,
     processed_files: Arc<HashSet<String>>,
     scope_prefixes: Vec<String>,
 ) -> Result<usize> {
-    use crate::git::walk_tree_at_commit;
-
     let mut sent_files = 0;
     let mut filtered_already_processed = 0;
 
     // Walk the tree at the commit and send tuples for matching files
-    walk_tree_at_commit(&repo_path, &commit_sha, |relative_path, object_id| {
+    let repo = repo.to_thread_local();
+    walk_tree_at_commit_with_repo(&repo, &commit_sha, |relative_path, object_id| {
         // Skip files outside the requested scope (source subdir, --include dirs)
         if !path_in_scope(relative_path, &scope_prefixes) {
             return Ok(());
@@ -1048,6 +1049,12 @@ fn stream_tree_file_tuples(
 /// Unlike process_git_range which walks commits, this walks the tree snapshot
 async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTupleStats> {
     use std::sync::Mutex;
+
+    // One object store for the generator and every worker of the pipeline
+    // (see `stream_git_file_tuples_batch`).
+    let repo = gix::discover(&config.repo_path)
+        .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?
+        .into_sync();
 
     // Create progress bar for file processing
     let pb = ProgressBar::new_spinner();
@@ -1105,7 +1112,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     });
 
     // Spawn single generator thread that walks the tree
-    let generator_repo_path = config.repo_path.clone();
+    let generator_repo = repo.clone();
     let generator_commit_sha = config.commit_sha.clone();
     let generator_extensions = config.extensions.clone();
     let generator_processed_files = config.processed_files.clone();
@@ -1113,7 +1120,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
 
     let generator_handle = thread::spawn(move || {
         if let Err(e) = stream_tree_file_tuples(
-            generator_repo_path,
+            generator_repo,
             generator_commit_sha,
             generator_extensions,
             tuple_tx,
@@ -1134,7 +1141,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
             worker_id,
             shared_tuple_rx: shared_tuple_rx.clone(),
             result_tx: result_tx.clone(),
-            repo_path: config.repo_path.clone(),
+            repo: repo.clone(),
             source_root: config.source_root.clone(),
             no_macros: config.no_macros,
             processed_count: processed_count.clone(),
@@ -1429,6 +1436,8 @@ pub async fn process_git_range(
     }
     let commit_shas = list_shas_in_range(&repo, git_range)?;
     let commit_count = commit_shas.len();
+    // The pipelines below open a store each; this one is done.
+    drop(repo);
 
     if !commit_shas.is_empty() {
         info!(
@@ -1821,5 +1830,92 @@ mod tests {
         let includes = vec![PathBuf::from("/elsewhere/x")];
         let out = scope_prefixes(workdir, source, &includes);
         assert!(out.is_empty());
+    }
+
+    /// The generators and workers read objects only through the store they
+    /// are handed. A thread that opened a store of its own would map the
+    /// repository's packs a second time, and the handed store's pack would
+    /// stay unopened.
+    #[test]
+    fn generators_and_workers_read_through_the_store_they_are_handed() {
+        let (dir, commits) = crate::git::packed_test_repo();
+        let open_packs =
+            |repo: &gix::ThreadSafeRepository| repo.objects.metrics().open_reachable_packs;
+
+        let generator_repo = gix::discover(dir.path()).unwrap().into_sync();
+        let (tuple_tx, tuple_rx) = mpsc::channel();
+        stream_git_file_tuples_batch(
+            0,
+            generator_repo.clone(),
+            commits,
+            vec!["c".to_string()],
+            tuple_tx,
+            Arc::new(HashSet::new()),
+            Arc::new(DashSet::new()),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(open_packs(&generator_repo), 1);
+
+        // A second store of the same repository, untouched by the generator.
+        let worker_repo = gix::discover(dir.path()).unwrap().into_sync();
+        assert_eq!(open_packs(&worker_repo), 0);
+
+        let shared_tuple_rx = Arc::new(std::sync::Mutex::new(tuple_rx));
+        let (result_tx, result_rx) = mpsc::sync_channel(16);
+        let processed_count = Arc::new(AtomicUsize::new(0));
+        let batches_sent = Arc::new(AtomicUsize::new(0));
+        let accumulate_lock = Arc::new(std::sync::Mutex::new(()));
+        let workers: Vec<_> = (0..4)
+            .map(|worker_id| {
+                let ctx = TupleWorkerContext {
+                    worker_id,
+                    shared_tuple_rx: shared_tuple_rx.clone(),
+                    result_tx: result_tx.clone(),
+                    repo: worker_repo.clone(),
+                    source_root: dir.path().to_path_buf(),
+                    no_macros: false,
+                    processed_count: processed_count.clone(),
+                    batches_sent: batches_sent.clone(),
+                    accumulate_lock: accumulate_lock.clone(),
+                };
+                thread::spawn(move || tuple_worker_shared(ctx))
+            })
+            .collect();
+        drop(result_tx);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        // a.c at both commits and b.c: three blobs, each read once.
+        let files: usize = result_rx.iter().map(|batch| batch.files_processed).sum();
+        assert_eq!(files, 3);
+        assert_eq!(processed_count.load(Ordering::Relaxed), 3);
+        assert_eq!(open_packs(&worker_repo), 1);
+    }
+
+    /// The tree walker reads through the store it is handed, like the range
+    /// generators.
+    #[test]
+    fn tree_walker_reads_through_the_store_it_is_handed() {
+        let (dir, commits) = crate::git::packed_test_repo();
+        let repo = gix::discover(dir.path()).unwrap().into_sync();
+        assert_eq!(repo.objects.metrics().open_reachable_packs, 0);
+
+        let (tuple_tx, tuple_rx) = mpsc::channel();
+        let sent = stream_tree_file_tuples(
+            repo.clone(),
+            commits[1].clone(),
+            vec!["c".to_string()],
+            tuple_tx,
+            Arc::new(HashSet::new()),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut paths: Vec<_> = tuple_rx.iter().map(|t| t.file_path).collect();
+        paths.sort();
+        assert_eq!(sent, 2);
+        assert_eq!(paths, [PathBuf::from("a.c"), PathBuf::from("b.c")]);
+        assert_eq!(repo.objects.metrics().open_reachable_packs, 1);
     }
 }

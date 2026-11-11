@@ -586,6 +586,67 @@ fn extract_symbols_from_email_body(body: &str) -> Vec<String> {
     }
 }
 
+/// Extract metadata for each commit SHA received from `commit_rx` until it
+/// closes, sending it to `result_tx` in batches of `batch_size`. `repo` is
+/// the pipeline's one object store, shared by every worker.
+fn commit_metadata_worker(
+    worker_id: usize,
+    repo: gix::ThreadSafeRepository,
+    commit_rx: Arc<std::sync::Mutex<mpsc::Receiver<String>>>,
+    result_tx: mpsc::SyncSender<Vec<GitCommitInfo>>,
+    processed: Arc<AtomicUsize>,
+    batch_size: usize,
+) {
+    let repo = repo.to_thread_local();
+    let mut batch = Vec::new();
+
+    loop {
+        // Get next commit SHA
+        let commit_sha = {
+            match commit_rx.lock() {
+                Ok(rx) => rx.recv(),
+                Err(e) => {
+                    tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
+                    break;
+                }
+            }
+        };
+
+        match commit_sha {
+            Ok(sha) => {
+                match extract_commit_metadata(&repo, &sha) {
+                    Ok(metadata) => {
+                        batch.push(metadata);
+                        processed.fetch_add(1, Ordering::Relaxed);
+
+                        // Send batch when it reaches batch_size
+                        if batch.len() >= batch_size {
+                            if result_tx.send(batch.clone()).is_err() {
+                                break;
+                            }
+                            batch.clear();
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Worker {} failed to extract metadata for {}: {}",
+                            worker_id, sha, e
+                        );
+                        processed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            Err(_) => {
+                // Channel closed, send remaining batch
+                if !batch.is_empty() {
+                    let _ = result_tx.send(batch);
+                }
+                break;
+            }
+        }
+    }
+}
+
 /// Process commits using a streaming pipeline
 pub async fn process_commits_pipeline(
     repo_path: &std::path::Path,
@@ -598,6 +659,13 @@ pub async fn process_commits_pipeline(
 ) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use std::sync::Mutex;
+
+    // One object store for every worker. Each store maps the pack files on
+    // its own and `VmRSS` counts a mapped page once per mapping, so a store
+    // per worker counts the repository's packs once per worker.
+    let shared_repo = gix::discover(repo_path)
+        .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?
+        .into_sync();
 
     // Create progress bar
     let pb = ProgressBar::new(commit_shas.len() as u64);
@@ -640,66 +708,18 @@ pub async fn process_commits_pipeline(
     for worker_id in 0..num_workers {
         let worker_commit_rx = shared_commit_rx.clone();
         let worker_result_tx = result_tx.clone();
-        let worker_repo_path = repo_path.to_path_buf();
+        let worker_repo = shared_repo.clone();
         let worker_processed = processed_count.clone();
 
         let handle = thread::spawn(move || {
-            // Open repository ONCE per worker thread, reuse for all commits
-            let thread_repo = match gix::discover(&worker_repo_path) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
-                    return;
-                }
-            };
-
-            let mut batch = Vec::new();
-
-            loop {
-                // Get next commit SHA
-                let commit_sha = {
-                    match worker_commit_rx.lock() {
-                        Ok(rx) => rx.recv(),
-                        Err(e) => {
-                            tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
-                            break;
-                        }
-                    }
-                };
-
-                match commit_sha {
-                    Ok(sha) => {
-                        match extract_commit_metadata(&thread_repo, &sha) {
-                            Ok(metadata) => {
-                                batch.push(metadata);
-                                worker_processed.fetch_add(1, Ordering::Relaxed);
-
-                                // Send batch when it reaches batch_size
-                                if batch.len() >= batch_size {
-                                    if worker_result_tx.send(batch.clone()).is_err() {
-                                        break;
-                                    }
-                                    batch.clear();
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Worker {} failed to extract metadata for {}: {}",
-                                    worker_id, sha, e
-                                );
-                                worker_processed.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Channel closed, send remaining batch
-                        if !batch.is_empty() {
-                            let _ = worker_result_tx.send(batch);
-                        }
-                        break;
-                    }
-                }
-            }
+            commit_metadata_worker(
+                worker_id,
+                worker_repo,
+                worker_commit_rx,
+                worker_result_tx,
+                worker_processed,
+                batch_size,
+            )
         });
         worker_handles.push(handle);
     }
@@ -1144,6 +1164,50 @@ mod tests {
     /// Helper: run a git command in a directory, panic on failure.
     fn git(repo: &std::path::Path, args: &[&str]) -> String {
         crate::git::test_git(repo, args)
+    }
+
+    /// The metadata workers read through the store they are handed. A
+    /// worker that opened a store of its own would map the repository's
+    /// packs again, and the handed store's pack would stay unopened.
+    #[test]
+    fn commit_metadata_workers_read_through_the_store_they_are_handed() {
+        let (dir, commits) = crate::git::packed_test_repo();
+        let repo = gix::discover(dir.path()).unwrap().into_sync();
+        assert_eq!(repo.objects.metrics().open_reachable_packs, 0);
+
+        let (commit_tx, commit_rx) = mpsc::channel();
+        for commit in &commits {
+            commit_tx.send(commit.clone()).unwrap();
+        }
+        drop(commit_tx);
+        let commit_rx = Arc::new(std::sync::Mutex::new(commit_rx));
+        let (result_tx, result_rx) = mpsc::sync_channel(16);
+        let processed = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..4)
+            .map(|worker_id| {
+                let (repo, commit_rx, result_tx, processed) = (
+                    repo.clone(),
+                    commit_rx.clone(),
+                    result_tx.clone(),
+                    processed.clone(),
+                );
+                thread::spawn(move || {
+                    commit_metadata_worker(worker_id, repo, commit_rx, result_tx, processed, 1)
+                })
+            })
+            .collect();
+        drop(result_tx);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let mut extracted: Vec<String> = result_rx.iter().flatten().map(|c| c.git_sha).collect();
+        extracted.sort();
+        let mut expected = commits.clone();
+        expected.sort();
+        assert_eq!(extracted, expected);
+        assert_eq!(processed.load(Ordering::Relaxed), 2);
+        assert_eq!(repo.objects.metrics().open_reachable_packs, 1);
     }
 
     /// Build a repo with merge topology and a tag on the side branch:
