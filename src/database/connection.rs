@@ -30,6 +30,7 @@ use crate::types::{
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
 use crate::worktree::{WorkingCopy, WorkingCopyHashes};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -219,12 +220,28 @@ pub struct DatabaseManager {
     callees_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<String>>>,
 }
 
+/// The URI to give lancedb for a local database path.
+///
+/// lancedb 0.27 sends every URI that starts with `db` to its LanceDB Cloud
+/// client, not only `db://` ones, so a relative path such as `db/x` or
+/// `dbdata/x` fails to open. Such a path is passed with a leading `./`,
+/// which names the same directory and does not start with `db`. Every
+/// other path passes unchanged. This can go once semcode's lancedb checks
+/// for `db://`.
+fn local_uri(path: &str) -> Cow<'_, str> {
+    if path.starts_with("db") && !path.starts_with("db://") {
+        Cow::Owned(format!("./{path}"))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
 impl DatabaseManager {
     pub async fn new(db_path: &str, git_repo_path: String) -> Result<Self> {
         let database_options = ListingDatabaseOptions::builder()
             .data_storage_version(LanceFileVersion::V2_2)
             .build();
-        let connection = lancedb::connect(db_path)
+        let connection = lancedb::connect(&local_uri(db_path))
             .database_options(&database_options)
             .execute()
             .await?;
@@ -9441,5 +9458,39 @@ mod anonymous_members {
     fn a_plain_edge_never_addresses_a_qualified_target() {
         // "read" alone cannot reach Io::read; only its owner-tagged twin can.
         assert!(!DatabaseManager::calls_json_names_function(r#"["read"]"#, "Io::read").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod local_uri_tests {
+    use super::local_uri;
+
+    #[test]
+    fn paths_starting_with_db_get_a_leading_dot_slash() {
+        for (path, uri) in [
+            ("db/x", "./db/x"),
+            ("dbx/y", "./dbx/y"),
+            ("db", "./db"),
+            ("dbx:y", "./dbx:y"),
+        ] {
+            assert_eq!(local_uri(path), uri, "{path}");
+        }
+    }
+
+    #[test]
+    fn every_other_path_passes_unchanged() {
+        for path in [
+            "./db/x",
+            "../db",
+            "/abs/db",
+            "x/db",
+            ".semcode.db",
+            "file:/abs/db",
+            "db://cloud",
+            "s3://bucket/db",
+            "",
+        ] {
+            assert_eq!(local_uri(path), path, "{path}");
+        }
     }
 }
