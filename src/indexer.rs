@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use gix::revision::walk::Sorting;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -15,7 +15,7 @@ use std::thread;
 use tracing::{debug, error, info, warn};
 
 use crate::git::resolve_to_commit;
-use crate::{DatabaseManager, GitCommitInfo};
+use crate::{DatabaseManager, GitCommitInfo, LoreIdState};
 
 /// Perform periodic optimization check during indexing operations
 /// Returns true if optimization was performed, false otherwise
@@ -809,8 +809,46 @@ pub async fn process_commits_pipeline(
     Ok(())
 }
 
+/// The duplicate check the lore inserters share: message_id to its state.
+pub type LoreIdMap = Arc<std::sync::Mutex<HashMap<String, LoreIdState>>>;
+
+/// message_ids already in the lore table, shared by every archive of one
+/// lore run and loaded when the first archive with new mail needs them.
+/// Between pipelines every entry is `LoreIdState::Stored`: inserters mark
+/// what they stored and remove what failed before they exit.  The
+/// exception is an inserter that panics between claiming ids and marking
+/// them.  Its ids stay `Pending` for the rest of the run, so later
+/// archives defer those emails and the next run retries them; debug
+/// builds fail an assertion at the end of the pipeline instead.
+#[derive(Default)]
+pub struct KnownLoreIds(tokio::sync::OnceCell<LoreIdMap>);
+
+impl KnownLoreIds {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The shared map, scanning the lore table's message_ids on the first
+    /// call only.  A failed scan leaves it unloaded, so the next call
+    /// retries.
+    pub async fn get(&self, db: &DatabaseManager) -> Result<LoreIdMap> {
+        let ids = self
+            .0
+            .get_or_try_init(|| async {
+                let ids = db.get_lore_message_ids().await?;
+                info!("Loaded {} existing lore message_ids", ids.len());
+                Ok::<_, anyhow::Error>(Arc::new(std::sync::Mutex::new(ids)))
+            })
+            .await?;
+        Ok(Arc::clone(ids))
+    }
+}
+
 /// Process lore commits using a streaming pipeline
 /// Similar to process_commits_pipeline but parses email from 'm' file
+///
+/// `known_ids` is the duplicate check for crossposts and partially failed
+/// runs; pass the same one for every archive of a run.
 pub async fn process_lore_commits_pipeline(
     repo_path: &std::path::Path,
     commit_shas: Vec<String>,
@@ -818,9 +856,12 @@ pub async fn process_lore_commits_pipeline(
     batch_size: usize,
     num_workers: usize,
     num_inserters: usize,
+    known_ids: &KnownLoreIds,
 ) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use std::sync::Mutex;
+
+    let known_ids = known_ids.get(&db_manager).await?;
 
     // Create progress bar
     let pb = ProgressBar::new(commit_shas.len() as u64);
@@ -954,6 +995,7 @@ pub async fn process_lore_commits_pipeline(
         let result_rx_clone = shared_result_rx.clone();
         let batches_counter = batches_inserted.clone();
         let optimization_check_timer = last_optimization_check.clone();
+        let known_ids = known_ids.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -971,7 +1013,10 @@ pub async fn process_lore_commits_pipeline(
                 match batch {
                     Ok(emails) => {
                         // Insert batch into database
-                        match db_manager_clone.insert_lore_emails(&emails).await {
+                        match db_manager_clone
+                            .insert_lore_emails(&emails, &known_ids)
+                            .await
+                        {
                             Err(e) => {
                                 error!("Inserter {} failed to insert batch: {}", inserter_id, e);
                             }
@@ -1045,6 +1090,15 @@ pub async fn process_lore_commits_pipeline(
     for handle in inserter_handles {
         let _ = handle.await;
     }
+
+    debug_assert!(
+        known_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .all(|state| *state == LoreIdState::Stored),
+        "lore message_id map holds pending ids after every inserter finished"
+    );
 
     pb.finish_with_message(format!(
         "Processed {} emails, inserted {}",
@@ -1285,5 +1339,228 @@ mod tests {
         let got: std::collections::HashSet<&str> = shas.iter().map(|s| s.as_str()).collect();
 
         assert_eq!(expected, got, "HEAD (no range) should return all 5 commits");
+    }
+
+    async fn lore_database() -> (tempfile::TempDir, Arc<DatabaseManager>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            dir.path().join(".semcode.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        (dir, Arc::new(db))
+    }
+
+    fn lore_email(git_commit_sha: &str, message_id: &str) -> crate::LoreEmailInfo {
+        crate::LoreEmailInfo {
+            git_commit_sha: git_commit_sha.to_string(),
+            from: "A U Thor <author@example.org>".to_string(),
+            date: "Mon, 2 Nov 2026 10:00:00 +0000".to_string(),
+            date_timestamp: 1_793_613_600,
+            message_id: message_id.to_string(),
+            in_reply_to: None,
+            subject: "[PATCH] test".to_string(),
+            references: None,
+            recipients: "list@example.org".to_string(),
+            body: "body".to_string(),
+            symbols: Vec::new(),
+        }
+    }
+
+    async fn lore_rows(db: &DatabaseManager, filter: Option<String>) -> usize {
+        db.connection()
+            .open_table("lore")
+            .execute()
+            .await
+            .unwrap()
+            .count_rows(filter)
+            .await
+            .unwrap()
+    }
+
+    /// The map is scanned once: a second get() returns the same map and
+    /// does not see a row stored behind its back.
+    #[tokio::test]
+    async fn known_lore_ids_loads_once() {
+        let (_dir, db) = lore_database().await;
+        let side_map = std::sync::Mutex::new(std::collections::HashMap::new());
+        let failed = db
+            .insert_lore_emails(
+                &[lore_email("1111", "<one@x>"), lore_email("2222", "<two@x>")],
+                &side_map,
+            )
+            .await
+            .unwrap();
+        assert!(failed.is_empty());
+
+        let known = KnownLoreIds::new();
+        let first = known.get(&db).await.unwrap();
+        {
+            let ids = first.lock().unwrap();
+            assert_eq!(ids.len(), 2);
+            assert_eq!(ids.get("<one@x>"), Some(&LoreIdState::Stored));
+            assert_eq!(ids.get("<two@x>"), Some(&LoreIdState::Stored));
+        }
+
+        let failed = db
+            .insert_lore_emails(&[lore_email("3333", "<three@x>")], &side_map)
+            .await
+            .unwrap();
+        assert!(failed.is_empty());
+
+        let second = known.get(&db).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!second.lock().unwrap().contains_key("<three@x>"));
+
+        // The row is in the table: a fresh map loads it.
+        let fresh = KnownLoreIds::new().get(&db).await.unwrap();
+        assert!(fresh.lock().unwrap().contains_key("<three@x>"));
+    }
+
+    /// A batch holding an id that another batch has pending defers that
+    /// email: its index is returned as not stored, no row is written for
+    /// it, and the other batch's claim is left alone.  The rest of the
+    /// batch is stored.
+    #[tokio::test]
+    async fn pending_id_is_deferred() {
+        let (_dir, db) = lore_database().await;
+        let map = std::sync::Mutex::new(HashMap::from([(
+            "<held@x>".to_string(),
+            LoreIdState::Pending,
+        )]));
+
+        let failed = db
+            .insert_lore_emails(
+                &[
+                    lore_email("4444", "<held@x>"),
+                    lore_email("5555", "<new@x>"),
+                ],
+                &map,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(failed, vec![0]);
+        assert_eq!(
+            lore_rows(&db, Some("message_id = '<held@x>'".to_string())).await,
+            0
+        );
+        assert_eq!(
+            lore_rows(&db, Some("message_id = '<new@x>'".to_string())).await,
+            1
+        );
+        let map = map.lock().unwrap();
+        assert_eq!(map.get("<held@x>"), Some(&LoreIdState::Pending));
+        assert_eq!(map.get("<new@x>"), Some(&LoreIdState::Stored));
+    }
+
+    /// A failed scan leaves the map unloaded: the next get() scans again.
+    #[tokio::test]
+    async fn known_lore_ids_retries_after_failed_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            dir.path().join(".semcode.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        let known = KnownLoreIds::new();
+
+        // No lore table yet.
+        assert!(known.get(&db).await.is_err());
+
+        db.create_tables().await.unwrap();
+        let side_map = std::sync::Mutex::new(HashMap::new());
+        let failed = db
+            .insert_lore_emails(&[lore_email("6666", "<late@x>")], &side_map)
+            .await
+            .unwrap();
+        assert!(failed.is_empty());
+
+        let ids = known.get(&db).await.unwrap();
+        assert_eq!(
+            ids.lock().unwrap().get("<late@x>"),
+            Some(&LoreIdState::Stored)
+        );
+    }
+
+    /// Commit one RFC 2822 message as file `m`, the layout of a lore
+    /// archive, and return the commit's SHA.
+    fn commit_lore_message(
+        repo: &std::path::Path,
+        message_id: &str,
+        commit_message: &str,
+    ) -> String {
+        std::fs::write(
+            repo.join("m"),
+            format!(
+                "From: A U Thor <author@example.org>\n\
+                 Date: Mon, 2 Nov 2026 10:00:00 +0000\n\
+                 Message-ID: {message_id}\n\
+                 Subject: [PATCH] test\n\
+                 To: list@example.org\n\
+                 \n\
+                 body\n"
+            ),
+        )
+        .unwrap();
+        git(repo, &["add", "m"]);
+        git(repo, &["commit", "-q", "-m", commit_message]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// A crosspost appears in two archives of one run.  The second
+    /// archive's pipeline must see the id the first one stored, store no
+    /// second row, and still record its commit as indexed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crossposted_email_is_stored_once_across_archives() {
+        let (_dir, db) = lore_database().await;
+
+        let archive_a = tempfile::tempdir().unwrap();
+        git(archive_a.path(), &["init", "-q", "-b", "master"]);
+        let cross_a = commit_lore_message(archive_a.path(), "<cross@x>", "list a");
+
+        let archive_b = tempfile::tempdir().unwrap();
+        git(archive_b.path(), &["init", "-q", "-b", "master"]);
+        let cross_b = commit_lore_message(archive_b.path(), "<cross@x>", "list b");
+        let only_b = commit_lore_message(archive_b.path(), "<only-b@x>", "list b only");
+        assert_ne!(cross_a, cross_b);
+
+        let known = KnownLoreIds::new();
+        process_lore_commits_pipeline(
+            archive_a.path(),
+            vec![cross_a.clone()],
+            db.clone(),
+            1024,
+            1,
+            1,
+            &known,
+        )
+        .await
+        .unwrap();
+        process_lore_commits_pipeline(
+            archive_b.path(),
+            vec![cross_b.clone(), only_b.clone()],
+            db.clone(),
+            1024,
+            1,
+            1,
+            &known,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lore_rows(&db, Some("message_id = '<cross@x>'".to_string())).await,
+            1
+        );
+        assert_eq!(lore_rows(&db, None).await, 2);
+
+        let indexed = db.get_indexed_lore_commits().await.unwrap();
+        for sha in [&cross_a, &cross_b, &only_b] {
+            assert!(indexed.contains(sha), "{sha} not recorded as indexed");
+        }
     }
 }

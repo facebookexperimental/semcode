@@ -3,7 +3,7 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 use semcode::indexer::{
-    list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline,
+    list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline, KnownLoreIds,
 };
 use semcode::{measure, process_database_path, CodeVectorizer, DatabaseManager};
 // Temporary call relationships are now embedded in function JSON columns
@@ -682,6 +682,8 @@ struct LoreIndexResult {
 
 /// Index a lore archive repository, filtering out already-indexed commits.
 /// This is the common logic shared by both --lore and --refresh-lore handlers.
+/// Every archive of one run shares `known_ids`.
+#[allow(clippy::too_many_arguments)]
 async fn index_lore_archive(
     lore_repo: gix::Repository,
     archive_path: &Path,
@@ -690,6 +692,7 @@ async fn index_lore_archive(
     batch_size: usize,
     num_workers: usize,
     db_threads: usize,
+    known_ids: &KnownLoreIds,
 ) -> Result<LoreIndexResult> {
     // Get the remote tracking branch to include all fetched commits
     // Try refs/remotes/origin/master first, then refs/remotes/origin/main as fallback
@@ -764,6 +767,7 @@ async fn index_lore_archive(
         batch_size,
         num_workers,
         db_threads,
+        known_ids,
     )
     .await?;
 
@@ -1117,6 +1121,7 @@ async fn main() -> Result<()> {
             let mut total_new_emails = 0usize;
             let mut total_emails_all_archives = 0usize;
             let mut failed_archives: Vec<(String, String)> = Vec::new();
+            let known_ids = KnownLoreIds::new();
 
             // Process each lore archive
             for lore_url in lore_args {
@@ -1153,6 +1158,7 @@ async fn main() -> Result<()> {
                     batch_size,
                     num_workers,
                     args.db_threads,
+                    &known_ids,
                 )
                 .await;
 
@@ -1170,6 +1176,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // One string per stored email: free it before compaction.
+            drop(known_ids);
 
             let total_time = start_time.elapsed();
 
@@ -1300,6 +1308,7 @@ async fn main() -> Result<()> {
             // causing both to stall indefinitely.
             let mut results: Vec<Result<(String, LoreIndexResult), (String, anyhow::Error)>> =
                 Vec::with_capacity(total_archives);
+            let known_ids = KnownLoreIds::new();
 
             for (archive_path, display_name) in archives_with_names {
                 println!("\n=== Refreshing lore archive: {} ===", display_name);
@@ -1321,6 +1330,7 @@ async fn main() -> Result<()> {
                     batch_size,
                     num_workers,
                     db_threads,
+                    &known_ids,
                 )
                 .await;
 
@@ -1331,6 +1341,8 @@ async fn main() -> Result<()> {
                     Err(e) => results.push(Err((display_name, e))),
                 }
             }
+            // One string per stored email: free it before compaction.
+            drop(known_ids);
 
             // Aggregate results
             let mut total_new_emails = 0usize;

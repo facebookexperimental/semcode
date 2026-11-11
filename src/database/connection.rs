@@ -150,6 +150,16 @@ fn log_absence(kind: &str, name: &str, git_sha: &str, why: Absent, elsewhere: &s
 /// moves the generation and drops every entry).
 type CallerMemoKey = (String, String, u64);
 
+/// Where a message_id stands in the duplicate check that the lore
+/// inserters share (see DatabaseManager::insert_lore_emails()).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoreIdState {
+    /// The email is in the lore table.
+    Stored,
+    /// A batch has claimed the id and its append has not finished.
+    Pending,
+}
+
 pub struct DatabaseManager {
     connection: Connection,
     git_repo_path: String,
@@ -6574,11 +6584,22 @@ impl DatabaseManager {
     /// any emails that could not be stored.  Callers must not record
     /// commit SHAs for failed indices in the lore_indexed_commits
     /// table, otherwise those emails are permanently lost.
+    ///
+    /// `known_ids` holds every message_id already in the lore table
+    /// (see get_lore_message_ids()) and is shared by all inserters.
+    /// Emails whose message_id is stored are skipped.  New ids are
+    /// claimed as pending before the append, then marked stored, or
+    /// released if their email failed.  An email whose id another
+    /// inserter has pending is deferred: it is returned with the failed
+    /// indices, so its SHA is not recorded and the next run retries it
+    /// against the table.
     pub async fn insert_lore_emails(
         &self,
         emails: &[crate::types::LoreEmailInfo],
+        known_ids: &std::sync::Mutex<HashMap<String, LoreIdState>>,
     ) -> Result<Vec<usize>> {
         use arrow::datatypes::{DataType, Field, Schema};
+        use std::collections::hash_map::Entry;
         use std::sync::Arc;
 
         if emails.is_empty() {
@@ -6629,27 +6650,58 @@ impl DatabaseManager {
         let mut failed_indices: Vec<usize> = Vec::new();
 
         // Filter out emails whose message_id already exists in the
-        // table.  Normally every email here is new because
-        // index_lore_archive skips already-indexed commits, but a
-        // partial failure on a previous run can leave rows in the
-        // table whose commit SHA was never recorded in
-        // lore_indexed_commits.  Filtering avoids duplicates without
-        // relying on merge_insert, which hits a spurious null-column
-        // error in lance-file 3.0.1.
-        let new_indices = Self::filter_existing_lore_ids(&table, emails, &dedup_indices).await?;
+        // table.  A crossposted email has the same message_id in
+        // every list's archive, and a partial failure on a previous
+        // run can leave rows in the table whose commit SHA was never
+        // recorded in lore_indexed_commits.  Filtering avoids
+        // duplicates without relying on merge_insert, which hits a
+        // spurious null-column error in lance-file 3.0.1.
+        //
+        // The check runs against an in-memory set rather than a
+        // `message_id IN (...)` query: lance plans that predicate once
+        // per fragment, and a filtered query costs a scan of every
+        // fragment appended since the last index update.  Crossposts
+        // are caught because one set, loaded from the table once per
+        // run, is shared by the inserters of every archive in the run.
+        // An id is claimed under the lock so that two batches holding
+        // the same message_id cannot both store it.
+        let mut new_indices: Vec<usize> = Vec::new();
+        let mut deferred: Vec<usize> = Vec::new();
+        {
+            let mut known = known_ids.lock().unwrap_or_else(|e| e.into_inner());
+            for &i in &dedup_indices {
+                match known.entry(emails[i].message_id.clone()) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(LoreIdState::Pending);
+                        new_indices.push(i);
+                    }
+                    Entry::Occupied(slot) if *slot.get() == LoreIdState::Pending => {
+                        deferred.push(i);
+                    }
+                    Entry::Occupied(_) => {}
+                }
+            }
+        }
 
-        if new_indices.len() < dedup_indices.len() {
+        let skipped = dedup_indices.len() - new_indices.len() - deferred.len();
+        if skipped > 0 {
             tracing::info!(
                 "insert_lore_emails: {} of {} already in table, inserting {}",
-                dedup_indices.len() - new_indices.len(),
+                skipped,
                 dedup_indices.len(),
                 new_indices.len(),
+            );
+        }
+        if !deferred.is_empty() {
+            tracing::info!(
+                "insert_lore_emails: deferring {} emails another batch is storing",
+                deferred.len()
             );
         }
 
         if new_indices.is_empty() {
             tracing::info!("insert_lore_emails: no new emails to insert");
-            return Ok(failed_indices);
+            return Ok(deferred);
         }
 
         // Use table.add() instead of merge_insert.  merge_insert in
@@ -6657,7 +6709,7 @@ impl DatabaseManager {
         // internal join/write phase, causing every insert to fail
         // with "subject contained null values".  Plain append avoids
         // the merge codepath entirely.  Duplicates are prevented by
-        // the filter_existing_lore_ids check above.
+        // the known_ids check above.
         if let Err(e) = Self::add_lore_chunk(&table, emails, &new_indices, &schema).await {
             tracing::warn!(
                 "insert_lore_emails: full batch of {} failed ({}), \
@@ -6700,60 +6752,59 @@ impl DatabaseManager {
             );
         }
 
+        // Mark the claimed ids stored, and release those whose email
+        // failed so that another copy of it can still be stored.
+        {
+            let mut known = known_ids.lock().unwrap_or_else(|e| e.into_inner());
+            for &idx in &new_indices {
+                if let Some(state) = known.get_mut(&emails[idx].message_id) {
+                    *state = LoreIdState::Stored;
+                }
+            }
+            for &idx in &failed_indices {
+                known.remove(&emails[idx].message_id);
+            }
+        }
+
         tracing::info!("insert_lore_emails: Batch insertion complete");
 
+        failed_indices.extend(deferred);
         Ok(failed_indices)
     }
 
-    /// Return the subset of `indices` whose message_id does not
-    /// already exist in the lore table.
-    async fn filter_existing_lore_ids(
-        table: &lancedb::Table,
-        emails: &[crate::types::LoreEmailInfo],
-        indices: &[usize],
-    ) -> Result<Vec<usize>> {
-        use futures::TryStreamExt as _;
+    /// Return every message_id in the lore table, marked stored, for the
+    /// duplicate check in insert_lore_emails().  One unfiltered column
+    /// scan is far cheaper than a filtered query per batch.
+    pub async fn get_lore_message_ids(&self) -> Result<HashMap<String, LoreIdState>> {
+        let table = self.connection.open_table("lore").execute().await?;
 
-        // Build an IN-list predicate.  message_ids are already
-        // validated to be non-empty, but escape single quotes for
-        // the SQL literal.
-        let id_list: Vec<String> = indices
-            .iter()
-            .map(|&i| format!("'{}'", emails[i].message_id.replace('\'', "''")))
-            .collect();
-
-        let predicate = format!("message_id IN ({})", id_list.join(", "));
-
-        let stream = table
+        let mut stream = table
             .query()
             .select(lancedb::query::Select::Columns(vec![
                 "message_id".to_string()
             ]))
-            .only_if(&predicate)
             .execute()
             .await?;
-        let batches: Vec<_> = stream.try_collect().await?;
 
-        let mut existing = std::collections::HashSet::new();
-        for batch in &batches {
+        // Consume batch by batch, so the Arrow copy of the column is
+        // never held in memory next to the map.
+        let mut existing = HashMap::new();
+        while let Some(batch) = stream.try_next().await? {
             if let Some(col) = batch.column_by_name("message_id") {
                 let arr = col
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
+                    .downcast_ref::<StringArray>()
                     .expect("message_id column must be StringArray");
+                existing.reserve(arr.len());
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
-                        existing.insert(arr.value(i).to_string());
+                        existing.insert(arr.value(i).to_string(), LoreIdState::Stored);
                     }
                 }
             }
         }
 
-        Ok(indices
-            .iter()
-            .copied()
-            .filter(|&i| !existing.contains(&emails[i].message_id))
-            .collect())
+        Ok(existing)
     }
 
     /// Build a [`RecordBatch`] from the given email indices and

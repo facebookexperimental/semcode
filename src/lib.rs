@@ -32,8 +32,8 @@ pub mod search;
 // Re-export the main types and structs
 pub use database::processed_files::ProcessedFileRecord;
 pub use database::resolution::{Evidence, IndirectCaller};
-pub use database::DatabaseManager;
 pub use database::SCHEMA_VERSION;
+pub use database::{DatabaseManager, LoreIdState};
 pub use database_utils::process_database_path;
 pub use git::{get_git_sha, get_git_sha_for_workdir};
 pub use hash::{compute_content_hash, compute_file_hash};
