@@ -227,12 +227,13 @@ The default is to try and saturate your cpus.
 
 ### Proxy Support
 
-The model setup script honors standard proxy environment variables:
+The model setup scripts, and uv when it installs their dependencies, honor
+standard proxy environment variables:
 
 ```bash
 export HTTP_PROXY=http://proxy.company.com:8080
 export HTTPS_PROXY=http://proxy.company.com:8080
-python scripts/direct_download.py
+scripts/direct_download.py
 ```
 
 ## MCP (Model Context Protocol) Server
@@ -304,13 +305,17 @@ You can test the MCP server outside of Claude:
 
 Note: this is mostly untested, and not required for general usage.  I've been
 trying nomic v2 and running it through model2vec to make things faster without
-a GPU.  There are scripts:
+a GPU.  There are scripts, which need [uv](https://docs.astral.sh/uv/)
+to install their dependencies:
 
 ```
-pip3 install -r scripts/requirements.txt
 scripts/direct_download.py
 scripts/nomic2vec.py
 ```
+
+Where `env -S` is unavailable (e.g. BusyBox), run them as
+`uv run --script scripts/<name>.py`.  Without uv, install the dependencies
+with `pip3 install -r scripts/requirements.txt` and run them with `python3`.
 
 Take the resulting model directory and move it to ~/.cache/semcode/models/model2vec.
 
