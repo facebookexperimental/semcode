@@ -2950,20 +2950,45 @@ impl VectorSearchManager {
                 .execute()
                 .await?;
 
+            // Workers send one Vec per lore RecordBatch that still has
+            // emails without a vector.  On an incremental run most of
+            // those hold only a few, and every merge_insert joins
+            // against the whole table, so write once at least
+            // LORE_VECTOR_FLUSH_ROWS have accumulated.
+            const LORE_VECTOR_FLUSH_ROWS: usize = 8192;
+            let mut pending: Vec<VectorEntry> = Vec::new();
             let mut total_inserted = 0;
-            while let Some(batch_vectors) = result_rx.recv().await {
+            let mut open = true;
+            while open {
+                match result_rx.recv().await {
+                    Some(batch_vectors) => {
+                        let received = batch_vectors.len();
+                        let count =
+                            processed_clone.fetch_add(received, Ordering::Relaxed) + received;
+                        pb_clone.set_position(count as u64);
+                        pb_clone.set_message(format!("Vectorized {} emails", count));
+                        pending.extend(batch_vectors);
+                    }
+                    None => open = false,
+                }
+                if pending.is_empty() || (open && pending.len() < LORE_VECTOR_FLUSH_ROWS) {
+                    continue;
+                }
+
+                // merge_insert inserts every unmatched source row, so two
+                // copies of a message_id in one buffer would become two
+                // rows.  Keep one.
+                let batch = crate::database::one_row_per_key(std::mem::take(&mut pending), |e| {
+                    e.content_hash.clone()
+                });
                 if let Err(e) =
-                    insert_lore_vectors_batch_with_table(&lore_vectors_table, &batch_vectors).await
+                    insert_lore_vectors_batch_with_table(&lore_vectors_table, &batch).await
                 {
                     tracing::error!("Failed to insert lore vectors batch: {}", e);
                     return Err(e);
                 }
 
-                total_inserted += batch_vectors.len();
-                let count = processed_clone.fetch_add(batch_vectors.len(), Ordering::Relaxed)
-                    + batch_vectors.len();
-                pb_clone.set_position(count as u64);
-                pb_clone.set_message(format!("Inserted {} vectors", count));
+                total_inserted += batch.len();
             }
             Ok::<_, anyhow::Error>(total_inserted)
         });
