@@ -1721,18 +1721,7 @@ impl SchemaManager {
         // Prune orphaned index data left behind by drop_index().
         if dropped {
             tracing::info!("Pruning orphaned index data from lore table...");
-            if let Err(e) = table
-                .optimize(OptimizeAction::Prune {
-                    older_than: Some(
-                        lancedb::table::Duration::try_seconds(0).expect("valid duration"),
-                    ),
-                    delete_unverified: Some(true),
-                    error_if_tagged_old_versions: Some(false),
-                })
-                .await
-            {
-                tracing::warn!("Failed to prune lore table after FTS rebuild: {}", e);
-            }
+            Self::prune_old_versions(&table, "lore").await;
         }
 
         Ok(())
@@ -1787,7 +1776,9 @@ impl SchemaManager {
     /// brute-force fallback at query time, so queries remain correct
     /// even before this call.  Running optimize merges those rows
     /// into the inverted index structure, eliminating the scan cost.
-    pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+    ///
+    /// Returns false, after printing why, if it skipped the merge.
+    pub async fn optimize_lore_fts_indices(&self) -> Result<bool> {
         // Guard against running on a table with a large _indices/
         // backlog.  lance/index/append.rs opens every delta fragment
         // for a column before merging any, so peak memory scales
@@ -1796,23 +1787,34 @@ impl SchemaManager {
         // drives semcode-index into swap and gets it OOM-killed.
         // Query correctness is preserved regardless: unindexed rows
         // still fall back to a brute-force scan.
+        //
+        // Count only non-empty entries: pruning old versions deletes a
+        // superseded index's files but leaves its directory behind.
+        // Those empty directories accumulate, five per lore run; they
+        // cost a directory entry each and nothing else.
         const MAX_LORE_INDEX_FRAGMENTS: usize = 100;
         let uri = self.connection.uri();
         let indices_dir = std::path::Path::new(uri)
             .join("lore.lance")
             .join("_indices");
         if let Ok(rd) = std::fs::read_dir(&indices_dir) {
-            let count = rd.count();
+            let count = rd
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    std::fs::read_dir(entry.path())
+                        .map(|mut files| files.next().is_some())
+                        .unwrap_or(true)
+                })
+                .count();
             if count > MAX_LORE_INDEX_FRAGMENTS {
-                tracing::warn!(
-                    "Skipping lore FTS index optimization: \
+                eprintln!(
+                    "Warning: Skipping lore FTS index optimization: \
                      {} _indices/ fragments exceeds {} threshold. \
                      Queries remain correct via brute-force fallback. \
                      Rebuild the lore table on a larger host to recover.",
-                    count,
-                    MAX_LORE_INDEX_FRAGMENTS
+                    count, MAX_LORE_INDEX_FRAGMENTS
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -1828,8 +1830,8 @@ impl SchemaManager {
             .collect();
 
         if fts_index_names.is_empty() {
-            tracing::warn!("Skipping lore FTS optimization: no FTS indices found");
-            return Ok(());
+            eprintln!("Warning: Skipping lore FTS index optimization: no FTS indices found");
+            return Ok(false);
         }
 
         let start_time = std::time::Instant::now();
@@ -1849,7 +1851,7 @@ impl SchemaManager {
             "Lore FTS index optimization completed in {:.1}s",
             elapsed.as_secs_f64()
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Shared helper: create all 5 FTS indices on an already-opened table.
@@ -2050,19 +2052,31 @@ impl SchemaManager {
     /// the database, including code-index tables and content shards
     /// that a lore run never touches.  On memory-constrained systems
     /// the combined working set of those compactions triggers the OOM
-    /// killer.  This method limits work to the two lore tables and
+    /// killer.  This method limits work to the lore tables and
     /// processes them sequentially to keep peak memory low.
-    pub async fn compact_lore_tables(&self) -> Result<()> {
+    ///
+    /// Returns false, after printing the problem, if any table failed.
+    pub async fn compact_lore_tables(&self) -> Result<bool> {
         tracing::info!("Running compaction for lore tables...");
 
         let table_names = self.connection.table_names().execute().await?;
-        let lore_tables = ["lore", "lore_indexed_commits"];
+        let lore_tables = ["lore", "lore_indexed_commits", "lore_vectors"];
 
+        // Print problems to stderr: the tracing warnings carrying the
+        // details are filtered out below SEMCODE_DEBUG=warn, and a prune
+        // that fails silently lets _indices/ grow until lore FTS updates
+        // stop, as they did when lore was never pruned.
+        let mut all_ok = true;
         for name in &lore_tables {
             if !table_names.iter().any(|n| n == name) {
                 continue;
             }
-            match Self::optimize_single_table(&self.connection, name).await {
+            let outcome = if *name == "lore" {
+                Self::prune_lore_table(&self.connection).await
+            } else {
+                Self::optimize_single_table(&self.connection, name).await
+            };
+            match outcome {
                 Ok(OptimizeOutcome::Optimized) => {
                     tracing::info!("Compacted table {}", name);
                 }
@@ -2070,15 +2084,66 @@ impl SchemaManager {
                     tracing::info!("Skipped table {} (too small)", name);
                 }
                 Ok(OptimizeOutcome::PartialFailure) => {
-                    tracing::warn!("Partial failure compacting table {}", name);
+                    eprintln!(
+                        "Warning: Partial failure compacting table {} \
+                         (set SEMCODE_DEBUG=warn for details)",
+                        name
+                    );
+                    all_ok = false;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to compact table {}: {}", name, e);
+                    eprintln!("Warning: Failed to compact table {}: {}", name, e);
+                    all_ok = false;
                 }
             }
         }
 
-        Ok(())
+        Ok(all_ok)
+    }
+
+    /// Delete every version of `table` but the latest, along with the
+    /// data and index files only those versions referenced.  Returns
+    /// false if the prune failed.
+    async fn prune_old_versions(table: &lancedb::table::Table, table_name: &str) -> bool {
+        match table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(lancedb::table::Duration::try_seconds(0).expect("valid duration")),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to prune old versions from table {}: {}",
+                    table_name,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// Prune old versions of the lore table, which optimize_single_table()
+    /// skips entirely.  Every lore run rewrites the FTS indices, and
+    /// unless old versions are pruned the superseded copies stay under
+    /// _indices/ until the count trips the guard in
+    /// optimize_lore_fts_indices() and FTS updates stop for good.  Prune
+    /// reads only each manifest's index metadata, not the index files,
+    /// so it avoids the memory cost of Compact.
+    ///
+    /// Only the lore run calls this, not optimize_database(): with
+    /// delete_unverified set, a prune can delete files that another
+    /// process writing to lore has not committed yet.  That also relies
+    /// on lore runs not overlapping, e.g. as a systemd oneshot unit ensures.
+    async fn prune_lore_table(connection: &Connection) -> Result<OptimizeOutcome> {
+        let table = connection.open_table("lore").execute().await?;
+        Ok(if Self::prune_old_versions(&table, "lore").await {
+            OptimizeOutcome::Optimized
+        } else {
+            OptimizeOutcome::PartialFailure
+        })
     }
 
     /// Optimize a single table - runs compact, prune, and index operations
@@ -2098,11 +2163,12 @@ impl SchemaManager {
         // the operation completes.  On memory-constrained systems the
         // resident set grows into swap and the OOM killer terminates
         // semcode-index before compaction finishes, leaving fresh
-        // delta fragments behind each time.  Skip the table entirely.
+        // delta fragments behind each time.  Skip the table entirely;
+        // compact_lore_tables() prunes its old versions.
         if table_name == "lore" {
             tracing::info!(
                 "Skipping generic optimization for lore table \
-                 (handled by optimize_lore_fts_indices)"
+                 (pruned by compact_lore_tables)"
             );
             return Ok(OptimizeOutcome::Skipped);
         }
@@ -2129,11 +2195,22 @@ impl SchemaManager {
 
         let mut success = true;
 
-        // 1. Compact files
+        // 1. Compact files.  Tables above MAX_COMPACT_FRAGMENTS are left
+        // alone, as a guard against lance compaction spinning on thousands
+        // of small fragments.  lore_indexed_commits is exempt: it holds one
+        // 40-char SHA per row and no index, and a table of that shape
+        // compacts in seconds at 3,660 fragments on lance 4.0.0.  A cold
+        // lore build leaves it with one fragment per inserted batch, over a
+        // thousand for a full archive set, so the guard would keep it
+        // uncompacted.
         const MAX_COMPACT_FRAGMENTS: usize = 500;
+        let fragment_limit_applies = table_name != "lore_indexed_commits";
 
         let should_compact = match table.stats().await {
-            Ok(stats) if stats.fragment_stats.num_fragments > MAX_COMPACT_FRAGMENTS => {
+            Ok(stats)
+                if fragment_limit_applies
+                    && stats.fragment_stats.num_fragments > MAX_COMPACT_FRAGMENTS =>
+            {
                 tracing::warn!(
                     "Skipping compaction for table {} \
                      ({} fragments exceeds {} limit -- \
@@ -2142,6 +2219,9 @@ impl SchemaManager {
                     stats.fragment_stats.num_fragments,
                     MAX_COMPACT_FRAGMENTS
                 );
+                // Not compacting is not success: the fragment count only
+                // grows from here, and callers report the outcome.
+                success = false;
                 false
             }
             Ok(_) => true,
@@ -2165,19 +2245,7 @@ impl SchemaManager {
         }
 
         // 2. Prune ALL old versions
-        if let Err(e) = table
-            .optimize(OptimizeAction::Prune {
-                older_than: Some(lancedb::table::Duration::try_seconds(0).expect("valid duration")),
-                delete_unverified: Some(true),
-                error_if_tagged_old_versions: Some(false),
-            })
-            .await
-        {
-            tracing::warn!(
-                "Failed to prune old versions from table {}: {}",
-                table_name,
-                e
-            );
+        if !Self::prune_old_versions(&table, table_name).await {
             success = false;
         }
 
@@ -2479,5 +2547,83 @@ impl SchemaManager {
 
         tracing::info!("Drop and recreate complete for table {}", table_name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use lancedb::connection::LanceFileVersion;
+    use lancedb::database::listing::ListingDatabaseOptions;
+
+    async fn fresh_schema_manager() -> (tempfile::TempDir, SchemaManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema.lancedb");
+        let options = ListingDatabaseOptions::builder()
+            .data_storage_version(LanceFileVersion::V2_2)
+            .build();
+        let connection = lancedb::connect(db_path.to_str().unwrap())
+            .database_options(&options)
+            .execute()
+            .await
+            .unwrap();
+        (dir, SchemaManager::new(connection))
+    }
+
+    /// A cold lore build appends one lore_indexed_commits fragment per
+    /// batch.  600 two-row fragments put the table above
+    /// MAX_COMPACT_FRAGMENTS and above MIN_ROWS_FOR_OPTIMIZATION, so the
+    /// lore compaction has to compact it rather than skip it.  One write
+    /// capped at two rows per file builds them all in a single commit.
+    #[tokio::test]
+    async fn lore_indexed_commits_compacts_above_the_fragment_limit() {
+        const FRAGMENTS: usize = 600;
+        const ROWS_PER_FRAGMENT: usize = 2;
+
+        let (_dir, schema_manager) = fresh_schema_manager().await;
+        schema_manager
+            .create_lore_indexed_commits_table()
+            .await
+            .unwrap();
+        let table = schema_manager
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await
+            .unwrap();
+        let shas: Vec<String> = (0..FRAGMENTS * ROWS_PER_FRAGMENT)
+            .map(|row| format!("{row:040x}"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            table.schema().await.unwrap(),
+            vec![Arc::new(StringArray::from(shas))],
+        )
+        .unwrap();
+        table
+            .add(vec![batch])
+            .write_options(lancedb::table::WriteOptions {
+                lance_write_params: Some(lance::dataset::WriteParams {
+                    max_rows_per_file: ROWS_PER_FRAGMENT,
+                    max_rows_per_group: ROWS_PER_FRAGMENT,
+                    mode: lance::dataset::WriteMode::Append,
+                    ..Default::default()
+                }),
+            })
+            .execute()
+            .await
+            .unwrap();
+        let before = table.stats().await.unwrap().fragment_stats.num_fragments;
+        assert_eq!(before, FRAGMENTS);
+
+        assert!(schema_manager.compact_lore_tables().await.unwrap());
+
+        table.checkout_latest().await.unwrap();
+        let after = table.stats().await.unwrap().fragment_stats.num_fragments;
+        assert!(after < 10, "{after} fragments left after compaction");
+        assert_eq!(
+            table.count_rows(None).await.unwrap(),
+            FRAGMENTS * ROWS_PER_FRAGMENT
+        );
     }
 }
