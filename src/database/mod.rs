@@ -21,7 +21,7 @@ mod symbol_filename;
 mod types;
 mod vectors;
 
-pub use connection::DatabaseManager;
+pub use connection::{DatabaseManager, LoreIdState};
 
 use anyhow::Result;
 use arrow::array::RecordBatch;

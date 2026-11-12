@@ -1,21 +1,35 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "torch>=2.0.0",
+#   "transformers>=4.30.0",
+#   "model2vec[distill]>=0.1.0",
+#   "sentence-transformers>=2.2.0",
+#   "sentencepiece>=0.1.97",
+#   "einops>=0.8.1",
+# ]
+# ///
 """
 Distill a locally-downloaded Nomic Embed v2 model from Hugging Face into a fast Model2Vec static model (offline).
 Artifacts must be downloaded first using direct_download.py, which populates:
-    ~/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v2-moe/snapshots/latest
+    ~/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v2-moe/snapshots/<commit>
 
 Usage:
   # Use default cache location (after running direct_download.py):
-  python nomic2vec.py
+  scripts/nomic2vec.py
 
   # Or specify custom location:
-  python nomic2vec.py -m /path/to/model/dir
+  scripts/nomic2vec.py -m /path/to/model/dir
 
   # Optional parameters:
-  python nomic2vec.py -o ./embed_v2_m2v -v ./custom_vocab.txt --pca-dims 256 --device cuda
+  scripts/nomic2vec.py -o ./embed_v2_m2v --pca-dims 256 --device cuda
 
 Requires:
-  pip install -U model2vec transformers sentence-transformers
+  uv, which installs the dependencies declared inline above.  Where
+  `env -S` is unavailable, run `uv run --script scripts/nomic2vec.py`.
+  Without uv: pip3 install -r scripts/requirements.txt, then
+  python3 scripts/nomic2vec.py
 """
 
 import os
@@ -151,7 +165,7 @@ def main():
     if not model_dir.exists():
         print(f"✗ Model directory does not exist: {model_dir}")
         print("  Make sure to run direct_download.py first to download the model files.")
-        print("  Example: python direct_download.py")
+        print("  Example: scripts/direct_download.py")
         sys.exit(1)
 
     if not (model_dir / "config.json").exists():
@@ -197,9 +211,8 @@ def main():
     except Exception as e1:
         print(f"Failed to load with trust_remote_code=True: {e1}")
         print("This model requires custom code from nomic-ai/nomic-bert-2048.")
-        print("Make sure you have downloaded both model repositories:")
-        print("1. python scripts/direct_download.py --main-only")
-        print("2. python scripts/direct_download.py --impl-only")
+        print("Make sure you have downloaded both model repositories")
+        print("(scripts/direct_download.py fetches both).")
         print("\nTrying alternative loading strategy...")
 
         try:

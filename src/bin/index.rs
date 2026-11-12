@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use semcode::indexer::{
-    list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline,
+    list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline, KnownLoreIds,
 };
 use semcode::{measure, process_database_path, CodeVectorizer, DatabaseManager};
 // Temporary call relationships are now embedded in function JSON columns
@@ -12,6 +12,16 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
+
+/// Upper bound on tokio worker threads and lore parser threads.  One
+/// thread per CPU (300+ on large hosts) spends more time in futex and
+/// allocator contention than it gains: lore indexing is limited by the
+/// database inserters, not by parsing.  The other modes do their CPU
+/// work on rayon, std threads or spawn_blocking, not tokio workers.
+/// The exception is lance's FTS index build, which tokenizes on tokio
+/// workers, so a full lore FTS (re)build is capped too; set
+/// TOKIO_WORKER_THREADS to lift the cap.
+const MAX_THREADS: usize = 32;
 
 #[derive(Parser, Debug)]
 #[command(name = "semcode-index")]
@@ -682,6 +692,8 @@ struct LoreIndexResult {
 
 /// Index a lore archive repository, filtering out already-indexed commits.
 /// This is the common logic shared by both --lore and --refresh-lore handlers.
+/// Every archive of one run shares `known_ids`.
+#[allow(clippy::too_many_arguments)]
 async fn index_lore_archive(
     lore_repo: gix::Repository,
     archive_path: &Path,
@@ -690,6 +702,7 @@ async fn index_lore_archive(
     batch_size: usize,
     num_workers: usize,
     db_threads: usize,
+    known_ids: &KnownLoreIds,
 ) -> Result<LoreIndexResult> {
     // Get the remote tracking branch to include all fetched commits
     // Try refs/remotes/origin/master first, then refs/remotes/origin/main as fallback
@@ -764,6 +777,7 @@ async fn index_lore_archive(
         batch_size,
         num_workers,
         db_threads,
+        known_ids,
     )
     .await?;
 
@@ -1008,8 +1022,21 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
 
 // ==================== End Branch Indexing Support ====================
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // #[tokio::main] starts one worker per CPU.  Cap it, but let
+    // TOKIO_WORKER_THREADS override as it does for the default runtime.
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        runtime.worker_threads(num_cpus::get().min(MAX_THREADS));
+    }
+    runtime
+        .build()
+        .context("failed to build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Suppress ORT verbose logging
     std::env::set_var("ORT_LOG_LEVEL", "ERROR");
 
@@ -1112,11 +1139,12 @@ async fn main() -> Result<()> {
 
             let start_time = std::time::Instant::now();
             let batch_size = 1024;
-            let num_workers = num_cpus::get();
+            let num_workers = num_cpus::get().min(MAX_THREADS);
 
             let mut total_new_emails = 0usize;
             let mut total_emails_all_archives = 0usize;
             let mut failed_archives: Vec<(String, String)> = Vec::new();
+            let known_ids = KnownLoreIds::new();
 
             // Process each lore archive
             for lore_url in lore_args {
@@ -1153,6 +1181,7 @@ async fn main() -> Result<()> {
                     batch_size,
                     num_workers,
                     args.db_threads,
+                    &known_ids,
                 )
                 .await;
 
@@ -1170,6 +1199,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // One string per stored email: free it before compaction.
+            drop(known_ids);
 
             let total_time = start_time.elapsed();
 
@@ -1202,7 +1233,8 @@ async fn main() -> Result<()> {
                 // combined working set triggers the OOM killer.
                 println!("\nCompacting lore tables...");
                 match db_manager.compact_lore_tables().await {
-                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Ok(true) => println!("Lore table compaction completed successfully"),
+                    Ok(false) => {}
                     Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
@@ -1216,7 +1248,8 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
                 }
                 match db_manager.optimize_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices updated successfully"),
+                    Ok(true) => println!("FTS indices updated successfully"),
+                    Ok(false) => {}
                     Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }
@@ -1290,7 +1323,7 @@ async fn main() -> Result<()> {
 
             let start_time = std::time::Instant::now();
             let batch_size = 1024;
-            let num_workers = num_cpus::get();
+            let num_workers = num_cpus::get().min(MAX_THREADS);
             let db_threads = args.db_threads;
             let total_archives = archives_with_names.len();
 
@@ -1300,6 +1333,7 @@ async fn main() -> Result<()> {
             // causing both to stall indefinitely.
             let mut results: Vec<Result<(String, LoreIndexResult), (String, anyhow::Error)>> =
                 Vec::with_capacity(total_archives);
+            let known_ids = KnownLoreIds::new();
 
             for (archive_path, display_name) in archives_with_names {
                 println!("\n=== Refreshing lore archive: {} ===", display_name);
@@ -1321,6 +1355,7 @@ async fn main() -> Result<()> {
                     batch_size,
                     num_workers,
                     db_threads,
+                    &known_ids,
                 )
                 .await;
 
@@ -1331,6 +1366,8 @@ async fn main() -> Result<()> {
                     Err(e) => results.push(Err((display_name, e))),
                 }
             }
+            // One string per stored email: free it before compaction.
+            drop(known_ids);
 
             // Aggregate results
             let mut total_new_emails = 0usize;
@@ -1376,7 +1413,8 @@ async fn main() -> Result<()> {
             if total_new_emails > 0 {
                 println!("\nCompacting lore tables...");
                 match db_manager.compact_lore_tables().await {
-                    Ok(_) => println!("Lore table compaction completed successfully"),
+                    Ok(true) => println!("Lore table compaction completed successfully"),
+                    Ok(false) => {}
                     Err(e) => error!("Failed to compact lore tables: {}", e),
                 }
 
@@ -1386,7 +1424,8 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("Warning: Failed to ensure FTS indices: {}", e),
                 }
                 match db_manager.optimize_lore_fts_indices().await {
-                    Ok(_) => println!("FTS indices updated successfully"),
+                    Ok(true) => println!("FTS indices updated successfully"),
+                    Ok(false) => {}
                     Err(e) => eprintln!("Warning: Failed to optimize FTS indices: {}", e),
                 }
             }

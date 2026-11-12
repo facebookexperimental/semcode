@@ -66,6 +66,11 @@ chrono = "0.4.44"
 chrono-english = "0.1"  # Natural language date parsing
 base64 = "0.22"         # Base64 decoding for MIME-encoded email bodies
 
+[dev-dependencies]
+# Tests reach lance's WriteParams, which lancedb does not re-export.  Pin
+# the exact version lancedb resolves to, so the two cannot drift apart.
+lance = { version = "=4.0.0", default-features = false }
+
 [[bin]]
 name = "semcode-index"
 path = "src/bin/index.rs"
