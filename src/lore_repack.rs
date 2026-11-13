@@ -78,16 +78,7 @@ pub fn repack_if_needed(repo_path: &Path, threshold: usize) -> Result<Option<Rep
         ids.extend(index.file.iter().map(|entry| entry.oid));
     }
 
-    // The repository's handle wraps the object database in a proxy that
-    // records writes for the in-memory overlay, and only the database
-    // underneath it can serve pack entries.
-    let mut odb = repo.objects.clone().into_inner();
-
-    // Counting records the pack id of each object and the entry writer
-    // resolves those ids afterwards. Both outlive the packs this
-    // function goes on to delete, so the handle has to keep every pack
-    // mapped rather than unloading one that leaves the directory.
-    odb.prevent_pack_unload();
+    let odb = rollup_handle(&repo)?;
 
     let (object_counts, _) = pack::data::output::count::objects(
         odb.clone(),
@@ -156,6 +147,33 @@ pub fn repack_if_needed(repo_path: &Path, threshold: usize) -> Result<Option<Rep
         packs_rolled_up: rollup,
         objects_written,
     }))
+}
+
+/// An object database handle for counting and writing a rollup.
+///
+/// The repository's handle wraps the object database in a proxy that
+/// records writes for the in-memory overlay, and only the database
+/// underneath it can serve pack entries.
+///
+/// Counting records the pack id of each object and the entry writer
+/// resolves those ids afterwards. Both outlive the packs the rollup
+/// goes on to delete, so the handle keeps every pack mapped rather than
+/// unloading one that leaves the directory.
+///
+/// Both steps look objects up from worker threads, each through its
+/// own clone of this handle, and a handle opens pack indices lazily on
+/// a lookup that misses the ones already open. That lazy loading is
+/// racy in gix-odb 0.80: a worker that misses while another has claimed
+/// the last unopened index, but has not yet marked it as being loaded,
+/// rescans the directory, finds nothing new and reports the object as
+/// missing. Every index is opened here, on one thread, so the clones
+/// start with all of them and never load one.
+fn rollup_handle(repo: &gix::Repository) -> Result<gix::odb::Handle> {
+    let mut odb = repo.objects.clone().into_inner();
+    odb.prevent_pack_unload();
+    odb.packed_object_count()
+        .context("opening the pack indices")?;
+    Ok(odb)
 }
 
 /// Count of packs, smallest first, that must be combined for the rest
@@ -427,6 +445,23 @@ mod tests {
                 "{oid} did not survive the rollup"
             );
         }
+    }
+
+    #[test]
+    fn a_rollup_handle_opens_every_index() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let repo_path = tmpdir.path().to_path_buf();
+        packs_per_commit(&repo_path, 8);
+        let packs = count_packs(&repo_path);
+
+        let repo = gix::open(&repo_path).unwrap();
+        let odb = rollup_handle(&repo).unwrap();
+
+        // An index the counting workers would have to open themselves
+        // is one they can race over.
+        let metrics = odb.store_ref().metrics();
+        assert_eq!(metrics.known_reachable_indices, packs);
+        assert_eq!(metrics.open_reachable_indices, packs);
     }
 
     #[test]
