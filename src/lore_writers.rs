@@ -389,18 +389,23 @@ fn convert_to_asctime(rfc2822_date: &str) -> String {
     }
 }
 
-/// Sort emails by date (oldest first) using RFC 2822 date parsing
+/// Sort emails by date, oldest first.
+///
+/// Emails whose Date header parses as RFC 2822 come first, in time order;
+/// the rest follow, ordered by the raw header. Ties break on the raw header,
+/// then on message_id, so the order is a total one and is the same on every
+/// run whatever order the emails arrived in.
 pub fn sort_emails_by_date(emails: &mut [crate::types::LoreEmailInfo]) {
-    emails.sort_by(|a, b| {
-        use chrono::DateTime;
-        let a_parsed = DateTime::parse_from_rfc2822(&a.date);
-        let b_parsed = DateTime::parse_from_rfc2822(&b.date);
-
-        match (a_parsed, b_parsed) {
-            (Ok(a_time), Ok(b_time)) => a_time.cmp(&b_time),
-            // If parsing fails, fall back to string comparison
-            _ => a.date.cmp(&b.date),
-        }
+    emails.sort_by_cached_key(|e| {
+        let ts = chrono::DateTime::parse_from_rfc2822(&e.date)
+            .ok()
+            .map(|d| d.timestamp());
+        (
+            ts.is_none(),
+            ts.unwrap_or(0),
+            e.date.clone(),
+            e.message_id.clone(),
+        )
     });
 }
 
@@ -1098,7 +1103,10 @@ pub async fn dig_lore_by_commit_to_writer(
         let b_date = chrono::DateTime::parse_from_rfc2822(&b.date).ok();
 
         match (b_date, a_date) {
-            (Some(b_dt), Some(a_dt)) => b_dt.cmp(&a_dt), // Descending order (newest first)
+            // Descending order (newest first); same-instant emails by message_id
+            (Some(b_dt), Some(a_dt)) => b_dt
+                .cmp(&a_dt)
+                .then_with(|| a.message_id.cmp(&b.message_id)),
             (Some(_), None) => std::cmp::Ordering::Less, // b is valid, a is not - b comes first
             (None, Some(_)) => std::cmp::Ordering::Greater, // a is valid, b is not - a comes first
             (None, None) => b.date.cmp(&a.date), // Both invalid - fall back to string comparison
@@ -1271,4 +1279,117 @@ pub async fn dig_lore_by_commit_to_writer(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn email(date: &str, message_id: &str) -> LoreEmailInfo {
+        LoreEmailInfo {
+            git_commit_sha: String::new(),
+            from: String::new(),
+            date: date.to_string(),
+            date_timestamp: 0,
+            message_id: message_id.to_string(),
+            in_reply_to: None,
+            subject: String::new(),
+            references: None,
+            recipients: String::new(),
+            body: String::new(),
+            symbols: Vec::new(),
+        }
+    }
+
+    fn ids(emails: &[LoreEmailInfo]) -> Vec<&str> {
+        emails.iter().map(|e| e.message_id.as_str()).collect()
+    }
+
+    /// C is older than A, and B's date does not parse, so the order is C, A, B
+    /// from every starting order, although the raw strings sort A, B, C.
+    #[test]
+    fn sort_emails_by_date_handles_the_intransitive_triple() {
+        let a = email("Tue, 01 Jan 2030 00:00:00 +0000", "a");
+        let b = email("U-not-a-date", "b");
+        let c = email("Wed, 01 Jan 2020 00:00:00 +0000", "c");
+        let orders = [
+            [&a, &b, &c],
+            [&a, &c, &b],
+            [&b, &a, &c],
+            [&b, &c, &a],
+            [&c, &a, &b],
+            [&c, &b, &a],
+        ];
+        for order in orders {
+            let mut emails: Vec<LoreEmailInfo> = order.iter().map(|e| (*e).clone()).collect();
+            sort_emails_by_date(&mut emails);
+            let input: Vec<&str> = order.iter().map(|e| e.message_id.as_str()).collect();
+            assert_eq!(ids(&emails), ["c", "a", "b"], "input order {input:?}");
+        }
+    }
+
+    /// The emails in a fixed pseudo-random order: `i -> (mul * i + add) % n`
+    /// is a permutation of `0..n` whenever `mul` and `n` are coprime.
+    fn permuted(emails: &[LoreEmailInfo], mul: usize, add: usize) -> Vec<LoreEmailInfo> {
+        let n = emails.len();
+        (0..n)
+            .map(|i| emails[(mul * i + add) % n].clone())
+            .collect()
+    }
+
+    #[test]
+    fn sort_emails_by_date_mixed_large_input() {
+        const N: usize = 2000;
+        const BASE: i64 = 1_700_000_000;
+        // Every third email has an unparseable date. The rest share 50
+        // timestamps and the unparseable ones 17 raw strings, so most keys
+        // tie on the date and only message_id separates them.
+        let mut timestamp_of: HashMap<String, Option<i64>> = HashMap::new();
+        let mut emails = Vec::with_capacity(N);
+        for k in 0..N {
+            let message_id = format!("<{k:05}@example.org>");
+            let (date, ts) = if k % 3 == 0 {
+                (format!("not-a-date-{:02}", k % 17), None)
+            } else {
+                let ts = BASE + (k as i64 % 50) * 3600;
+                let date = chrono::DateTime::from_timestamp(ts, 0)
+                    .unwrap()
+                    .to_rfc2822();
+                (date, Some(ts))
+            };
+            timestamp_of.insert(message_id.clone(), ts);
+            emails.push(email(&date, &message_id));
+        }
+
+        let mut sorted = permuted(&emails, 1237, 411);
+        sort_emails_by_date(&mut sorted);
+
+        assert_eq!(sorted.len(), N);
+        let unique: HashSet<&str> = ids(&sorted).into_iter().collect();
+        assert_eq!(unique.len(), N, "sorting lost or duplicated emails");
+
+        let parseable = N - N.div_ceil(3);
+        for (i, pair) in sorted.windows(2).enumerate() {
+            let (x, y) = (&pair[0], &pair[1]);
+            let (tx, ty) = (timestamp_of[&x.message_id], timestamp_of[&y.message_id]);
+            assert_eq!(tx.is_some(), i < parseable, "position {i}");
+            let in_order = match (tx, ty) {
+                (Some(tx), Some(ty)) => (tx, &x.message_id) < (ty, &y.message_id),
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => (&x.date, &x.message_id) < (&y.date, &y.message_id),
+            };
+            assert!(
+                in_order,
+                "position {i}: {} ({}) before {} ({})",
+                x.message_id, x.date, y.message_id, y.date
+            );
+        }
+
+        // A different input order gives the same output.
+        let mut again = permuted(&emails, 7, 1999);
+        sort_emails_by_date(&mut again);
+        assert_eq!(ids(&again), ids(&sorted));
+    }
 }
