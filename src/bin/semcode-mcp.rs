@@ -6104,6 +6104,11 @@ async fn index_current_commit_background(
                 let mut state = indexing_state.lock().await;
                 state.git_sha = Some(sha.clone());
                 state.started_at = Some(std::time::SystemTime::now());
+                state.status = IndexingStatus::InProgress {
+                    phase: "Checking index".to_string(),
+                    current: 0,
+                    total: None,
+                };
             }
             sha
         }
@@ -6159,6 +6164,9 @@ async fn index_current_commit_background(
                                         changed_file.path,
                                         &new_hash[..8]
                                     );
+                                    let mut state = indexing_state.lock().await;
+                                    state.status = IndexingStatus::Completed { files_processed: 0 };
+                                    state.completed_at = Some(std::time::SystemTime::now());
                                     return;
                                 } else {
                                     eprintln!(
@@ -6170,10 +6178,9 @@ async fn index_current_commit_background(
                             }
                             Err(e) => {
                                 eprintln!(
-                                    "[Background] Warning: Failed to get processed files: {}",
+                                    "[Background] Warning: Failed to get processed files: {}; continuing with indexing",
                                     e
                                 );
-                                return;
                             }
                         }
                     }
@@ -7277,5 +7284,123 @@ mod tests {
         let instructions = init["instructions"].as_str().unwrap();
         assert!(instructions.contains("# semcode usage guide"));
         assert!(instructions.contains("## Recipes"));
+    }
+
+    fn git_run(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            // Do not inherit developer's git configuration.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Semcode Test")
+            .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+            .env("GIT_COMMITTER_NAME", "Semcode Test")
+            .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A repository whose HEAD modifies `a.c`, so background indexing has a
+    /// changed C file to check against the index, and an empty database.
+    struct BackgroundFixture {
+        _repo_dir: tempfile::TempDir,
+        db_dir: tempfile::TempDir,
+        repo: String,
+        db: Arc<DatabaseManager>,
+    }
+
+    impl BackgroundFixture {
+        async fn new() -> Self {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let repo = repo_dir.path();
+            git_run(repo, &["init", "-q"]);
+            std::fs::write(repo.join("a.c"), "int a(void)\n{\n\treturn 1;\n}\n").unwrap();
+            git_run(repo, &["add", "a.c"]);
+            git_run(repo, &["commit", "-q", "-m", "first"]);
+            std::fs::write(repo.join("a.c"), "int a(void)\n{\n\treturn 2;\n}\n").unwrap();
+            git_run(repo, &["commit", "-q", "-am", "second"]);
+
+            let repo = repo.to_str().unwrap().to_string();
+            let db_dir = tempfile::tempdir().unwrap();
+            let db = Arc::new(
+                DatabaseManager::new(db_dir.path().to_str().unwrap(), repo.clone())
+                    .await
+                    .unwrap(),
+            );
+            db.create_tables().await.unwrap();
+            Self {
+                _repo_dir: repo_dir,
+                db_dir,
+                repo,
+                db,
+            }
+        }
+
+        /// Run background indexing to the end with a fresh state.
+        async fn run(&self) -> Arc<tokio::sync::Mutex<IndexingState>> {
+            let state = Arc::new(tokio::sync::Mutex::new(IndexingState::new()));
+            index_current_commit_background(
+                self.db.clone(),
+                self.repo.clone(),
+                state.clone(),
+                Arc::new(tokio::sync::Mutex::new(None)),
+            )
+            .await;
+            state
+        }
+    }
+
+    // When HEAD is already indexed, background indexing takes the fast path
+    // and returns early. The status must still reach a terminal state rather
+    // than staying at "Not started" forever.
+    #[tokio::test]
+    async fn test_background_indexing_already_indexed_reports_completed() {
+        let fixture = BackgroundFixture::new().await;
+
+        // First run indexes HEAD through the full path.
+        let first = fixture.run().await;
+        assert!(
+            matches!(first.lock().await.status, IndexingStatus::Completed { .. }),
+            "first run should complete indexing"
+        );
+
+        // Second run finds the changed file already indexed and returns early.
+        let second = fixture.run().await;
+        let state = second.lock().await;
+        assert!(
+            matches!(state.status, IndexingStatus::Completed { .. }),
+            "already-indexed fast path left status at {:?}",
+            state.status
+        );
+        assert!(state.completed_at.is_some());
+    }
+
+    // When the processed-files lookup fails, background indexing must still
+    // end in a terminal state (Completed or Failed), not "Not started".
+    #[tokio::test]
+    async fn test_background_indexing_lookup_failure_reaches_terminal_state() {
+        let fixture = BackgroundFixture::new().await;
+
+        // Drop the table the already-indexed check reads, so the lookup errors.
+        let conn = lancedb::connect(fixture.db_dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        conn.drop_table("processed_files", &[]).await.unwrap();
+        assert!(fixture.db.get_processed_file_pairs().await.is_err());
+
+        let state = fixture.run().await;
+        let state = state.lock().await;
+        assert!(
+            matches!(
+                state.status,
+                IndexingStatus::Completed { .. } | IndexingStatus::Failed { .. }
+            ),
+            "lookup failure left status at {:?}",
+            state.status
+        );
+        assert!(state.completed_at.is_some());
     }
 }
