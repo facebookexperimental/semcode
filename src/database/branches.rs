@@ -8,6 +8,7 @@
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatchIterator;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -79,9 +80,6 @@ impl IndexedBranchStore {
 
     /// Record that a branch has been indexed at a specific commit
     pub async fn record_branch_indexed(&self, info: &IndexedBranchInfo) -> Result<()> {
-        // First, remove any existing record for this branch
-        self.remove_branch(&info.branch_name).await?;
-
         let table = self
             .connection
             .open_table("indexed_branches")
@@ -102,23 +100,27 @@ impl IndexedBranchStore {
             None => remote_builder.append_null(),
         }
 
-        let batch = RecordBatch::try_from_iter(vec![
-            (
-                "branch_name",
+        // Use the table schema so the batch has the same non-null columns.
+        let schema = Self::get_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
                 Arc::new(branch_name_builder.finish()) as ArrayRef,
-            ),
-            (
-                "tip_commit",
                 Arc::new(tip_commit_builder.finish()) as ArrayRef,
-            ),
-            (
-                "indexed_at",
                 Arc::new(indexed_at_builder.finish()) as ArrayRef,
-            ),
-            ("remote", Arc::new(remote_builder.finish()) as ArrayRef),
-        ])?;
+                Arc::new(remote_builder.finish()) as ArrayRef,
+            ],
+        )?;
 
-        table.add(vec![batch]).execute().await?;
+        // Update the existing record, or insert one if there is none, in a
+        // single commit. Readers never see the branch missing during this
+        // write, and if the write fails the old record stays.
+        let mut merge = table.merge_insert(&["branch_name"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        merge.execute(Box::new(reader)).await?;
 
         Ok(())
     }
@@ -195,7 +197,7 @@ impl IndexedBranchStore {
         }
     }
 
-    /// Remove a branch record (used when branch is deleted or before updating)
+    /// Remove a branch record (used when branch is deleted)
     pub async fn remove_branch(&self, branch_name: &str) -> Result<()> {
         let table = self
             .connection
@@ -394,6 +396,13 @@ mod tests {
             remote: None,
         };
         store.record_branch_indexed(&info1).await.unwrap();
+        let table = store
+            .connection
+            .open_table("indexed_branches")
+            .execute()
+            .await
+            .unwrap();
+        let previous_version = table.version().await.unwrap();
 
         // Update with new commit
         let info2 = IndexedBranchInfo {
@@ -411,6 +420,18 @@ mod tests {
 
         // Count should be 1
         assert_eq!(store.count().await.unwrap(), 1);
+
+        // Every table version written during the update must still contain
+        // the branch.
+        table.checkout_latest().await.unwrap();
+        for version in previous_version..=table.version().await.unwrap() {
+            table.checkout(version).await.unwrap();
+            assert_eq!(
+                table.count_rows(None).await.unwrap(),
+                1,
+                "branch disappeared in table version {version}"
+            );
+        }
     }
 
     #[tokio::test]
