@@ -925,13 +925,8 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
             let repo = gix::discover(&args.source)
                 .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
 
-            let commit_shas = match list_shas_in_range(&repo, &range) {
-                Ok(shas) => shas,
-                Err(e) => {
-                    warn!("Failed to get commits for {}: {}", range, e);
-                    vec![]
-                }
-            };
+            let commit_shas = list_shas_in_range(&repo, &range)
+                .with_context(|| format!("Failed to get commits for {range}"))?;
 
             if commit_shas.is_empty() {
                 println!("  {} No new commits to index", "✓".green());
