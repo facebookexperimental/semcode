@@ -7,6 +7,18 @@ use gix::bstr::ByteSlice;
 /// Helper function to resolve a revspec (SHA, tag, etc.) to a commit object
 /// Ensures that tags are properly dereferenced to their target commits
 pub fn resolve_to_commit<'a>(repo: &'a gix::Repository, revspec: &str) -> Result<gix::Commit<'a>> {
+    // A full object id names its object directly. `rev_parse_single` would
+    // treat it as a prefix to disambiguate, and a prefix lookup ends in an
+    // object-store refresh that takes the store-wide write lock and rescans
+    // the pack directory, once per call, whether or not the id was found.
+    if let Ok(id) = gix::ObjectId::from_hex(revspec.as_bytes()) {
+        if let Ok(object) = repo.find_object(id) {
+            return object
+                .peel_to_commit()
+                .map_err(|_| anyhow::anyhow!("'{}' does not resolve to a commit", revspec));
+        }
+    }
+
     // Add ^{commit} to dereference tags to commits, but insert it before ancestry operators
     // For example: v6.16~8 becomes v6.16^{commit}~8
     let commit_spec = if revspec.contains("^{") {
@@ -219,6 +231,57 @@ pub fn get_git_file_hash_with_fallback<P: AsRef<Path>>(file_path: P) -> Result<S
     }
 }
 
+/// Run `git` for a test in `dir` and return its trimmed stdout, panicking
+/// with its stderr if it fails. The command sees neither the developer's git
+/// configuration nor a `GIT_DIR` or work tree inherited from a hook or
+/// `git rebase --exec`, so it can only touch the repository in `dir`.
+#[cfg(test)]
+pub(crate) fn test_git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
+        .output()
+        .expect("git command failed to execute");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A test repository whose objects all sit in one pack: a root commit with
+/// `a.c` and `b.c`, a second commit that changes `a.c`, and an annotated tag
+/// `v1` on the second. Returns the commits oldest first.
+#[cfg(test)]
+pub(crate) fn packed_test_repo() -> (tempfile::TempDir, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    test_git(p, &["init", "-q"]);
+    std::fs::write(p.join("a.c"), "int a(void) { return 1; }\n").unwrap();
+    std::fs::write(p.join("b.c"), "int b(void) { return a(); }\n").unwrap();
+    test_git(p, &["add", "a.c", "b.c"]);
+    test_git(p, &["commit", "-q", "-m", "one"]);
+    let first = test_git(p, &["rev-parse", "HEAD"]);
+    std::fs::write(p.join("a.c"), "int a(void) { return 2; }\n").unwrap();
+    test_git(p, &["commit", "-q", "-a", "-m", "two"]);
+    let second = test_git(p, &["rev-parse", "HEAD"]);
+    test_git(p, &["tag", "-a", "-m", "v1", "v1"]);
+    // One pack and no loose objects, so every read goes through the pack.
+    test_git(p, &["repack", "-a", "-d", "-q"]);
+    (dir, vec![first, second])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +475,57 @@ mod tests {
             assert_eq!(base.len(), 40);
             assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
         }
+    }
+
+    /// A full object id resolves through the object itself: a commit to
+    /// itself, an annotated tag to its commit, and anything that does not
+    /// peel to a commit to the usual error. Short ids and names still go
+    /// through rev-parse.
+    #[test]
+    fn resolve_to_commit_takes_full_ids_directly() {
+        let (dir, commits) = packed_test_repo();
+        let repo = gix::discover(dir.path()).unwrap();
+        let tag = test_git(dir.path(), &["rev-parse", "v1"]);
+        let tree = test_git(dir.path(), &["rev-parse", "HEAD^{tree}"]);
+        assert_ne!(tag, commits[1]);
+
+        let id = |spec: &str| resolve_to_commit(&repo, spec).unwrap().id.to_string();
+        assert_eq!(id(&commits[0]), commits[0]);
+        assert_eq!(id(&tag), commits[1]);
+        assert_eq!(id("v1"), commits[1]);
+        assert_eq!(id(&commits[1][..12]), commits[1]);
+        assert_eq!(id(&format!("{}~1", commits[1])), commits[0]);
+
+        let err = resolve_to_commit(&repo, &tree).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("'{tree}' does not resolve to a commit")
+        );
+        assert!(resolve_to_commit(&repo, &"0".repeat(40)).is_err());
+    }
+
+    /// Resolving a full id that exists leaves the object store alone. A
+    /// prefix lookup refreshes the store on every call, and every thread
+    /// sharing that store queues on the refresh's lock.
+    #[test]
+    fn resolve_to_commit_full_id_does_not_refresh_the_store() {
+        let (dir, commits) = packed_test_repo();
+        let repo = gix::discover(dir.path()).unwrap();
+        let refreshes = || repo.objects.store_ref().metrics().num_refreshes;
+        resolve_to_commit(&repo, &commits[0]).unwrap();
+
+        let before = refreshes();
+        for commit in &commits {
+            resolve_to_commit(&repo, commit).unwrap();
+        }
+        assert_eq!(refreshes(), before);
+
+        // The same commits by short id do refresh, so the count above
+        // would have moved had the full ids taken that path.
+        for commit in &commits {
+            resolve_to_commit(&repo, &commit[..12]).unwrap();
+        }
+        assert!(refreshes() > before);
     }
 }
 
