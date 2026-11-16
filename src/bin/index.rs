@@ -146,12 +146,16 @@ struct Args {
 }
 
 /// Fetch and parse the lore.kernel.org manifest
-fn fetch_lore_manifest() -> Result<serde_json::Value> {
+async fn fetch_lore_manifest() -> Result<serde_json::Value> {
+    fetch_lore_manifest_from_url("https://lore.kernel.org/manifest.js.gz").await
+}
+
+async fn fetch_lore_manifest_from_url(url: &str) -> Result<serde_json::Value> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
     info!("Fetching lore.kernel.org manifest...");
-    let response = reqwest::blocking::get("https://lore.kernel.org/manifest.js.gz")?;
+    let response = reqwest::get(url).await?;
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -160,7 +164,7 @@ fn fetch_lore_manifest() -> Result<serde_json::Value> {
         ));
     }
 
-    let bytes = response.bytes()?;
+    let bytes = response.bytes().await?;
     let mut decoder = GzDecoder::new(&bytes[..]);
     let mut json_str = String::new();
     decoder.read_to_string(&mut json_str)?;
@@ -277,7 +281,7 @@ async fn clone_lore_repository(lore_url: &str, db_path: &str) -> Result<PathBuf>
             lore_url
         );
         println!("Fetching manifest from lore.kernel.org...");
-        let manifest = fetch_lore_manifest()?;
+        let manifest = fetch_lore_manifest().await?;
         let resolved_url = resolve_lore_url(lore_url, &manifest)?;
         println!("Resolved '{}' to: {}", lore_url, resolved_url);
         info!("Resolved to URL: {}", resolved_url);
@@ -1432,7 +1436,7 @@ async fn async_main() -> Result<()> {
 
             // Check for new archives available on lore.kernel.org
             println!("\nChecking for new lore archives...");
-            match fetch_lore_manifest() {
+            match fetch_lore_manifest().await {
                 Ok(manifest) => {
                     let new_archives =
                         find_new_lore_archives(&archive_paths, &lore_base, &manifest);
@@ -1900,4 +1904,70 @@ async fn run_pipeline(args: Args) -> Result<()> {
         println!("\n🎉 Indexing completed successfully!");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::get, Router};
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    async fn serve_manifest(
+        status: StatusCode,
+        body: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/manifest.js.gz", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/manifest.js.gz",
+            get(move || {
+                let body = body.clone();
+                async move { (status, body) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn fetches_gzipped_manifest_on_tokio_runtime() {
+        let manifest = serde_json::json!({
+            "/bpf/git/0.git": { "description": "BPF mailing list" }
+        });
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        let (url, server) = serve_manifest(StatusCode::OK, encoder.finish().unwrap()).await;
+
+        // The server and client share a current-thread runtime: the HTTP
+        // fetch must yield so the server can answer. A blocking reqwest
+        // client also panics when called from within this runtime.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_lore_manifest_from_url(&url),
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(result.unwrap().unwrap(), manifest);
+    }
+
+    #[tokio::test]
+    async fn manifest_fetch_rejects_http_error() {
+        let (url, server) =
+            serve_manifest(StatusCode::SERVICE_UNAVAILABLE, b"unavailable".to_vec()).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_lore_manifest_from_url(&url),
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(
+            result.unwrap().unwrap_err().to_string(),
+            "Failed to fetch manifest: HTTP 503 Service Unavailable"
+        );
+    }
 }
