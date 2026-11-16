@@ -12681,10 +12681,50 @@ mod preproc_error_recovery_tests {
         }
     }
 
+    /// The process-wide subscriber `log_of` installs. It records nothing and
+    /// answers "ask per event" for every log line. tracing-core decides for
+    /// every thread whether a log line is wanted when a thread first reaches
+    /// it, and again whenever a subscriber is created; while a single scoped
+    /// subscriber is alive, a first reach asks only the reaching thread's own.
+    /// A test with no subscriber that first reaches a line while a `log_of`
+    /// runs beside it would switch the line off for that `log_of`.
+    /// With this as the global default, that first reach answers "ask per
+    /// event", which defers each event to the emitting thread's subscriber.
+    /// The INFO hint keeps debug and trace lines statically off.
+    struct AskEveryTime;
+
+    impl tracing::Subscriber for AskEveryTime {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::INFO)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     /// What the analyzer logs while reading one file. The subscriber is
     /// thread-local, so tests running beside each other do not read each
     /// other's lines.
     fn log_of(source: &str) -> String {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            tracing::subscriber::set_global_default(AskEveryTime)
+                .expect("log_of needs AskEveryTime as the global default");
+        });
         let recorded = Recorded::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(recorded.clone())
