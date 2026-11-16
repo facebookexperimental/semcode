@@ -7278,6 +7278,7 @@ impl DatabaseManager {
         from_patterns: Option<&[String]>,
         subject_patterns: Option<&[String]>,
         body_patterns: Option<&[String]>,
+        symbols_patterns: Option<&[String]>,
         recipients_patterns: Option<&[String]>,
         search_limit: usize,
         since_date: Option<&str>,
@@ -7498,6 +7499,26 @@ impl DatabaseManager {
             }
         }
 
+        // Query symbols field (OR across patterns)
+        if let Some(patterns) = symbols_patterns {
+            if !patterns.is_empty() {
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "symbols".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        &date_filter,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore symbols field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
+            }
+        }
+
         // Query recipients field (OR across patterns)
         if let Some(patterns) = recipients_patterns {
             if !patterns.is_empty() {
@@ -7581,6 +7602,7 @@ impl DatabaseManager {
         let from_patterns = field_map.get("from").map(|v| v.as_slice());
         let subject_patterns = field_map.get("subject").map(|v| v.as_slice());
         let body_patterns = field_map.get("body").map(|v| v.as_slice());
+        let symbols_patterns = field_map.get("symbols").map(|v| v.as_slice());
         let recipients_patterns = field_map.get("recipients").map(|v| v.as_slice());
 
         // Use helper to get intersection of message_ids.  The date
@@ -7592,6 +7614,7 @@ impl DatabaseManager {
                 from_patterns,
                 subject_patterns,
                 body_patterns,
+                symbols_patterns,
                 recipients_patterns,
                 0, // No limit for individual queries
                 since_date,
