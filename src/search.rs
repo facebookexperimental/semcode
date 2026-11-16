@@ -957,7 +957,7 @@ pub async fn lore_show_thread(
     message_id: &str,
     verbose: usize,
 ) -> Result<()> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::HashSet;
 
     println!("Finding thread root for message: {}", message_id.cyan());
 
@@ -1005,32 +1005,7 @@ pub async fn lore_show_thread(
     println!("Found thread root: {}", root_message_id.bright_black());
 
     // Step 2: Now walk down from root to collect all messages in thread
-    let mut all_emails = Vec::new();
-    let mut seen_message_ids = HashSet::new();
-    let mut to_process = VecDeque::new();
-
-    // Add root email to seen set and processing queue
-    seen_message_ids.insert(current_email.message_id.clone());
-    to_process.push_back(current_email.message_id.clone());
-    all_emails.push(current_email);
-
-    // Recursively find all messages that reply to messages in this thread
-    while let Some(current_message_id) = to_process.pop_front() {
-        // Find all emails that reference this message
-        let referencing_emails = db.get_lore_emails_referencing(&current_message_id).await?;
-
-        for email in referencing_emails {
-            // Add to seen set immediately to avoid duplicate processing
-            if !seen_message_ids.insert(email.message_id.clone()) {
-                // Already seen this message, skip it
-                continue;
-            }
-
-            // Add to processing queue and results
-            to_process.push_back(email.message_id.clone());
-            all_emails.push(email);
-        }
-    }
+    let all_emails = crate::lore_writers::collect_thread_descendants(db, current_email).await?;
 
     // Sort emails in thread order (respecting reply structure, then by date)
     // This uses a topological sort based on in_reply_to relationships
@@ -1089,8 +1064,6 @@ pub async fn lore_show_replies(
     message_id: &str,
     verbose: usize,
 ) -> Result<()> {
-    use std::collections::{HashSet, VecDeque};
-
     println!("Finding all replies to message: {}", message_id.cyan());
 
     // Get the starting message
@@ -1107,32 +1080,7 @@ pub async fn lore_show_replies(
     };
 
     // Collect all descendants (messages that reply to this message or its descendants)
-    let mut all_emails = Vec::new();
-    let mut seen_message_ids = HashSet::new();
-    let mut to_process = VecDeque::new();
-
-    // Start with the root message
-    seen_message_ids.insert(root_email.message_id.clone());
-    to_process.push_back(root_email.message_id.clone());
-    all_emails.push(root_email);
-
-    // Recursively find all messages that reply to messages in this subthread
-    while let Some(current_message_id) = to_process.pop_front() {
-        // Find all emails that reference this message
-        let referencing_emails = db.get_lore_emails_referencing(&current_message_id).await?;
-
-        for email in referencing_emails {
-            // Add to seen set immediately to avoid duplicate processing
-            if !seen_message_ids.insert(email.message_id.clone()) {
-                // Already seen this message, skip it
-                continue;
-            }
-
-            // Add to processing queue and results
-            to_process.push_back(email.message_id.clone());
-            all_emails.push(email);
-        }
-    }
+    let all_emails = crate::lore_writers::collect_thread_descendants(db, root_email).await?;
 
     if all_emails.len() == 1 {
         // Only the root message, no replies

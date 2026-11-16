@@ -3,13 +3,14 @@
 //! These are shared between the CLI (with file output) and MCP (with string buffers)
 
 use anyhow::Result;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::Write;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
 use crate::search::LoreSearchOptions;
+use crate::text_utils::header_names_message_id;
 use crate::types::LoreEmailInfo;
 use crate::DatabaseManager;
 
@@ -463,32 +464,7 @@ pub async fn lore_show_thread_to_writer(
     }
 
     // Step 2: Now walk down from root to collect all messages in thread
-    let mut all_emails = Vec::new();
-    let mut seen_message_ids = HashSet::new();
-    let mut to_process = VecDeque::new();
-
-    // Add root email to seen set and processing queue
-    seen_message_ids.insert(current_email.message_id.clone());
-    to_process.push_back(current_email.message_id.clone());
-    all_emails.push(current_email);
-
-    // Recursively find all messages that reply to messages in this thread
-    while let Some(current_message_id) = to_process.pop_front() {
-        // Find all emails that reference this message
-        let referencing_emails = db.get_lore_emails_referencing(&current_message_id).await?;
-
-        for email in referencing_emails {
-            // Add to seen set immediately to avoid duplicate processing
-            if !seen_message_ids.insert(email.message_id.clone()) {
-                // Already seen this message, skip it
-                continue;
-            }
-
-            // Add to processing queue and results
-            to_process.push_back(email.message_id.clone());
-            all_emails.push(email);
-        }
-    }
+    let all_emails = collect_thread_descendants(db, current_email).await?;
 
     // Sort emails in thread order (respecting reply structure, then by date)
     let sorted_emails = crate::search::sort_emails_by_thread_order(&all_emails);
@@ -544,9 +520,6 @@ pub async fn lore_show_replies_to_writer(
     options: &LoreSearchOptions<'_>,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    #[allow(unused)] // verbose is used in conditional compilation
-    use std::collections::{HashSet, VecDeque};
-
     if !options.mbox_output {
         writeln!(writer, "Finding all replies to message: {}", message_id)?;
     }
@@ -567,33 +540,8 @@ pub async fn lore_show_replies_to_writer(
     };
 
     // Collect all descendants (messages that reply to this message or its descendants)
-    let mut all_emails = Vec::new();
-    let mut seen_message_ids = HashSet::new();
-    let mut to_process = VecDeque::new();
-
-    // Start with the root message
     let root_message_id = root_email.message_id.clone();
-    seen_message_ids.insert(root_email.message_id.clone());
-    to_process.push_back(root_email.message_id.clone());
-    all_emails.push(root_email);
-
-    // Recursively find all messages that reply to messages in this subthread
-    while let Some(current_message_id) = to_process.pop_front() {
-        // Find all emails that reference this message
-        let referencing_emails = db.get_lore_emails_referencing(&current_message_id).await?;
-
-        for email in referencing_emails {
-            // Add to seen set immediately to avoid duplicate processing
-            if !seen_message_ids.insert(email.message_id.clone()) {
-                // Already seen this message, skip it
-                continue;
-            }
-
-            // Add to processing queue and results
-            to_process.push_back(email.message_id.clone());
-            all_emails.push(email);
-        }
-    }
+    let all_emails = collect_thread_descendants(db, root_email).await?;
 
     if all_emails.len() == 1 {
         // Only the root message, no replies
@@ -673,6 +621,81 @@ pub async fn lore_show_replies_to_writer(
     }
 
     Ok(())
+}
+
+/// `root` and every email below it in its thread, `root` first.
+///
+/// Replies to replies count, however deep; ancestors of `root` do not. The
+/// walk asks for a whole level at once, through
+/// [`DatabaseManager::get_lore_emails_referencing_any`]: each lookup scans
+/// the `references` column of the whole lore table, and a level shares that
+/// scan instead of paying it once per email. Each id still costs a
+/// containment pass, so the walk's cost grows with the size of the thread.
+pub async fn collect_thread_descendants(
+    db: &DatabaseManager,
+    root: LoreEmailInfo,
+) -> Result<Vec<LoreEmailInfo>> {
+    collect_thread_descendants_with(root, async |ids: &[String]| {
+        db.get_lore_emails_referencing_any(ids).await
+    })
+    .await
+}
+
+/// [`collect_thread_descendants`] with the reply lookup supplied by the
+/// caller (tests count lookups through it): `replies_to_any` returns the
+/// emails that reply to any of the ids it is given, and is called once per
+/// thread level.
+///
+/// Within a level, emails are ordered by the message they answer, in the
+/// order those messages were found, those naming it in In-Reply-To before
+/// those naming it only in References. An email that answers several
+/// messages of the level is placed under the first. Each email appears once,
+/// by `message_id`.
+#[doc(hidden)]
+pub async fn collect_thread_descendants_with<F>(
+    root: LoreEmailInfo,
+    mut replies_to_any: F,
+) -> Result<Vec<LoreEmailInfo>>
+where
+    F: AsyncFnMut(&[String]) -> Result<Vec<LoreEmailInfo>>,
+{
+    let mut seen_message_ids = HashSet::new();
+    seen_message_ids.insert(root.message_id.clone());
+    let mut frontier = vec![root.message_id.trim().to_string()];
+    let mut all_emails = vec![root];
+
+    while !frontier.is_empty() {
+        let mut found: Vec<Option<LoreEmailInfo>> = replies_to_any(&frontier)
+            .await?
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut next_frontier = Vec::new();
+
+        let headers: [fn(&LoreEmailInfo) -> Option<&str>; 2] = [
+            |email| email.in_reply_to.as_deref(),
+            |email| email.references.as_deref(),
+        ];
+        for parent in &frontier {
+            for header in headers {
+                for slot in found.iter_mut() {
+                    let Some(email) = slot.take_if(|email| {
+                        header(email).is_some_and(|h| header_names_message_id(h, parent))
+                    }) else {
+                        continue;
+                    };
+                    if seen_message_ids.insert(email.message_id.clone()) {
+                        next_frontier.push(email.message_id.trim().to_string());
+                        all_emails.push(email);
+                    }
+                }
+            }
+        }
+
+        frontier = next_frontier;
+    }
+
+    Ok(all_emails)
 }
 
 /// Get email by message_id (writer version)
