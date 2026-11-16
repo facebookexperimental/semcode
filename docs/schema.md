@@ -509,8 +509,9 @@ naming the mechanism and a place to look lets it continue.
 name                (Utf8, NOT NULL)     - The end of the edge that is known
 direction           (Utf8, NOT NULL)     - in or out, from that end
 kind                (Utf8, NOT NULL)     - Mechanism, namespaced by language:
-                                           c:macro_parameter_call, and others as
-                                           they are recorded
+                                           c:macro_parameter_call,
+                                           rust:unrecognized_call_shape, and
+                                           others as they are recorded
 evidence            (Utf8, NOT NULL)     - What the source writes where the name
                                            would be: a macro parameter, a pasted
                                            fragment, an attribute string
@@ -531,8 +532,9 @@ line                (Int64, NOT NULL)    - Line of the first location
 - `kind` is an open string rather than an enum. The row shape holds across
   languages; the vocabulary does not, and a set common to C macros, Rust trait
   objects and Python attribute lookup would describe none of them
-- A row keyed by `(file_path, git_file_hash, line, name, direction)`, so
-  re-indexing unchanged content rewrites it rather than adding a second
+- A row keyed by `(file_path, git_file_hash, line, name, direction, kind)`,
+  so re-indexing unchanged content rewrites it rather than adding a second.
+  The store keeps one row per kind at a place in a file.
 
 **Indices:**
 - BTree on `name` and `kind`

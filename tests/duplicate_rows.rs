@@ -156,3 +156,37 @@ async fn two_same_named_types_under_different_owners_both_insert() {
         .collect::<Vec<_>>();
     assert_eq!(found.len(), 2, "{found:#?}");
 }
+
+#[tokio::test]
+async fn two_mechanisms_failing_at_one_place_are_two_rows() {
+    // Both rows insert at one place: the two kinds read as two rows
+    // (one batch holds both, so dedup by place alone would keep one).
+    let (_dir, db) = database().await;
+
+    let edge = |kind: &str| semcode::UnresolvedEdge {
+        name: "run".into(),
+        direction: "out".into(),
+        kind: kind.into(),
+        evidence: "(f)()".into(),
+        locations: vec![semcode::EdgeLocation {
+            role: "invocation".into(),
+            file_path: "x.rs".into(),
+            line: 9,
+        }],
+        file_path: "x.rs".into(),
+        git_file_hash: "abc123".into(),
+        line: 9,
+    };
+    db.insert_unresolved_edges(vec![
+        edge("rust:unrecognized_call_shape"),
+        edge("c:macro_parameter_call"),
+    ])
+    .await
+    .expect("two kinds at one place must both insert");
+
+    let found = db
+        .find_unresolved_edges_git_aware("run", "abc123")
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2, "{found:?}");
+}

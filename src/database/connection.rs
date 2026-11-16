@@ -2806,22 +2806,44 @@ impl DatabaseManager {
             .collect()
     }
 
-    /// Keep only the rows a spelled owner path addresses. `None` is the bare
-    /// name, which addresses every row; anything else drops the rows whose
-    /// owner the path does not name, including every unqualified row.
+    /// Keep only rows the spelled owner path addresses. A path
+    /// addressing nothing tries shorter suffixes, so a re-export
+    /// spelling still reaches its definition. The retry runs only
+    /// on a total miss.
     fn only_addressed_owner(
         functions: Vec<FunctionInfo>,
         owner_path: Option<&str>,
     ) -> Vec<FunctionInfo> {
         match owner_path {
-            Some(path) => functions
-                .into_iter()
-                .filter(|func| {
-                    func.qualifier.as_deref().is_some_and(|qualifier| {
-                        crate::types::qualifier_matches_path(qualifier, path)
-                    })
-                })
-                .collect(),
+            Some(path) => {
+                // The full path runs first; each retry shortens the
+                // path by its leading segment.
+                let mut remaining = functions;
+                let mut rest = path;
+                loop {
+                    let mut hit = Vec::new();
+                    let mut miss = Vec::new();
+                    for func in remaining {
+                        if func.qualifier.as_deref().is_some_and(|qualifier| {
+                            crate::types::qualifier_matches_path(qualifier, rest)
+                        }) {
+                            hit.push(func);
+                        } else {
+                            miss.push(func);
+                        }
+                    }
+                    if !hit.is_empty() {
+                        return hit;
+                    }
+                    match rest.split_once("::") {
+                        Some((_, tail)) => {
+                            rest = tail;
+                            remaining = miss;
+                        }
+                        None => return hit,
+                    }
+                }
+            }
             None => functions,
         }
     }
@@ -8835,6 +8857,22 @@ mod tests {
             guard: None,
             qualifier: None,
         }
+    }
+
+    #[test]
+    fn a_reexport_spelling_reaches_through_the_fallback() {
+        // The lookup tries shorter suffixes on a total miss: the
+        // re-export spelling needs two tries here, an exact spelling
+        // needs one, and an unknown prefix still finds nothing.
+        let mut arc = test_function("pin_init", "arc.rs", "hash");
+        arc.qualifier = Some("rust::kernel::sync::arc::Arc<T>".to_string());
+        let found = DatabaseManager::only_addressed_owner(vec![arc], Some("kernel::sync::Arc"));
+        assert_eq!(found.len(), 1, "{found:?}");
+
+        let mut arc = test_function("pin_init", "arc.rs", "hash");
+        arc.qualifier = Some("rust::kernel::sync::arc::Arc<T>".to_string());
+        let found = DatabaseManager::only_addressed_owner(vec![arc], Some("zzz::yyy"));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

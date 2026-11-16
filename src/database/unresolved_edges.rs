@@ -29,6 +29,7 @@ impl UnresolvedEdgeStore {
         }
         // A batch spanning commits holds the same file at the same hash twice,
         // and merge_insert refuses a batch with two source rows for one target.
+        // The store keeps one row per kind at a place in a file.
         let edges = crate::database::one_row_per_key(edges, |row| {
             (
                 row.file_path.clone(),
@@ -36,6 +37,7 @@ impl UnresolvedEdgeStore {
                 row.line,
                 row.name.clone(),
                 row.direction.clone(),
+                row.kind.clone(),
             )
         });
         let table = self
@@ -80,8 +82,14 @@ impl UnresolvedEdgeStore {
 
         // One row per unresolved edge at a place in a file, so re-indexing
         // unchanged content rewrites the row rather than adding a second.
-        let mut merge_insert =
-            table.merge_insert(&["file_path", "git_file_hash", "line", "name", "direction"]);
+        let mut merge_insert = table.merge_insert(&[
+            "file_path",
+            "git_file_hash",
+            "line",
+            "name",
+            "direction",
+            "kind",
+        ]);
         merge_insert
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
