@@ -17,6 +17,31 @@ use tracing::{debug, error, info, warn};
 use crate::git::resolve_to_commit;
 use crate::{DatabaseManager, GitCommitInfo, LoreIdState};
 
+/// Receive from a std channel shared by several inserter tasks without
+/// holding a tokio worker while waiting.
+///
+/// `f` runs on the blocking pool with the receiver locked, so a task waiting
+/// for a batch, or for another task to release the receiver, occupies a
+/// blocking-pool thread instead of a runtime worker. Returns `None` if the
+/// receiver's lock is poisoned, or if the runtime shut down before `f` ran.
+/// A panic in `f` is resumed in the caller. Dropping the returned future
+/// does not stop `f`; anything it received is lost.
+pub(crate) async fn recv_shared<T, R>(
+    rx: &Arc<std::sync::Mutex<mpsc::Receiver<T>>>,
+    f: impl FnOnce(&mpsc::Receiver<T>) -> R + Send + 'static,
+) -> Option<R>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    let rx = Arc::clone(rx);
+    match tokio::task::spawn_blocking(move || rx.lock().ok().map(|rx| f(&rx))).await {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => None,
+    }
+}
+
 /// Perform periodic optimization check during indexing operations
 /// Returns true if optimization was performed, false otherwise
 pub async fn check_and_optimize_if_needed(
@@ -737,10 +762,9 @@ pub async fn process_commits_pipeline(
         let handle = tokio::spawn(async move {
             loop {
                 // Get next batch from shared receiver
-                let batch = {
-                    let rx = result_rx_clone.lock().unwrap();
-                    rx.recv()
-                };
+                let batch = recv_shared(&result_rx_clone, |rx| rx.recv())
+                    .await
+                    .expect("commit inserter receiver lock poisoned");
 
                 match batch {
                     Ok(batch) => {
@@ -1006,21 +1030,23 @@ pub async fn process_lore_commits_pipeline(
                 // Otherwise each parser's last partial batch becomes
                 // its own small append, dozens of tiny fragments per
                 // archive on a refresh.
-                let batch = {
-                    match result_rx_clone.lock() {
-                        Ok(rx) => rx.recv().map(|mut emails| {
-                            while emails.len() < batch_size {
-                                match rx.recv() {
-                                    Ok(more) => emails.extend(more),
-                                    Err(_) => break,
-                                }
+                let batch = match recv_shared(&result_rx_clone, move |rx| {
+                    rx.recv().map(|mut emails| {
+                        while emails.len() < batch_size {
+                            match rx.recv() {
+                                Ok(more) => emails.extend(more),
+                                Err(_) => break,
                             }
-                            emails
-                        }),
-                        Err(e) => {
-                            error!("Inserter {} failed to lock receiver: {}", inserter_id, e);
-                            break;
                         }
+                        emails
+                    })
+                })
+                .await
+                {
+                    Some(batch) => batch,
+                    None => {
+                        error!("Inserter {} failed to lock receiver", inserter_id);
+                        break;
                     }
                 };
 
@@ -1208,6 +1234,56 @@ pub async fn index_git_commits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two inserter-style tasks waiting on a shared receiver whose sender
+    /// stays alive must leave the runtime's two workers free for other work.
+    /// The test body runs on the `block_on` thread, not on a worker, and
+    /// waits with std primitives, so it still fails (rather than hangs) if
+    /// the waiters do occupy both workers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_shared_does_not_hold_workers() {
+        let (tx, rx) = mpsc::channel::<u32>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let entered = Arc::new(AtomicUsize::new(0));
+
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let rx = Arc::clone(&rx);
+                let entered = Arc::clone(&entered);
+                tokio::spawn(async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    recv_shared(&rx, |rx| rx.recv()).await
+                })
+            })
+            .collect();
+
+        // Each waiter increments `entered` on a worker right before it
+        // starts waiting.  Once both have, waiters that block their workers
+        // would now hold both.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while entered.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiters never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        tokio::spawn(async move {
+            let _ = done_tx.send(7);
+        });
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(7),
+            "a task spawned while two receivers wait never ran"
+        );
+
+        drop(tx);
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap(), Some(Err(mpsc::RecvError)));
+        }
+    }
 
     /// Helper: run a git command in a directory, panic on failure.
     fn git(repo: &std::path::Path, args: &[&str]) -> String {

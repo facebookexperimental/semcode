@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::git::walk_tree_at_commit_with_repo;
-use crate::indexer::{list_shas_in_range, process_commits_pipeline};
+use crate::indexer::{list_shas_in_range, process_commits_pipeline, recv_shared};
 use crate::types::{ArgumentFunction, GlobalVariable};
 use crate::{
     DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
@@ -934,10 +934,9 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         let handle = tokio::spawn(async move {
             loop {
                 // Get next batch from shared receiver
-                let batch = {
-                    let rx = result_rx_clone.lock().unwrap();
-                    rx.recv()
-                };
+                let batch = recv_shared(&result_rx_clone, |rx| rx.recv())
+                    .await
+                    .expect("inserter receiver lock poisoned");
 
                 match batch {
                     Ok(batch) => {
@@ -1228,10 +1227,9 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
 
         let handle = tokio::spawn(async move {
             loop {
-                let batch = {
-                    let rx = result_rx_clone.lock().unwrap();
-                    rx.recv()
-                };
+                let batch = recv_shared(&result_rx_clone, |rx| rx.recv())
+                    .await
+                    .expect("inserter receiver lock poisoned");
 
                 match batch {
                     Ok(batch) => {
