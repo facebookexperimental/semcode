@@ -2328,6 +2328,16 @@ impl IndexingState {
     }
 }
 
+fn tool_page_cache_key(tool_name: &str, args: &Value) -> String {
+    // Removing "page" can change the key order, so sort the keys afterward.
+    let mut cache_args = args.clone();
+    if let Some(arguments) = cache_args.as_object_mut() {
+        arguments.remove("page");
+    }
+    cache_args.sort_all_objects();
+    format!("{tool_name}:{cache_args}")
+}
+
 /// Common parameters for commit filtering operations
 struct CommitFilterParams<'a> {
     verbose: bool,
@@ -4291,19 +4301,7 @@ impl McpServer {
 
         let message_id = args["message_id"].as_str();
 
-        // Generate a query key for caching
-        let query_key = format!(
-            "lore:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            from_patterns.join("|"),
-            subject_patterns.join("|"),
-            body_patterns.join("|"),
-            symbols_patterns.join("|"),
-            recipients_patterns.join("|"),
-            message_id.unwrap_or(""),
-            verbose,
-            show_thread,
-            show_replies
-        );
+        let query_key = tool_page_cache_key("lore", args);
 
         // Handle message_id lookup (same as query tool's -m flag)
         if let Some(msg_id) = message_id {
@@ -4525,17 +4523,7 @@ impl McpServer {
             None
         };
 
-        // Generate a query key for caching
-        let query_key = format!(
-            "vlore:{}:{}:{}:{}:{}:{}:{}",
-            query_text,
-            from_patterns.join("|"),
-            subject_patterns.join("|"),
-            body_patterns.join("|"),
-            symbols_patterns.join("|"),
-            recipients_patterns.join("|"),
-            limit
-        );
+        let query_key = tool_page_cache_key("vlore", args);
 
         let params = VLoreParams {
             query_text,
@@ -6670,6 +6658,150 @@ mod tests {
         } else {
             panic!("Expected Failed status");
         }
+    }
+
+    #[test]
+    fn lore_page_cache_key_covers_all_arguments_but_page() {
+        let first = json!({
+            "subject_patterns": ["openat2"],
+            "limit": 10,
+            "since_date": "2025-01-01",
+            "until_date": "2025-12-31",
+            "mbox": false,
+            "page": 1,
+        });
+        let mut next_page = first.clone();
+        next_page["page"] = json!(2);
+        assert_eq!(
+            tool_page_cache_key("lore", &first),
+            tool_page_cache_key("lore", &next_page)
+        );
+
+        for (name, value) in [
+            ("limit", json!(20)),
+            ("since_date", json!("2026-01-01")),
+            ("until_date", json!("2026-06-30")),
+            ("mbox", json!(true)),
+        ] {
+            let mut changed = first.clone();
+            changed[name] = value;
+            assert_ne!(
+                tool_page_cache_key("lore", &first),
+                tool_page_cache_key("lore", &changed),
+                "cache key omitted {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_cache_key_ignores_argument_order() {
+        // JSON parsing keeps the key order, so these requests would produce
+        // different cache keys without sorting.
+        let first: Value = serde_json::from_str(
+            r#"{"page": 1, "subject_patterns": ["openat2"], "since_date": "2025-01-01", "until_date": "2025-12-31", "limit": 10, "mbox": false}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"mbox": false, "limit": 10, "until_date": "2025-12-31", "since_date": "2025-01-01", "subject_patterns": ["openat2"], "page": 1}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tool_page_cache_key("lore", &first),
+            tool_page_cache_key("lore", &reordered)
+        );
+    }
+
+    #[test]
+    fn page_cache_key_depends_on_pattern_order() {
+        let ab: Value = json!({"subject_patterns": ["a", "b"], "page": 1});
+        let ba: Value = json!({"subject_patterns": ["b", "a"], "page": 1});
+        assert_ne!(
+            tool_page_cache_key("lore", &ab),
+            tool_page_cache_key("lore", &ba)
+        );
+    }
+
+    fn lore_test_email(era: &str, timestamp: i64, n: usize) -> semcode::LoreEmailInfo {
+        semcode::LoreEmailInfo {
+            git_commit_sha: format!("{era}-sha-{n}"),
+            from: "Tester <tester@example.com>".to_string(),
+            date: "Mon, 05 Jan 2026 12:00:00 +0000".to_string(),
+            date_timestamp: timestamp,
+            message_id: format!("{era}-{n}@example.com"),
+            in_reply_to: None,
+            subject: format!("[PATCH] openat2 {era} message {n}"),
+            references: None,
+            recipients: "list@example.com".to_string(),
+            body: format!("openat2 body for {era} message {n}"),
+            symbols: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lore_search_pages_do_not_leak_across_date_filters() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        db.create_tables().await.unwrap();
+
+        // Add enough emails in each date range to fill several pages.
+        let mut emails = Vec::new();
+        for n in 0..40 {
+            emails.push(lore_test_email("OLDERA", 1_580_000_000 + n as i64, n));
+            emails.push(lore_test_email("NEWERA", 1_770_000_000 + n as i64, n));
+        }
+        let known_ids = std::sync::Mutex::new(std::collections::HashMap::new());
+        db.insert_lore_emails(&emails, &known_ids).await.unwrap();
+        db.create_lore_fts_indices().await.unwrap();
+
+        let server = McpServer {
+            db,
+            database_path: String::new(),
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
+        };
+
+        let text = |response: &Value| response["content"][0]["text"].as_str().unwrap().to_string();
+
+        let old_range = text(
+            &server
+                .handle_lore_search(&json!({
+                    "subject_patterns": ["openat2"],
+                    "verbose": true,
+                    "limit": 100,
+                    "since_date": "2020-01-01",
+                    "until_date": "2021-01-01",
+                    "page": 1,
+                }))
+                .await,
+        );
+        assert!(old_range.contains("OLDERA"), "{old_range}");
+        assert!(!old_range.contains("NEWERA"), "{old_range}");
+        assert!(!old_range.starts_with("Page 1 of 1"), "{old_range}");
+
+        // A different date range should not use the first request's cached pages.
+        let new_range = text(
+            &server
+                .handle_lore_search(&json!({
+                    "subject_patterns": ["openat2"],
+                    "verbose": true,
+                    "limit": 100,
+                    "since_date": "2026-01-01",
+                    "page": 1,
+                }))
+                .await,
+        );
+        assert!(new_range.contains("NEWERA"), "{new_range}");
+        assert!(!new_range.contains("OLDERA"), "{new_range}");
     }
 
     #[tokio::test]
