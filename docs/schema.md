@@ -453,6 +453,9 @@ line                (Int64, NOT NULL)    - Line of the site
 member              (Utf8, NOT NULL)     - Member dispatched through, empty for a plain pointer call
 receiver_expr       (Utf8, nullable)     - Receiver as written
 receiver_type       (Utf8, nullable)     - Type of the receiver, when the file declares it
+receiver_bound      (Utf8, nullable)     - Bound of a receiver typed as a generic
+                                           parameter. Set beside the type, or alone
+                                           for `impl`/`dyn` parameters
 receiver_base_type  (Utf8, nullable)     - For `base->field->m()`, the type of the base
 receiver_field      (Utf8, nullable)     - For `base->field->m()`, the field read from it
 kind                (Utf8, NOT NULL)     - member_arrow, member_dot, pointer_param, pointer_local,

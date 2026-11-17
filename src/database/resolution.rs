@@ -550,6 +550,7 @@ mod tests {
             receiver_type: receiver_type.map(|t| t.to_string()),
             receiver_base_type: None,
             receiver_field: None,
+            receiver_bound: None,
             kind: DispatchKind::MemberArrow,
             target: None,
         }

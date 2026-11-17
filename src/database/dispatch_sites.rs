@@ -58,6 +58,7 @@ impl DispatchSiteStore {
         let mut receiver_type = StringBuilder::new();
         let mut receiver_base_type = StringBuilder::new();
         let mut receiver_field = StringBuilder::new();
+        let mut receiver_bound = StringBuilder::new();
         let mut kind = StringBuilder::new();
         let mut target = StringBuilder::new();
 
@@ -72,6 +73,7 @@ impl DispatchSiteStore {
             receiver_type.append_option(site.receiver_type.as_deref());
             receiver_base_type.append_option(site.receiver_base_type.as_deref());
             receiver_field.append_option(site.receiver_field.as_deref());
+            receiver_bound.append_option(site.receiver_bound.as_deref());
             kind.append_value(site.kind.as_str());
             target.append_value(site.target.as_deref().unwrap_or(""));
         }
@@ -101,6 +103,10 @@ impl DispatchSiteStore {
             (
                 "receiver_field",
                 Arc::new(receiver_field.finish()) as ArrayRef,
+            ),
+            (
+                "receiver_bound",
+                Arc::new(receiver_bound.finish()) as ArrayRef,
             ),
             ("kind", Arc::new(kind.finish()) as ArrayRef),
             ("target", Arc::new(target.finish()) as ArrayRef),
@@ -231,6 +237,7 @@ impl DispatchSiteStore {
             receiver_type: optional_text("receiver_type")?,
             receiver_base_type: optional_text("receiver_base_type")?,
             receiver_field: optional_text("receiver_field")?,
+            receiver_bound: optional_text("receiver_bound")?,
             kind,
             target: optional_text("target")?.filter(|t| !t.is_empty()),
         })

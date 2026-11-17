@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 2;
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -428,6 +428,7 @@ struct RawDispatchSite {
     /// which field the receiver reads from it.
     receiver_base_type: Option<String>,
     receiver_field: Option<String>,
+    receiver_bound: Option<String>,
     kind: DispatchKind,
     byte_start: usize,
     line: u32,
@@ -447,11 +448,21 @@ impl RawDispatchSite {
             receiver_type: self.receiver_type.clone(),
             receiver_base_type: self.receiver_base_type.clone(),
             receiver_field: self.receiver_field.clone(),
+            receiver_bound: self.receiver_bound.clone(),
             kind: self.kind,
             target: self.target.clone(),
         }
     }
 }
+
+/// What a Rust function body proves about its names: the byte range, the
+/// declared types in scope, and the trait bounds on its generic parameters.
+type RustScope = (
+    usize,
+    usize,
+    HashMap<String, String>,
+    HashMap<String, String>,
+);
 
 /// An identifier and nothing else: `ops`, but not `ops->fn` or `get()`.
 fn is_plain_name(text: &str) -> bool {
@@ -2614,6 +2625,7 @@ impl TreeSitterAnalyzer {
                                 receiver_type: None,
                                 receiver_base_type: None,
                                 receiver_field: None,
+                                receiver_bound: None,
                                 kind: DispatchKind::PointerDeref,
                                 byte_start: capture.node.start_byte(),
                                 line: capture.node.start_position().row as u32 + 1,
@@ -2657,6 +2669,7 @@ impl TreeSitterAnalyzer {
                     receiver_type: Some(key),
                     receiver_base_type: None,
                     receiver_field: None,
+                    receiver_bound: None,
                     kind: DispatchKind::StaticCall,
                     byte_start: call.start_byte(),
                     line: call.start_position().row as u32 + 1,
@@ -2688,6 +2701,7 @@ impl TreeSitterAnalyzer {
                         receiver_type: container,
                         receiver_base_type: None,
                         receiver_field: None,
+                        receiver_bound: None,
                         kind: DispatchKind::ArrayElement,
                         byte_start: array.start_byte(),
                         line: array.start_position().row as u32 + 1,
@@ -2732,6 +2746,7 @@ impl TreeSitterAnalyzer {
                     receiver_type: None,
                     receiver_base_type: None,
                     receiver_field: None,
+                    receiver_bound: None,
                     kind,
                     byte_start: member.start_byte(),
                     line: member.start_position().row as u32 + 1,
@@ -2792,22 +2807,31 @@ impl TreeSitterAnalyzer {
             return;
         }
 
-        let mut scopes: Vec<(usize, usize, HashMap<String, String>)> = Vec::new();
+        let mut scopes: Vec<RustScope> = Vec::new();
         let mut cursor = root.walk();
-        let mut stack = vec![(root, None::<String>)];
-        while let Some((node, self_type)) = stack.pop() {
-            // `impl Foo { ... }` is what `self` means inside.
-            let self_type = if node.kind() == "impl_item" {
-                node.child_by_field_name("type")
-                    .and_then(|t| Self::rust_type_name(t, source))
-                    .or(self_type)
+        let mut stack = vec![(root, None::<String>, None::<HashMap<String, String>>)];
+        while let Some((node, self_type, impl_bounds)) = stack.pop() {
+            // `impl Foo { ... }` is what `self` means inside, and its
+            // `where` and parameter bounds constrain every method's.
+            let (self_type, impl_bounds) = if node.kind() == "impl_item" {
+                let bounds = Self::rust_generic_bounds_in(node, source);
+                let bounds = bounds
+                    .into_iter()
+                    .chain(Self::rust_impl_trait_bounds_in(node, source))
+                    .collect();
+                (
+                    node.child_by_field_name("type")
+                        .and_then(|t| Self::rust_type_name(t, source))
+                        .or(self_type),
+                    Some(bounds),
+                )
             } else {
-                self_type
+                (self_type, impl_bounds)
             };
 
             cursor.reset(node);
             for child in node.children(&mut cursor) {
-                stack.push((child, self_type.clone()));
+                stack.push((child, self_type.clone(), impl_bounds.clone()));
             }
 
             if node.kind() != "function_item" {
@@ -2819,7 +2843,36 @@ impl TreeSitterAnalyzer {
                 declared.insert("self".to_string(), self_type.clone());
             }
             Self::rust_declared_types_in(node, source, &mut declared);
-            scopes.push((node.start_byte(), node.end_byte(), declared));
+            // Bounds read beside declarations: a bare parameter resolves
+            // through its bound, with impl bounds underneath and
+            // function bounds on top.
+            let mut bounds = impl_bounds.clone().unwrap_or_default();
+            let own = Self::rust_own_generic_params(node, source);
+            for (param, bound) in Self::rust_generic_bounds_in(node, source) {
+                if bound.is_empty() || own.contains(&param) {
+                    // The function's own parameters keep their own bounds.
+                    bounds.insert(param, bound);
+                    continue;
+                }
+                // A method `where` on an impl parameter joins both bounds.
+                bounds
+                    .entry(param)
+                    .and_modify(|held| {
+                        if held.is_empty() {
+                            *held = bound.clone();
+                        } else {
+                            for piece in bound.split(" + ") {
+                                if !held.split(" + ").any(|have| have == piece) {
+                                    held.push_str(" + ");
+                                    held.push_str(piece);
+                                }
+                            }
+                        }
+                    })
+                    .or_insert(bound);
+            }
+            bounds.extend(Self::rust_impl_trait_bounds_in(node, source));
+            scopes.push((node.start_byte(), node.end_byte(), declared, bounds));
         }
 
         for site in sites.iter_mut() {
@@ -2829,16 +2882,34 @@ impl TreeSitterAnalyzer {
             let Some(receiver) = site.receiver_expr.as_deref() else {
                 continue;
             };
-            let Some((_, _, declared)) = scopes
+            // A site belongs to its narrowest enclosing function.
+            let Some((_, _, declared, bounds)) = scopes
                 .iter()
-                .find(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
+                .filter(|(start, end, _, _)| site.byte_start >= *start && site.byte_start < *end)
+                .min_by_key(|(start, end, _, _)| end - start)
             else {
                 continue;
             };
 
             if is_plain_name(receiver) {
                 if let Some(type_name) = declared.get(receiver) {
-                    site.receiver_type = Some(type_name.clone());
+                    match bounds.get(type_name) {
+                        // A bare parameter resolves through its bound.
+                        Some(bound) if !bound.is_empty() => {
+                            site.receiver_bound = Some(bound.clone());
+                            site.receiver_type = Some(type_name.clone());
+                        }
+                        // An unbounded parameter records no type.
+                        Some(_) => {}
+                        None => {
+                            site.receiver_type = Some(type_name.clone());
+                        }
+                    }
+                } else if let Some(bound) = bounds.get(receiver) {
+                    // `impl Display` records the bound with no type.
+                    if !bound.is_empty() {
+                        site.receiver_bound = Some(bound.clone());
+                    }
                 }
                 continue;
             }
@@ -2856,34 +2927,193 @@ impl TreeSitterAnalyzer {
         }
     }
 
-    /// Names a Rust body binds to a stated type: parameters, and bindings
-    /// annotated at the `let`. An inferred binding states nothing here, and
-    /// guessing from the initialiser would need the callee's return type.
+    /// What a Rust body binds to a stated type: parameters, annotated
+    /// bindings, and aliases of typed bindings. Only identifier
+    /// initializers alias, so call results stay untyped.
     fn rust_declared_types_in(
         node: tree_sitter::Node,
         source: &str,
         out: &mut HashMap<String, String>,
     ) {
+        // Aliases resolve in source order after the walk.
+        let mut aliases: Vec<(String, String)> = Vec::new();
         let mut visit = |current: tree_sitter::Node| -> bool {
             if !matches!(current.kind(), "parameter" | "let_declaration") {
                 return true;
             }
-            let (Some(pattern), Some(type_node)) = (
-                current.child_by_field_name("pattern"),
-                current.child_by_field_name("type"),
-            ) else {
+            let Some(pattern) = current.child_by_field_name("pattern") else {
                 return true;
             };
             if pattern.kind() != "identifier" {
                 return true;
             }
-            let Some(type_name) = Self::rust_type_name(type_node, source) else {
+            let name = source[pattern.byte_range()].to_string();
+            if let Some(type_node) = current.child_by_field_name("type") {
+                if let Some(type_name) = Self::rust_type_name(type_node, source) {
+                    out.insert(name, type_name);
+                }
                 return true;
-            };
-            out.insert(source[pattern.byte_range()].to_string(), type_name);
+            }
+            // An unannotated binding counts only as an alias.
+            if current.kind() == "let_declaration" {
+                if let Some(value) = current.child_by_field_name("value") {
+                    if value.kind() == "identifier" {
+                        aliases.push((name, source[value.byte_range()].to_string()));
+                    }
+                }
+            }
             true
         };
         preorder_prune(node, &mut visit);
+        aliases.reverse();
+        for (name, target) in aliases {
+            if let Some(aliased) = out.get(&target).cloned() {
+                out.insert(name, aliased);
+            }
+        }
+    }
+
+    /// What bounds a Rust item's generic parameters carry, by parameter.
+    /// Every parameter maps, bound or not, so a concrete type stays
+    /// distinct from an unbounded parameter.
+    fn rust_generic_bounds_in(
+        function: tree_sitter::Node,
+        source: &str,
+    ) -> HashMap<String, String> {
+        let mut bounds: HashMap<String, Vec<String>> = HashMap::new();
+        if let Some(params) = function.child_by_field_name("type_parameters") {
+            let mut cursor = params.walk();
+            for child in params.named_children(&mut cursor) {
+                if child.kind() != "type_parameter" {
+                    continue;
+                }
+                let (Some(name), bounds_list) = (
+                    child.child_by_field_name("name"),
+                    child.child_by_field_name("bounds"),
+                ) else {
+                    continue;
+                };
+                let name = source[name.byte_range()].to_string();
+                // Every parameter maps, bound or not.
+                bounds.entry(name.clone()).or_default();
+                Self::take_bound(&mut bounds, &name, bounds_list, source);
+            }
+        }
+        // A `where` clause reads from its own children only.
+        let mut cursor = function.walk();
+        for child in function.children(&mut cursor) {
+            if child.kind() != "where_clause" {
+                continue;
+            }
+            let mut inner = child.walk();
+            for predicate in child.children(&mut inner) {
+                if predicate.kind() != "where_predicate" {
+                    continue;
+                }
+                let (Some(left), bounds_list) = (
+                    predicate.child_by_field_name("left"),
+                    predicate.child_by_field_name("bounds"),
+                ) else {
+                    continue;
+                };
+                if left.kind() != "type_identifier" {
+                    continue;
+                }
+                Self::take_bound(&mut bounds, &source[left.byte_range()], bounds_list, source);
+            }
+        }
+        bounds
+            .into_iter()
+            .map(|(param, list)| (param, list.join(" + ")))
+            .collect()
+    }
+
+    /// One parameter's bounds, without lifetimes or `?Sized` relief.
+    fn take_bound(
+        bounds: &mut HashMap<String, Vec<String>>,
+        param: &str,
+        list: Option<tree_sitter::Node>,
+        source: &str,
+    ) {
+        let Some(list) = list else { return };
+        let mut cursor = list.walk();
+        for child in list.named_children(&mut cursor) {
+            if child.kind() == "lifetime" || child.kind() == "removed_trait_bound" {
+                continue;
+            }
+            let text = collapse_whitespace(&source[child.byte_range()]);
+            if !text.is_empty() {
+                bounds.entry(param.to_string()).or_default().push(text);
+            }
+        }
+    }
+
+    /// The generic names an item declares itself. A method `where` on
+    /// any other name constrains the impl's parameter.
+    fn rust_own_generic_params(
+        function: tree_sitter::Node,
+        source: &str,
+    ) -> std::collections::HashSet<String> {
+        let mut own = std::collections::HashSet::new();
+        if let Some(params) = function.child_by_field_name("type_parameters") {
+            let mut cursor = params.walk();
+            for child in params.named_children(&mut cursor) {
+                if child.kind() != "type_parameter" {
+                    continue;
+                }
+                if let Some(name) = child.child_by_field_name("name") {
+                    own.insert(source[name.byte_range()].to_string());
+                }
+            }
+        }
+        own
+    }
+
+    /// The bounds `impl Trait` and `dyn Trait` parameters state, by
+    /// parameter name: `fn f(v: impl Display)` maps `v` to `Display`, and
+    /// `&dyn Display` unwraps the reference first. These state no type, so
+    /// they join the bounds map directly, and the site records the bound
+    /// with no receiver type beside it.
+    fn rust_impl_trait_bounds_in(
+        function: tree_sitter::Node,
+        source: &str,
+    ) -> HashMap<String, String> {
+        let mut bounds = HashMap::new();
+        let Some(params) = function.child_by_field_name("parameters") else {
+            return bounds;
+        };
+        let mut cursor = params.walk();
+        for child in params.named_children(&mut cursor) {
+            if child.kind() != "parameter" {
+                continue;
+            }
+            let (Some(pattern), Some(mut type_node)) = (
+                child.child_by_field_name("pattern"),
+                child.child_by_field_name("type"),
+            ) else {
+                continue;
+            };
+            if pattern.kind() != "identifier" {
+                continue;
+            }
+            while type_node.kind() == "reference_type" {
+                let Some(inner) = type_node.child_by_field_name("type") else {
+                    break;
+                };
+                type_node = inner;
+            }
+            if !matches!(type_node.kind(), "abstract_type" | "dynamic_type") {
+                continue;
+            }
+            let Some(bound) = type_node.child_by_field_name("trait") else {
+                continue;
+            };
+            let text = collapse_whitespace(&source[bound.byte_range()]);
+            if !text.is_empty() {
+                bounds.insert(source[pattern.byte_range()].to_string(), text);
+            }
+        }
+        bounds
     }
 
     /// The name a Rust type node denotes, with references, lifetimes and
@@ -3388,6 +3618,7 @@ impl TreeSitterAnalyzer {
                     receiver_type: None,
                     receiver_base_type: None,
                     receiver_field: None,
+                    receiver_bound: None,
                     kind: if var.is_parameter {
                         DispatchKind::PointerParam
                     } else {
@@ -4856,6 +5087,7 @@ impl TreeSitterAnalyzer {
                 receiver_type: None,
                 receiver_base_type: None,
                 receiver_field: None,
+                receiver_bound: None,
                 kind: DispatchKind::MacroDeclared,
                 byte_start: candidate.start_byte(),
                 line: candidate.start_position().row as u32 + 1,
@@ -12614,6 +12846,167 @@ mod rust_receiver_tests {
             Some("Vec"),
             "{sites:?}"
         );
+    }
+
+    #[test]
+    fn an_alias_binding_carries_the_aliased_type() {
+        // `let d = dev` states nothing, but `dev` is already known: the
+        // alias is exact, while `let x = foo()` stays untyped because no
+        // callee return type is guessed.
+        let sites = sites_of(
+            "fn go(dev: Device) {\n\
+             \tlet d = dev;\n\
+             \tlet e = d;\n\
+             \td.read();\n\
+             \te.read();\n\
+             \tlet x = foo();\n\
+             \tx.bar();\n\
+             }\n",
+        );
+        let typed: Vec<_> = sites
+            .iter()
+            .filter(|s| s.member == "read")
+            .map(|s| s.receiver_type.clone())
+            .collect();
+        assert_eq!(
+            typed,
+            vec![Some("Device".to_string()), Some("Device".to_string())],
+            "{sites:?}"
+        );
+        assert_eq!(receiver_type_of(&sites, "bar"), None, "{sites:?}");
+    }
+
+    #[test]
+    fn a_generic_param_receiver_carries_its_bound() {
+        // A bare parameter resolves through its bound (the inline bound
+        // puts `Display` directly on `T`).
+        let sites = sites_of("fn show<T: Display>(v: T) { v.fmt(); }\n");
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type.as_deref(), Some("T"), "{site:?}");
+        assert_eq!(site.receiver_bound.as_deref(), Some("Display"), "{site:?}");
+    }
+
+    #[test]
+    fn a_where_clause_bound_rides_the_site_too() {
+        // A `where` bound reads as an inline bound (the fixture spells
+        // `fmt::Display` in the clause to pin the module prefix).
+        let sites = sites_of("fn show<T>(v: T) where T: fmt::Display { v.fmt(); }\n");
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type.as_deref(), Some("T"), "{site:?}");
+        assert_eq!(
+            site.receiver_bound.as_deref(),
+            Some("fmt::Display"),
+            "{site:?}"
+        );
+    }
+
+    #[test]
+    fn bounds_join_and_lifetimes_do_not() {
+        // A bound list joins with ` + `, without lifetimes or `?Sized`
+        // relief (the fixture mixes both into one list).
+        let sites = sites_of("fn f<'a, T: Display + Debug + 'a>(v: T) { v.fmt(); }\n");
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(
+            site.receiver_bound.as_deref(),
+            Some("Display + Debug"),
+            "{site:?}"
+        );
+
+        let sites = sites_of("fn g<T: ?Sized>(v: &T) { v.fmt(); }\n");
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type, None, "{site:?}");
+        assert_eq!(site.receiver_bound, None, "{site:?}");
+    }
+
+    #[test]
+    fn an_unbounded_param_stays_opaque() {
+        // An unbounded parameter records no type (a bare `T` gives the
+        // join nothing to read).
+        let sites = sites_of("fn f<T>(v: T) { v.fmt(); }\n");
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type, None, "{site:?}");
+        assert_eq!(site.receiver_bound, None, "{site:?}");
+    }
+
+    #[test]
+    fn an_impl_block_bound_constrains_its_methods() {
+        // An impl bound constrains every method (the fixture declares
+        // `T` once on the impl).
+        let sites = sites_of(
+            "impl<T: Display> Foo<T> {\n\
+             \tfn show(&self, v: T) { v.fmt(); }\n\
+             }\n",
+        );
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type.as_deref(), Some("T"), "{site:?}");
+        assert_eq!(site.receiver_bound.as_deref(), Some("Display"), "{site:?}");
+    }
+
+    #[test]
+    fn a_function_param_keeps_its_own_bound_beside_the_impl_bound() {
+        // Each item's parameters keep their own bounds (the fixture
+        // declares `T` on the impl and `U` on the method).
+        let sites = sites_of(
+            "impl<T: Display> Foo<T> {\n\
+             \tfn show<U: Debug>(&self, v: T, w: U) { v.fmt(); w.dbg(); }\n\
+             }\n",
+        );
+        let fmt = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(fmt.receiver_bound.as_deref(), Some("Display"), "{fmt:?}");
+        let dbg = sites.iter().find(|s| s.member == "dbg").unwrap();
+        assert_eq!(dbg.receiver_bound.as_deref(), Some("Debug"), "{dbg:?}");
+    }
+
+    #[test]
+    fn a_method_where_clause_adds_to_the_impl_bound() {
+        // A method `where` on an impl parameter joins both bounds (the
+        // fixture constrains `T` twice, forcing the union).
+        let sites = sites_of(
+            "impl<T: Display> Foo<T> {\n\
+             \tfn show(&self, v: T) where T: Debug { v.fmt(); }\n\
+             }\n",
+        );
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type.as_deref(), Some("T"), "{site:?}");
+        assert_eq!(
+            site.receiver_bound.as_deref(),
+            Some("Display + Debug"),
+            "{site:?}"
+        );
+    }
+
+    #[test]
+    fn an_impl_trait_param_is_a_bound_with_no_type() {
+        // `impl Display` records the bound with no type.
+        let sites = sites_of("fn show(v: impl Display) { v.fmt(); }\n");
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type, None, "{site:?}");
+        assert_eq!(site.receiver_bound.as_deref(), Some("Display"), "{site:?}");
+    }
+
+    #[test]
+    fn a_dyn_param_is_a_bound_behind_a_reference() {
+        // `&dyn Display` records the bound behind the reference.
+        let sites = sites_of("fn show(v: &dyn Display) { v.fmt(); }\n");
+        let site = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(site.receiver_type, None, "{site:?}");
+        assert_eq!(site.receiver_bound.as_deref(), Some("Display"), "{site:?}");
+    }
+
+    #[test]
+    fn a_nested_function_shadows_the_outer_scope() {
+        // A site belongs to its narrowest function (the nested `w: U`
+        // shares nothing with the outer `v: T`).
+        let sites = sites_of(
+            "fn o<T: Display>(v: T) {\n\
+             \tv.fmt();\n\
+             \tfn i<U: Debug>(w: U) { w.dbg(); }\n\
+             }\n",
+        );
+        let fmt = sites.iter().find(|s| s.member == "fmt").unwrap();
+        assert_eq!(fmt.receiver_bound.as_deref(), Some("Display"), "{fmt:?}");
+        let dbg = sites.iter().find(|s| s.member == "dbg").unwrap();
+        assert_eq!(dbg.receiver_bound.as_deref(), Some("Debug"), "{dbg:?}");
     }
 
     #[test]

@@ -1014,6 +1014,9 @@ pub struct DispatchSite {
     /// against the types table. Both are set together or not at all.
     pub receiver_base_type: Option<String>,
     pub receiver_field: Option<String>,
+    /// Bound of a receiver typed as a generic parameter. The trait
+    /// join reads it.
+    pub receiver_bound: Option<String>,
     pub kind: DispatchKind,
     /// A target the site itself names, such as a local pointer's initializer.
     pub target: Option<String>,

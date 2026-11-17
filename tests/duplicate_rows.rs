@@ -75,6 +75,7 @@ async fn a_batch_holding_one_dispatch_site_twice_still_inserts() {
         receiver_type: None,
         receiver_base_type: None,
         receiver_field: None,
+        receiver_bound: None,
         kind: semcode::DispatchKind::MemberArrow,
         target: None,
     };
@@ -84,6 +85,38 @@ async fn a_batch_holding_one_dispatch_site_twice_still_inserts() {
     db.insert_dispatch_sites(vec![site.clone(), site])
         .await
         .expect("a batch holding an existing site twice must still insert");
+}
+
+#[tokio::test]
+async fn a_generic_bound_survives_the_round_trip() {
+    // The bound writes and reads back beside the type (a bound beside
+    // a type forces the nullable column to hold it).
+    let (_dir, db) = database().await;
+    let site = DispatchSite {
+        caller_name: "show".into(),
+        file_path: "x.rs".into(),
+        git_file_hash: "abc123".into(),
+        byte_start: 100,
+        line: 5,
+        member: "fmt".into(),
+        receiver_expr: Some("v".into()),
+        receiver_type: Some("T".into()),
+        receiver_base_type: None,
+        receiver_field: None,
+        receiver_bound: Some("Display".into()),
+        kind: semcode::DispatchKind::MemberArrow,
+        target: None,
+    };
+    db.insert_dispatch_sites(vec![site]).await.unwrap();
+
+    let found = db.find_dispatch_sites_by_caller("show").await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].receiver_type.as_deref(), Some("T"), "{found:?}");
+    assert_eq!(
+        found[0].receiver_bound.as_deref(),
+        Some("Display"),
+        "{found:?}"
+    );
 }
 
 #[tokio::test]

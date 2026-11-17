@@ -54,7 +54,11 @@ pub enum OptimizeOutcome {
 ///    lookup is an indexed equality on `callee` instead of a full-column
 ///    LIKE scan over serialized calls JSON. A version 12 index has no such
 ///    table; it backfills from the functions rows on first open.
-pub const SCHEMA_VERSION: u32 = 13;
+/// 14: `dispatch_sites` gains a nullable `receiver_bound` column carrying
+///    the trait bound of a receiver typed as a generic parameter (`x: T`
+///    with `T: Display` records `Display`), which the trait join reads. A
+///    version 13 index has no such column; it backfills as null.
+pub const SCHEMA_VERSION: u32 = 14;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -114,7 +118,7 @@ impl SchemaManager {
         } else {
             self.recreate_without_columns(
                 "dispatch_sites",
-                &["receiver_base_type", "receiver_field"],
+                &["receiver_base_type", "receiver_field", "receiver_bound"],
             )
             .await?;
         }
@@ -290,6 +294,9 @@ impl SchemaManager {
             Field::new("receiver_type", DataType::Utf8, true),
             Field::new("receiver_base_type", DataType::Utf8, true),
             Field::new("receiver_field", DataType::Utf8, true),
+            // Bound of a generic-parameter receiver. Nullable and off
+            // the merge key, so a null keeps its row.
+            Field::new("receiver_bound", DataType::Utf8, true),
             Field::new("kind", DataType::Utf8, false),
             // Part of the merge key, so it carries "" rather than null: a
             // null key column matches nothing and the row is dropped.

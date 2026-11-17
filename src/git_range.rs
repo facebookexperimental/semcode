@@ -1722,6 +1722,7 @@ mod tests {
                 receiver_type: None,
                 receiver_base_type: None,
                 receiver_field: None,
+                receiver_bound: None,
                 kind: crate::types::DispatchKind::MemberArrow,
                 target: None,
             }],
