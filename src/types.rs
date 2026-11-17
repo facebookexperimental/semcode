@@ -149,6 +149,144 @@ fn last_top_level_scope(edge: &str) -> Option<usize> {
     found
 }
 
+/// The last `::` segment outside arguments: what a path selects where
+/// prefixes differ.
+fn last_segment(text: &str) -> &str {
+    match last_top_level_scope(text) {
+        Some(at) => &text[at + 2..],
+        None => text,
+    }
+}
+
+/// The implementing type and trait inside a qualifier's installation
+/// group. Only `<Type as Trait>` installs; everything else answers
+/// `None`.
+pub fn split_trait_qualifier(qualifier: &str) -> Option<(&str, &str)> {
+    // The installation group holds `<Type as Trait>`.
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (i, b) in qualifier.bytes().enumerate() {
+        match b {
+            b'<' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'>' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start.take() {
+                        groups.push((s, i));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (s, e) in groups.into_iter().rev() {
+        match split_top_level_as(&qualifier[s + 1..e]) {
+            // A group without ` as ` installs nothing.
+            None => {}
+            Some((implementor, trait_)) => {
+                if !implementor.is_empty() && !trait_.is_empty() {
+                    return Some((implementor, trait_));
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// The halves of a top-level ` as `.
+fn split_top_level_as(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at + 3 < bytes.len() {
+        match bytes[at] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b' ' if depth == 0
+                && bytes[at + 1] == b'a'
+                && bytes[at + 2] == b's'
+                && bytes[at + 3] == b' ' =>
+            {
+                return Some((&text[..at], &text[at + 4..]));
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+/// One trait spelling meeting another: full text or module-prefix
+/// suffix. Arguments stay significant, so same-named traits in other
+/// modules never meet.
+pub fn trait_names_match(bound: &str, implementor_side: &str) -> bool {
+    if bound == implementor_side {
+        return true;
+    }
+    if bound.len() > implementor_side.len() {
+        return bound.ends_with(&format!("::{implementor_side}"));
+    }
+    if implementor_side.len() > bound.len() {
+        return implementor_side.ends_with(&format!("::{bound}"));
+    }
+    false
+}
+
+/// Each bound in a `+` list, split outside arguments.
+pub fn each_bound(bound: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, b) in bound.bytes().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b'+' if depth == 0 => {
+                pieces.push(bound[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    pieces.push(bound[start..].trim());
+    pieces.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// A trait container answering for a queried owner: the container
+/// sheds arguments and either suffix counts. The owner keeps its
+/// arguments, so a spelled owner names its own instantiation.
+pub fn trait_container_matches_owner(container: &str, owner: &str) -> bool {
+    let container = strip_instantiations(container);
+    !container.is_empty()
+        && !owner.is_empty()
+        && (container == owner
+            || container.ends_with(&format!("::{owner}"))
+            || owner.ends_with(&format!("::{container}")))
+}
+
+/// A trait-impl target reaching a receiver: the target owner names
+/// the receiver type, with the target's arguments stripped.
+pub fn target_owner_matches(target: &str, receiver: &str) -> bool {
+    let (_, owner) = split_callee_edge(target);
+    let owner = owner.unwrap_or("");
+    let owner = match owner.find('<') {
+        Some(at) => &owner[..at],
+        None => owner,
+    };
+    let (owner_last, receiver_last) = (last_segment(owner), last_segment(receiver));
+    !owner_last.is_empty() && !receiver_last.is_empty() && owner_last == receiver_last
+}
+
 /// Whether a stored qualifier is what a spelled owner path addresses.
 ///
 /// The stored path is the file's module plus its inline owners, which a
@@ -1260,6 +1398,8 @@ pub enum RegistrationKind {
     DesignatedInit,
     /// `x->member = target;` or `x.member = target;`
     Assignment,
+    /// A method installed in its trait slot. The trait join reads it.
+    TraitImpl,
 }
 
 impl RegistrationKind {
@@ -1267,6 +1407,7 @@ impl RegistrationKind {
         match self {
             RegistrationKind::DesignatedInit => "designated_init",
             RegistrationKind::Assignment => "assignment",
+            RegistrationKind::TraitImpl => "trait_impl",
         }
     }
 
@@ -1274,6 +1415,7 @@ impl RegistrationKind {
         match text {
             "designated_init" => Some(RegistrationKind::DesignatedInit),
             "assignment" => Some(RegistrationKind::Assignment),
+            "trait_impl" => Some(RegistrationKind::TraitImpl),
             _ => None,
         }
     }
@@ -1598,6 +1740,99 @@ mod ambiguity_note_tests {
         assert_eq!((bare, path), ("new", None));
         let (bare, path) = split_callee_edge("::new");
         assert_eq!((bare, path), ("::new", None));
+    }
+
+    #[test]
+    fn trait_qualifiers_split_into_implementor_and_trait() {
+        // Only `<Type as Trait>` is an installation: inherent owners,
+        // trait declarations and bare names answer `None`.
+        assert_eq!(
+            split_trait_qualifier("<Foo as Display>"),
+            Some(("Foo", "Display"))
+        );
+        assert_eq!(
+            split_trait_qualifier("<Foo as fmt::Display>"),
+            Some(("Foo", "fmt::Display"))
+        );
+        assert_eq!(
+            split_trait_qualifier("<Split<&T> as From<u8>>"),
+            Some(("Split<&T>", "From<u8>"))
+        );
+        assert_eq!(
+            split_trait_qualifier("fmt::<Foo as Display>"),
+            Some(("Foo", "Display"))
+        );
+        assert_eq!(
+            split_trait_qualifier("<Foo as From<Option<T>>>"),
+            Some(("Foo", "From<Option<T>>"))
+        );
+        assert_eq!(
+            split_trait_qualifier("m::Foo<T>::f::<Bar as Show>"),
+            Some(("Bar", "Show"))
+        );
+        assert_eq!(split_trait_qualifier("m::Foo<Bar::Baz>"), None);
+        assert_eq!(split_trait_qualifier("m::Foo"), None);
+        assert_eq!(split_trait_qualifier("m::Display"), None);
+        assert_eq!(split_trait_qualifier("new"), None);
+        assert_eq!(split_trait_qualifier("<Foo>"), None);
+        assert_eq!(split_trait_qualifier("<>"), None);
+    }
+
+    #[test]
+    fn trait_spellings_meet_on_a_module_suffix() {
+        // Spellings meet on a module suffix (arguments and same-named
+        // traits in other modules force both misses).
+        assert!(trait_names_match("Display", "Display"));
+        assert!(trait_names_match("fmt::Display", "Display"));
+        assert!(trait_names_match("Display", "fmt::Display"));
+        assert!(!trait_names_match("From<u8>", "From<u16>"));
+        assert!(trait_names_match("From<u8>", "From<u8>"));
+        assert!(!trait_names_match("Display", "Debug"));
+        assert!(!trait_names_match("", "Display"));
+        assert!(!trait_names_match("a::Driver", "b::Driver"));
+        assert!(!trait_names_match("Driver", "a::DriverX"));
+    }
+
+    #[test]
+    fn bound_lists_split_into_their_bounds() {
+        // A `+` list splits outside arguments (nested arguments and an
+        // empty string force both cases).
+        assert_eq!(each_bound("Display"), vec!["Display"]);
+        assert_eq!(each_bound("Display + Send"), vec!["Display", "Send"]);
+        assert_eq!(
+            each_bound("From<Option<u8>> + Display"),
+            vec!["From<Option<u8>>", "Display"]
+        );
+        assert!(each_bound("").is_empty());
+    }
+
+    #[test]
+    fn trait_containers_answer_for_any_spelling_of_the_owner() {
+        // Containers answer for bare and qualified owners (a generic
+        // impl and two instantiations force both cases).
+        assert!(trait_container_matches_owner("Display", "Display"));
+        assert!(trait_container_matches_owner("fmt::Display", "Display"));
+        assert!(trait_container_matches_owner("Display", "fmt::Display"));
+        assert!(trait_container_matches_owner("Foo<T>", "Foo"));
+        assert!(trait_container_matches_owner("Foo<T>", "m::Foo"));
+        assert!(!trait_container_matches_owner("From<u8>", "From<u16>"));
+        assert!(!trait_container_matches_owner("a::Driver", "b::Driver"));
+        assert!(!trait_container_matches_owner("", "Display"));
+        assert!(!trait_container_matches_owner("Display", ""));
+    }
+
+    #[test]
+    fn a_target_reaches_the_receiver_it_names() {
+        assert!(target_owner_matches("Foo::fmt", "Foo"));
+        assert!(target_owner_matches("a::Foo::fmt", "Foo"));
+        assert!(!target_owner_matches("Bar::fmt", "Foo"));
+        assert!(!target_owner_matches("fmt", "Foo"));
+        assert!(!target_owner_matches("Foo::fmt", ""));
+        // Targets shed arguments; receivers keep them (a generic impl
+        // and two `From` spellings force both cases).
+        assert!(target_owner_matches("Foo<T>::fmt", "Foo"));
+        assert!(!target_owner_matches("From<u16>::from", "From<u8>"));
+        assert!(!target_owner_matches("From::from", "From<u8>"));
     }
 
     #[test]

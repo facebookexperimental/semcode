@@ -481,7 +481,8 @@ Functions installed in a struct member: `.read = my_read`, or
 
 **Schema:**
 ```
-container_type      (Utf8, NOT NULL)     - Struct or union the member belongs to
+container_type      (Utf8, NOT NULL)     - Struct or union the member belongs to,
+                                           or the trait for a trait_impl row
 member              (Utf8, NOT NULL)     - Member being installed into
 target              (Utf8, NOT NULL)     - What is installed, as written
 file_path           (Utf8, NOT NULL)     - File containing the registration
@@ -489,7 +490,7 @@ git_file_hash       (Utf8, NOT NULL)     - Content hash of that file
 byte_start          (Int64, NOT NULL)    - Byte offset within the file
 line                (Int64, NOT NULL)    - Line of the registration
 enclosing_function  (Utf8, NOT NULL)     - Function containing it, empty at file scope
-kind                (Utf8, NOT NULL)     - designated_init or assignment
+kind                (Utf8, NOT NULL)     - designated_init, assignment, or trait_impl
 ```
 
 **Notes:**
@@ -497,6 +498,10 @@ kind                (Utf8, NOT NULL)     - designated_init or assignment
   too; the join against known functions filters those without a separate rule
 - An initializer whose container type the file does not state is skipped
   rather than guessed at
+- A `trait_impl` row installs a trait method in its trait: `impl Display
+  for Foo` records container `Display`, member `fmt`, target `Foo::fmt`.
+  These rows join through a site bound or the target owner; an untyped
+  site joins nothing
 
 **Indices:**
 - BTree on `target`, `member` and `container_type`

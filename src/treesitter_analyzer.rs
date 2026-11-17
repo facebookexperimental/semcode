@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 3;
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -5135,6 +5135,7 @@ impl TreeSitterAnalyzer {
     ) -> Result<ExtractedFunctions> {
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
+        let mut trait_impls: Vec<RawRegistration> = Vec::new();
         let mut covered_sites: std::collections::HashSet<usize> = Default::default();
         let mut covered_registrations: std::collections::HashSet<usize> = Default::default();
         // A call site belongs to exactly one function: the innermost
@@ -5253,6 +5254,26 @@ impl TreeSitterAnalyzer {
             let relative_path = self.make_relative_path(ctx.file_path, ctx.source_root);
             let qualifier =
                 Self::owner_qualifier(ctx.language, defined_at, ctx.source, &relative_path);
+            // A trait-impl method installs in its trait slot; the row
+            // reads at file scope.
+            if matches!(ctx.language, Language::Rust) {
+                if let Some(qualifier) = qualifier.as_deref() {
+                    if let Some((implementor, trait_)) =
+                        crate::types::split_trait_qualifier(qualifier)
+                    {
+                        trait_impls.push(RawRegistration {
+                            container_type: trait_.to_string(),
+                            container_base_type: None,
+                            container_field: None,
+                            member: name.clone(),
+                            target: format!("{implementor}::{name}"),
+                            byte_start: function_start_byte,
+                            line: line_start,
+                            kind: RegistrationKind::TraitImpl,
+                        });
+                    }
+                }
+            }
             // Member calls through `this`/`self` name no path: the
             // enclosing owner goes beside them as a tagged edge instead
             // of a dispatch site, which could never resolve them.
@@ -5401,6 +5422,15 @@ impl TreeSitterAnalyzer {
             .iter()
             .filter(|reg| !covered_registrations.contains(&reg.byte_start))
         {
+            registrations.push(raw.attribute(
+                "",
+                &self.make_relative_path(ctx.file_path, ctx.source_root),
+                ctx.git_hash,
+            ));
+        }
+
+        // Trait installations read at file scope.
+        for raw in &trait_impls {
             registrations.push(raw.attribute(
                 "",
                 &self.make_relative_path(ctx.file_path, ctx.source_root),
@@ -13007,6 +13037,39 @@ mod rust_receiver_tests {
         assert_eq!(fmt.receiver_bound.as_deref(), Some("Display"), "{fmt:?}");
         let dbg = sites.iter().find(|s| s.member == "dbg").unwrap();
         assert_eq!(dbg.receiver_bound.as_deref(), Some("Debug"), "{dbg:?}");
+    }
+
+    #[test]
+    fn trait_impl_methods_are_installed_in_their_trait() {
+        // A trait-impl method installs in its trait slot (one trait, one
+        // inherent method, and one declaration force the three cases).
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "trait Display {\n\
+                 \tfn fmt(&self) -> i32;\n\
+                 }\n\
+                 struct Foo;\n\
+                 impl Foo {\n\
+                 \tfn inherent(&self) -> i32 { 1 }\n\
+                 }\n\
+                 impl Display for Foo {\n\
+                 \tfn fmt(&self) -> i32 { 0 }\n\
+                 }\n",
+                std::path::Path::new("x.rs"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let installed: Vec<_> = analysis
+            .registrations
+            .iter()
+            .filter(|r| r.kind == crate::types::RegistrationKind::TraitImpl)
+            .collect();
+        assert_eq!(installed.len(), 1, "{:?}", analysis.registrations);
+        assert_eq!(installed[0].container_type, "Display");
+        assert_eq!(installed[0].member, "fmt");
+        assert_eq!(installed[0].target, "Foo::fmt");
     }
 
     #[test]

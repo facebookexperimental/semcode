@@ -1394,6 +1394,46 @@ impl DatabaseManager {
             .await?;
         registrations.retain(|r| r.container_type == container_type);
 
+        // A module-qualified trait misses bare-stored rows, so trait
+        // rows come in by member on a suffix match.
+        let mut seen: std::collections::HashSet<_> = registrations
+            .iter()
+            .map(|r| {
+                (
+                    r.file_path.clone(),
+                    r.git_file_hash.clone(),
+                    r.byte_start,
+                    r.target.clone(),
+                )
+            })
+            .collect();
+        let mut trait_rows = crate::database::resolution::at_revision(
+            self.registration_store
+                .find_trait_impls_by_member(member)
+                .await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        );
+        self.resolve_chained_registrations(&mut trait_rows, &manifest)
+            .await?;
+        self.keep_verified_tables(&mut trait_rows, git_sha).await?;
+        for row in trait_rows {
+            let key = (
+                row.file_path.clone(),
+                row.git_file_hash.clone(),
+                row.byte_start,
+                row.target.clone(),
+            );
+            if seen.insert(key)
+                && (crate::types::trait_container_matches_owner(
+                    &row.container_type,
+                    container_type,
+                ) || crate::types::target_owner_matches(&row.target, container_type))
+            {
+                registrations.push(row);
+            }
+        }
+
         Ok(registrations)
     }
 
@@ -1715,6 +1755,44 @@ impl DatabaseManager {
             &manifest,
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
         );
+        // A trait-method query matches no target, so impl rows come in
+        // by member for owners the query names, or all rows where the
+        // query names no owner.
+        let (member, owner) = crate::types::split_callee_edge(target);
+        {
+            let mut seen: std::collections::HashSet<_> = registrations
+                .iter()
+                .map(|r| {
+                    (
+                        r.file_path.clone(),
+                        r.git_file_hash.clone(),
+                        r.byte_start,
+                        r.target.clone(),
+                    )
+                })
+                .collect();
+            for row in at_revision(
+                self.registration_store
+                    .find_trait_impls_by_member(member)
+                    .await?,
+                &manifest,
+                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+            ) {
+                let key = (
+                    row.file_path.clone(),
+                    row.git_file_hash.clone(),
+                    row.byte_start,
+                    row.target.clone(),
+                );
+                if owner.is_none_or(|owner| {
+                    crate::types::trait_container_matches_owner(&row.container_type, owner)
+                        || crate::types::target_owner_matches(&row.target, owner)
+                }) && seen.insert(key)
+                {
+                    registrations.push(row);
+                }
+            }
+        }
         self.resolve_chained_registrations(&mut registrations, &manifest)
             .await?;
         self.keep_verified_tables(&mut registrations, git_sha)
