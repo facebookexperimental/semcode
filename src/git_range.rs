@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::git::walk_tree_at_commit_with_repo;
-use crate::indexer::{list_shas_in_range, process_commits_pipeline, recv_shared};
+use crate::indexer::{
+    counted_problem, join_failed, list_shas_in_range, plural, process_commits_pipeline, recv_shared,
+};
 use crate::types::{ArgumentFunction, GlobalVariable};
 use crate::{
     DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
@@ -139,27 +141,6 @@ struct GitTupleStats {
     failed_threads: usize,
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
-/// Join pipeline threads and count the ones that failed: returned an error
-/// (a generator that could not list its files, a worker that stopped early)
-/// or panicked. Either leaves files no counter saw, so any failure fails the
-/// run.
-fn join_failed<T>(kind: &str, handles: Vec<thread::JoinHandle<Result<T>>>) -> usize {
-    let mut failed = 0;
-    for (id, handle) in handles.into_iter().enumerate() {
-        match handle.join() {
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => tracing::error!("{kind} {id} failed: {e:#}"),
-            Err(panic) => tracing::error!("{kind} {id} thread panicked: {panic:?}"),
-        }
-        failed += 1;
-    }
-    failed
-}
-
 impl GitTupleStats {
     /// The run's error if any file was not read or stored. The run otherwise
     /// looks complete -- the branch would be marked current -- and only a
@@ -174,19 +155,18 @@ impl GitTupleStats {
     /// What the run left undone, for the summary and the error, or `None`
     /// when it finished.
     fn incomplete_summary(&self) -> Option<String> {
-        let mut problems = Vec::new();
-        if self.failed_threads > 0 {
-            problems.push(format!(
-                "{} failed",
-                plural(self.failed_threads, "pipeline thread", "pipeline threads")
-            ));
-        }
-        if self.unread_files > 0 {
-            problems.push(format!(
-                "{} could not be read",
-                plural(self.unread_files, "file", "files")
-            ));
-        }
+        let mut problems: Vec<_> = [
+            counted_problem(
+                self.failed_threads,
+                "pipeline thread",
+                "pipeline threads",
+                "failed",
+            ),
+            counted_problem(self.unread_files, "file", "files", "could not be read"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if self.failed_batches > 0 {
             problems.push(format!(
                 "{} ({}) {} not stored",
@@ -1334,8 +1314,8 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     }
 
     // Wait for the generator, then all workers, to complete
-    let failed_threads = join_failed("Tree generator", vec![generator_handle])
-        + join_failed("Worker", worker_handles);
+    let failed_threads =
+        join_failed("Tree generator", [generator_handle]) + join_failed("Worker", worker_handles);
 
     // Wait for all inserter tasks to finish
     for (inserter_id, (handle, in_flight_files)) in inserter_handles.into_iter().enumerate() {

@@ -4,6 +4,7 @@ use clap::Parser;
 use colored::Colorize;
 use semcode::indexer::{
     list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline, KnownLoreIds,
+    LoreIndexIncomplete,
 };
 use semcode::{measure, process_database_path, CodeVectorizer, DatabaseManager};
 // Temporary call relationships are now embedded in function JSON columns
@@ -688,8 +689,19 @@ async fn repack_lore_archive(
     }
 }
 
+/// Rows a failed archive appended before it failed, counted as
+/// LoreIndexResult::new_emails counts them for an archive that finished.
+/// They stay in the table, so they count towards the compaction and FTS
+/// update that new emails trigger.
+fn appended_before_failure(e: &anyhow::Error) -> usize {
+    e.downcast_ref::<LoreIndexIncomplete>()
+        .map_or(0, |incomplete| incomplete.appended)
+}
+
 /// Result of indexing a single lore archive
 struct LoreIndexResult {
+    /// Rows appended to the lore table.  Emails already stored, such as
+    /// crossposts, and commits that hold no message are not counted.
     new_emails: usize,
     total_emails: usize,
 }
@@ -774,7 +786,7 @@ async fn index_lore_archive(
     let new_count = new_commits.len();
 
     // Process new commits
-    process_lore_commits_pipeline(
+    let new_emails = process_lore_commits_pipeline(
         archive_path,
         new_commits,
         db_manager.clone(),
@@ -786,12 +798,12 @@ async fn index_lore_archive(
     .await?;
 
     println!(
-        "Indexed {} new emails from {} (total in archive: {})",
-        new_count, display_name, total_commits
+        "Indexed {} new emails from {} new commits of {} (total in archive: {})",
+        new_emails, new_count, display_name, total_commits
     );
 
     Ok(LoreIndexResult {
-        new_emails: new_count,
+        new_emails,
         total_emails: total_commits,
     })
 }
@@ -1193,6 +1205,7 @@ async fn async_main() -> Result<()> {
                     }
                     Err(e) => {
                         eprintln!("Error indexing {}: {}", lore_url, e);
+                        total_new_emails += appended_before_failure(&e);
                         failed_archives.push((lore_url.clone(), e.to_string()));
                         continue;
                     }
@@ -1382,6 +1395,7 @@ async fn async_main() -> Result<()> {
                         archives_processed += 1;
                     }
                     Err((name, e)) => {
+                        total_new_emails += appended_before_failure(&e);
                         failed_archives.push((name, e.to_string()));
                     }
                 }
