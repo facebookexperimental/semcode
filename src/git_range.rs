@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::thread;
 use tracing::{error, info};
 
@@ -82,6 +82,9 @@ struct TupleWorkerContext {
     no_macros: bool,
     processed_count: Arc<AtomicUsize>,
     batches_sent: Arc<AtomicUsize>,
+    /// Files this run could not read, so the run fails instead of marking
+    /// the branch current without them.
+    unread_files: Arc<AtomicUsize>,
     accumulate_lock: Arc<std::sync::Mutex<()>>,
 }
 
@@ -129,35 +132,74 @@ struct GitTupleStats {
     /// a panicked inserter held, and the files they left unmarked.
     failed_batches: usize,
     failed_files: usize,
+    /// Files a worker could not read.
+    unread_files: usize,
+    /// Generators that failed or panicked and workers that stopped early or
+    /// panicked. Either leaves files nobody counted unread.
+    failed_threads: usize,
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Join pipeline threads and count the ones that failed: returned an error
+/// (a generator that could not list its files, a worker that stopped early)
+/// or panicked. Either leaves files no counter saw, so any failure fails the
+/// run.
+fn join_failed<T>(kind: &str, handles: Vec<thread::JoinHandle<Result<T>>>) -> usize {
+    let mut failed = 0;
+    for (id, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => tracing::error!("{kind} {id} failed: {e:#}"),
+            Err(panic) => tracing::error!("{kind} {id} thread panicked: {panic:?}"),
+        }
+        failed += 1;
+    }
+    failed
 }
 
 impl GitTupleStats {
-    /// The run's error if any batch was not stored. The run otherwise looks
-    /// complete, and only a later run over the same files reads them again.
-    fn unstored_batches_error(&self) -> Result<()> {
-        if self.failed_batches > 0 {
-            anyhow::bail!(
-                "{} not stored; indexing again reads them",
-                self.unstored_summary()
-            );
+    /// The run's error if any file was not read or stored. The run otherwise
+    /// looks complete -- the branch would be marked current -- and only a
+    /// later run over the same files reads them again.
+    fn incomplete_error(&self) -> Result<()> {
+        match self.incomplete_summary() {
+            Some(summary) => anyhow::bail!("{summary}; indexing again reads them"),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// "N batches (M files)", for the summary and the error.
-    fn unstored_summary(&self) -> String {
-        let plural =
-            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-        format!(
-            "{} ({}) {}",
-            plural(self.failed_batches, "batch", "batches"),
-            plural(self.failed_files, "file", "files"),
-            if self.failed_batches == 1 {
-                "was"
-            } else {
-                "were"
-            }
-        )
+    /// What the run left undone, for the summary and the error, or `None`
+    /// when it finished.
+    fn incomplete_summary(&self) -> Option<String> {
+        let mut problems = Vec::new();
+        if self.failed_threads > 0 {
+            problems.push(format!(
+                "{} failed",
+                plural(self.failed_threads, "pipeline thread", "pipeline threads")
+            ));
+        }
+        if self.unread_files > 0 {
+            problems.push(format!(
+                "{} could not be read",
+                plural(self.unread_files, "file", "files")
+            ));
+        }
+        if self.failed_batches > 0 {
+            problems.push(format!(
+                "{} ({}) {} not stored",
+                plural(self.failed_batches, "batch", "batches"),
+                plural(self.failed_files, "file", "files"),
+                if self.failed_batches == 1 {
+                    "was"
+                } else {
+                    "were"
+                }
+            ));
+        }
+        (!problems.is_empty()).then(|| problems.join(", "))
     }
 }
 
@@ -344,12 +386,18 @@ fn stream_git_file_tuples_batch(
 // Mapping extraction functions removed - now using embedded calls/types columns
 
 /// Process a single git file tuple and extract functions/types/macros (with repo reuse)
+///
+/// An error means the file could not be read -- its object is missing or the
+/// temp copy failed -- and the run must fail so a later run reads it again.
+/// `Ok(None)` is a file that was read but cannot be analyzed (an unsupported
+/// extension, a failed parse): reading it again gives the same answer, so it
+/// is skipped rather than failing every run.
 fn process_git_file_tuple_with_repo(
     tuple: &GitFileTuple,
     repo: &gix::Repository,
     source_root: &std::path::Path,
     no_macros: bool,
-) -> Result<GitTupleResults> {
+) -> Result<Option<GitTupleResults>> {
     // Load git file content to temp file using the reused repo
     let file_stem = tuple
         .file_path
@@ -366,14 +414,16 @@ fn process_git_file_tuple_with_repo(
         temp_file_path: temp_path,
     };
 
-    // Read source code and analyze
-    let source_code = std::fs::read_to_string(&git_file.temp_file_path).map_err(|e| {
+    // Read source code and analyze. A file that is not UTF-8 (a Latin-1
+    // comment, say) is still source: decode it lossily rather than drop it.
+    let source_bytes = std::fs::read(&git_file.temp_file_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to read temp file {}: {}",
             git_file.temp_file_path.display(),
             e
         )
     })?;
+    let source_code = String::from_utf8_lossy(&source_bytes);
 
     // Each thread needs its own TreeSitter analyzer
     let mut ts_analyzer = TreeSitterAnalyzer::new()
@@ -396,7 +446,13 @@ fn process_git_file_tuple_with_repo(
     }
 
     // Check analysis results
-    let analysis = analysis_result?;
+    let analysis = match analysis_result {
+        Ok(analysis) => analysis,
+        Err(e) => {
+            tracing::warn!("Skipping {}: {e:#}", tuple.file_path.display());
+            return Ok(None);
+        }
+    };
     let (
         mut functions,
         types,
@@ -450,11 +506,20 @@ fn process_git_file_tuple_with_repo(
         files_processed: 1,
     };
 
-    Ok(results)
+    Ok(Some(results))
 }
 
 /// Worker function that processes tuples from a shared channel and sends batches to inserters
-fn tuple_worker_shared(ctx: TupleWorkerContext) {
+///
+/// A file that fails to read is counted in `unread_files` and the worker
+/// goes on. An error means the worker stopped early and the files it would
+/// have read went uncounted, so the caller fails the run.
+///
+/// Both locks guard nothing a panic can leave half-written (`()` and a
+/// receiver), so a lock poisoned by a panicked worker is taken anyway: that
+/// panic already fails the run, and stopping here too would only count it
+/// twice.
+fn tuple_worker_shared(ctx: TupleWorkerContext) -> Result<()> {
     let thread_safe_repo = &ctx.repo;
 
     // Files per insert batch. Each batch holds full function bodies for
@@ -467,13 +532,10 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
 
     loop {
         // Step 1: Acquire lock to ensure only one worker accumulates at a time
-        let _guard = match ctx.accumulate_lock.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::error!("Worker {} failed to acquire accumulate lock", ctx.worker_id);
-                return;
-            }
-        };
+        let _guard = ctx
+            .accumulate_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
 
         // Step 2: Accumulate tuples until we have DB_BATCH_SIZE files
         let mut tuples_to_process = Vec::new();
@@ -485,18 +547,12 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
             }
 
             // Get next tuple with blocking receive
-            let tuple = {
-                let rx = match ctx.shared_tuple_rx.lock() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("Worker {} failed to lock receiver: {}", ctx.worker_id, e);
-                        return;
-                    }
-                };
-
-                // Blocking receive - wait for work
-                rx.recv()
-            };
+            // Blocking receive - wait for work
+            let tuple = ctx
+                .shared_tuple_rx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
 
             match tuple {
                 Ok(t) => {
@@ -510,7 +566,7 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
                             "Worker {} exiting: channel closed, no files accumulated",
                             ctx.worker_id
                         );
-                        return;
+                        return Ok(());
                     }
                     // Have some files - process them even if < DB_BATCH_SIZE
                     tracing::info!(
@@ -538,7 +594,7 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
         use rayon::prelude::*;
 
         let processed_count_clone = ctx.processed_count.clone();
-        let results: Vec<Result<GitTupleResults>> = tuples_to_process_now
+        let results: Vec<Result<Option<GitTupleResults>>> = tuples_to_process_now
             .par_iter()
             .map_init(
                 || {
@@ -567,11 +623,13 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
         // Merge all successful results
         for result in results {
             match result {
-                Ok(tuple_result) => {
+                Ok(Some(tuple_result)) => {
                     batch.merge(tuple_result);
                 }
+                Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!("Worker {} failed to process tuple: {}", ctx.worker_id, e);
+                    tracing::error!("Worker {} failed to read file: {e:#}", ctx.worker_id);
+                    ctx.unread_files.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -579,13 +637,12 @@ fn tuple_worker_shared(ctx: TupleWorkerContext) {
         // Step 3: Send the batch (always exactly DB_BATCH_SIZE files)
         if batch.files_processed > 0 {
             ctx.batches_sent.fetch_add(1, Ordering::Relaxed);
-            if ctx.result_tx.send(batch).is_err() {
-                tracing::warn!(
+            ctx.result_tx.send(batch).map_err(|_| {
+                anyhow::anyhow!(
                     "Worker {} failed to send batch (channel closed)",
                     ctx.worker_id
-                );
-                return;
-            }
+                )
+            })?;
         }
     }
 }
@@ -827,6 +884,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     let batches_inserted = Arc::new(AtomicUsize::new(0));
     let failed_batches = Arc::new(AtomicUsize::new(0));
     let failed_files = Arc::new(AtomicUsize::new(0));
+    let unread_files = Arc::new(AtomicUsize::new(0));
 
     // Shared deduplication set across all generators (lock-free)
     let sent_in_this_run = Arc::new(DashSet::new());
@@ -875,7 +933,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         let generator_scope = config.scope_prefixes.clone();
 
         let handle = thread::spawn(move || {
-            if let Err(e) = stream_git_file_tuples_batch(
+            stream_git_file_tuples_batch(
                 generator_id,
                 generator_repo,
                 commit_chunk,
@@ -884,9 +942,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                 generator_processed_files,
                 generator_sent_in_run,
                 generator_scope,
-            ) {
-                tracing::error!("Generator {} failed: {}", generator_id, e);
-            }
+            )
         });
         generator_handles.push(handle);
     }
@@ -910,12 +966,11 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
             no_macros: config.no_macros,
             processed_count: processed_count.clone(),
             batches_sent: batches_sent.clone(),
+            unread_files: unread_files.clone(),
             accumulate_lock: accumulate_lock.clone(),
         };
 
-        let handle = thread::spawn(move || {
-            tuple_worker_shared(ctx);
-        });
+        let handle = thread::spawn(move || tuple_worker_shared(ctx));
         worker_handles.push(handle);
     }
 
@@ -990,19 +1045,9 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         inserter_handles.push((handle, in_flight_files));
     }
 
-    // Wait for all generators to complete
-    for (generator_id, handle) in generator_handles.into_iter().enumerate() {
-        if let Err(e) = handle.join() {
-            tracing::error!("Generator {} thread panicked: {:?}", generator_id, e);
-        }
-    }
-
-    // Wait for all workers to complete
-    for (worker_id, handle) in worker_handles.into_iter().enumerate() {
-        if let Err(e) = handle.join() {
-            tracing::error!("Worker {} thread panicked: {:?}", worker_id, e);
-        }
-    }
+    // Wait for all generators, then all workers, to complete
+    let failed_threads =
+        join_failed("Generator", generator_handles) + join_failed("Worker", worker_handles);
 
     // Wait for all inserter tasks to finish
     for (inserter_id, (handle, in_flight_files)) in inserter_handles.into_iter().enumerate() {
@@ -1020,6 +1065,8 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         types_count: inserted_types.load(Ordering::Relaxed),
         failed_batches: failed_batches.load(Ordering::Relaxed),
         failed_files: failed_files.load(Ordering::Relaxed),
+        unread_files: unread_files.load(Ordering::Relaxed),
+        failed_threads,
     };
 
     // Finish progress bar
@@ -1149,6 +1196,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let batches_inserted = Arc::new(AtomicUsize::new(0));
     let failed_batches = Arc::new(AtomicUsize::new(0));
     let failed_files = Arc::new(AtomicUsize::new(0));
+    let unread_files = Arc::new(AtomicUsize::new(0));
 
     // Spawn progress updater thread
     let pb_clone = pb.clone();
@@ -1185,16 +1233,14 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let generator_scope = config.scope_prefixes.clone();
 
     let generator_handle = thread::spawn(move || {
-        if let Err(e) = stream_tree_file_tuples(
+        stream_tree_file_tuples(
             generator_repo,
             generator_commit_sha,
             generator_extensions,
             tuple_tx,
             generator_processed_files,
             generator_scope,
-        ) {
-            tracing::error!("Tree generator failed: {}", e);
-        }
+        )
     });
 
     // Use a mutex as a simple semaphore to control worker batch filling
@@ -1212,12 +1258,11 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
             no_macros: config.no_macros,
             processed_count: processed_count.clone(),
             batches_sent: batches_sent.clone(),
+            unread_files: unread_files.clone(),
             accumulate_lock: accumulate_lock.clone(),
         };
 
-        let handle = thread::spawn(move || {
-            tuple_worker_shared(ctx);
-        });
+        let handle = thread::spawn(move || tuple_worker_shared(ctx));
         worker_handles.push(handle);
     }
 
@@ -1288,17 +1333,9 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
         inserter_handles.push((handle, in_flight_files));
     }
 
-    // Wait for generator to complete
-    if let Err(e) = generator_handle.join() {
-        tracing::error!("Tree generator thread panicked: {:?}", e);
-    }
-
-    // Wait for all workers to complete
-    for (worker_id, handle) in worker_handles.into_iter().enumerate() {
-        if let Err(e) = handle.join() {
-            tracing::error!("Worker {} thread panicked: {:?}", worker_id, e);
-        }
-    }
+    // Wait for the generator, then all workers, to complete
+    let failed_threads = join_failed("Tree generator", vec![generator_handle])
+        + join_failed("Worker", worker_handles);
 
     // Wait for all inserter tasks to finish
     for (inserter_id, (handle, in_flight_files)) in inserter_handles.into_iter().enumerate() {
@@ -1316,6 +1353,8 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
         types_count: inserted_types.load(Ordering::Relaxed),
         failed_batches: failed_batches.load(Ordering::Relaxed),
         failed_files: failed_files.load(Ordering::Relaxed),
+        unread_files: unread_files.load(Ordering::Relaxed),
+        failed_threads,
     };
 
     pb.finish_with_message(format!(
@@ -1408,9 +1447,9 @@ pub async fn process_git_tree(
 
     let total_time = start_time.elapsed();
 
-    if stats.failed_batches > 0 {
+    if let Some(summary) = stats.incomplete_summary() {
         println!("\n=== Git Tree Indexing Incomplete ===");
-        println!("Not stored: {}", stats.unstored_summary());
+        println!("{summary}");
     } else {
         println!("\n=== Git Tree Indexing Complete ===");
     }
@@ -1443,9 +1482,9 @@ pub async fn process_git_tree(
         error!("Failed to ensure call_edges index: {}", e);
     }
 
-    // A batch that was not stored leaves its files unread, so the coverage
-    // records below would claim a tree this run did not finish.
-    stats.unstored_batches_error()?;
+    // A file that was not read or not stored is missing from the index, so
+    // the coverage records below would claim a tree this run did not finish.
+    stats.incomplete_error()?;
 
     // The whole tree has been read with this build, so a file still recorded
     // against an older extractor is content the tree no longer holds. Left in
@@ -1637,9 +1676,9 @@ pub async fn process_git_range(
 
     let total_time = start_time.elapsed();
 
-    if stats.failed_batches > 0 {
+    if let Some(summary) = stats.incomplete_summary() {
         info!("\n=== Git Range Pipeline Incomplete ===");
-        info!("Not stored: {}", stats.unstored_summary());
+        info!("{summary}");
     } else {
         info!("\n=== Git Range Pipeline Complete ===");
     }
@@ -1676,7 +1715,7 @@ pub async fn process_git_range(
     // Do not write a database version. Part of the database was updated here,
     // but other parts could have been written by an older version of semcode.
 
-    stats.unstored_batches_error()
+    stats.incomplete_error()
 }
 
 #[cfg(test)]
@@ -1864,38 +1903,6 @@ mod tests {
         assert_eq!(landed_types.len(), 1);
     }
 
-    #[test]
-    fn unstored_batches_error_counts_batches_and_files() {
-        assert!(GitTupleStats::default().unstored_batches_error().is_ok());
-        let stats = |failed_batches, failed_files| GitTupleStats {
-            failed_batches,
-            failed_files,
-            ..Default::default()
-        };
-        assert_eq!(
-            stats(1, 1)
-                .unstored_batches_error()
-                .unwrap_err()
-                .to_string(),
-            "1 batch (1 file) was not stored; indexing again reads them"
-        );
-        assert_eq!(
-            stats(2, 512)
-                .unstored_batches_error()
-                .unwrap_err()
-                .to_string(),
-            "2 batches (512 files) were not stored; indexing again reads them"
-        );
-        // A panicked inserter that held no batch still fails the run.
-        assert_eq!(
-            stats(1, 0)
-                .unstored_batches_error()
-                .unwrap_err()
-                .to_string(),
-            "1 batch (0 files) was not stored; indexing again reads them"
-        );
-    }
-
     /// A mark that fails after every fact landed still leaves the file
     /// unread, so the batch is reported as not stored.
     #[tokio::test]
@@ -1975,6 +1982,109 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.recorded_tree_sha().await.unwrap(), Some(head));
+    }
+
+    /// A one-commit repository holding a.c, with the loose object `spec`
+    /// names (`HEAD:a.c`, `HEAD^{tree}`) deleted, and the commit's sha.
+    fn repo_missing_object(spec: &str) -> (tempfile::TempDir, String) {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(
+            repo.join("a.c"),
+            "int a_function(void)\n{\n\treturn 0;\n}\n",
+        )
+        .unwrap();
+        git(repo, &["add", "a.c"]);
+        git(repo, &["commit", "-q", "-m", "a"]);
+        let head = crate::git::get_git_sha(repo).unwrap().unwrap();
+        let object = gix::open(repo)
+            .unwrap()
+            .rev_parse_single(spec)
+            .unwrap()
+            .detach()
+            .to_string();
+        std::fs::remove_file(
+            repo.join(".git/objects")
+                .join(&object[..2])
+                .join(&object[2..]),
+        )
+        .unwrap();
+        (repo_dir, head)
+    }
+
+    /// A tree or range run fails, and records no tree coverage, when a worker
+    /// cannot read a file (the blob is gone) or a generator cannot list the
+    /// files (the tree is gone). Either used to be logged and the run
+    /// reported success, so the branch was marked current without the files.
+    #[tokio::test]
+    async fn a_run_that_cannot_read_its_files_fails() {
+        let extensions = crate::file_extensions::default_extensions();
+        for (spec, expected) in [
+            ("HEAD:a.c", "1 file could not be read"),
+            ("HEAD^{tree}", "1 pipeline thread failed"),
+        ] {
+            let (repo_dir, head) = repo_missing_object(spec);
+            let repo = repo_dir.path().to_path_buf();
+
+            let (_db_dir, db) = test_db().await;
+            let db = Arc::new(db);
+            let err = process_git_tree(&repo, &head, &extensions, db.clone(), false, 1, &[])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{spec}: {err}");
+            assert_eq!(db.recorded_tree_sha().await.unwrap(), None, "{spec}");
+
+            let (_db_dir, db) = test_db().await;
+            let db = Arc::new(db);
+            let err = process_git_range(&repo, "HEAD", &extensions, db.clone(), false, 1, &[])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{spec}: {err}");
+        }
+    }
+
+    /// A file the pipeline reads but cannot analyze does not fail the run:
+    /// reading it again gives the same answer, so failing would leave the
+    /// branch stuck for good. A non-UTF-8 source file is decoded lossily and
+    /// indexed; a file with no grammar (here `.txt`) is skipped.
+    #[tokio::test]
+    async fn a_run_with_files_it_cannot_analyze_succeeds() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_path_buf();
+        git(&repo, &["init", "-q"]);
+        // A Latin-1 comment: valid C, but not UTF-8.
+        std::fs::write(
+            repo.join("a.c"),
+            b"/* caf\xe9 */\nint a_function(void)\n{\n\treturn 0;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("notes.txt"), "not source\n").unwrap();
+        git(&repo, &["add", "a.c", "notes.txt"]);
+        git(&repo, &["commit", "-q", "-m", "a"]);
+        let head = crate::git::get_git_sha(&repo).unwrap().unwrap();
+        let extensions = vec!["c".to_string(), "txt".to_string()];
+
+        let (_db_dir, db) = test_db().await;
+        let db = Arc::new(db);
+        process_git_tree(&repo, &head, &extensions, db.clone(), false, 1, &[])
+            .await
+            .unwrap();
+        assert_eq!(db.recorded_tree_sha().await.unwrap(), Some(head));
+        let names: Vec<_> = db
+            .get_all_functions_metadata_only()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, ["a_function"]);
+
+        let (_db_dir, db) = test_db().await;
+        let db = Arc::new(db);
+        process_git_range(&repo, "HEAD", &extensions, db.clone(), false, 1, &[])
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -2062,6 +2172,7 @@ mod tests {
         let (result_tx, result_rx) = mpsc::sync_channel(16);
         let processed_count = Arc::new(AtomicUsize::new(0));
         let batches_sent = Arc::new(AtomicUsize::new(0));
+        let unread_files = Arc::new(AtomicUsize::new(0));
         let accumulate_lock = Arc::new(std::sync::Mutex::new(()));
         let workers: Vec<_> = (0..4)
             .map(|worker_id| {
@@ -2074,6 +2185,7 @@ mod tests {
                     no_macros: false,
                     processed_count: processed_count.clone(),
                     batches_sent: batches_sent.clone(),
+                    unread_files: unread_files.clone(),
                     accumulate_lock: accumulate_lock.clone(),
                 };
                 thread::spawn(move || tuple_worker_shared(ctx))
@@ -2081,13 +2193,14 @@ mod tests {
             .collect();
         drop(result_tx);
         for worker in workers {
-            worker.join().unwrap();
+            worker.join().unwrap().unwrap();
         }
 
         // a.c at both commits and b.c: three blobs, each read once.
         let files: usize = result_rx.iter().map(|batch| batch.files_processed).sum();
         assert_eq!(files, 3);
         assert_eq!(processed_count.load(Ordering::Relaxed), 3);
+        assert_eq!(unread_files.load(Ordering::Relaxed), 0);
         assert_eq!(open_packs(&worker_repo), 1);
     }
 
