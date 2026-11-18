@@ -297,6 +297,19 @@ const SCOPE_AXES: &[&str] = &["arch"];
 /// Every other tool either reports all definitions of a name or does not
 /// resolve one at all. Kept beside the schemas it must agree with, and a
 /// test asserts it does.
+/// A tool result reporting that the call failed.
+///
+/// MCP carries a tool's error message the same way as its output: as text
+/// in `content`, with `isError` set so the client knows the call failed.
+/// A bare `error` field is not part of the result shape, so a client may
+/// reject the response or show the failure without its explanation.
+fn tool_error(message: impl Into<String>) -> Value {
+    json!({
+        "content": [{"type": "text", "text": message.into()}],
+        "isError": true
+    })
+}
+
 const SCOPED_TOOLS: &[&str] = &["find_callers", "find_calls", "find_callchain"];
 
 /// Refuse a scope handed to a tool that would ignore it.
@@ -317,14 +330,11 @@ fn refuse_unscopable_tool(tool: &str, arguments: &Value) -> Option<Value> {
     let named = ["scope", "scopes", "arch"]
         .into_iter()
         .find(|key| arguments.get(key).is_some_and(|value| !value.is_null()))?;
-    Some(json!({
-        "error": format!(
-            "'{tool}' does not take '{named}'; it does not answer about one \
+    Some(tool_error(format!(
+        "'{tool}' does not take '{named}'; it does not answer about one \
              definition. Scope is taken by {}.",
-            SCOPED_TOOLS.join(", ")
-        ),
-        "isError": true
-    }))
+        SCOPED_TOOLS.join(", ")
+    )))
 }
 
 /// What an index can be asked to constrain by, read from the index.
@@ -3456,10 +3466,7 @@ impl McpServer {
             "list_categories" => self.handle_list_categories().await,
             "get_tools" => self.handle_get_tools(arguments).await,
             "call_tool" => self.handle_call_tool(arguments).await,
-            _ => json!({
-                "error": format!("Unknown tool: {}", name),
-                "isError": true
-            }),
+            _ => tool_error(format!("Unknown tool: {}", name)),
         }
     }
 
@@ -3580,10 +3587,7 @@ impl McpServer {
     // Tool implementation methods
     async fn handle_file_survey(&self, args: &Value) -> Value {
         let Some(path) = args["path"].as_str() else {
-            return json!({
-                "error": "path is required",
-                "isError": true
-            });
+            return tool_error("path is required");
         };
 
         let workspace = std::path::Path::new(&self.git_repo_path);
@@ -3609,10 +3613,7 @@ impl McpServer {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": output}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to survey file: {e}"),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to survey file: {e}")),
         }
     }
 
@@ -3636,10 +3637,7 @@ impl McpServer {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to find function: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to find function: {}", e)),
         }
     }
 
@@ -3663,10 +3661,7 @@ impl McpServer {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to find type: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to find type: {}", e)),
         }
     }
 
@@ -3687,17 +3682,14 @@ impl McpServer {
         let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
         let pin = match context_for_scope(&self.db, args.get("scope")).await {
             Ok(pin) => pin,
-            Err(refusal) => return json!({"error": refusal, "isError": true}),
+            Err(refusal) => return tool_error(refusal),
         };
 
         match mcp_show_callers(&self.db, name, &git_sha, pin).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to find callers: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to find callers: {}", e)),
         }
     }
 
@@ -3741,10 +3733,7 @@ impl McpServer {
                 }
                 json!({"content": [{"type": "text", "text": truncate_output(text)}]})
             }
-            Err(e) => json!({
-                "error": format!("Failed to find implementors: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to find implementors: {}", e)),
         }
     }
 
@@ -3785,10 +3774,7 @@ impl McpServer {
                 }
                 json!({"content": [{"type": "text", "text": truncate_output(text)}]})
             }
-            Err(e) => json!({
-                "error": format!("Failed to find registrations: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to find registrations: {}", e)),
         }
     }
 
@@ -3809,17 +3795,14 @@ impl McpServer {
         let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
         let pin = match context_for_scope(&self.db, args.get("scope")).await {
             Ok(pin) => pin,
-            Err(refusal) => return json!({"error": refusal, "isError": true}),
+            Err(refusal) => return tool_error(refusal),
         };
 
         match mcp_show_calls(&self.db, name, &git_sha, pin).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to find calls: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to find calls: {}", e)),
         }
     }
 
@@ -3840,7 +3823,7 @@ impl McpServer {
         let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
         let pin = match context_for_scope(&self.db, args.get("scope")).await {
             Ok(pin) => pin,
-            Err(refusal) => return json!({"error": refusal, "isError": true}),
+            Err(refusal) => return tool_error(refusal),
         };
 
         // Parse the new parameters with same defaults as query tool
@@ -3866,10 +3849,7 @@ impl McpServer {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to find callchain: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to find callchain: {}", e)),
         }
     }
 
@@ -3880,10 +3860,7 @@ impl McpServer {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to extract functions from diff: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to extract functions from diff: {}", e)),
         }
     }
 
@@ -3913,10 +3890,7 @@ impl McpServer {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to search function bodies: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to search function bodies: {}", e)),
         }
     }
 
@@ -3951,10 +3925,7 @@ impl McpServer {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
-            Err(e) => json!({
-                "error": format!("Failed to search similar functions: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to search similar functions: {}", e)),
         }
     }
 
@@ -4054,10 +4025,7 @@ impl McpServer {
                         "content": [{"type": "text", "text": truncate_output(result)}]
                     })
                 }
-                Err(e) => json!({
-                    "error": format!("Failed to find commits in range: {}", e),
-                    "isError": true
-                }),
+                Err(e) => tool_error(format!("Failed to find commits in range: {}", e)),
             }
         } else if let Some(git_ref_str) = git_ref {
             // Show single commit
@@ -4078,10 +4046,7 @@ impl McpServer {
                         "content": [{"type": "text", "text": truncate_output(result)}]
                     })
                 }
-                Err(e) => json!({
-                    "error": format!("Failed to find commit: {}", e),
-                    "isError": true
-                }),
+                Err(e) => tool_error(format!("Failed to find commit: {}", e)),
             }
         } else {
             // Neither git_ref nor git_range provided - show all commits from database
@@ -4102,10 +4067,7 @@ impl McpServer {
                         "content": [{"type": "text", "text": truncate_output(result)}]
                     })
                 }
-                Err(e) => json!({
-                    "error": format!("Failed to find commits: {}", e),
-                    "isError": true
-                }),
+                Err(e) => tool_error(format!("Failed to find commits: {}", e)),
             }
         }
     }
@@ -4206,10 +4168,7 @@ impl McpServer {
                     "content": [{"type": "text", "text": truncate_output(result)}]
                 })
             }
-            Err(e) => json!({
-                "error": format!("Failed to search similar commits: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to search similar commits: {}", e)),
         }
     }
 
@@ -4229,10 +4188,7 @@ impl McpServer {
             match semcode::date_utils::parse_date(date_str) {
                 Ok(parsed) => Some(parsed),
                 Err(e) => {
-                    return json!({
-                        "error": format!("Invalid --since date '{}': {}", date_str, e),
-                        "isError": true
-                    });
+                    return tool_error(format!("Invalid --since date '{}': {}", date_str, e));
                 }
             }
         } else {
@@ -4243,10 +4199,7 @@ impl McpServer {
             match semcode::date_utils::parse_date(date_str) {
                 Ok(parsed) => Some(parsed),
                 Err(e) => {
-                    return json!({
-                        "error": format!("Invalid --until date '{}': {}", date_str, e),
-                        "isError": true
-                    });
+                    return tool_error(format!("Invalid --until date '{}': {}", date_str, e));
                 }
             }
         } else {
@@ -4321,10 +4274,7 @@ impl McpServer {
                         "content": [{"type": "text", "text": truncate_output(result)}]
                     })
                 }
-                Err(e) => json!({
-                    "error": format!("Failed to lookup lore email: {}", e),
-                    "isError": true
-                }),
+                Err(e) => tool_error(format!("Failed to lookup lore email: {}", e)),
             }
         } else {
             // Multi-field search (same as query tool's lore command with multiple -f/-s/-b/-g/-t flags)
@@ -4349,10 +4299,7 @@ impl McpServer {
                         "content": [{"type": "text", "text": truncate_output(result)}]
                     })
                 }
-                Err(e) => json!({
-                    "error": format!("Failed to search lore emails: {}", e),
-                    "isError": true
-                }),
+                Err(e) => tool_error(format!("Failed to search lore emails: {}", e)),
             }
         }
     }
@@ -4373,10 +4320,7 @@ impl McpServer {
             match semcode::date_utils::parse_date(date_str) {
                 Ok(parsed) => Some(parsed),
                 Err(e) => {
-                    return json!({
-                        "error": format!("Invalid --since date '{}': {}", date_str, e),
-                        "isError": true
-                    });
+                    return tool_error(format!("Invalid --since date '{}': {}", date_str, e));
                 }
             }
         } else {
@@ -4387,10 +4331,7 @@ impl McpServer {
             match semcode::date_utils::parse_date(date_str) {
                 Ok(parsed) => Some(parsed),
                 Err(e) => {
-                    return json!({
-                        "error": format!("Invalid --until date '{}': {}", date_str, e),
-                        "isError": true
-                    });
+                    return tool_error(format!("Invalid --until date '{}': {}", date_str, e));
                 }
             }
         } else {
@@ -4428,10 +4369,7 @@ impl McpServer {
                     "content": [{"type": "text", "text": truncate_output(result)}]
                 })
             }
-            Err(e) => json!({
-                "error": format!("Failed to search lore emails for commit: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to search lore emails for commit: {}", e)),
         }
     }
 
@@ -4499,10 +4437,7 @@ impl McpServer {
             match semcode::date_utils::parse_date(date_str) {
                 Ok(parsed) => Some(parsed),
                 Err(e) => {
-                    return json!({
-                        "error": format!("Invalid --since date '{}': {}", date_str, e),
-                        "isError": true
-                    });
+                    return tool_error(format!("Invalid --since date '{}': {}", date_str, e));
                 }
             }
         } else {
@@ -4513,10 +4448,7 @@ impl McpServer {
             match semcode::date_utils::parse_date(date_str) {
                 Ok(parsed) => Some(parsed),
                 Err(e) => {
-                    return json!({
-                        "error": format!("Invalid --until date '{}': {}", date_str, e),
-                        "isError": true
-                    });
+                    return tool_error(format!("Invalid --until date '{}': {}", date_str, e));
                 }
             }
         } else {
@@ -4544,10 +4476,7 @@ impl McpServer {
                     "content": [{"type": "text", "text": truncate_output(result)}]
                 })
             }
-            Err(e) => json!({
-                "error": format!("Failed to search similar lore emails: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to search similar lore emails: {}", e)),
         }
     }
 
@@ -4648,10 +4577,7 @@ impl McpServer {
                     "content": [{"type": "text", "text": output}]
                 })
             }
-            Err(e) => json!({
-                "error": format!("Failed to list branches: {}", e),
-                "isError": true
-            }),
+            Err(e) => tool_error(format!("Failed to list branches: {}", e)),
         }
     }
 
@@ -4660,29 +4586,20 @@ impl McpServer {
         let branch2 = args["branch2"].as_str().unwrap_or("");
 
         if branch1.is_empty() || branch2.is_empty() {
-            return json!({
-                "error": "Both branch1 and branch2 are required",
-                "isError": true
-            });
+            return tool_error("Both branch1 and branch2 are required");
         }
 
         // Resolve both branches to SHAs
         let sha1 = match git::resolve_branch(&self.git_repo_path, branch1) {
             Ok(sha) => sha,
             Err(e) => {
-                return json!({
-                    "error": format!("Cannot resolve branch '{}': {}", branch1, e),
-                    "isError": true
-                });
+                return tool_error(format!("Cannot resolve branch '{}': {}", branch1, e));
             }
         };
         let sha2 = match git::resolve_branch(&self.git_repo_path, branch2) {
             Ok(sha) => sha,
             Err(e) => {
-                return json!({
-                    "error": format!("Cannot resolve branch '{}': {}", branch2, e),
-                    "isError": true
-                });
+                return tool_error(format!("Cannot resolve branch '{}': {}", branch2, e));
             }
         };
 
@@ -6536,7 +6453,7 @@ mod tests {
         // constrained, which is what the parameter exists to prevent.
         let scoped = json!({"name": "vfs_read", "scope": {"arch": "x86"}});
         let refusal = refuse_unscopable_tool("find_function", &scoped).unwrap();
-        let text = refusal["error"].as_str().unwrap();
+        let text = refusal["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("find_callers"), "{text}");
         assert!(refusal["isError"].as_bool().unwrap());
 
@@ -7109,6 +7026,111 @@ mod tests {
             tools_in_categories, all_tools,
             "Categories should cover all tools"
         );
+    }
+
+    /// A failed tool call must carry its message where MCP clients read it.
+    fn assert_tool_error(result: &Value, expected: &str) {
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(result.get("error").is_none(), "{result}");
+        let content = result["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 1, "{result}");
+        assert_eq!(content[0]["type"], json!("text"), "{result}");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains(expected), "{text}");
+    }
+
+    #[test]
+    fn tool_error_puts_the_message_in_content() {
+        let result = tool_error("something went wrong");
+        assert_eq!(
+            result,
+            json!({
+                "content": [{"type": "text", "text": "something went wrong"}],
+                "isError": true
+            })
+        );
+        assert_tool_error(&tool_error(String::from("owned")), "owned");
+    }
+
+    #[tokio::test]
+    async fn tool_call_failures_use_the_mcp_error_shape() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(temp_dir.path().to_str().unwrap(), ".".to_string())
+                .await
+                .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            database_path: String::new(),
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
+        };
+
+        let cases = [
+            (
+                json!({"name": "no_such_tool"}),
+                "Unknown tool: no_such_tool",
+            ),
+            (
+                json!({"name": "find_function", "arguments": {"name": "x", "scope": {"arch": "x86"}}}),
+                "does not take 'scope'",
+            ),
+            (
+                json!({"name": "file_survey", "arguments": {}}),
+                "path is required",
+            ),
+            (
+                json!({"name": "compare_branches", "arguments": {"branch1": "main"}}),
+                "Both branch1 and branch2 are required",
+            ),
+            (
+                json!({"name": "compare_branches", "arguments": {
+                    "branch1": "semcode-no-such-branch-a",
+                    "branch2": "semcode-no-such-branch-b"
+                }}),
+                "Cannot resolve branch 'semcode-no-such-branch-a'",
+            ),
+            (
+                json!({"name": "lore_search", "arguments": {"since_date": "not a date"}}),
+                "Invalid --since date 'not a date'",
+            ),
+            (
+                json!({"name": "dig", "arguments": {"commit": "HEAD", "until_date": "not a date"}}),
+                "Invalid --until date 'not a date'",
+            ),
+            (
+                json!({"name": "vlore_similar_emails", "arguments": {
+                    "message_id": "x", "since_date": "not a date"
+                }}),
+                "Invalid --since date 'not a date'",
+            ),
+        ];
+        for (params, expected) in cases {
+            let result = server.handle_tool_call(&params).await;
+            assert_tool_error(&result, expected);
+        }
+
+        // A failure while running a tool is a tool execution error: the
+        // JSON-RPC response carries it as a result, not as a protocol error.
+        let response = server
+            .handle_request(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "compare_branches", "arguments": {
+                    "branch1": "semcode-no-such-branch-a",
+                    "branch2": "semcode-no-such-branch-b"
+                }}
+            }))
+            .await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_tool_error(&response["result"], "Cannot resolve branch");
     }
 
     #[tokio::test]
