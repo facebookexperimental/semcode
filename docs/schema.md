@@ -453,6 +453,9 @@ line                (Int64, NOT NULL)    - Line of the site
 member              (Utf8, NOT NULL)     - Member dispatched through, empty for a plain pointer call
 receiver_expr       (Utf8, nullable)     - Receiver as written
 receiver_type       (Utf8, nullable)     - Type of the receiver, when the file declares it
+receiver_bound      (Utf8, nullable)     - Bound of a receiver typed as a generic
+                                           parameter. Set beside the type, or alone
+                                           for `impl`/`dyn` parameters
 receiver_base_type  (Utf8, nullable)     - For `base->field->m()`, the type of the base
 receiver_field      (Utf8, nullable)     - For `base->field->m()`, the field read from it
 kind                (Utf8, NOT NULL)     - member_arrow, member_dot, pointer_param, pointer_local,
@@ -478,7 +481,8 @@ Functions installed in a struct member: `.read = my_read`, or
 
 **Schema:**
 ```
-container_type      (Utf8, NOT NULL)     - Struct or union the member belongs to
+container_type      (Utf8, NOT NULL)     - Struct or union the member belongs to,
+                                           or the trait for a trait_impl row
 member              (Utf8, NOT NULL)     - Member being installed into
 target              (Utf8, NOT NULL)     - What is installed, as written
 file_path           (Utf8, NOT NULL)     - File containing the registration
@@ -486,7 +490,7 @@ git_file_hash       (Utf8, NOT NULL)     - Content hash of that file
 byte_start          (Int64, NOT NULL)    - Byte offset within the file
 line                (Int64, NOT NULL)    - Line of the registration
 enclosing_function  (Utf8, NOT NULL)     - Function containing it, empty at file scope
-kind                (Utf8, NOT NULL)     - designated_init or assignment
+kind                (Utf8, NOT NULL)     - designated_init, assignment, or trait_impl
 ```
 
 **Notes:**
@@ -494,6 +498,10 @@ kind                (Utf8, NOT NULL)     - designated_init or assignment
   too; the join against known functions filters those without a separate rule
 - An initializer whose container type the file does not state is skipped
   rather than guessed at
+- A `trait_impl` row installs a trait method in its trait: `impl Display
+  for Foo` records container `Display`, member `fmt`, target `Foo::fmt`.
+  These rows join through a site bound or the target owner; an untyped
+  site joins nothing
 
 **Indices:**
 - BTree on `target`, `member` and `container_type`
@@ -509,8 +517,9 @@ naming the mechanism and a place to look lets it continue.
 name                (Utf8, NOT NULL)     - The end of the edge that is known
 direction           (Utf8, NOT NULL)     - in or out, from that end
 kind                (Utf8, NOT NULL)     - Mechanism, namespaced by language:
-                                           c:macro_parameter_call, and others as
-                                           they are recorded
+                                           c:macro_parameter_call,
+                                           rust:unrecognized_call_shape, and
+                                           others as they are recorded
 evidence            (Utf8, NOT NULL)     - What the source writes where the name
                                            would be: a macro parameter, a pasted
                                            fragment, an attribute string
@@ -531,8 +540,9 @@ line                (Int64, NOT NULL)    - Line of the first location
 - `kind` is an open string rather than an enum. The row shape holds across
   languages; the vocabulary does not, and a set common to C macros, Rust trait
   objects and Python attribute lookup would describe none of them
-- A row keyed by `(file_path, git_file_hash, line, name, direction)`, so
-  re-indexing unchanged content rewrites it rather than adding a second
+- A row keyed by `(file_path, git_file_hash, line, name, direction, kind)`,
+  so re-indexing unchanged content rewrites it rather than adding a second.
+  The store keeps one row per kind at a place in a file.
 
 **Indices:**
 - BTree on `name` and `kind`

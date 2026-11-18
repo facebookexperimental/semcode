@@ -101,12 +101,37 @@ pub fn indirect_callers(
             // A site that states its receiver type only matches the type the
             // function was installed in; one that does not is a member-name
             // match, which is weaker but is what the reader asked for.
+            //
+            // Trait rows join through the bound, or through the target
+            // owner where the site carries no bound. An untyped site
+            // joins nothing: member names alone over-match.
             let type_matched = match site.receiver_type.as_deref() {
-                Some(receiver_type) => {
-                    if receiver_type != registration.container_type {
-                        continue;
+                Some(receiver_type) if receiver_type == registration.container_type => true,
+                Some(receiver_type)
+                    if registration.kind == crate::types::RegistrationKind::TraitImpl =>
+                {
+                    match site.receiver_bound.as_deref() {
+                        Some(bound) => {
+                            if !crate::types::each_bound(bound).iter().any(|piece| {
+                                crate::types::trait_names_match(piece, &registration.container_type)
+                            }) {
+                                continue;
+                            }
+                        }
+                        None => {
+                            if !crate::types::target_owner_matches(
+                                &registration.target,
+                                receiver_type,
+                            ) {
+                                continue;
+                            }
+                        }
                     }
                     true
+                }
+                Some(_) => continue,
+                None if registration.kind == crate::types::RegistrationKind::TraitImpl => {
+                    continue;
                 }
                 None => false,
             };
@@ -550,6 +575,7 @@ mod tests {
             receiver_type: receiver_type.map(|t| t.to_string()),
             receiver_base_type: None,
             receiver_field: None,
+            receiver_bound: None,
             kind: DispatchKind::MemberArrow,
             target: None,
         }
@@ -773,5 +799,156 @@ mod tests {
                 other => panic!("unexpected evidence: {other:?}"),
             }
         }
+    }
+
+    fn trait_row(container: &str, member: &str, target: &str) -> Registration {
+        let mut row = registration(container, member, target);
+        row.kind = RegistrationKind::TraitImpl;
+        row
+    }
+
+    /// The same installation from another file, answering on its own.
+    fn trait_row_at(container: &str, member: &str, target: &str, file_path: &str) -> Registration {
+        let mut row = trait_row(container, member, target);
+        row.file_path = file_path.to_string();
+        row.git_file_hash = format!("hash-{file_path}");
+        row
+    }
+
+    fn bound_site(member: &str, caller: &str, receiver: &str, bound: &str) -> DispatchSite {
+        let mut site = site(member, caller, Some(receiver));
+        site.receiver_bound = Some(bound.to_string());
+        site
+    }
+
+    #[test]
+    fn a_bound_receiver_reaches_the_impls_of_its_bound() {
+        // A bound site answers once per caller across impls (two files
+        // force the count to carry the multiplicity).
+        let sites = group_by_member(vec![bound_site("fmt", "render", "T", "Display")]);
+        let found = indirect_callers(
+            &[
+                trait_row_at("Display", "fmt", "Foo::fmt", "foo.rs"),
+                trait_row_at("Display", "fmt", "Bar::fmt", "bar.rs"),
+            ],
+            &sites,
+            &[],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        match &found[0].evidence {
+            Evidence::Registered {
+                container_type,
+                type_matched,
+                registration_count,
+                ..
+            } => {
+                assert_eq!(container_type, "Display");
+                assert!(type_matched);
+                assert_eq!(*registration_count, 2);
+            }
+            other => panic!("unexpected evidence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_bound_in_a_plus_list_is_a_route() {
+        // Each bound in the list answers (three traits force the
+        // non-member out).
+        let sites = group_by_member(vec![bound_site("fmt", "render", "T", "Display + Send")]);
+        let found = indirect_callers(
+            &[
+                trait_row_at("Display", "fmt", "Foo::fmt", "foo.rs"),
+                trait_row_at("Send", "fmt", "Qux::fmt", "qux.rs"),
+                trait_row_at("Debug", "fmt", "Baz::fmt", "baz.rs"),
+            ],
+            &sites,
+            &[],
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        for caller in &found {
+            assert_eq!(caller.caller_name, "render");
+        }
+    }
+
+    #[test]
+    fn a_bound_site_ignores_the_implementing_type() {
+        // A bound site ignores the implementing type (the fixture aims
+        // both rows at one receiver, so the bound must choose).
+        let sites = group_by_member(vec![bound_site("fmt", "render", "Foo", "Display")]);
+        let found = indirect_callers(
+            &[
+                trait_row_at("Display", "fmt", "Foo::fmt", "foo.rs"),
+                trait_row_at("Send", "fmt", "Foo::fmt", "foo_send.rs"),
+            ],
+            &sites,
+            &[],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        match &found[0].evidence {
+            Evidence::Registered { container_type, .. } => {
+                assert_eq!(container_type, "Display", "{found:?}")
+            }
+            other => panic!("unexpected evidence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_named_traits_in_other_modules_stay_out() {
+        // Same-named traits in other modules stay out (two `Driver`
+        // traits force the suffix check).
+        let sites = group_by_member(vec![bound_site("probe", "boot", "T", "a::Driver")]);
+        let found = indirect_callers(
+            &[
+                trait_row_at("b::Driver", "probe", "Qux::probe", "qux.rs"),
+                trait_row_at("a::Driver", "probe", "Foo::probe", "foo.rs"),
+            ],
+            &sites,
+            &[],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].caller_name, "boot");
+    }
+
+    #[test]
+    fn a_concrete_receiver_reaches_the_impl_for_its_type() {
+        // A concrete receiver answers through its type (two implementors
+        // force the choice).
+        let sites = group_by_member(vec![site("fmt", "show", Some("Foo"))]);
+        let found = indirect_callers(
+            &[
+                trait_row("Display", "fmt", "Foo::fmt"),
+                trait_row("Display", "fmt", "Baz::fmt"),
+            ],
+            &sites,
+            &[],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].caller_name, "show");
+    }
+
+    #[test]
+    fn an_untyped_site_never_joins_a_trait_row() {
+        // An untyped site joins no trait row (one common member name
+        // forces the refusal).
+        let sites = group_by_member(vec![site("fmt", "show", None)]);
+        let found = indirect_callers(&[trait_row("Display", "fmt", "Foo::fmt")], &sites, &[]);
+        assert!(found.is_empty(), "untyped site joined a trait: {found:?}");
+    }
+
+    #[test]
+    fn a_bound_for_another_trait_selects_nothing() {
+        // A bound for another trait selects nothing (a wrong trait and
+        // a wrong instantiation force both misses).
+        let sites = group_by_member(vec![bound_site("fmt", "render", "T", "Debug")]);
+        let found = indirect_callers(&[trait_row("Display", "fmt", "Foo::fmt")], &sites, &[]);
+        assert!(found.is_empty(), "wrong trait joined: {found:?}");
+
+        let sites = group_by_member(vec![bound_site("from", "convert", "T", "From<u8>")]);
+        let found = indirect_callers(
+            &[trait_row("From<u16>", "from", "Error::from")],
+            &sites,
+            &[],
+        );
+        assert!(found.is_empty(), "wrong instantiation joined: {found:?}");
     }
 }

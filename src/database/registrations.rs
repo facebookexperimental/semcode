@@ -159,6 +159,15 @@ impl RegistrationStore {
             .await
     }
 
+    /// Trait-impl installations of a member, narrowed by kind.
+    pub async fn find_trait_impls_by_member(&self, member: &str) -> Result<Vec<Registration>> {
+        self.query(&format!(
+            "member = '{}' AND kind = 'trait_impl'",
+            member.replace('\'', "''")
+        ))
+        .await
+    }
+
     async fn query(&self, filter: &str) -> Result<Vec<Registration>> {
         let table = self
             .connection

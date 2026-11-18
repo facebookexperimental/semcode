@@ -201,3 +201,71 @@ async fn empty_scope_indexes_everything() {
         .unwrap();
     assert_eq!(outside.len(), 1, "{outside:?}");
 }
+
+async fn use_alias_tree() -> (tempfile::TempDir, Arc<DatabaseManager>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    // Two files define `assoc`; the caller names one through an alias.
+    std::fs::write(
+        repo.join("def.rs"),
+        "pub mod m {\n    pub struct H;\n    impl H {\n        pub fn assoc() -> u32 {\n            1\n        }\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("other.rs"),
+        "pub struct H;\nimpl H {\n    pub fn assoc() -> u32 {\n        2\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("user.rs"),
+        "use def::m::H;\n\npub fn user() -> u32 {\n    H::assoc()\n}\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "use alias fixture"]);
+    let sha = git::get_git_sha(repo).unwrap().unwrap();
+
+    let db = Arc::new(
+        DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    let extensions = ["rs".to_string()];
+    semcode::git_range::process_git_tree(repo, &sha, &extensions, db.clone(), false, 1, &[])
+        .await
+        .unwrap();
+    (dir, db, sha)
+}
+
+#[tokio::test]
+async fn use_alias_head_selects_the_aliased_owner() {
+    let (_dir, db, sha) = use_alias_tree().await;
+
+    // The stored edge reads as the alias target (one `assoc` per file
+    // forces the head to choose).
+    let user = db.find_all_functions_git_aware("user", &sha).await.unwrap();
+    assert_eq!(user.len(), 1, "{user:?}");
+    let calls = user[0]
+        .calls
+        .clone()
+        .expect("user calls H::assoc, so it must record an edge");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    match &calls[0] {
+        CallEdge::Plain(call) => assert_eq!(call, "def::m::H::assoc", "{call}"),
+        other => panic!("aliased H::assoc must rewrite to a plain path, got {other:?}"),
+    }
+
+    // The spelled path then selects one definition (two definitions
+    // share the name, so the unspelled head cannot).
+    let defs = db
+        .find_all_functions_git_aware("def::m::H::assoc", &sha)
+        .await
+        .unwrap();
+    assert_eq!(defs.len(), 1, "{defs:?}");
+    assert_eq!(defs[0].file_path, "def.rs", "{defs:?}");
+}

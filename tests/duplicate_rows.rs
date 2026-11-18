@@ -75,6 +75,7 @@ async fn a_batch_holding_one_dispatch_site_twice_still_inserts() {
         receiver_type: None,
         receiver_base_type: None,
         receiver_field: None,
+        receiver_bound: None,
         kind: semcode::DispatchKind::MemberArrow,
         target: None,
     };
@@ -84,6 +85,38 @@ async fn a_batch_holding_one_dispatch_site_twice_still_inserts() {
     db.insert_dispatch_sites(vec![site.clone(), site])
         .await
         .expect("a batch holding an existing site twice must still insert");
+}
+
+#[tokio::test]
+async fn a_generic_bound_survives_the_round_trip() {
+    // The bound writes and reads back beside the type (a bound beside
+    // a type forces the nullable column to hold it).
+    let (_dir, db) = database().await;
+    let site = DispatchSite {
+        caller_name: "show".into(),
+        file_path: "x.rs".into(),
+        git_file_hash: "abc123".into(),
+        byte_start: 100,
+        line: 5,
+        member: "fmt".into(),
+        receiver_expr: Some("v".into()),
+        receiver_type: Some("T".into()),
+        receiver_base_type: None,
+        receiver_field: None,
+        receiver_bound: Some("Display".into()),
+        kind: semcode::DispatchKind::MemberArrow,
+        target: None,
+    };
+    db.insert_dispatch_sites(vec![site]).await.unwrap();
+
+    let found = db.find_dispatch_sites_by_caller("show").await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].receiver_type.as_deref(), Some("T"), "{found:?}");
+    assert_eq!(
+        found[0].receiver_bound.as_deref(),
+        Some("Display"),
+        "{found:?}"
+    );
 }
 
 #[tokio::test]
@@ -155,4 +188,38 @@ async fn two_same_named_types_under_different_owners_both_insert() {
         .filter(|t| t.name == "Box" && t.file_path == "box.cpp")
         .collect::<Vec<_>>();
     assert_eq!(found.len(), 2, "{found:#?}");
+}
+
+#[tokio::test]
+async fn two_mechanisms_failing_at_one_place_are_two_rows() {
+    // Both rows insert at one place: the two kinds read as two rows
+    // (one batch holds both, so dedup by place alone would keep one).
+    let (_dir, db) = database().await;
+
+    let edge = |kind: &str| semcode::UnresolvedEdge {
+        name: "run".into(),
+        direction: "out".into(),
+        kind: kind.into(),
+        evidence: "(f)()".into(),
+        locations: vec![semcode::EdgeLocation {
+            role: "invocation".into(),
+            file_path: "x.rs".into(),
+            line: 9,
+        }],
+        file_path: "x.rs".into(),
+        git_file_hash: "abc123".into(),
+        line: 9,
+    };
+    db.insert_unresolved_edges(vec![
+        edge("rust:unrecognized_call_shape"),
+        edge("c:macro_parameter_call"),
+    ])
+    .await
+    .expect("two kinds at one place must both insert");
+
+    let found = db
+        .find_unresolved_edges_git_aware("run", "abc123")
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2, "{found:?}");
 }

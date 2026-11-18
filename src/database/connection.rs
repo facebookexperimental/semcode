@@ -1394,6 +1394,46 @@ impl DatabaseManager {
             .await?;
         registrations.retain(|r| r.container_type == container_type);
 
+        // A module-qualified trait misses bare-stored rows, so trait
+        // rows come in by member on a suffix match.
+        let mut seen: std::collections::HashSet<_> = registrations
+            .iter()
+            .map(|r| {
+                (
+                    r.file_path.clone(),
+                    r.git_file_hash.clone(),
+                    r.byte_start,
+                    r.target.clone(),
+                )
+            })
+            .collect();
+        let mut trait_rows = crate::database::resolution::at_revision(
+            self.registration_store
+                .find_trait_impls_by_member(member)
+                .await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        );
+        self.resolve_chained_registrations(&mut trait_rows, &manifest)
+            .await?;
+        self.keep_verified_tables(&mut trait_rows, git_sha).await?;
+        for row in trait_rows {
+            let key = (
+                row.file_path.clone(),
+                row.git_file_hash.clone(),
+                row.byte_start,
+                row.target.clone(),
+            );
+            if seen.insert(key)
+                && (crate::types::trait_container_matches_owner(
+                    &row.container_type,
+                    container_type,
+                ) || crate::types::target_owner_matches(&row.target, container_type))
+            {
+                registrations.push(row);
+            }
+        }
+
         Ok(registrations)
     }
 
@@ -1715,6 +1755,44 @@ impl DatabaseManager {
             &manifest,
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
         );
+        // A trait-method query matches no target, so impl rows come in
+        // by member for owners the query names, or all rows where the
+        // query names no owner.
+        let (member, owner) = crate::types::split_callee_edge(target);
+        {
+            let mut seen: std::collections::HashSet<_> = registrations
+                .iter()
+                .map(|r| {
+                    (
+                        r.file_path.clone(),
+                        r.git_file_hash.clone(),
+                        r.byte_start,
+                        r.target.clone(),
+                    )
+                })
+                .collect();
+            for row in at_revision(
+                self.registration_store
+                    .find_trait_impls_by_member(member)
+                    .await?,
+                &manifest,
+                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+            ) {
+                let key = (
+                    row.file_path.clone(),
+                    row.git_file_hash.clone(),
+                    row.byte_start,
+                    row.target.clone(),
+                );
+                if owner.is_none_or(|owner| {
+                    crate::types::trait_container_matches_owner(&row.container_type, owner)
+                        || crate::types::target_owner_matches(&row.target, owner)
+                }) && seen.insert(key)
+                {
+                    registrations.push(row);
+                }
+            }
+        }
         self.resolve_chained_registrations(&mut registrations, &manifest)
             .await?;
         self.keep_verified_tables(&mut registrations, git_sha)
@@ -2806,22 +2884,44 @@ impl DatabaseManager {
             .collect()
     }
 
-    /// Keep only the rows a spelled owner path addresses. `None` is the bare
-    /// name, which addresses every row; anything else drops the rows whose
-    /// owner the path does not name, including every unqualified row.
+    /// Keep only rows the spelled owner path addresses. A path
+    /// addressing nothing tries shorter suffixes, so a re-export
+    /// spelling still reaches its definition. The retry runs only
+    /// on a total miss.
     fn only_addressed_owner(
         functions: Vec<FunctionInfo>,
         owner_path: Option<&str>,
     ) -> Vec<FunctionInfo> {
         match owner_path {
-            Some(path) => functions
-                .into_iter()
-                .filter(|func| {
-                    func.qualifier.as_deref().is_some_and(|qualifier| {
-                        crate::types::qualifier_matches_path(qualifier, path)
-                    })
-                })
-                .collect(),
+            Some(path) => {
+                // The full path runs first; each retry shortens the
+                // path by its leading segment.
+                let mut remaining = functions;
+                let mut rest = path;
+                loop {
+                    let mut hit = Vec::new();
+                    let mut miss = Vec::new();
+                    for func in remaining {
+                        if func.qualifier.as_deref().is_some_and(|qualifier| {
+                            crate::types::qualifier_matches_path(qualifier, rest)
+                        }) {
+                            hit.push(func);
+                        } else {
+                            miss.push(func);
+                        }
+                    }
+                    if !hit.is_empty() {
+                        return hit;
+                    }
+                    match rest.split_once("::") {
+                        Some((_, tail)) => {
+                            rest = tail;
+                            remaining = miss;
+                        }
+                        None => return hit,
+                    }
+                }
+            }
             None => functions,
         }
     }
@@ -8838,6 +8938,22 @@ mod tests {
     }
 
     #[test]
+    fn a_reexport_spelling_reaches_through_the_fallback() {
+        // The lookup tries shorter suffixes on a total miss: the
+        // re-export spelling needs two tries here, an exact spelling
+        // needs one, and an unknown prefix still finds nothing.
+        let mut arc = test_function("pin_init", "arc.rs", "hash");
+        arc.qualifier = Some("rust::kernel::sync::arc::Arc<T>".to_string());
+        let found = DatabaseManager::only_addressed_owner(vec![arc], Some("kernel::sync::Arc"));
+        assert_eq!(found.len(), 1, "{found:?}");
+
+        let mut arc = test_function("pin_init", "arc.rs", "hash");
+        arc.qualifier = Some("rust::kernel::sync::arc::Arc<T>".to_string());
+        let found = DatabaseManager::only_addressed_owner(vec![arc], Some("zzz::yyy"));
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
     fn a_macro_is_an_attribute_if_any_arm_makes_it_one() {
         // `__tag` expands to an attribute under CONFIG_X and to nothing
         // otherwise; `__alias` reaches it through another name. Neither
@@ -9044,6 +9160,7 @@ mod tests {
             receiver_type: receiver_type.map(|t| t.to_string()),
             receiver_base_type: None,
             receiver_field: None,
+            receiver_bound: None,
             kind: DispatchKind::MemberArrow,
             target: None,
         };
@@ -9150,6 +9267,7 @@ mod tests {
             receiver_type: None,
             receiver_base_type: None,
             receiver_field: None,
+            receiver_bound: None,
             kind: DispatchKind::MemberArrow,
             target: None,
         };
