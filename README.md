@@ -259,14 +259,17 @@ The MCP server provides these tools:
 Check your claude documentation on this one, but it is setup for one
 semcode-mcp server per claude instance.
 
+```
 cd linux
 semcode-index -s .
 claude --mcp-config mcp-config.json
 > func btrfs_search_slot
+```
 
 mcp-config.json:
-
+```
 {"mcpServers":{"semcode":{"command":"/some_path/semcode-mcp"}}}
+```
 
 See examples/mcp-config.json for an example file
 
@@ -320,10 +323,10 @@ with `pip3 install -r scripts/requirements.txt` and run them with `python3`.
 Take the resulting model directory and move it to ~/.cache/semcode/models/model2vec.
 
 Then do a index run:
-semcode-index -s .
+`semcode-index -s .`
 
 Then do a vector run:
-semcode-index -s . --vectors
+`semcode-index -s . --vectors`
 
 Then you can do vector searches with the vgrep command either in the
 query tool or MCP.
