@@ -223,6 +223,7 @@ struct UseAlias {
 /// are not known until query time.
 #[derive(Debug, Default)]
 struct CallExtraction {
+    /// Sorted by call start so each function can find its slice by byte range.
     calls: Vec<(String, usize, usize)>,
     member_sites: Vec<RawDispatchSite>,
     /// Call heads outside the query shapes, with where they sit. The
@@ -1719,29 +1720,18 @@ impl TreeSitterAnalyzer {
         // Compute git hash of the file
         let git_hash = compute_file_hash(file_path)?.unwrap_or_default();
 
-        let mut raw_functions = Vec::new();
-        let mut raw_types = Vec::new();
+        let ctx = ExtractionContext {
+            tree: &tree,
+            source: &source_code,
+            file_path,
+            git_hash: &git_hash,
+            source_root,
+            language,
+        };
+        let comments = self.extract_comments(&ctx);
+        let raw_functions = self.extract_functions(&ctx, &comments)?;
+        let mut raw_types = self.extract_types(&ctx, &comments)?;
         let mut raw_macros = Vec::new();
-
-        // Extract functions
-        raw_functions.extend(self.extract_functions(
-            &tree,
-            &source_code,
-            file_path,
-            &git_hash,
-            source_root,
-            language,
-        )?);
-
-        // Extract types
-        raw_types.extend(self.extract_types(
-            &tree,
-            &source_code,
-            file_path,
-            &git_hash,
-            source_root,
-            language,
-        )?);
 
         // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
         if language == Language::C {
@@ -1809,7 +1799,15 @@ impl TreeSitterAnalyzer {
         let dummy_path = Path::new("snippet.c");
         let git_hash = crate::hash::compute_content_hash(code);
         // No git SHA for code snippets
-        self.extract_functions(&tree, code, dummy_path, &git_hash, None, language)
+        let ctx = ExtractionContext {
+            tree: &tree,
+            source: code,
+            file_path: dummy_path,
+            git_hash: &git_hash,
+            source_root: None,
+            language,
+        };
+        self.extract_functions(&ctx, &self.extract_comments(&ctx))
     }
 
     /// Analyze source code directly with specified file path and git hash
@@ -2408,6 +2406,7 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         };
+        let comments = self.extract_comments(&ctx);
 
         // Extract functions with embedded call data
         let ExtractedFunctions {
@@ -2416,17 +2415,10 @@ impl TreeSitterAnalyzer {
             mut registrations,
             mut argument_functions,
             mut unresolved_edges,
-        } = self.extract_functions_with_calls(&ctx, &extraction)?;
+        } = self.extract_functions_with_calls(&ctx, &extraction, &comments)?;
 
         // Extract types (single traversal as before)
-        let types = self.extract_types(
-            tree,
-            source_code,
-            file_path,
-            git_hash,
-            source_root,
-            language,
-        )?;
+        let types = self.extract_types(&ctx, &comments)?;
 
         // Extract macros with embedded data (single traversal)
         let (macros, macro_sites, macro_registrations, macro_arguments, macro_unresolved) = self
@@ -2792,6 +2784,9 @@ impl TreeSitterAnalyzer {
             .registrations
             .retain(|registration| !Self::is_c_keyword(&registration.member));
 
+        extraction
+            .calls
+            .sort_unstable_by_key(|(_, start, _)| *start);
         Ok(extraction)
     }
 
@@ -3607,8 +3602,14 @@ impl TreeSitterAnalyzer {
             .collect();
 
         let mut calls: Vec<(String, usize)> = Vec::new();
-        for (call_name, call_start, call_end) in &extraction.calls {
-            if *call_start < start || *call_end > end {
+        let first = extraction
+            .calls
+            .partition_point(|(_, byte, _)| *byte < start);
+        for (call_name, call_start, call_end) in &extraction.calls[first..] {
+            if *call_start >= end {
+                break;
+            }
+            if *call_end > end {
                 continue;
             }
             match pointers.get(call_name.as_str()) {
@@ -5132,6 +5133,7 @@ impl TreeSitterAnalyzer {
         &self,
         ctx: &ExtractionContext,
         extraction: &CallExtraction,
+        comments: &LeadingComments<'_>,
     ) -> Result<ExtractedFunctions> {
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
@@ -5177,9 +5179,6 @@ impl TreeSitterAnalyzer {
         parsed.sort_by_key(|p| p.function_end_byte.saturating_sub(p.function_start_byte));
         let mut functions = Vec::new();
 
-        // Extract all comments once (used by extract_function_with_comments)
-        let comments = self.extract_comments(ctx.tree, ctx.source, ctx.language)?;
-
         for parsed in parsed {
             let ParsedFunction {
                 name,
@@ -5214,17 +5213,13 @@ impl TreeSitterAnalyzer {
             }
 
             // Extract complete function text including top comments
-            let complete_body = self.extract_function_with_comments(
-                ctx.source,
-                function_start_byte,
-                function_end_byte,
+            let complete_body = comments.with_definition(
+                &ctx.source[function_start_byte..function_end_byte],
                 line_start,
-                &comments,
             );
 
             // Only extract calls and types for functions with bodies (not just declarations)
             let (unique_calls, function_types) = if has_body {
-                // Extract calls within this function from pre-computed list (O(m) instead of O(n))
                 // Function pointers declared by this function: a call
                 // naming one of them dispatches through a value.
                 // Each site belongs to exactly one function: matches run
@@ -5560,102 +5555,63 @@ impl TreeSitterAnalyzer {
     /// Legacy extract_functions method for backward compatibility with older analyze methods
     fn extract_functions(
         &self,
-        tree: &Tree,
-        source: &str,
-        file_path: &Path,
-        git_hash: &str,
-        source_root: Option<&Path>,
-        language: Language,
+        ctx: &ExtractionContext,
+        comments: &LeadingComments<'_>,
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
-        let extraction =
-            Self::extract_all_calls_optimized(self.get_queries(language), tree, source, language)?;
-        let ctx = ExtractionContext {
+        let extraction = Self::extract_all_calls_optimized(
+            self.get_queries(ctx.language),
+            ctx.tree,
+            ctx.source,
+            ctx.language,
+        )?;
+        let ExtractedFunctions { functions, .. } =
+            self.extract_functions_with_calls(ctx, &extraction, comments)?;
+
+        Ok(functions)
+    }
+
+    fn extract_comments<'a>(&self, ctx: &ExtractionContext<'a>) -> LeadingComments<'a> {
+        let queries = self.get_queries(ctx.language);
+        let mut cursor = QueryCursor::new();
+        let mut captures = cursor.captures(
+            &queries.comment_query,
+            ctx.tree.root_node(),
+            ctx.source.as_bytes(),
+        );
+        let mut comments = Vec::new();
+
+        while let Some((m, _)) = captures.next() {
+            for capture in m.captures {
+                let node = capture.node;
+                let text = &ctx.source[node.byte_range()];
+                let start_line = node.start_position().row as u32 + 1;
+                let end_line = node.end_position().row as u32 + 1;
+                comments.push((start_line, end_line, text));
+            }
+        }
+
+        LeadingComments::new(ctx.source, comments)
+    }
+
+    fn extract_types(
+        &self,
+        ctx: &ExtractionContext,
+        comments: &LeadingComments<'_>,
+    ) -> Result<Vec<TypeInfo>> {
+        let ExtractionContext {
             tree,
             source,
             file_path,
             git_hash,
             source_root,
             language,
-        };
-        let ExtractedFunctions { functions, .. } =
-            self.extract_functions_with_calls(&ctx, &extraction)?;
-
-        Ok(functions)
-    }
-
-    fn extract_comments(
-        &self,
-        tree: &Tree,
-        source: &str,
-        language: Language,
-    ) -> Result<Vec<(u32, u32, String)>> {
-        let queries = self.get_queries(language);
-        let mut cursor = QueryCursor::new();
-        let mut captures =
-            cursor.captures(&queries.comment_query, tree.root_node(), source.as_bytes());
-        let mut comments = Vec::new();
-
-        while let Some((m, _)) = captures.next() {
-            for capture in m.captures {
-                let node = capture.node;
-                let text = &source[node.byte_range()];
-                let start_line = node.start_position().row as u32 + 1;
-                let end_line = node.end_position().row as u32 + 1;
-                comments.push((start_line, end_line, text.to_string()));
-            }
-        }
-
-        // Sort comments by line number
-        comments.sort_by_key(|&(start_line, _, _)| start_line);
-        Ok(comments)
-    }
-
-    fn extract_function_with_comments(
-        &self,
-        source: &str,
-        function_start_byte: usize,
-        function_end_byte: usize,
-        function_start_line: u32,
-        comments: &[(u32, u32, String)],
-    ) -> String {
-        let top_comments = collect_leading_comments(source, function_start_line, comments);
-
-        // Get the complete function text (including the function body)
-        let function_text = &source[function_start_byte..function_end_byte];
-
-        // Combine top comments with function text
-        let mut complete_body = String::new();
-
-        if !top_comments.is_empty() {
-            for comment in &top_comments {
-                complete_body.push_str(comment);
-                complete_body.push('\n');
-            }
-            complete_body.push('\n');
-        }
-
-        complete_body.push_str(function_text);
-        complete_body
-    }
-
-    fn extract_types(
-        &self,
-        tree: &Tree,
-        source: &str,
-        file_path: &Path,
-        git_hash: &str,
-        source_root: Option<&Path>,
-        language: Language,
-    ) -> Result<Vec<TypeInfo>> {
+        } = *ctx;
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         let mut captures =
             cursor.captures(&queries.type_query, tree.root_node(), source.as_bytes());
         let mut types = Vec::new();
-
-        // Extract all comments with their positions
-        let comments = self.extract_comments(tree, source, language)?;
 
         while let Some((m, _)) = captures.next() {
             let mut type_name = None;
@@ -5755,13 +5711,8 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = type_name {
                 // Extract complete type definition including top comments
-                let complete_definition = self.extract_type_with_comments(
-                    source,
-                    type_start_byte,
-                    type_end_byte,
-                    line_start,
-                    &comments,
-                );
+                let complete_definition =
+                    comments.with_definition(&source[type_start_byte..type_end_byte], line_start);
 
                 // Extract types referenced by this type's members
                 let referenced_types = self.extract_type_referenced_types(&members);
@@ -5909,34 +5860,6 @@ impl TreeSitterAnalyzer {
         }
 
         Ok(typedef_types)
-    }
-
-    fn extract_type_with_comments(
-        &self,
-        source: &str,
-        type_start_byte: usize,
-        type_end_byte: usize,
-        type_start_line: u32,
-        comments: &[(u32, u32, String)],
-    ) -> String {
-        let top_comments = collect_leading_comments(source, type_start_line, comments);
-
-        // Get the complete type definition text (including any internal comments)
-        let type_text = &source[type_start_byte..type_end_byte];
-
-        // Combine top comments with type definition
-        let mut complete_definition = String::new();
-
-        if !top_comments.is_empty() {
-            for comment in &top_comments {
-                complete_definition.push_str(comment);
-                complete_definition.push('\n');
-            }
-            complete_definition.push('\n');
-        }
-
-        complete_definition.push_str(type_text);
-        complete_definition
     }
 
     fn extract_macros(
@@ -8962,38 +8885,64 @@ impl TreeSitterAnalyzer {
 /// documents the block, not the definition below it.
 const MAX_INTERVENING_LINES: usize = 3;
 
-/// Collect the comment block that documents the entity starting at
-/// `start_line` (1-based), walking backwards through `comments`.
-///
-/// Shared by `extract_function_with_comments` and
-/// `extract_type_with_comments`, which previously carried two verbatim
-/// copies of this walk and therefore the same defect.
-///
-/// `comments` must be sorted ascending by start line, which
-/// `extract_comments` guarantees.
-fn collect_leading_comments(
-    source: &str,
-    start_line: u32,
-    comments: &[(u32, u32, String)],
-) -> Vec<String> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut top_comments: Vec<String> = Vec::new();
-    // Last source line that may still hold a comment for this entity.
-    let mut current_line = start_line.saturating_sub(1);
+/// Source lines and comment spans shared by all definitions in a file.
+struct LeadingComments<'a> {
+    lines: Vec<&'a str>,
+    comments: Vec<(u32, u32, &'a str)>,
+}
 
-    for (comment_start_line, comment_end_line, comment_text) in comments.iter().rev() {
-        // Comments at or below the entity are not leading comments.
-        if *comment_end_line > current_line {
-            continue;
-        }
-        if !gap_is_transparent(&lines, *comment_end_line, current_line) {
-            break;
-        }
-        top_comments.insert(0, comment_text.clone());
-        current_line = comment_start_line.saturating_sub(1);
+impl<'a> LeadingComments<'a> {
+    fn new(source: &'a str, mut comments: Vec<(u32, u32, &'a str)>) -> Self {
+        comments.sort_by_key(|&(start_line, _, _)| start_line);
+        let lines = if comments.is_empty() {
+            Vec::new()
+        } else {
+            source.lines().collect()
+        };
+        Self { lines, comments }
     }
 
-    top_comments
+    fn with_definition(&self, definition: &str, start_line: u32) -> String {
+        let leading = self.leading_at(start_line);
+        if leading.is_empty() {
+            return definition.to_owned();
+        }
+
+        let comment_bytes = leading
+            .iter()
+            .map(|comment| comment.len() + 1)
+            .sum::<usize>();
+        let mut body = String::with_capacity(comment_bytes + 1 + definition.len());
+        for comment in leading {
+            body.push_str(comment);
+            body.push('\n');
+        }
+        body.push('\n');
+        body.push_str(definition);
+        body
+    }
+
+    fn leading_at(&self, start_line: u32) -> Vec<&'a str> {
+        let mut leading = Vec::new();
+        let mut current_line = start_line.saturating_sub(1);
+        let end = self
+            .comments
+            .partition_point(|&(comment_start, _, _)| comment_start <= current_line);
+
+        for &(comment_start, comment_end, text) in self.comments[..end].iter().rev() {
+            if comment_end > current_line {
+                continue;
+            }
+            if !gap_is_transparent(&self.lines, comment_end, current_line) {
+                break;
+            }
+            leading.push(text);
+            current_line = comment_start.saturating_sub(1);
+        }
+
+        leading.reverse();
+        leading
+    }
 }
 
 /// True when every line strictly after `comment_end_line` and up to and
@@ -9082,8 +9031,8 @@ fn is_forward_declaration(trimmed: &str) -> bool {
 mod leading_comment_tests {
     use super::*;
 
-    fn comment(start: u32, end: u32, text: &str) -> (u32, u32, String) {
-        (start, end, text.to_string())
+    fn comment(start: u32, end: u32, text: &str) -> (u32, u32, &str) {
+        (start, end, text)
     }
 
     #[test]
@@ -9091,8 +9040,8 @@ mod leading_comment_tests {
         let source = "/* doc */\nvoid f(void)\n{\n}\n";
         let comments = vec![comment(1, 1, "/* doc */")];
         assert_eq!(
-            collect_leading_comments(source, 2, &comments),
-            vec!["/* doc */".to_string()]
+            LeadingComments::new(source, comments).leading_at(2),
+            vec!["/* doc */"]
         );
     }
 
@@ -9114,8 +9063,8 @@ mod leading_comment_tests {
         let doc = "/*\n * Task is throttled and someone wants to dequeue it again:\n * ... task sched class change etc.\n */";
         let comments = vec![comment(1, 4, doc)];
         assert_eq!(
-            collect_leading_comments(source, 6, &comments),
-            vec![doc.to_string()],
+            LeadingComments::new(source, comments).leading_at(6),
+            vec![doc],
         );
     }
 
@@ -9131,8 +9080,8 @@ mod leading_comment_tests {
         );
         let comments = vec![comment(1, 1, "/* doc */")];
         assert_eq!(
-            collect_leading_comments(source, 4, &comments),
-            vec!["/* doc */".to_string()]
+            LeadingComments::new(source, comments).leading_at(4),
+            vec!["/* doc */"]
         );
     }
 
@@ -9146,7 +9095,9 @@ mod leading_comment_tests {
             "}\n",
         );
         let comments = vec![comment(1, 1, "/* doc for the include block */")];
-        assert!(collect_leading_comments(source, 3, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(3)
+            .is_empty());
     }
 
     #[test]
@@ -9159,7 +9110,9 @@ mod leading_comment_tests {
             "}\n",
         );
         let comments = vec![comment(1, 1, "/* doc */")];
-        assert!(collect_leading_comments(source, 3, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(3)
+            .is_empty());
     }
 
     #[test]
@@ -9175,7 +9128,9 @@ mod leading_comment_tests {
             "}\n",
         );
         let comments = vec![comment(1, 1, "/* doc for the whole group */")];
-        assert!(collect_leading_comments(source, 6, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(6)
+            .is_empty());
     }
 
     #[test]
@@ -9183,8 +9138,8 @@ mod leading_comment_tests {
         let source = "/* first */\n/* second */\nvoid f(void)\n{\n}\n";
         let comments = vec![comment(1, 1, "/* first */"), comment(2, 2, "/* second */")];
         assert_eq!(
-            collect_leading_comments(source, 3, &comments),
-            vec!["/* first */".to_string(), "/* second */".to_string()]
+            LeadingComments::new(source, comments).leading_at(3),
+            vec!["/* first */", "/* second */"]
         );
     }
 
@@ -9192,7 +9147,9 @@ mod leading_comment_tests {
     fn comments_below_the_entity_are_ignored() {
         let source = "void f(void)\n{\n}\n/* trailing */\n";
         let comments = vec![comment(4, 4, "/* trailing */")];
-        assert!(collect_leading_comments(source, 1, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(1)
+            .is_empty());
     }
 
     #[test]
@@ -9226,6 +9183,56 @@ mod tests {
             .iter()
             .map(|m| (m.name.clone(), m.type_name.clone()))
             .collect()
+    }
+
+    #[test]
+    fn each_definition_carries_only_its_own_doc_comment() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "/* doc a */\n\
+                 void a(void)\n\
+                 {\n\
+                 }\n\
+                 \n\
+                 /* doc s */\n\
+                 struct s {\n\
+                 \tint x;\n\
+                 };\n\
+                 \n\
+                 /* doc b */\n\
+                 void b(void)\n\
+                 {\n\
+                 }\n",
+                Path::new("test.c"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+
+        let docs = ["/* doc a */", "/* doc s */", "/* doc b */"];
+        let text_of = |name: &str| -> &str {
+            analysis
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.body.as_str())
+                .or_else(|| {
+                    analysis
+                        .types
+                        .iter()
+                        .find(|t| t.name == name)
+                        .map(|t| t.definition.as_str())
+                })
+                .unwrap_or_else(|| panic!("{name} not extracted"))
+        };
+
+        for (name, own) in [("a", docs[0]), ("s", docs[1]), ("b", docs[2])] {
+            let text = text_of(name);
+            for doc in docs {
+                assert_eq!(text.contains(doc), doc == own, "{name}: {text}");
+            }
+        }
     }
 
     #[test]
