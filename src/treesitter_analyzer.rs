@@ -223,6 +223,7 @@ struct UseAlias {
 /// are not known until query time.
 #[derive(Debug, Default)]
 struct CallExtraction {
+    /// Sorted by call start so each function can find its slice by byte range.
     calls: Vec<(String, usize, usize)>,
     member_sites: Vec<RawDispatchSite>,
     /// Call heads outside the query shapes, with where they sit. The
@@ -2792,6 +2793,9 @@ impl TreeSitterAnalyzer {
             .registrations
             .retain(|registration| !Self::is_c_keyword(&registration.member));
 
+        extraction
+            .calls
+            .sort_unstable_by_key(|(_, start, _)| *start);
         Ok(extraction)
     }
 
@@ -3607,8 +3611,14 @@ impl TreeSitterAnalyzer {
             .collect();
 
         let mut calls: Vec<(String, usize)> = Vec::new();
-        for (call_name, call_start, call_end) in &extraction.calls {
-            if *call_start < start || *call_end > end {
+        let first = extraction
+            .calls
+            .partition_point(|(_, byte, _)| *byte < start);
+        for (call_name, call_start, call_end) in &extraction.calls[first..] {
+            if *call_start >= end {
+                break;
+            }
+            if *call_end > end {
                 continue;
             }
             match pointers.get(call_name.as_str()) {
@@ -5224,7 +5234,6 @@ impl TreeSitterAnalyzer {
 
             // Only extract calls and types for functions with bodies (not just declarations)
             let (unique_calls, function_types) = if has_body {
-                // Extract calls within this function from pre-computed list (O(m) instead of O(n))
                 // Function pointers declared by this function: a call
                 // naming one of them dispatches through a value.
                 // Each site belongs to exactly one function: matches run
