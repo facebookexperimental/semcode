@@ -2854,8 +2854,8 @@ mod tests {
     /// stored, and asserts that every email was stored.
     async fn insert_emails(db: &DatabaseManager, batch: &[LoreEmailInfo]) {
         let known_ids = std::sync::Mutex::new(db.get_lore_message_ids().await.unwrap());
-        let failed = db.insert_lore_emails(batch, &known_ids).await.unwrap();
-        assert!(failed.is_empty(), "emails not stored: {failed:?}");
+        let outcome = db.insert_lore_emails(batch, &known_ids).await.unwrap();
+        assert!(outcome.is_complete(), "emails not stored: {outcome:?}");
     }
 
     /// Every BTree index on lore as (name, indexed rows, unindexed rows).

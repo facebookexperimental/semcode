@@ -161,6 +161,35 @@ pub enum LoreIdState {
     Pending,
 }
 
+/// The emails of a batch that DatabaseManager::insert_lore_emails() did
+/// not store, by index into the batch.  Every other email of the batch is
+/// in the lore table, either from this batch or from an earlier one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LoreInsertOutcome {
+    /// Emails whose append failed.  Their ids are released, so inserting
+    /// them again tries the append again.
+    pub failed: Vec<usize>,
+    /// Emails whose id another inserter had pending.  Insert them again
+    /// once that inserter has finished.
+    pub deferred: Vec<usize>,
+    /// Rows this call appended to the table.  Emails already in the
+    /// table and copies of a message_id the batch holds more than once
+    /// are not counted.
+    pub appended: usize,
+}
+
+impl LoreInsertOutcome {
+    /// Whether every email of the batch is stored.
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty() && self.deferred.is_empty()
+    }
+
+    /// The indices of every email not stored, failed or deferred.
+    pub fn not_stored(&self) -> impl Iterator<Item = usize> + '_ {
+        self.failed.iter().chain(&self.deferred).copied()
+    }
+}
+
 pub struct DatabaseManager {
     connection: Connection,
     git_repo_path: String,
@@ -6690,29 +6719,29 @@ impl DatabaseManager {
     }
 
     /// Insert lore emails into the database, returning the indices of
-    /// any emails that could not be stored.  Callers must not record
-    /// commit SHAs for failed indices in the lore_indexed_commits
-    /// table, otherwise those emails are permanently lost.
+    /// the emails that were not stored.  Callers must not record commit
+    /// SHAs for those indices in the lore_indexed_commits table,
+    /// otherwise those emails are permanently lost.
     ///
     /// `known_ids` holds every message_id already in the lore table
     /// (see get_lore_message_ids()) and is shared by all inserters.
     /// Emails whose message_id is stored are skipped.  New ids are
     /// claimed as pending before the append, then marked stored, or
     /// released if their email failed.  An email whose id another
-    /// inserter has pending is deferred: it is returned with the failed
-    /// indices, so its SHA is not recorded and the next run retries it
-    /// against the table.
+    /// inserter has pending is deferred: it is not stored and not
+    /// failed, and inserting it again once that inserter finishes either
+    /// skips it (the other copy was stored) or stores it.
     pub async fn insert_lore_emails(
         &self,
         emails: &[crate::types::LoreEmailInfo],
         known_ids: &std::sync::Mutex<HashMap<String, LoreIdState>>,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<LoreInsertOutcome> {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::collections::hash_map::Entry;
         use std::sync::Arc;
 
         if emails.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LoreInsertOutcome::default());
         }
 
         tracing::info!(
@@ -6810,7 +6839,11 @@ impl DatabaseManager {
 
         if new_indices.is_empty() {
             tracing::info!("insert_lore_emails: no new emails to insert");
-            return Ok(deferred);
+            return Ok(LoreInsertOutcome {
+                failed: Vec::new(),
+                deferred: Self::with_duplicate_copies(emails, deferred),
+                appended: 0,
+            });
         }
 
         // Use table.add() instead of merge_insert.  merge_insert in
@@ -6877,8 +6910,32 @@ impl DatabaseManager {
 
         tracing::info!("insert_lore_emails: Batch insertion complete");
 
-        failed_indices.extend(deferred);
-        Ok(failed_indices)
+        let appended = new_indices.len() - failed_indices.len();
+        Ok(LoreInsertOutcome {
+            failed: Self::with_duplicate_copies(emails, failed_indices),
+            deferred: Self::with_duplicate_copies(emails, deferred),
+            appended,
+        })
+    }
+
+    /// Extend `indices`, which name the one copy of each message_id that
+    /// insert_lore_emails() tried, to every email of the batch with that
+    /// message_id.  The other copies are no more stored than the one
+    /// tried, and their commits must not be recorded as indexed.
+    fn with_duplicate_copies(
+        emails: &[crate::types::LoreEmailInfo],
+        indices: Vec<usize>,
+    ) -> Vec<usize> {
+        let ids: std::collections::HashSet<&str> = indices
+            .iter()
+            .map(|&i| emails[i].message_id.as_str())
+            .collect();
+        emails
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| ids.contains(e.message_id.as_str()))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Return every message_id in the lore table, marked stored, for the
