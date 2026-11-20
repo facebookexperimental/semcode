@@ -4189,8 +4189,10 @@ impl DatabaseManager {
             let db_callers = self
                 .get_function_callers_with_manifest(function_name, &git_manifest)
                 .await?;
+            let mut seen: HashSet<_> = caller_names.iter().cloned().collect();
             for (name, file_path) in db_callers {
-                if admits(&file_path) && !caller_names.contains(&name) {
+                if admits(&file_path) && !seen.contains(&name) {
+                    seen.insert(name.clone());
                     caller_names.push(name);
                 }
             }
