@@ -8,9 +8,13 @@ use semcode::{
     Resolution, Surface,
 };
 use serde_json::{json, Value};
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 
 /// Truncate output at 3,000 lines with a warning message
 /// "Under: <guard>" as its own line for a definition inside a conditional,
@@ -2301,6 +2305,20 @@ struct Args {
     /// Enable lazy tool loading (reduces initial context by ~96%)
     #[arg(long, default_value = "false")]
     lazy: bool,
+
+    /// Maximum number of tool calls that can run concurrently
+    #[arg(long, default_value_t = 2, value_parser = parse_request_limit)]
+    max_concurrent_requests: usize,
+}
+
+fn parse_request_limit(value: &str) -> Result<usize> {
+    let limit = value.parse()?;
+    anyhow::ensure!(
+        (1..=Semaphore::MAX_PERMITS).contains(&limit),
+        "expected a request limit between 1 and {}",
+        Semaphore::MAX_PERMITS
+    );
+    Ok(limit)
 }
 
 #[derive(Debug, Clone)]
@@ -3283,46 +3301,21 @@ impl McpServer {
     }
 
     async fn check_database_status(&self) -> Option<String> {
-        let state = self.indexing_state.lock().await;
-
-        // Check if indexing is currently in progress
-        if matches!(state.status, IndexingStatus::InProgress { .. }) {
-            if let IndexingStatus::InProgress { ref phase, .. } = state.status {
-                return Some(format!(
-                    "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
-                    phase
-                ));
-            }
-        }
-
-        // Check if indexing failed
-        if let IndexingStatus::Failed { ref error } = state.status {
-            return Some(format!(
+        // The table count can yield to other requests and background indexing.
+        let status = self.indexing_state.lock().await.status.clone();
+        let empty_message = match status {
+            IndexingStatus::InProgress { phase, .. } => return Some(format!(
+                "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
+                phase
+            )),
+            IndexingStatus::Failed { error } => return Some(format!(
                 "Database indexing failed: {}. The database may be incomplete or empty.",
                 error
-            ));
-        }
-
-        // Check if we have any functions in the database at all
-        match self.db.count_functions().await {
-            Ok(0) => {
-                // Completely empty database
-                match &state.status {
-                    IndexingStatus::NotStarted => {
-                        Some("Database is empty. Background indexing hasn't started yet. Please wait a moment and try again.".to_string())
-                    }
-                    IndexingStatus::Completed { .. } => {
-                        Some("Database is empty. This repository may not contain any C/C++ source files, or indexing didn't find any functions.".to_string())
-                    }
-                    _ => None,
-                }
-            }
-            Ok(_count) => {
-                // Database has data, allow queries to proceed
-                None
-            }
-            _ => None, // Couldn't check or other error
-        }
+            )),
+            IndexingStatus::NotStarted => "Database is empty. Background indexing hasn't started yet. Please wait a moment and try again.",
+            IndexingStatus::Completed { .. } => "Database is empty. This repository may not contain any C/C++ source files, or indexing didn't find any functions.",
+        };
+        matches!(self.db.count_functions().await, Ok(0)).then(|| empty_message.to_string())
     }
 
     async fn handle_request(&self, request: Value) -> Value {
@@ -6195,139 +6188,172 @@ async fn index_current_commit_background(
     }
 }
 
-async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
-    eprintln!("MCP server ready on stdin/stdout");
+async fn write_message<W: AsyncWrite + Unpin>(stdout: &mut W, message: &str) -> Result<()> {
+    stdout.write_all(message.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
 
-    // Handle MCP protocol over stdin/stdout using tokio's async I/O
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+async fn write_response<W: AsyncWrite + Unpin>(stdout: &Mutex<W>, response: &Value) -> Result<()> {
+    let message = serde_json::to_string(response)?;
+    write_message(&mut *stdout.lock().await, &message).await
+}
 
-    let stdin = tokio::io::stdin();
-    let mut stdin = BufReader::new(stdin);
-    let stdout = tokio::io::stdout();
+async fn serve_requests<R, W, F, Fut>(
+    stdin: R,
+    stdout: Arc<Mutex<W>>,
+    limit: usize,
+    handle_request: F,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: Fn(Value) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Value>,
+{
+    let runtime = tokio::runtime::Handle::current();
+    let capacity = Arc::new(Semaphore::new(limit));
+    let mut requests = JoinSet::new();
+    let mut lines = stdin.lines();
 
-    // Create notification channel
-    let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    loop {
+        let line = tokio::select! {
+            biased;
+            Some(finished) = requests.join_next(), if !requests.is_empty() => {
+                finished??;
+                continue;
+            }
+            line = lines.next_line() => line?,
+        };
+        let Some(line) = line else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
 
-    // Set up notification sender in server
-    {
-        let mut tx_guard = server.notification_tx.lock().await;
-        *tx_guard = Some(notification_tx);
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("Failed to parse JSON request: {error}");
+                write_response(
+                    &stdout,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {"code": -32700, "message": "Parse error"}
+                    }),
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        let method = request["method"].as_str().unwrap_or("");
+        if request.get("id").is_none() {
+            match method {
+                "notifications/initialized" => eprintln!("Client initialized"),
+                "notifications/cancelled" => eprintln!("Cancellation notification received"),
+                _ => eprintln!("Received notification: {method}"),
+            }
+            continue;
+        }
+
+        // Protocol requests are lightweight and can run while all tool slots are occupied.
+        if method != "tools/call" {
+            write_response(&stdout, &handle_request(request).await).await?;
+            continue;
+        }
+
+        let id = request["id"].clone();
+        let Ok(permit) = capacity.clone().try_acquire_owned() else {
+            write_response(
+                &stdout,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32001,
+                        "message": "Server is at its concurrent request limit",
+                        "data": {"retryable": true}
+                    }
+                }),
+            )
+            .await?;
+            continue;
+        };
+
+        let handle_request = handle_request.clone();
+        let runtime = runtime.clone();
+        let stdout = stdout.clone();
+        requests.spawn(async move {
+            let worker = tokio::task::spawn_blocking(move || {
+                // Tool handlers can contain synchronous work and futures that are
+                // !Send. Poll them on a blocking worker, with async I/O and any
+                // tasks they spawn using the long-lived server runtime.
+                runtime.block_on(handle_request(request))
+            });
+            let response = match worker.await {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("MCP request {id} failed: {error}");
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32603, "message": "Request worker failed"}
+                    })
+                }
+            };
+            let message = serde_json::to_string(&response)?;
+            // Wait for the writer before releasing the slot. This bounds pending
+            // responses and makes the slot available before the client sees its reply.
+            let mut stdout = stdout.lock().await;
+            drop(permit);
+            write_message(&mut *stdout, &message).await
+        });
     }
 
-    // Spawn task to forward notifications to stdout
-    let stdout_clone = Arc::new(tokio::sync::Mutex::new(stdout));
-    let stdout_for_notifications = stdout_clone.clone();
-    tokio::spawn(async move {
+    // At EOF, finish requests already admitted so a client can close its input
+    // and still read all responses.
+    while let Some(finished) = requests.join_next().await {
+        finished??;
+    }
+    Ok(())
+}
+
+async fn run_stdio_server(server: Arc<McpServer>, limit: usize) -> Result<()> {
+    let stdin = BufReader::new(tokio::io::stdin());
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+    let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    *server.notification_tx.lock().await = Some(notification_tx);
+
+    let stdout_for_notifications = stdout.clone();
+    let notifications = tokio::spawn(async move {
         while let Some(notification) = notification_rx.recv().await {
             let mut stdout = stdout_for_notifications.lock().await;
-            if let Err(e) = stdout.write_all(notification.as_bytes()).await {
-                eprintln!("[Notification] Failed to write: {}", e);
-                break;
-            }
-            if let Err(e) = stdout.write_all(b"\n").await {
-                eprintln!("[Notification] Failed to write newline: {}", e);
-                break;
-            }
-            if let Err(e) = stdout.flush().await {
-                eprintln!("[Notification] Failed to flush: {}", e);
+            if let Err(error) = write_message(&mut *stdout, &notification).await {
+                eprintln!("[Notification] Failed to write: {error}");
                 break;
             }
         }
     });
 
-    let stdout = stdout_clone;
-
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-
-        match stdin.read_line(&mut line).await {
-            Ok(0) => {
-                // EOF
-                eprintln!("Reached EOF on stdin");
-                break;
-            }
-            Ok(_) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(request) => {
-                        // Check if this is a notification (no id) or a request (has id)
-                        if request.get("id").is_some() {
-                            // It's a request, send a response
-                            let response = server.handle_request(request).await;
-                            if let Ok(response_str) = serde_json::to_string(&response) {
-                                let mut stdout_guard = stdout.lock().await;
-                                if let Err(e) =
-                                    stdout_guard.write_all(response_str.as_bytes()).await
-                                {
-                                    eprintln!("Failed to write response: {e}");
-                                    break;
-                                }
-                                if let Err(e) = stdout_guard.write_all(b"\n").await {
-                                    eprintln!("Failed to write newline: {e}");
-                                    break;
-                                }
-                                if let Err(e) = stdout_guard.flush().await {
-                                    eprintln!("Failed to flush stdout: {e}");
-                                    break;
-                                }
-                            }
-                        } else {
-                            // It's a notification, handle without response
-                            let method = request["method"].as_str().unwrap_or("");
-                            match method {
-                                "notifications/initialized" => {
-                                    eprintln!("Client initialized");
-                                }
-                                "notifications/cancelled" => {
-                                    eprintln!("Request cancelled (notification received)");
-                                }
-                                _ => {
-                                    eprintln!("Received notification: {}", method);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse JSON request: {e}");
-                        let error_response = json!({
-                            "jsonrpc": "2.0",
-                            "id": null,
-                            "error": {
-                                "code": -32700,
-                                "message": "Parse error"
-                            }
-                        });
-                        if let Ok(response_str) = serde_json::to_string(&error_response) {
-                            let mut stdout_guard = stdout.lock().await;
-                            let _ = stdout_guard.write_all(response_str.as_bytes()).await;
-                            let _ = stdout_guard.write_all(b"\n").await;
-                            let _ = stdout_guard.flush().await;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Error reading from stdin: {e}");
-                break;
-            }
-        }
-    }
-
-    Ok(())
+    eprintln!("MCP server ready on stdin/stdout");
+    let result = serve_requests(stdin, stdout, limit, move |request| {
+        let server = server.clone();
+        async move { server.handle_request(request).await }
+    })
+    .await;
+    notifications.abort();
+    let _ = notifications.await;
+    result
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Suppress ORT verbose logging
     std::env::set_var("ORT_LOG_LEVEL", "ERROR");
-
-    // Set single-threaded configuration for MCP server
-    // Note: model2vec-rs handles threading internally, no manual configuration needed
 
     // Initialize tracing with SEMCODE_DEBUG environment variable support
     semcode::logging::init_tracing();
@@ -6345,6 +6371,10 @@ async fn main() -> Result<()> {
         if args.lazy { "enabled" } else { "disabled" }
     );
     eprintln!("Transport: stdio");
+    eprintln!(
+        "Maximum concurrent tool calls: {}",
+        args.max_concurrent_requests
+    );
 
     // Process database path with search order: 1) -d flag, 2) current directory
     let database_path = process_database_path(args.database.as_deref(), None);
@@ -6378,13 +6408,13 @@ async fn main() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // Run MCP server on stdio
-    run_stdio_server(server).await?;
+    let result = run_stdio_server(server, args.max_concurrent_requests).await;
 
     // Gracefully shutdown the background indexing task
     indexing_handle.abort();
     let _ = indexing_handle.await;
 
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -6392,6 +6422,106 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::env;
+
+    #[test]
+    fn request_limit_must_fit_the_semaphore() {
+        assert_eq!(
+            Args::try_parse_from(["semcode-mcp"])
+                .unwrap()
+                .max_concurrent_requests,
+            2
+        );
+        assert!(Args::try_parse_from(["semcode-mcp", "--max-concurrent-requests", "0"]).is_err());
+        let too_large = (Semaphore::MAX_PERMITS + 1).to_string();
+        assert!(
+            Args::try_parse_from(["semcode-mcp", "--max-concurrent-requests", &too_large]).is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdio_overlaps_tools_and_keeps_protocol_responsive() {
+        use std::time::Duration;
+        use tokio::io::{duplex, split, Lines};
+        use tokio::time::timeout;
+
+        async fn send<W: AsyncWrite + Unpin>(writer: &mut W, id: u32, method: &str, name: &str) {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": {"name": name}
+            });
+            writer
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn receive<R: AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> Value {
+            let line = timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("server should respond while the slow tools are held")
+                .unwrap()
+                .unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        for limit in [1, 2] {
+            let (client, server) = duplex(4096);
+            let (client_reader, mut client_writer) = split(client);
+            let mut responses = BufReader::new(client_reader).lines();
+            let (server_reader, server_writer) = split(server);
+            let started = Arc::new(tokio::sync::Notify::new());
+            let started_by_worker = started.clone();
+            let (release, hold) = std::sync::mpsc::channel();
+            let hold = Arc::new(std::sync::Mutex::new(hold));
+            let server = tokio::spawn(serve_requests(
+                BufReader::new(server_reader),
+                Arc::new(Mutex::new(server_writer)),
+                limit,
+                move |request| {
+                    let started = started_by_worker.clone();
+                    let hold = hold.clone();
+                    async move {
+                        if request["params"]["name"] == "slow" {
+                            started.notify_one();
+                            hold.lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10))
+                                .unwrap();
+                        }
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": {}})
+                    }
+                },
+            ));
+
+            send(&mut client_writer, 1, "tools/call", "slow").await;
+            timeout(Duration::from_secs(5), started.notified())
+                .await
+                .unwrap();
+            send(&mut client_writer, 2, "ping", "").await;
+            assert_eq!(receive(&mut responses).await["id"], 2);
+
+            send(&mut client_writer, 3, "tools/call", "quick").await;
+            let reply = receive(&mut responses).await;
+            assert_eq!(reply["id"], 3);
+            if limit == 1 {
+                assert_eq!(reply["error"]["code"], -32001);
+                assert_eq!(reply["error"]["data"]["retryable"], true);
+            } else {
+                assert_eq!(reply["result"], json!({}));
+            }
+
+            client_writer.shutdown().await.unwrap();
+            release.send(()).unwrap();
+            assert_eq!(receive(&mut responses).await["id"], 1);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     // Combined into a single test so the three cases don't race on the
     // process-wide SEMCODE_GIT_REPO env var when cargo runs tests in parallel.
