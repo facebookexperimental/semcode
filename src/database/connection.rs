@@ -2223,12 +2223,6 @@ impl DatabaseManager {
         guard.as_ref().is_some_and(|w| w.is_deleted(file_path))
     }
 
-    fn workdir_is_dirty(&self, file_path: &str, git_sha: &str) -> bool {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard.as_ref().is_some_and(|w| w.is_dirty(file_path))
-    }
-
     fn workdir_dirty_count(&self, git_sha: &str) -> usize {
         self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
@@ -3895,19 +3889,39 @@ impl DatabaseManager {
         function_names: &[String],
         type_names: &[String],
         git_sha: &str,
-    ) -> Result<(
-        std::collections::HashMap<String, usize>,
-        std::collections::HashMap<String, usize>,
-    )> {
-        use std::collections::{HashMap, HashSet};
-
+    ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
         let function_targets: HashSet<String> = function_names.iter().cloned().collect();
         let type_targets: HashSet<String> = type_names.iter().cloned().collect();
         let mut function_referrers: HashMap<String, HashSet<String>> = HashMap::new();
         let mut type_referrers: HashMap<String, HashSet<String>> = HashMap::new();
         let git_manifest = self.generate_git_manifest(git_sha).await?;
+        let scan_index =
+            !git_manifest.is_empty() && (!function_targets.is_empty() || !type_targets.is_empty());
 
-        if !git_manifest.is_empty() && (!function_targets.is_empty() || !type_targets.is_empty()) {
+        // Check overlay eligibility once before scanning. Capture modified and
+        // deleted paths together with the working-copy counts so both scans
+        // use the same overlay without holding the read lock.
+        if scan_index {
+            self.ensure_workdir_index_built(git_sha);
+        }
+        let (overlaid_paths, (workdir_function_counts, workdir_type_counts)) = {
+            let guard = self.workdir_index.read().unwrap();
+            guard
+                .as_ref()
+                .map(|index| {
+                    let paths: HashSet<_> = index
+                        .dirty_file_paths()
+                        .keys()
+                        .chain(index.deleted_file_paths())
+                        .cloned()
+                        .collect();
+                    let counts = index.distinct_reference_counts(&function_targets, &type_targets);
+                    (paths, counts)
+                })
+                .unwrap_or_default()
+        };
+
+        if scan_index {
             let functions_table = self.connection.open_table("functions").execute().await?;
             let relationship_filter = match (function_targets.is_empty(), type_targets.is_empty()) {
                 (false, false) => "calls IS NOT NULL OR types IS NOT NULL",
@@ -3915,7 +3929,7 @@ impl DatabaseManager {
                 (true, false) => "types IS NOT NULL",
                 (true, true) => unreachable!(),
             };
-            let batches = functions_table
+            let mut batches = functions_table
                 .query()
                 .only_if(relationship_filter)
                 .select(lancedb::query::Select::Columns(vec![
@@ -3927,11 +3941,9 @@ impl DatabaseManager {
                     "types".to_string(),
                 ]))
                 .execute()
-                .await?
-                .try_collect::<Vec<_>>()
                 .await?;
 
-            for batch in batches {
+            while let Some(batch) = batches.try_next().await? {
                 let names: &StringArray = super::get_column(&batch, "name")?;
                 let paths: &StringArray = super::get_column(&batch, "file_path")?;
                 let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
@@ -3941,9 +3953,7 @@ impl DatabaseManager {
 
                 for row in 0..batch.num_rows() {
                     let path = paths.value(row);
-                    if self.workdir_is_dirty(path, git_sha)
-                        || self.workdir_is_deleted(path, git_sha)
-                    {
+                    if overlaid_paths.contains(path) {
                         continue;
                     }
                     if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
@@ -3983,7 +3993,7 @@ impl DatabaseManager {
 
             if !type_targets.is_empty() {
                 let types_table = self.connection.open_table("types").execute().await?;
-                let batches = types_table
+                let mut batches = types_table
                     .query()
                     .only_if("types IS NOT NULL")
                     .select(lancedb::query::Select::Columns(vec![
@@ -3994,11 +4004,9 @@ impl DatabaseManager {
                         "types".to_string(),
                     ]))
                     .execute()
-                    .await?
-                    .try_collect::<Vec<_>>()
                     .await?;
 
-                for batch in batches {
+                while let Some(batch) = batches.try_next().await? {
                     let names: &StringArray = super::get_column(&batch, "name")?;
                     let paths: &StringArray = super::get_column(&batch, "file_path")?;
                     let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
@@ -4007,9 +4015,7 @@ impl DatabaseManager {
 
                     for row in 0..batch.num_rows() {
                         let path = paths.value(row);
-                        if self.workdir_is_dirty(path, git_sha)
-                            || self.workdir_is_deleted(path, git_sha)
-                        {
+                        if overlaid_paths.contains(path) {
                             continue;
                         }
                         if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
@@ -4035,13 +4041,6 @@ impl DatabaseManager {
             }
         }
 
-        let (workdir_function_counts, workdir_type_counts) = {
-            let guard = self.workdir_index.read().unwrap();
-            guard
-                .as_ref()
-                .map(|index| index.distinct_reference_counts(&function_targets, &type_targets))
-                .unwrap_or_default()
-        };
         let function_counts = function_targets
             .into_iter()
             .map(|name| {
@@ -9512,6 +9511,26 @@ mod tests {
             .unwrap();
         assert_eq!(function_counts["target"], 2);
         assert_eq!(type_counts["duplicate"], 3);
+
+        std::fs::write(
+            repo_path.join("a.h"),
+            "void overlay_caller(void) { target(); overlay_only(); }\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repo_path.join("b.h")).unwrap();
+        db.note_repl_command();
+
+        let (function_counts, type_counts) = db
+            .get_distinct_reference_counts_git_aware(
+                &["target".to_string(), "overlay_only".to_string()],
+                &["duplicate".to_string()],
+                &git_sha,
+            )
+            .await
+            .unwrap();
+        assert_eq!(function_counts["target"], 1);
+        assert_eq!(function_counts["overlay_only"], 1);
+        assert_eq!(type_counts["duplicate"], 0);
     }
 
     #[tokio::test]
