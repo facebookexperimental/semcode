@@ -31,6 +31,10 @@ pub mod pages;
 pub mod search;
 
 // Re-export the main types and structs
+pub use database::macro_via::{
+    call_actuals, call_arities, forward_closure, is_macro_row, macro_rows_for, snapshot_for,
+    CallerEdge, ResolvedActual, ViaBudget,
+};
 pub use database::processed_files::ProcessedFileRecord;
 pub use database::resolution::{Evidence, IndirectCaller};
 pub use database::SCHEMA_VERSION;

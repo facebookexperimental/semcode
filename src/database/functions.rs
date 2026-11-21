@@ -788,6 +788,36 @@ impl FunctionStore {
         Ok(result)
     }
 
+    /// Metadata-first batched read for macro classification: one batched
+    /// metadata read per frontier, with bodies bulk-fetched only for rows
+    /// passing the empty-return-type filter. A full `get_by_names` would
+    /// bulk-fetch every body on the frontier; a `callers printk` frontier
+    /// is thousands of names, almost all functions.
+    pub(crate) async fn macro_candidates_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<FunctionInfo>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (all_function_data, _) = self.fetch_metadata_by_names(names).await?;
+        let candidates: Vec<FunctionMetadata> = all_function_data
+            .into_iter()
+            .filter(|func_data| func_data.return_type.is_empty())
+            .collect();
+        let mut body_hashes = std::collections::HashSet::new();
+        for func_data in &candidates {
+            if let Some(ref body_hash) = func_data.body_hash {
+                body_hashes.insert(body_hash.clone());
+            }
+        }
+        let content_map = self.fetch_bodies_for_hashes(body_hashes).await?;
+        Ok(candidates
+            .into_iter()
+            .map(|func_data| Self::metadata_into_function(func_data, &content_map))
+            .collect())
+    }
+
     /// Build a `name IN (...)` filter for one chunk of names.
     fn name_in_filter(names: &[String]) -> String {
         let name_list = names

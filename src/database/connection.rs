@@ -2120,6 +2120,13 @@ impl DatabaseManager {
     /// path (`help` on its own) still never pays either cost.
     fn ensure_workdir_index_built(&self, git_sha: &str) {
         if !self.workdir_overlay_usable(git_sha) {
+            // A query naming a revision other than the checked-out one
+            // must never see workdir state: drop whatever an earlier
+            // query at another revision built, so every reader below
+            // finds nothing and falls back to committed rows. Without
+            // the drop, a warmed index leaks one revision's dirty text
+            // into the next revision's answer in a long-lived process.
+            *self.workdir_index.write().unwrap() = None;
             return;
         }
         let current_generation = self.workdir_command_generation.load(Ordering::Relaxed);
@@ -2207,6 +2214,70 @@ impl DatabaseManager {
         self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard.as_ref().and_then(|w| w.find_callees(name))
+    }
+
+    /// Query-time macro traversal (`macro_via`) reaches through these: the
+    /// overlay's callers and rows by name, macros by file, the repo path
+    /// for blob reads, and the overlay generation that keys the snapshot.
+    pub(crate) fn overlay_callers_of(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.workdir_find_callers(name, git_sha)
+    }
+
+    pub(crate) fn overlay_rows_named(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_all_functions(name).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn overlay_macros_in_file(
+        &self,
+        file_path: &str,
+        git_sha: &str,
+    ) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.file_macros(file_path).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn overlay_dirty_files(&self, git_sha: &str) -> Vec<String> {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().map(|w| w.dirty_files()).unwrap_or_default()
+    }
+
+    pub(crate) fn repo_path(&self) -> &str {
+        &self.git_repo_path
+    }
+
+    pub(crate) async fn macro_candidates(&self, names: &[String]) -> Result<Vec<FunctionInfo>> {
+        self.function_store.macro_candidates_by_names(names).await
+    }
+
+    pub(crate) async fn argument_rows_for_callee(
+        &self,
+        callee: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_callee(callee).await
+    }
+
+    pub(crate) async fn argument_rows_for_target(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_target(target).await
+    }
+
+    pub(crate) async fn dispatch_sites_for_caller(
+        &self,
+        caller: &str,
+    ) -> Result<Vec<crate::types::DispatchSite>> {
+        self.dispatch_site_store.find_by_caller(caller).await
     }
 
     /// Grep function bodies in the workdir overlay.
@@ -6143,6 +6214,10 @@ impl DatabaseManager {
         &self,
         git_sha: &str,
     ) -> Result<crate::database::resolution::RevisionPaths> {
+        // Through `ensure`: a query naming another revision clears a
+        // warmed index instead of reading it, so the manifest's dirty
+        // set never carries one revision's workdir state into another's.
+        self.ensure_workdir_index_built(git_sha);
         let (dirty, deleted) = {
             let guard = self.workdir_index.read().unwrap();
             match guard.as_ref() {

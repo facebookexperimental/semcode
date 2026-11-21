@@ -3,20 +3,14 @@ use anyhow::Result;
 use clap::Parser;
 use semcode::domain::{domain_of, kernel_arch, Context};
 use semcode::{
-    asm, git, lore_writers::decode_email_body, pages::PageCache, process_database_path,
-    qualified_name, row_defines_the_function, search::LoreSearchOptions, DatabaseManager,
-    FunctionInfo, LoreEmailFilters, Resolution, Surface,
+    git, lore_writers::decode_email_body, pages::PageCache, process_database_path, qualified_name,
+    row_defines_the_function, search::LoreSearchOptions, DatabaseManager, LoreEmailFilters,
+    Resolution, Surface,
 };
 use serde_json::{json, Value};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-
-/// Whether a stored row is a macro: macros read as functions with no
-/// return type, but so do assembly definitions, which read as assembly.
-fn is_macro_row(entity: &FunctionInfo) -> bool {
-    entity.return_type.is_empty() && !asm::is_asm_path(Path::new(&entity.file_path))
-}
 
 /// "Under: <guard>" as its own line for a definition inside a conditional,
 /// nothing at file scope.
@@ -103,7 +97,7 @@ async fn mcp_query_function_or_macro(
         // Single definition found
         let entity = &definitions[0];
 
-        if is_macro_row(entity) {
+        if semcode::is_macro_row(entity) {
             // Found macro (stored as function with empty return_type)
             let params_str = entity
                 .parameters
@@ -175,7 +169,7 @@ async fn mcp_query_function_or_macro(
                 definitions.len()
             ));
 
-            if is_macro_row(entity) {
+            if semcode::is_macro_row(entity) {
                 // Macro
                 let params_str = entity
                     .parameters
@@ -467,7 +461,7 @@ async fn mcp_show_callers(
                 writeln!(buffer, "Ambiguous: {note}")?;
             }
             let entity = chosen.function;
-            let is_macro = is_macro_row(&entity);
+            let is_macro = semcode::is_macro_row(&entity);
             let entity_type = if is_macro { "macro" } else { "function" };
 
             // Callers of THIS definition, not of the name: a caller in
@@ -519,7 +513,7 @@ async fn mcp_show_callers(
                     {
                         Ok(Resolution::Chosen(caller_chosen)) => {
                             let caller_entity = caller_chosen.function;
-                            if is_macro_row(&caller_entity) {
+                            if semcode::is_macro_row(&caller_entity) {
                                 writeln!(
                                     buffer,
                                     "     macro ({}:{})",
@@ -565,6 +559,9 @@ async fn mcp_show_callers(
     }
 
     write_indirect_callers(db, function_name, git_sha, &mut buffer).await?;
+
+    // Same macro-via edges as the REPL callers path.
+    semcode::callchain::write_via_callers(db, function_name, git_sha, pin, &mut buffer).await?;
 
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
@@ -673,7 +670,7 @@ async fn mcp_show_calls(
                 writeln!(buffer, "Ambiguous: {note}")?;
             }
             let entity = chosen.function;
-            let is_macro = is_macro_row(&entity);
+            let is_macro = semcode::is_macro_row(&entity);
             let entity_type = if is_macro { "Macro" } else { "Function" };
 
             // What this definition calls is answered within its own build:
@@ -724,7 +721,7 @@ async fn mcp_show_calls(
                     {
                         Ok(Resolution::Chosen(callee_chosen)) => {
                             let callee_entity = callee_chosen.function;
-                            if is_macro_row(&callee_entity) {
+                            if semcode::is_macro_row(&callee_entity) {
                                 writeln!(
                                     buffer,
                                     "     macro ({}:{})",
@@ -1934,6 +1931,57 @@ async fn mcp_show_all_commits(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+/// Hop three of the MCP reverse display: macro edges recurse with the
+/// extended via chain, function edges show ordinary callers carrying the
+/// chain they arrived on. Present at `--up=3`, absent at `--up=2`.
+async fn mcp_third_level(
+    db: &DatabaseManager,
+    git_sha: &str,
+    second_name: &str,
+    via_chain: &[String],
+    chain_context: Context,
+    calls_limit: usize,
+    buffer: &mut Vec<u8>,
+) {
+    use std::io::Write;
+    if let Ok((is_macro, edges)) =
+        semcode::callchain::caller_level_edges(db, git_sha, second_name, via_chain, chain_context)
+            .await
+    {
+        if is_macro {
+            for edge in edges.iter().take(3) {
+                let _ = writeln!(buffer, "        └─ {}{}", edge.name, edge.via_suffix());
+            }
+            if edges.len() > 3 {
+                let _ = writeln!(buffer, "        └─ ... and {} more", edges.len() - 3);
+            }
+            return;
+        }
+    }
+    if let Ok(third) = db
+        .get_function_callers_in(second_name, git_sha, chain_context)
+        .await
+    {
+        let shown: Vec<_> = if calls_limit == 0 {
+            third
+        } else {
+            third.into_iter().take(calls_limit).collect()
+        };
+        let via = if via_chain.is_empty() {
+            String::new()
+        } else {
+            let chain: Vec<String> = via_chain.iter().map(|m| format!("via {m}")).collect();
+            format!(" [{}]", chain.join(" "))
+        };
+        for name in shown.iter().take(3) {
+            let _ = writeln!(buffer, "        └─ {name}{via}");
+        }
+        if shown.len() > 3 {
+            let _ = writeln!(buffer, "        └─ ... and {} more", shown.len() - 3);
+        }
+    }
+}
+
 async fn mcp_show_callchain_with_limits(
     db: &DatabaseManager,
     function_name: &str,
@@ -2085,6 +2133,14 @@ async fn mcp_show_callchain_with_limits(
                 callers.iter().take(calls_limit).cloned().collect()
             };
 
+            // One batched pass for the whole level: macro callers expand
+            // through their admitted second level below.
+            let caller_names: Vec<String> = limited_callers.clone();
+            let (macro_levels, _) =
+                semcode::callchain::macro_second_levels(db, git_sha, &caller_names, chain_context)
+                    .await
+                    .unwrap_or_default();
+
             for (i, caller) in limited_callers.iter().enumerate() {
                 writeln!(buffer, "{}. {}", i + 1, caller)?;
 
@@ -2103,9 +2159,36 @@ async fn mcp_show_callchain_with_limits(
                     )?;
                 }
 
-                // For multi-level depth, show second-level callers
+                // For multi-level depth, show second-level callers. A macro
+                // caller expands through its admitted second level with the
+                // via chain on every line; admission and depth apply before
+                // anything renders.
                 if up_levels > 1 {
-                    if let Ok(second_level_callers) = db
+                    if let Some(edges) = macro_levels.get(caller) {
+                        let shown: Vec<_> = if calls_limit == 0 {
+                            edges.clone()
+                        } else {
+                            edges.iter().take(calls_limit).cloned().collect()
+                        };
+                        for edge in shown.iter().take(3) {
+                            writeln!(buffer, "      └─ {}{}", edge.name, edge.via_suffix())?;
+                            if up_levels > 2 {
+                                mcp_third_level(
+                                    db,
+                                    git_sha,
+                                    &edge.name,
+                                    &edge.via,
+                                    chain_context,
+                                    calls_limit,
+                                    &mut buffer,
+                                )
+                                .await;
+                            }
+                        }
+                        if shown.len() > 3 {
+                            writeln!(buffer, "      └─ ... and {} more", shown.len() - 3)?;
+                        }
+                    } else if let Ok(second_level_callers) = db
                         .get_function_callers_in(caller, git_sha, chain_context)
                         .await
                     {
@@ -2122,6 +2205,18 @@ async fn mcp_show_callchain_with_limits(
                         for second_caller in limited_second.iter().take(3) {
                             // Show up to 3 second-level callers
                             writeln!(buffer, "      └─ {second_caller}")?;
+                            if up_levels > 2 {
+                                mcp_third_level(
+                                    db,
+                                    git_sha,
+                                    second_caller,
+                                    &[],
+                                    chain_context,
+                                    calls_limit,
+                                    &mut buffer,
+                                )
+                                .await;
+                            }
                         }
                         if limited_second.len() > 3 {
                             writeln!(buffer, "      └─ ... and {} more", limited_second.len() - 3)?;
@@ -2205,10 +2300,68 @@ async fn mcp_show_callchain_with_limits(
                         for second_callee in limited_second.iter().take(3) {
                             // Show up to 3 second-level callees
                             writeln!(buffer, "      └─ {second_callee}")?;
+                            // Macro callees invoke their parameters: legs
+                            // at the live sites, same as the first level.
+                            if let Ok((legs, total, truncated)) =
+                                semcode::callchain::forward_handover_display(
+                                    db,
+                                    git_sha,
+                                    second_callee,
+                                )
+                                .await
+                            {
+                                for (actual, site_file, site_line, via, guard) in &legs {
+                                    let guard_text = if guard.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" [{guard}]")
+                                    };
+                                    writeln!(
+                                        buffer,
+                                        "        └─ {actual} ({site_file}:{site_line}) {via}{guard_text}"
+                                    )?;
+                                }
+                                let more = total.saturating_sub(legs.len());
+                                if truncated && more > 0 {
+                                    writeln!(buffer, "        └─ ... and {more} more")?;
+                                } else if truncated {
+                                    writeln!(
+                                        buffer,
+                                        "        └─ ... (forward legs truncated by work limit)"
+                                    )?;
+                                }
+                            }
                         }
                         if limited_second.len() > 3 {
                             writeln!(buffer, "      └─ ... and {} more", limited_second.len() - 3)?;
                         }
+                    }
+                }
+
+                // A macro callee invokes its parameters: the handover legs
+                // at its live sites, with their call-site evidence.
+                if let Ok((legs, total, truncated)) =
+                    semcode::callchain::forward_handover_display(db, git_sha, callee).await
+                {
+                    for (actual, site_file, site_line, via, guard) in &legs {
+                        let guard_text = if guard.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{guard}]")
+                        };
+                        writeln!(
+                            buffer,
+                            "      └─ {actual} ({site_file}:{site_line}) {via}{guard_text}"
+                        )?;
+                    }
+                    let more = total.saturating_sub(legs.len());
+                    if truncated && more > 0 {
+                        writeln!(buffer, "      └─ ... and {more} more")?;
+                    } else if truncated {
+                        writeln!(
+                            buffer,
+                            "      └─ ... (forward legs truncated by work limit)"
+                        )?;
                     }
                 }
             }
@@ -6396,6 +6549,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use semcode::FunctionInfo;
     use std::env;
 
     // Combined into a single test so the three cases don't race on the
@@ -6421,8 +6575,10 @@ mod tests {
     #[test]
     fn assembly_rows_are_functions_not_macros() {
         // Macros read as functions with no return type, but so do
-        // assembly definitions: the file path distinguishes them.
-        let row = |path: &str, return_type: &str| FunctionInfo {
+        // assembly definitions: the file path distinguishes them. And
+        // `SYSCALL_DEFINE` functions have no return type either: only the
+        // `#define NAME(` text settles whether a row is a macro.
+        let row = |path: &str, return_type: &str, body: &str| FunctionInfo {
             name: "f".to_string(),
             file_path: path.to_string(),
             git_file_hash: "hash".to_string(),
@@ -6430,15 +6586,37 @@ mod tests {
             line_end: 2,
             return_type: return_type.to_string(),
             parameters: Vec::new(),
-            body: String::new(),
+            body: body.to_string(),
             calls: None,
             types: None,
             guard: None,
             qualifier: None,
         };
-        assert!(is_macro_row(&row("kernel/fork.c", "")));
-        assert!(!is_macro_row(&row("arch/x86/entry.S", "")));
-        assert!(!is_macro_row(&row("kernel/fork.c", "int")));
+        assert!(semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "",
+            "#define f(x) (x)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "arch/x86/entry.S",
+            "",
+            "SYM_FUNC_START(f)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "int",
+            "int f(void)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "",
+            "asmlinkage long sys_f(void)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "",
+            "#define f 0"
+        )));
     }
 
     #[test]
@@ -7904,5 +8082,67 @@ mod tests {
             ),
             other => panic!("metadata error must mark Failed, got {other:?}"),
         }
+    }
+
+    /// The MCP callers surface carries the same macro-via edges as the
+    /// REPL: a handover chain with per-hop evidence on a macro fixture.
+    #[tokio::test]
+    async fn mcp_callers_shows_macro_via_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.join("m.h"),
+            "#define WRAP(_fn, x) _fn(x)\n#define LOGM(s) WRAP(efn, s)\nvoid efn(const char *s);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("u.c"),
+            "#include \"m.h\"\nint c1(void) { LOGM(\"hi\"); return 0; }\nvoid efn(const char *s) { (void)s; }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+        let db = std::sync::Arc::new(
+            DatabaseManager::new(
+                repo.join(".semcode.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db.create_tables().await.unwrap();
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha,
+            &["c".to_string(), "h".to_string()],
+            db.clone(),
+            false,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+        let text = mcp_show_callers(&db, "efn", &sha, Context::Any)
+            .await
+            .unwrap();
+        assert!(text.contains("Via Macros"), "{text}");
+        assert!(text.contains("via WRAP"), "{text}");
+        assert!(text.contains("c1"), "{text}");
     }
 }

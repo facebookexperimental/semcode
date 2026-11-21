@@ -3499,8 +3499,7 @@ impl TreeSitterAnalyzer {
             let Some(arguments) = node.child_by_field_name("arguments") else {
                 return true;
             };
-            let mut cursor = arguments.walk();
-            for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+            for (index, argument) in crate::call_actuals(arguments).into_iter().enumerate() {
                 let named = match argument.kind() {
                     "identifier" => Some(argument),
                     "pointer_expression" => argument
@@ -4999,8 +4998,8 @@ impl TreeSitterAnalyzer {
                         Some((base_type.clone(), source[member.byte_range()].to_string()))
                     });
 
-                    let mut cursor = arguments.walk();
-                    for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+                    for (index, argument) in crate::call_actuals(arguments).into_iter().enumerate()
+                    {
                         let (identifier, taken_address) = match argument.kind() {
                             "identifier" => (Some(argument), false),
                             "pointer_expression" => (
