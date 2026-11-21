@@ -36,9 +36,11 @@ struct Args {
     #[arg(short, long)]
     database: Option<String>,
 
-    /// File extensions to process (comma-separated)
-    #[arg(short, long, default_value_t = semcode::file_extensions::default_extensions_string())]
-    extensions: String,
+    /// File extensions to process (comma-separated). Omitted means the
+    /// recorded build options when the index has them, else the indexer
+    /// defaults — a later run never silently widens or narrows the build.
+    #[arg(short, long)]
+    extensions: Option<String>,
 
     /// Include directories (can be specified multiple times).
     /// Only files under these dirs are indexed. Relative paths resolve
@@ -810,6 +812,28 @@ async fn index_lore_archive(
 
 // ==================== Branch Indexing Support ====================
 
+/// Extensions and macro flag for this CLI run: an explicit flag wins;
+/// otherwise the recorded build options win, unless `--clear` restarts
+/// the build and drops the record; otherwise the indexer defaults. A
+/// later CLI run must not silently widen a narrowed index (or narrow a
+/// widened one): the record is the build. No flag turns macros back on:
+/// only `--clear` drops an inherited `--no-macros`.
+async fn cli_options(args: &Args, db_manager: &DatabaseManager) -> Result<(Vec<String>, bool)> {
+    // The record is dropped beside every wipe, so a restart reads no
+    // record and falls to the defaults below: one mechanism, not two.
+    let recorded = db_manager.recorded_index_options().await?;
+    let extensions = match (args.extensions.as_deref(), &recorded) {
+        (Some(explicit), _) => explicit
+            .split(',')
+            .map(|ext| ext.trim().trim_start_matches('.').to_string())
+            .collect(),
+        (None, Some((recorded_extensions, _))) => recorded_extensions.clone(),
+        (None, None) => semcode::file_extensions::default_extensions(),
+    };
+    let no_macros = args.no_macros || recorded.is_some_and(|(_, no_macros)| no_macros);
+    Ok((extensions, no_macros))
+}
+
 /// Collect branches to index from the various branch-related CLI flags
 /// Returns BranchRef structs with proper is_remote/remote metadata
 fn collect_branches_to_index(args: &Args) -> Result<Vec<semcode::git::BranchRef>> {
@@ -912,12 +936,8 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
             continue;
         }
 
-        // Get extensions for this indexing operation
-        let extensions: Vec<String> = args
-            .extensions
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
+        // Get extensions for this indexing operation; see cli_options.
+        let (extensions, no_macros) = cli_options(&args, &db_manager).await?;
 
         // An index written before this build does not hold what this build
         // extracts, however current its recorded tip is. Indexing the commits
@@ -934,6 +954,18 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
             // Incremental indexing: commits from last indexed tip to current tip
             let range = format!("{}..{}", indexed_tip, tip_commit);
             info!("Incremental indexing: {} for branch {}", range, branch_name);
+
+            // Same rule as one-off --git ranges: an incremental branch
+            // read under disagreeing flags would poison the build.
+            if args.extensions.is_some() || args.no_macros {
+                refuse_scoped_option_drift(
+                    &format!("branch {branch_name} range {range}"),
+                    &db_manager,
+                    &extensions,
+                    no_macros,
+                )
+                .await?;
+            }
 
             println!("  {} Processing range: {}", "→".blue(), range);
 
@@ -958,7 +990,7 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
                     &range,
                     &extensions,
                     db_manager.clone(),
-                    args.no_macros,
+                    no_macros,
                     args.db_threads,
                     &args.include,
                 )
@@ -980,7 +1012,7 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
                 tip_commit,
                 &extensions,
                 db_manager.clone(),
-                args.no_macros,
+                no_macros,
                 args.db_threads,
                 &args.include,
             )
@@ -1564,6 +1596,12 @@ async fn run_commits_only(args: Args) -> Result<()> {
         ));
     }
 
+    // Resolve the range before anything is wiped: a bad range must fail
+    // while the database is still intact, never after a clear.
+    let probe_repo = gix::discover(&args.source)
+        .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+    validate_explicit_range(&probe_repo, commit_range)?;
+
     // Process database path
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
 
@@ -1650,12 +1688,181 @@ async fn run_commits_only(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a scoped read under options the recorded build does not hold:
+/// explicit flags that disagree with the record would mark the range's
+/// files under options no later run reproduces, leaving holes the record
+/// denies. Only scoped reads refuse: a standing run rewrites the record,
+/// and a tree read records what it read.
+async fn refuse_scoped_option_drift(
+    what: &str,
+    db_manager: &DatabaseManager,
+    extensions: &[String],
+    no_macros: bool,
+) -> Result<()> {
+    if let Some((recorded_exts, recorded_macros)) = db_manager.recorded_index_options().await? {
+        // Membership, not order or multiplicity: the reader tests
+        // membership, so `-e rs,c` and `-e c,rs,c` are the `c,rs` build.
+        let mut want = extensions.to_vec();
+        want.sort();
+        want.dedup();
+        let mut have = recorded_exts.clone();
+        have.sort();
+        have.dedup();
+        if have != want || recorded_macros != no_macros {
+            return Err(anyhow::anyhow!(
+                "{what} names options the recorded build does not hold \
+                 (recorded extensions [{}] macros {}; requested extensions [{}] macros {}). \
+                 Drop the flags to ask under the build's options, drop the range or branch selection \
+                 to change the build with these flags, or add --clear to restart it.",
+                recorded_exts.join(","),
+                if recorded_macros { "skipped" } else { "on" },
+                extensions.join(","),
+                if no_macros { "skipped" } else { "on" },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an explicit user range before anything is wiped: the format,
+/// both endpoints, and — since the walk falls back silently — the from
+/// side under the narrowed fallback rule (see `check_from_side`).
+fn validate_explicit_range(repo: &gix::Repository, range: &str) -> Result<()> {
+    semcode::indexer::list_shas_in_range(repo, range)?;
+    if let Some((from, _)) = range.split_once("..") {
+        // The walk falls back to a single commit when the from side fails;
+        // without this check a typo in a typed range would pass silently:
+        // try the whole endpoint the same way the walk does, and allow
+        // the fallback only for well-formed ancestry on a resolvable base.
+        if !from.is_empty() {
+            check_from_side(repo, from)
+                .with_context(|| format!("invalid from side of range '{range}'"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The walk's from-side fallback, narrowed to its legitimate use: the
+/// endpoint itself resolves, or it is a base that resolves followed
+/// only by well-formed ancestry suffixes (`^`, `^N`, `~`, `~N`). `tpyo`,
+/// `tpyo^`, `HEAD^foo`, `HEAD^foo^` and `HEAD^{not-a-type}` fail, while
+/// `X^`, `X^1` and `X~N` on short history keep root-commit indexing. A
+/// `^N` past the first parent must name parents that exist: on linear
+/// history `HEAD^5` is a `~5` typo, while `M^2~K` past the root still
+/// falls back.
+fn check_from_side(repo: &gix::Repository, from: &str) -> Result<()> {
+    if let Err(e) = semcode::git::resolve_to_commit(repo, from) {
+        let base = from.split(['~', '^']).next().unwrap_or(from);
+        // Every suffix after the base must be ancestry: a malformed
+        // middle (`HEAD^foo^`) passes unnoticed behind a good ending
+        // and base.
+        let mut rest = &from[base.len()..];
+        while !rest.is_empty() {
+            if let Some(tail) = rest.strip_prefix('^') {
+                // `^N` selects the Nth parent, like a bare `^` alone. The
+                // count follows gitoxide's `isize` bound, as `~N` follows
+                // its `usize` one: unparseable counts must fail. And past
+                // the first parent the prefix through the count must
+                // resolve: on linear history `HEAD^5` is a `~5` typo,
+                // while `M^2~K` past the root still falls back.
+                let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+                let number = if digits == 0 {
+                    1
+                } else {
+                    match tail[..digits].parse::<isize>() {
+                        Ok(n) => n,
+                        Err(_) => return Err(e),
+                    }
+                };
+                if number >= 2 {
+                    let prefix = &from[..from.len() - rest.len() + 1 + digits];
+                    if semcode::git::resolve_to_commit(repo, prefix).is_err() {
+                        return Err(e);
+                    }
+                }
+                rest = &tail[digits..];
+            } else if let Some(tail) = rest.strip_prefix('~') {
+                let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+                // A bare `~` reads as `~1`, matching git; anything else
+                // needs digits gitoxide itself can parse.
+                if digits > 0 && tail[..digits].parse::<usize>().is_err() {
+                    return Err(e);
+                }
+                rest = &tail[digits..];
+            } else {
+                return Err(e);
+            }
+        }
+        if semcode::git::resolve_to_commit(repo, base).is_err() {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Resolve which git range a CLI run reads, before anything is wiped or
+/// written. The explicit range is validated now (format and resolvability),
+/// not when the pipeline first walks it: a bad range fails while the
+/// database is still intact.
+fn resolve_git_range(args: &Args) -> Result<String> {
+    if let Some(ref explicit_range) = args.git {
+        // Explicit --git flag provided
+        if !explicit_range.contains("..") {
+            return Err(anyhow::anyhow!(
+                "Git indexing requires a range format (e.g., 'HEAD~10..HEAD'). Single commit mode has been removed. Got: '{}'",
+                explicit_range
+            ));
+        }
+        let repo = gix::discover(&args.source)
+            .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+        validate_explicit_range(&repo, explicit_range)?;
+        Ok(explicit_range.clone())
+    } else {
+        // No --git flag: detect current HEAD commit and process it
+        // This is the new default behavior for semcode-index -s .
+        match gix::discover(&args.source) {
+            Ok(repo) => {
+                match repo.head_commit() {
+                    Ok(commit) => {
+                        let commit_sha = commit.id().to_string();
+                        info!(
+                            "No --git flag provided, indexing current HEAD commit: {}",
+                            commit_sha
+                        );
+                        // Create a range that includes just the current commit
+                        // Format: HEAD^..HEAD (parent to current)
+                        Ok(format!("{}^..{}", commit_sha, commit_sha))
+                    }
+                    Err(e) => Err(anyhow::anyhow!(
+                        "Not in a git repository or HEAD is unborn (no commits yet): {}. Use --git flag to specify a commit range.",
+                        e
+                    )),
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Not in a git repository: {}. semcode-index requires a git repository. Initialize one with 'git init' first.",
+                e
+            )),
+        }
+    }
+}
+
 /// Process commits using a streaming pipeline
 async fn run_pipeline(args: Args) -> Result<()> {
     info!("Starting Tree-sitter pipeline processing");
 
     // Process database path with search order: 1) -d flag, 2) source directory, 3) current directory
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
+
+    // Resolve the range before table setup, not just before the wipe: on
+    // a stale index the migration inside setup drops functions and types,
+    // so a bad range must fail before that too. Skipped for vectors-only
+    // runs, which need no repository.
+    let git_range = if !args.vectors {
+        Some(resolve_git_range(&args)?)
+    } else {
+        None
+    };
 
     // Create database manager and tables
     let db_manager =
@@ -1673,54 +1880,19 @@ async fn run_pipeline(args: Args) -> Result<()> {
 
     // Skip source indexing if we're only doing vectorization
     if !args.vectors {
-        let extensions: Vec<String> = args
-            .extensions
-            .split(',')
-            .map(|ext| ext.trim().trim_start_matches('.').to_string())
-            .collect();
+        let (extensions, no_macros) = cli_options(&args, &db_manager).await?;
+        let git_range = git_range.unwrap();
 
-        // Determine git range to process
-        let git_range = if let Some(ref explicit_range) = args.git {
-            // Explicit --git flag provided
-            if !explicit_range.contains("..") {
-                return Err(anyhow::anyhow!(
-                    "Git indexing requires a range format (e.g., 'HEAD~10..HEAD'). Single commit mode has been removed. Got: '{}'",
-                    explicit_range
-                ));
-            }
-            explicit_range.clone()
-        } else {
-            // No --git flag: detect current HEAD commit and process it
-            // This is the new default behavior for semcode-index -s .
-            match gix::discover(&args.source) {
-                Ok(repo) => {
-                    match repo.head_commit() {
-                        Ok(commit) => {
-                            let commit_sha = commit.id().to_string();
-                            info!(
-                                "No --git flag provided, indexing current HEAD commit: {}",
-                                commit_sha
-                            );
-                            // Create a range that includes just the current commit
-                            // Format: HEAD^..HEAD (parent to current)
-                            format!("{}^..{}", commit_sha, commit_sha)
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "Not in a git repository or HEAD is unborn (no commits yet): {}. Use --git flag to specify a commit range.",
-                                e
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Not in a git repository: {}. semcode-index requires a git repository. Initialize one with 'git init' first.",
-                        e
-                    ));
-                }
-            }
-        };
+        // A one-off range resolves under the build's options.
+        if args.git.is_some() && (args.extensions.is_some() || args.no_macros) {
+            refuse_scoped_option_drift(
+                &format!("--git {}", args.git.as_deref().unwrap_or("")),
+                &db_manager,
+                &extensions,
+                no_macros,
+            )
+            .await?;
+        }
 
         // An index written by an older semcode holds rows that no commit
         // range will refresh: the files have not changed, so a range covers
@@ -1743,7 +1915,7 @@ async fn run_pipeline(args: Args) -> Result<()> {
                 &head,
                 &extensions,
                 db_manager.clone(),
-                args.no_macros,
+                no_macros,
                 args.db_threads,
                 &args.include,
             )
@@ -1756,11 +1928,30 @@ async fn run_pipeline(args: Args) -> Result<()> {
                 &git_range,
                 &extensions,
                 db_manager.clone(),
-                args.no_macros,
+                no_macros,
                 args.db_threads,
                 &args.include,
             )
             .await?;
+        }
+
+        // Persist what this build read with: interactive startup reuses
+        // recorded options, and a fresh CLI build is otherwise optionless.
+        // The initial build records, as does a standing-build run that
+        // names options explicitly (typed flags are a deliberate build
+        // change). A one-off `--git` range never rewrites an existing
+        // record: it resolves under the build's options, the same
+        // policy the branch path follows. An inherited run records
+        // nothing. Coverage stays where it was (no tree SHA is recorded
+        // here). Header routing is not configurable yet: `.h` always
+        // reads as C, the same value the row versions consult.
+        if args.clear
+            || db_manager.recorded_index_options().await?.is_none()
+            || (args.git.is_none() && (args.extensions.is_some() || args.no_macros))
+        {
+            db_manager
+                .record_index_build(&extensions, no_macros, false)
+                .await?;
         }
     } else {
         println!("Skipping source indexing - vectorization only mode");
@@ -1977,6 +2168,1305 @@ mod tests {
         assert_eq!(
             result.unwrap().unwrap_err().to_string(),
             "Failed to fetch manifest: HTTP 503 Service Unavailable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cli_round_trip_tests {
+    use super::run_branch_indexing;
+    use super::run_commits_only;
+    use super::run_pipeline;
+    use super::Args;
+    use clap::Parser;
+
+    /// A fresh CLI build persists what it read with: build with
+    /// `--extensions c --no-macros`, and the recorded options say so
+    /// instead of falling back to every supported extension.
+    #[tokio::test]
+    async fn fresh_build_records_its_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+
+        let args = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c",
+            "--no-macros",
+        ])
+        .unwrap();
+        run_pipeline(args).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string()], true))
+        );
+    }
+
+    /// A later CLI run with no flags inherits the record: adding an `.rs`
+    /// file and rebuilding plain must not index it, and the record must
+    /// still say what the build was built with.
+    #[tokio::test]
+    async fn plain_rerun_inherits_recorded_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.join("a.c"),
+            "int f(void)\n{\n\treturn 1;\n}\n#define CMAC(x) ((x) + 1)\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+
+        let args = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c",
+            "--no-macros",
+        ])
+        .unwrap();
+        run_pipeline(args).await.unwrap();
+
+        std::fs::write(repo.join("b.rs"), "fn rs_fn() -> i32 {\n\t1\n}\n").unwrap();
+        std::fs::write(
+            repo.join("b.c"),
+            "int g(void)\n{\n\treturn 1;\n}\n#define CMAC2(x) ((x) + 1)\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v3 adds rust"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let plain =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(plain).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string()], true))
+        );
+        assert!(
+            db.find_function_git_aware("rs_fn", &sha)
+                .await
+                .unwrap()
+                .is_none(),
+            "a plain rerun must not widen a narrowed index"
+        );
+        assert!(
+            db.find_function_git_aware("CMAC", &sha)
+                .await
+                .unwrap()
+                .is_none(),
+            "a plain rerun must inherit the macro opt-out too"
+        );
+        assert!(
+            db.find_function_git_aware("CMAC2", &sha)
+                .await
+                .unwrap()
+                .is_none(),
+            "a file the rerun reads must still skip its macro row"
+        );
+        assert!(
+            db.find_function_git_aware("g", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "the rerun must read plain rows from the files it visits"
+        );
+
+        // Restating the record's own flags on a range is agreement, not a
+        // change: the guard must let it through.
+        let agree = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--git",
+            &format!("{sha}^..{sha}"),
+            "--no-macros",
+        ])
+        .unwrap();
+        run_pipeline(agree).await.unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string()], true))
+        );
+    }
+
+    /// A one-off `--git` range asks under the build's options and never
+    /// rewrites the record; flags that disagree with the build are
+    /// refused, while the same flags on a standing run become the build.
+    #[tokio::test]
+    async fn scoped_range_leaves_the_build_record_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let wide = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c,rs",
+        ])
+        .unwrap();
+        run_pipeline(wide).await.unwrap();
+
+        let scoped = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--git",
+            &format!("{sha}^..{sha}"),
+        ])
+        .unwrap();
+        run_pipeline(scoped).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string(), "rs".to_string()], false)),
+            "a scoped range must not rewrite the build record"
+        );
+
+        // Flags that disagree with the build are refused on a range: the
+        // range would mark files under options no later run reproduces.
+        let foreign = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c",
+            "--git",
+            &format!("{sha}^..{sha}"),
+        ])
+        .unwrap();
+        assert!(
+            run_pipeline(foreign).await.is_err(),
+            "a scoped range must not smuggle in a flag change"
+        );
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string(), "rs".to_string()], false)),
+            "a refused range must not touch the record"
+        );
+
+        // The reader tests membership, not order: restating the build's
+        // extensions in another order is agreement too.
+        let reordered = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "rs,c",
+            "--git",
+            &format!("{sha}^..{sha}"),
+        ])
+        .unwrap();
+        run_pipeline(reordered).await.unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string(), "rs".to_string()], false))
+        );
+
+        // Multiplicity is not membership either: a repeated flag still
+        // agrees with the build it restates.
+        let dup = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c,rs,c",
+            "--git",
+            &format!("{sha}^..{sha}"),
+        ])
+        .unwrap();
+        run_pipeline(dup).await.unwrap();
+
+        let standing = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c",
+        ])
+        .unwrap();
+        run_pipeline(standing).await.unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string()], false)),
+            "the same flags on a standing run become the build"
+        );
+
+        let widen = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c,rs",
+        ])
+        .unwrap();
+        run_pipeline(widen).await.unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((vec!["c".to_string(), "rs".to_string()], false)),
+            "explicit flags on a standing run widen the record too"
+        );
+    }
+
+    /// `--clear` restarts the build and drops the record: after a
+    /// `--no-macros` build, a plain `--clear` reads with macros on, so
+    /// the macro row comes back and the record says defaults.
+    #[tokio::test]
+    async fn clear_forgets_the_recorded_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.join("a.c"),
+            "int f(void)\n{\n\treturn 1;\n}\n#define CMAC(x) ((x) + 1)\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let narrow = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c",
+            "--no-macros",
+        ])
+        .unwrap();
+        run_pipeline(narrow).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(
+            db.find_function_git_aware("CMAC", &sha)
+                .await
+                .unwrap()
+                .is_none(),
+            "no-macros build must skip the macro row"
+        );
+
+        let clear = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+        ])
+        .unwrap();
+        run_pipeline(clear).await.unwrap();
+
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((semcode::file_extensions::default_extensions(), false)),
+            "--clear must reset the record to defaults with macros on"
+        );
+        assert!(
+            db.find_function_git_aware("CMAC", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "--clear must bring the macro row back"
+        );
+    }
+
+    /// `--clear --commits` drops the record too: the commits path wipes
+    /// source rows without rebuilding them, so a surviving record would
+    /// strand the next build under options the wiped rows never held.
+    #[tokio::test]
+    async fn commits_clear_forgets_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+        let old = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let narrow = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c",
+            "--no-macros",
+        ])
+        .unwrap();
+        run_pipeline(narrow).await.unwrap();
+
+        let head = semcode::git::get_git_sha(repo).unwrap().unwrap();
+        let commits = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+            "--commits",
+            &format!("{old}..{head}"),
+        ])
+        .unwrap();
+        run_commits_only(commits).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            None,
+            "commits clear must forget the record"
+        );
+        assert!(
+            db.find_function_git_aware("f", &head)
+                .await
+                .unwrap()
+                .is_none(),
+            "commits clear still wipes source rows"
+        );
+    }
+
+    /// A bad `--git` range with `--clear` fails before anything is wiped:
+    /// the record and the rows stay as the last good build left them.
+    #[tokio::test]
+    async fn clear_with_bad_range_leaves_everything_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+
+        let build =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(build).await.unwrap();
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let bad = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+            "--git",
+            "nosuch..alsonot",
+        ])
+        .unwrap();
+        assert!(
+            run_pipeline(bad).await.is_err(),
+            "an unresolvable range must fail"
+        );
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((semcode::file_extensions::default_extensions(), false)),
+            "a failed clear must not touch the record"
+        );
+        assert!(
+            db.find_function_git_aware("f", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "a failed clear must not wipe rows"
+        );
+
+        // And a plain run after the failure resumes where the last good
+        // build left off: the failure above wiped and rewrote nothing.
+        let resume =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(resume).await.unwrap();
+        assert!(
+            db.find_function_git_aware("f", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "a plain run after a failed clear still finds the rows"
+        );
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((semcode::file_extensions::default_extensions(), false)),
+            "the resumed run records the build it read"
+        );
+    }
+
+    /// A `--git` range naming options the build does not hold fails
+    /// instead of poisoning it: the failed run marks nothing, so a plain
+    /// rerun still reads the range's files whole, macro row included.
+    #[tokio::test]
+    async fn scoped_range_with_foreign_flags_fails_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let old = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let build =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(build).await.unwrap();
+
+        std::fs::write(
+            repo.join("b.c"),
+            "int g(void)\n{\n\treturn 1;\n}\n#define CMAC3(x) ((x) + 1)\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v2 adds macro"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let foreign = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--git",
+            &format!("{old}..{sha}"),
+            "--no-macros",
+        ])
+        .unwrap();
+        let error = run_pipeline(foreign).await.unwrap_err();
+        assert!(
+            error.to_string().contains("recorded build"),
+            "the refusal must name the record: {error}"
+        );
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((semcode::file_extensions::default_extensions(), false)),
+            "a refused range must not touch the record"
+        );
+
+        let plain =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(plain).await.unwrap();
+        assert!(
+            db.find_function_git_aware("CMAC3", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "the refused run must mark nothing: the rerun reads the macro row"
+        );
+        assert!(
+            db.find_function_git_aware("g", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "the rerun reads the refused range's files whole"
+        );
+    }
+
+    /// Forgetting the build clears options and tree coverage together,
+    /// and leaves the schema version alone: a wipe claims nothing, but
+    /// the database is still current.
+    #[tokio::test]
+    async fn forget_recorded_build_clears_options_and_tree_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let db = semcode::DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        db.record_index_build(&["c".to_string()], true, true)
+            .await
+            .unwrap();
+        db.record_tree_sha("abc123").await.unwrap();
+        assert_eq!(db.recorded_headers_as_cpp().await.unwrap(), Some(true));
+
+        db.forget_recorded_build().await.unwrap();
+
+        assert_eq!(db.recorded_index_options().await.unwrap(), None);
+        assert_eq!(db.recorded_tree_sha().await.unwrap(), None);
+        assert_eq!(db.recorded_headers_as_cpp().await.unwrap(), None);
+        assert!(
+            !db.index_predates_reader().await.unwrap(),
+            "forgetting must not touch the schema version"
+        );
+
+        // Forgetting over tables that were never created succeeds too:
+        // absence reads as no record.
+        let bare = semcode::DatabaseManager::new(
+            dir.path().join("bare.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        bare.forget_recorded_build().await.unwrap();
+        assert_eq!(bare.recorded_index_options().await.unwrap(), None);
+
+        // A corrupt options table fails loudly instead of reporting a
+        // wipe with the record intact: only absence is tolerated.
+        std::fs::write(
+            dir.path().join("bare.db").join("schema_meta.lance"),
+            b"garbage",
+        )
+        .unwrap();
+        bare.forget_recorded_build().await.unwrap_err();
+    }
+
+    /// An incremental branch read under disagreeing flags is refused like
+    /// a one-off range: the same poisoning, the same guard. A flagless
+    /// incremental run still goes through.
+    #[tokio::test]
+    async fn branch_incremental_with_foreign_flags_fails_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let v1 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+        let tip = |sha: &str| semcode::git::BranchRef {
+            name: "main".to_string(),
+            tip_commit: sha.to_string(),
+            is_remote: false,
+            remote: None,
+        };
+
+        let build =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_branch_indexing(build, vec![tip(&v1)]).await.unwrap();
+
+        std::fs::write(repo.join("b.c"), "int g(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v2"]);
+        let v2 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let foreign = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--extensions",
+            "c",
+        ])
+        .unwrap();
+        let error = run_branch_indexing(foreign, vec![tip(&v2)])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("recorded build"),
+            "the refusal must name the record: {error}"
+        );
+
+        // Same for the macro half of the build: opting out on a range
+        // would skip macro rows the record claims.
+        let macros = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--no-macros",
+        ])
+        .unwrap();
+        assert!(
+            run_branch_indexing(macros, vec![tip(&v2)])
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap_err()
+                .contains("recorded build"),
+            "a branch range must not smuggle in a macro opt-out either"
+        );
+
+        let plain =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_branch_indexing(plain, vec![tip(&v2)]).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((semcode::file_extensions::default_extensions(), false)),
+            "a refused branch run must not touch the record"
+        );
+        assert!(
+            db.find_function_git_aware("g", &v2)
+                .await
+                .unwrap()
+                .is_some(),
+            "the flagless incremental run still reads the new file"
+        );
+    }
+
+    /// A bad `--commits` range with `--clear` fails before anything is
+    /// wiped, like a bad `--git` range.
+    #[tokio::test]
+    async fn commits_clear_with_bad_range_leaves_everything_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+
+        let build =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(build).await.unwrap();
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let bad = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+            "--commits",
+            "nosuch..alsonot",
+        ])
+        .unwrap();
+        assert!(
+            run_commits_only(bad).await.is_err(),
+            "an unresolvable commits range must fail"
+        );
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.recorded_index_options().await.unwrap(),
+            Some((semcode::file_extensions::default_extensions(), false)),
+            "a failed commits clear must not touch the record"
+        );
+        assert!(
+            db.find_function_git_aware("f", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "a failed commits clear must not wipe rows"
+        );
+    }
+
+    /// A bad left endpoint fails before anything is wiped too: the walk
+    /// falls back to the right side silently, so the from side needs its
+    /// own check. Mirror for `--git` and `--commits`.
+    #[tokio::test]
+    async fn clear_with_bad_left_endpoint_leaves_everything_intact() {
+        bad_left_endpoint_leaves_everything_intact(false).await;
+    }
+
+    #[tokio::test]
+    async fn commits_clear_with_bad_left_endpoint_leaves_everything_intact() {
+        bad_left_endpoint_leaves_everything_intact(true).await;
+    }
+
+    async fn bad_left_endpoint_leaves_everything_intact(commits: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+
+        let build =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(build).await.unwrap();
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        // A bare typo, a hatted typo, and malformed ancestry must all
+        // fail: the walk falls back silently for any of them.
+        for range in [
+            "nosuch..HEAD",
+            "nosuch^..HEAD",
+            "HEAD^{not-a-type}..HEAD",
+            "HEAD^foo..HEAD",
+            "HEAD^foo^..HEAD",
+            "HEAD^{x}~2..HEAD",
+            "HEAD~18446744073709551616..HEAD",
+            "HEAD^9223372036854775808..HEAD",
+            "HEAD^9223372036854775807..HEAD",
+            "HEAD^5..HEAD",
+        ] {
+            let bad = if commits {
+                Args::try_parse_from([
+                    "semcode-index",
+                    "--source",
+                    repo.to_str().unwrap(),
+                    "--clear",
+                    "--commits",
+                    range,
+                ])
+                .unwrap()
+            } else {
+                Args::try_parse_from([
+                    "semcode-index",
+                    "--source",
+                    repo.to_str().unwrap(),
+                    "--clear",
+                    "--git",
+                    range,
+                ])
+                .unwrap()
+            };
+            let failed = if commits {
+                run_commits_only(bad).await.is_err()
+            } else {
+                run_pipeline(bad).await.is_err()
+            };
+            assert!(failed, "an unresolvable from side must fail: {range}");
+
+            let db_path = semcode::process_database_path(None, Some(repo));
+            let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.recorded_index_options().await.unwrap(),
+                Some((semcode::file_extensions::default_extensions(), false)),
+                "a failed clear must not touch the record: {range}"
+            );
+            assert!(
+                db.find_function_git_aware("f", &sha)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a failed clear must not wipe rows: {range}"
+            );
+        }
+    }
+
+    /// A bad range fails before table setup, not just before the wipe: on
+    /// a stale index the migration inside setup drops functions and types,
+    /// so validation must precede it.
+    #[tokio::test]
+    async fn stale_index_with_bad_range_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2"]);
+
+        let build =
+            Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
+        run_pipeline(build).await.unwrap();
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        // Age the index: a stale mark and an older schema version.
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        db.mark_files_processed(vec![semcode::ProcessedFileRecord {
+            file: "a.c".to_string(),
+            git_sha: None,
+            git_file_sha: "staleblob".to_string(),
+            extractor_version: Some("stale".to_string()),
+        }])
+        .await
+        .unwrap();
+        let options = lancedb::database::listing::ListingDatabaseOptions::builder()
+            .data_storage_version(lancedb::connection::LanceFileVersion::V2_2)
+            .build();
+        let connection = lancedb::connect(db_path.as_str())
+            .database_options(&options)
+            .execute()
+            .await
+            .unwrap();
+        let table = connection
+            .open_table("schema_meta")
+            .execute()
+            .await
+            .unwrap();
+        table.delete("key = 'schema_version'").await.unwrap();
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("key", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow::array::StringArray::from(vec!["schema_version"]))
+                    as arrow::array::ArrayRef,
+                std::sync::Arc::new(arrow::array::StringArray::from(vec!["0"]))
+                    as arrow::array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        table.add(vec![batch]).execute().await.unwrap();
+
+        let bad = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+            "--git",
+            "nosuch..HEAD",
+        ])
+        .unwrap();
+        assert!(run_pipeline(bad).await.is_err(), "a bad range must fail");
+
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(
+            db.index_predates_reader().await.unwrap(),
+            "the failed run must not migrate anything"
+        );
+        assert!(
+            db.find_function_git_aware("f", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "a failed run on a stale index must not drop rows"
+        );
+    }
+
+    /// An explicit caret range on a root commit still indexes: the from
+    /// side has no parent, so the walk's single-commit fallback is the
+    /// answer, not an error.
+    #[tokio::test]
+    async fn root_commit_explicit_caret_range_still_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        // Caret, bare-tilde, and explicit-first-parent spellings all
+        // fall back on a root commit: git reads `~` as `~1` and `^1`
+        // as `^`. Each leg asserts on its own, since every leg runs
+        // `--clear`: a shared assert after the loop would let one leg
+        // mask another.
+        for range in [
+            format!("{sha}^..{sha}"),
+            format!("{sha}~..{sha}"),
+            format!("{sha}^1..{sha}"),
+        ] {
+            let root = Args::try_parse_from([
+                "semcode-index",
+                "--source",
+                repo.to_str().unwrap(),
+                "--clear",
+                "--git",
+                &range,
+            ])
+            .unwrap();
+            run_pipeline(root).await.unwrap();
+
+            let db_path = semcode::process_database_path(None, Some(repo));
+            let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+                .await
+                .unwrap();
+            assert!(
+                db.find_function_git_aware("f", &sha)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the root commit's files must be indexed: {range}"
+            );
+        }
+    }
+
+    /// A `~N` range past the root still indexes: the count exceeds the
+    /// history, so the walk's single-commit fallback is the answer, not
+    /// an error. Companion to the root-caret test for the `~N` spelling.
+    #[tokio::test]
+    async fn shallow_history_tilde_range_still_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let shallow = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+            "--git",
+            "HEAD~2..HEAD",
+        ])
+        .unwrap();
+        run_pipeline(shallow).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(
+            db.find_function_git_aware("f", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "the fallback must index the single commit"
+        );
+    }
+
+    /// A huge but parseable count still falls back: the platform's
+    /// largest count exceeds any history, so the walk indexes the
+    /// single commit instead of erroring. Companion to the overflow
+    /// leg, which must fail.
+    #[tokio::test]
+    async fn max_count_tilde_range_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let huge = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+            "--git",
+            &format!("HEAD~{}..HEAD", usize::MAX),
+        ])
+        .unwrap();
+        run_pipeline(huge).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(
+            db.find_function_git_aware("f", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "a parseable count past history must fall back, not fail"
+        );
+    }
+
+    /// A corrupt data table fails the wipe loudly instead of reporting
+    /// success with rows left behind.
+    #[tokio::test]
+    async fn clear_with_corrupt_table_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let db = semcode::DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        db.clear_all_data().await.unwrap();
+
+        std::fs::remove_dir_all(db_path.join("functions.lance")).unwrap();
+        std::fs::write(db_path.join("functions.lance"), b"garbage").unwrap();
+        let error = db.clear_all_data().await.unwrap_err();
+        assert!(
+            error.to_string().contains("clearing functions"),
+            "the wipe must name the table: {error}"
+        );
+    }
+
+    /// A wipe over tables that were never created succeeds: absence is
+    /// skippable, so a half-built database still clears.
+    #[tokio::test]
+    async fn clear_without_tables_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = semcode::DatabaseManager::new(
+            dir.path().join("t.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.clear_all_data().await.unwrap();
+        assert_eq!(db.recorded_index_options().await.unwrap(), None);
+    }
+
+    /// A second parent's history past the root still falls back: `M^2`
+    /// names a parent that exists, so only the `~K` count exceeds what
+    /// is there. Refusing every `^N` would break this spelling.
+    #[tokio::test]
+    async fn merge_second_parent_range_past_root_still_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.c"), "int f(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(repo.join("b.c"), "int g(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "side"]);
+        git(&["checkout", "-q", "main"]);
+        git(&["merge", "-q", "--no-ff", "side", "-m", "merge"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let range = Args::try_parse_from([
+            "semcode-index",
+            "--source",
+            repo.to_str().unwrap(),
+            "--clear",
+            "--git",
+            "HEAD^2~10..HEAD",
+        ])
+        .unwrap();
+        run_pipeline(range).await.unwrap();
+
+        let db_path = semcode::process_database_path(None, Some(repo));
+        let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(
+            db.find_function_git_aware("f", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "an existing second parent must keep the fallback working"
         );
     }
 }

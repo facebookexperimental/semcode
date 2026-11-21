@@ -639,6 +639,35 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Forget the recorded build: options and tree coverage. Called beside
+    /// every data wipe: a wipe with a record claims a build that no longer
+    /// exists, and the next run would inherit options the wiped rows never
+    /// held. The schema version stays: forgetting is not migrating.
+    pub async fn forget_recorded_build(&self) -> Result<()> {
+        let keys = [
+            "index:extensions",
+            "index:macros",
+            "index:headers_as_cpp",
+            "index:tree_sha",
+        ];
+        // A missing table reads as no record everywhere else; match that
+        // here so a wipe of a half-built database still succeeds. Only
+        // absence is tolerated: a real I/O error stays loud, or a wipe
+        // could report success with the record intact.
+        let names = self.connection.table_names().execute().await?;
+        if !names.iter().any(|name| name == "schema_meta") {
+            return Ok(());
+        }
+        let table = self.connection.open_table("schema_meta").execute().await?;
+        for key in keys {
+            table
+                .delete(&format!("key = '{key}'"))
+                .await
+                .with_context(|| format!("forgetting {key}"))?;
+        }
+        Ok(())
+    }
+
     /// Record that the index now holds what this version writes, after a
     /// migration that dropped what an older one wrote. A new key in
     /// `schema_meta`, not a new column, so no migration.

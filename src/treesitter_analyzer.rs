@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 5;
+pub const EXTRACTOR_VERSION: u32 = 6;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -97,6 +97,11 @@ pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
 /// reads records the shared version alone: no grammar is involved, so a
 /// grammar bump must not re-read it while a shared bump must.
 pub fn extractor_version_for_file(path: &std::path::Path, headers_as_cpp: bool) -> String {
+    if crate::asm::is_asm_path(path) {
+        // The scanner versions alone: a scanner fix re-reads only `.S`
+        // (which records `N+asm-M`), never the grammars' rows.
+        return format!("{EXTRACTOR_VERSION}+asm-{}", crate::asm::ASM_VERSION);
+    }
     match Language::from_path_with_headers(path, headers_as_cpp) {
         Some(language) => extractor_version(language),
         None => EXTRACTOR_VERSION.to_string(),
@@ -1706,12 +1711,23 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         source_root: Option<&Path>,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+        let source_code = std::fs::read_to_string(file_path)?;
+
+        // Assembly reads through the line scanner, not the grammars: no
+        // tree-sitter grammar parses GAS-macro sources.
+        if crate::asm::is_asm_path(file_path) {
+            let git_hash = compute_file_hash(file_path)?.unwrap_or_default();
+            let relative_path = self.make_relative_path(file_path, source_root);
+            let functions = crate::asm::scan(&source_code, &relative_path, &git_hash);
+            let functions = self.deduplicate_functions_within_file(functions, Language::C);
+            return Ok((functions, Vec::new(), Vec::new()));
+        }
+
         // Detect language from file extension
         let language = self
             .language_for(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
 
-        let source_code = std::fs::read_to_string(file_path)?;
         let parser = self.get_parser(language);
         let tree = parser
             .parse(&source_code, None)
@@ -1819,6 +1835,23 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
     ) -> Result<FileAnalysis> {
+        // Assembly reads through the line scanner, not the grammars.
+        if crate::asm::is_asm_path(file_path) {
+            let relative_path = self.make_relative_path(file_path, source_root);
+            let functions = crate::asm::scan(source_code, &relative_path, git_hash);
+            let functions = self.deduplicate_functions_within_file(functions, Language::C);
+            return Ok(FileAnalysis {
+                functions,
+                types: Vec::new(),
+                macros: Vec::new(),
+                dispatch_sites: Vec::new(),
+                registrations: Vec::new(),
+                argument_functions: Vec::new(),
+                unresolved_edges: Vec::new(),
+                globals: Vec::new(),
+            });
+        }
+
         // Detect language from file extension
         let language = self
             .language_for(file_path)
@@ -9312,6 +9345,21 @@ mod leading_comment_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assembly_versions_apart_from_the_grammars() {
+        // `.S` records `N+asm-M`: a scanner fix re-reads only assembly,
+        // never the grammars' rows. Anything with a grammar keeps its
+        // language version.
+        let asm = extractor_version_for_file(Path::new("arch/x86/entry.S"), false);
+        assert!(
+            asm.starts_with(&format!("{EXTRACTOR_VERSION}+asm-")),
+            "asm version must ride the shared one: {asm}"
+        );
+        let c = extractor_version_for_file(Path::new("kernel/fork.c"), false);
+        assert!(!c.contains("+asm-"), "{c}");
+        assert!(c.starts_with(&format!("{EXTRACTOR_VERSION}+")), "{c}");
+    }
 
     fn fields_of(source: &str, type_name: &str) -> Vec<(String, String)> {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();

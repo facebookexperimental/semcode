@@ -123,18 +123,21 @@ async fn refuse_or_rebuild_stale_index(
     // them gets the indexer's defaults, said out loud: rebuilding a `c,h`
     // index as `c,h,rs` is not what the reader asked for, and finding that
     // out from the output beats finding it out from a wrong answer later.
-    let (extensions, no_macros) = match db_manager.recorded_index_options().await? {
-        Some(recorded) => recorded,
-        None => {
-            println!(
-                "Index does not record how it was built; using defaults ({}, macros indexed)",
-                semcode::file_extensions::default_extensions_string()
-            );
-            (semcode::file_extensions::default_extensions(), false)
-        }
-    };
+    let recorded = db_manager.recorded_index_options().await?;
+    if recorded.is_none() {
+        println!(
+            "Index does not record how it was built; using defaults ({}, macros indexed)",
+            semcode::file_extensions::default_extensions_string()
+        );
+    }
+    let (extensions, no_macros) = stale_rebuild_options(recorded);
 
-    println!("Index was written by an older semcode: reading {git_repo} again");
+    println!(
+        "Index was written by an older semcode: reading {git_repo} again \
+         with extensions [{}]{}",
+        extensions.join(","),
+        if no_macros { ", macros skipped" } else { "" }
+    );
     let repo = gix::discover(git_repo).map_err(|e| anyhow::anyhow!("not a git repository: {e}"))?;
     let head = repo.head_commit()?.id().to_string();
 
@@ -169,67 +172,54 @@ async fn index_current_commit_if_needed(
     let repo_path = PathBuf::from(git_repo);
 
     // Quick check: look at files changed in the current commit.
-    // If no supported files changed, or the changed files are already indexed, skip.
-    match semcode::git::get_changed_files(&repo_path, "HEAD~1", "HEAD") {
-        Ok(changed_files) => {
-            // Find supported files that were added or modified
-            let supported_changes: Vec<_> = changed_files
-                .iter()
-                .filter(|cf| {
-                    matches!(
-                        cf.change_type,
-                        semcode::git::ChangeType::Added | semcode::git::ChangeType::Modified
-                    ) && cf.new_file_hash.is_some()
-                        && semcode::file_extensions::is_supported_for_analysis(&cf.path)
-                })
-                .collect();
-
-            if supported_changes.is_empty() {
-                info!("No supported files changed in current commit, skipping auto-indexing");
-                return Ok(());
-            }
-
-            // Check if the first supported changed file is already indexed
-            if let Some(new_hash) = &supported_changes[0].new_file_hash {
-                if db_manager.is_file_processed(new_hash).await? {
-                    info!(
-                        "Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
-                        supported_changes[0].path,
-                        &new_hash[..8]
-                    );
-                    return Ok(());
+    // One shared decision: run with the recorded options (or every
+    // supported extension when the index records none); skip only when
+    // an indexable change exists and all of it is indexed. An empty
+    // change list still runs: the range walks HEAD's whole manifest, so
+    // a tip with nothing new still picks up files a missed run left
+    // behind. A metadata read error propagates: without readable
+    // options the index cannot be trusted.
+    let (extensions_vec, no_macros) =
+        match semcode::git::get_changed_files(&repo_path, "HEAD~1", "HEAD") {
+            Ok(changed_files) => {
+                match semcode::git_range::startup_decision(&db_manager, &changed_files).await? {
+                    semcode::git_range::StartupDecision::Skip => {
+                        info!("Index already covers the current commit, skipping auto-indexing");
+                        return Ok(());
+                    }
+                    semcode::git_range::StartupDecision::Run {
+                        extensions,
+                        no_macros,
+                    } => {
+                        info!("Indexing current commit...");
+                        (extensions, no_macros)
+                    }
                 }
-                info!(
-                    "Changed file '{}' (SHA: {}) needs indexing",
-                    supported_changes[0].path,
-                    &new_hash[..8]
-                );
             }
-        }
-        Err(e) => {
-            // Failed to get changed files (might be initial commit, root commit, etc.)
-            info!("Could not get changed files ({}), will check all files", e);
-        }
-    }
+            Err(e) => {
+                // Failed to get changed files (might be initial commit, root commit, etc.)
+                info!("Could not get changed files ({}), will check all files", e);
+                semcode::git_range::incremental_options(&db_manager).await?
+            }
+        };
 
     // Index the current commit
     println!("Checking for files to index...");
 
     let git_range = format!("{}^..{}", git_sha, git_sha);
-    let extensions_vec = semcode::file_extensions::supported_extensions();
 
     match semcode::git_range::process_git_range(
         &repo_path,
         &git_range,
         &extensions_vec,
         db_manager.clone(),
-        false, // no_macros = false (index macros)
-        4,     // db_threads
+        no_macros,
+        4, // db_threads
         &[],
     )
     .await
     {
-        Ok(()) => {
+        Ok(_) => {
             println!("Indexing complete");
         }
         Err(e) => {
@@ -631,11 +621,303 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Extensions for a stale rebuild: recorded options win when present —
+/// an explicit opt-out stays opted out — and an index too old to record
+/// them gets the indexer's current defaults, said out loud at the call
+/// site. A recorded list never gains a new language on its own: an old
+/// default-built index picks up `.S` through a fresh index, not a
+/// rebuild, so the rebuild never answers a wider question than the build
+/// the reader asked for.
+fn stale_rebuild_options(recorded: Option<(Vec<String>, bool)>) -> (Vec<String>, bool) {
+    recorded.unwrap_or_else(|| (semcode::file_extensions::default_extensions(), false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
     use std::env;
+
+    #[tokio::test]
+    async fn incremental_run_keeps_recorded_options() {
+        // Recorded options win — extensions and the macro opt-out — and
+        // only an index too old to record them gets every supported one.
+        // Against the shared helper, through a real database.
+        let dir = tempfile::tempdir().unwrap();
+        let db = semcode::DatabaseManager::new(
+            dir.path().join("t.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        db.record_index_build(&["c".to_string()], true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            semcode::git_range::incremental_options(&db).await.unwrap(),
+            (vec!["c".to_string()], true)
+        );
+
+        let fresh = semcode::DatabaseManager::new(
+            dir.path().join("f.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        fresh.create_tables().await.unwrap();
+        let (extensions, no_macros) = semcode::git_range::incremental_options(&fresh)
+            .await
+            .unwrap();
+        assert_eq!(extensions, semcode::file_extensions::supported_extensions());
+        assert!(!no_macros);
+    }
+
+    #[test]
+    fn stale_rebuild_keeps_recorded_extensions() {
+        // Recorded options win — an explicit opt-out stays opted out,
+        // and an old default-built index rebuilds as built, gaining no
+        // new language on its own. Only an index too old to record them
+        // gets the current defaults.
+        let recorded = Some((vec!["c".to_string(), "h".to_string()], true));
+        assert_eq!(
+            stale_rebuild_options(recorded),
+            (vec!["c".to_string(), "h".to_string()], true)
+        );
+        let (extensions, no_macros) = stale_rebuild_options(None);
+        assert_eq!(extensions, semcode::file_extensions::default_extensions());
+        assert!(!no_macros);
+    }
+
+    /// An opted-out file neither triggers a run nor feeds one: built
+    /// for C only, a HEAD adding a `.S` file must leave it out of the
+    /// index even when a C file in the same HEAD runs the indexer.
+    #[tokio::test]
+    async fn opted_out_file_neither_triggers_nor_feeds() {
+        use std::process::Command;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int keep_fn(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let sha1 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha1,
+            &["c".to_string()],
+            db_manager.clone(),
+            true,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        std::fs::create_dir_all(repo.join("drivers")).unwrap();
+        std::fs::write(repo.join("b.c"), "int new_fn(void)\n{\n\treturn 2;\n}\n").unwrap();
+        std::fs::write(
+            repo.join("drivers/opt.S"),
+            "ENTRY(optout_fn)\n\tjmp keep_fn\nEND(optout_fn)\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v2 adds c and S"]);
+        let sha2 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        index_current_commit_if_needed(db_manager.clone(), repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // The C file in the same HEAD ran the indexer...
+        assert!(
+            db_manager
+                .find_function_git_aware("new_fn", &sha2)
+                .await
+                .unwrap()
+                .is_some(),
+            "new_fn must index"
+        );
+        // ...while the opted-out `.S` file fed it nothing.
+        assert!(
+            db_manager
+                .find_function_git_aware("optout_fn", &sha2)
+                .await
+                .unwrap()
+                .is_none(),
+            "opted-out .S must stay out of the index"
+        );
+    }
+
+    /// An empty HEAD over a fresh index still indexes: the range walks
+    /// commit trees, not just the diff, so skipping on "no changes"
+    /// would leave a fresh database empty.
+    #[tokio::test]
+    async fn empty_head_over_fresh_index_still_indexes() {
+        use std::process::Command;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int keep_fn(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "v2 empty"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+
+        index_current_commit_if_needed(db_manager.clone(), repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            db_manager
+                .find_function_git_aware("keep_fn", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "empty HEAD must not leave a fresh index empty"
+        );
+    }
+
+    /// A rename-only HEAD through interactive startup: the destination
+    /// indexes even though its blob did not change, and the trigger sees
+    /// renames (the range API alone would not exercise either path).
+    #[tokio::test]
+    async fn rename_only_head_indexes_through_startup() {
+        use std::process::Command;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.join("old.c"),
+            "int moved_fn(void)\n{\n\treturn 1;\n}\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+        let sha1 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha1,
+            &semcode::file_extensions::default_extensions(),
+            db_manager.clone(),
+            false,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        git(&["mv", "old.c", "new.c"]);
+        git(&["commit", "-q", "-m", "v2 rename"]);
+        let sha2 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        index_current_commit_if_needed(db_manager.clone(), repo.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let blob = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", &format!("{sha2}:new.c")])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert!(
+            db_manager
+                .is_file_processed_at_path(&blob, "new.c")
+                .await
+                .unwrap(),
+            "renamed destination must record as processed"
+        );
+        let found = db_manager
+            .find_function_git_aware("moved_fn", &sha2)
+            .await
+            .unwrap()
+            .expect("moved_fn must resolve at the new SHA");
+        assert_eq!(found.file_path, "new.c");
+    }
 
     // Combined into a single test so the three cases don't race on the
     // process-wide SEMCODE_GIT_REPO env var when cargo runs tests in parallel.

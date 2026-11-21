@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Module declarations
+pub mod asm;
 mod database;
 pub mod database_utils;
 pub mod date_utils;

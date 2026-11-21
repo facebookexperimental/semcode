@@ -382,10 +382,15 @@ impl DatabaseManager {
         self.schema_manager.stored_schema_version().await
     }
 
-    /// Content hashes this build's extractor has read, which is the set a
-    /// later run may skip. A file read by an older extractor is missing from
-    /// it even though the file itself has not changed.
-    pub async fn processed_by_this_extractor(&self) -> Result<std::collections::HashSet<String>> {
+    /// (Blob, path) pairs this build's extractor has read, which is the
+    /// set a later run may skip. A file read by an older extractor is
+    /// missing from it even though the file itself has not changed, and
+    /// so is a file read at another path: analysis can read the path
+    /// (the assembly arch gate does), so a moved file re-analyzes even
+    /// when its blob did not change.
+    pub async fn processed_by_this_extractor(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
         let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
         Ok(self
             .get_all_processed_files()
@@ -401,7 +406,7 @@ impl DatabaseManager {
                         .as_str(),
                     )
             })
-            .map(|record| record.git_file_sha)
+            .map(|record| (record.git_file_sha, record.file))
             .collect())
     }
 
@@ -474,6 +479,12 @@ impl DatabaseManager {
         self.schema_manager.meta_value("index:tree_sha").await
     }
 
+    /// Forget the recorded build beside a data wipe; see
+    /// `SchemaManager::forget_recorded_build`.
+    pub async fn forget_recorded_build(&self) -> Result<()> {
+        self.schema_manager.forget_recorded_build().await
+    }
+
     /// How the index was built: the extensions indexed, and whether macros
     /// were skipped. `None` when the index does not say, which is every index
     /// written before this was recorded.
@@ -536,6 +547,21 @@ impl DatabaseManager {
     }
 
     pub async fn clear_all_data(&self) -> Result<()> {
+        // Forget the record first: a wipe with a record claims a build
+        // that no longer exists. A failure here aborts before anything is
+        // wiped; per-table opens below stay tolerant of absence while a
+        // delete failure aborts loudly, and retrying the wipe converges,
+        // so the next run rebuilds under current options instead of
+        // inheriting stranded ones. The schema version stays: forgetting
+        // is not migrating.
+        self.forget_recorded_build().await?;
+
+        // A wipe skips only tables that are not there: a table that
+        // exists but will not open fails loudly instead of reporting a
+        // wipe with rows left behind.
+        let names = self.connection.table_names().execute().await?;
+        let missing = |name: &str| !names.iter().any(|n| n == name);
+
         // Delete all data from each main table
         for table_name in &[
             "functions",
@@ -554,17 +580,29 @@ impl DatabaseManager {
             // attribute, so a row left behind here outlives the definition.
             "object_macros",
         ] {
-            if let Ok(table) = self.connection.open_table(*table_name).execute().await {
-                table.delete("1=1").await?;
-            }
+            let table = match self.connection.open_table(*table_name).execute().await {
+                Ok(table) => table,
+                Err(_) if missing(table_name) => continue,
+                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            };
+            table
+                .delete("1=1")
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?;
         }
 
         // Delete all data from content shard tables (content_0 through content_15)
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
-            if let Ok(table) = self.connection.open_table(&table_name).execute().await {
-                table.delete("1=1").await?;
-            }
+            let table = match self.connection.open_table(&table_name).execute().await {
+                Ok(table) => table,
+                Err(_) if missing(&table_name) => continue,
+                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            };
+            table
+                .delete("1=1")
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?;
         }
 
         Ok(())
@@ -5189,6 +5227,14 @@ impl DatabaseManager {
     /// Check if a file has been processed with the given git SHA and file content hash
     pub async fn is_file_processed(&self, git_file_sha: &str) -> Result<bool> {
         self.processed_file_store.is_processed(git_file_sha).await
+    }
+
+    /// Check if a blob has been processed at a path. The blob alone does
+    /// not qualify: a moved file re-analyzes under its new path.
+    pub async fn is_file_processed_at_path(&self, git_file_sha: &str, file: &str) -> Result<bool> {
+        self.processed_file_store
+            .is_processed_at(git_file_sha, file)
+            .await
     }
 
     /// Get all processed files for a specific git SHA
