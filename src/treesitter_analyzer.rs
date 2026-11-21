@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 4;
+pub const EXTRACTOR_VERSION: u32 = 5;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -4013,14 +4013,18 @@ impl TreeSitterAnalyzer {
     fn rewrite_rust_use_aliases(
         calls: Vec<CallEdge>,
         aliases: &HashMap<&str, (&str, usize)>,
+        root_shadows: bool,
+        shadow: Option<isize>,
     ) -> Vec<CallEdge> {
-        if aliases.is_empty() {
-            return calls;
-        }
+        // No empty-map early return: an unmapped `bindings::` head still
+        // strips where no local module shadows it, resolving as the
+        // extern crate.
         calls
             .into_iter()
             .map(|edge| match edge {
-                CallEdge::Plain(call) => CallEdge::Plain(Self::rewrite_use_head(&call, aliases)),
+                CallEdge::Plain(call) => {
+                    CallEdge::Plain(Self::rewrite_use_head(&call, aliases, root_shadows, shadow))
+                }
                 tagged => tagged,
             })
             .collect()
@@ -4044,7 +4048,30 @@ impl TreeSitterAnalyzer {
         None
     }
 
-    fn rewrite_use_head(call: &str, aliases: &HashMap<&str, (&str, usize)>) -> String {
+    fn rewrite_use_head(
+        call: &str,
+        aliases: &HashMap<&str, (&str, usize)>,
+        root_shadows: bool,
+        shadow: Option<isize>,
+    ) -> String {
+        // A spelled-out `crate::bindings::` head resolves from the root
+        // scope: the shim unless the root binds the name to its own
+        // module or a non-shim import. Enclosing modules cannot shadow
+        // an absolute path, but a root binding still wins however deep
+        // the call sits. Anything else keeps the written spelling: a
+        // root import marks the shadow, but the rewrite does not follow
+        // it to its target.
+        if let Some(after) = call.strip_prefix("crate::bindings::") {
+            if !root_shadows
+                && after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                return after.to_string();
+            }
+            return call.to_string();
+        }
         let Some(at) = Self::first_top_level_scope(call) else {
             return call.to_string();
         };
@@ -4052,10 +4079,114 @@ impl TreeSitterAnalyzer {
         if matches!(head, "crate" | "self" | "super" | "Self") {
             return call.to_string();
         }
+        // The FFI shim is a rename, not an owner: `bindings::seq_printf`
+        // names the C function `seq_printf`. A `kernel::bindings` import
+        // names the extern crate and strips where the import reads
+        // inside the shadowing scope; a `crate::bindings` import starts
+        // from the crate root and strips where the root binds nothing of
+        // its own. A bare head is the shim where no enclosing module,
+        // the definition's own body, or the root declares the module —
+        // the kernel crate builds with `--extern bindings`, so it
+        // resolves with no import in scope. Anything else keeps its
+        // spelling, as does a shadow with no import.
+        if head == "bindings" {
+            let shim = match aliases.get("bindings") {
+                Some((path, depth)) => {
+                    let in_scope = shadow.is_none_or(|k| *depth as isize > k + 1);
+                    in_scope
+                        && (*path == "kernel::bindings" || *path == "bindings" && !root_shadows)
+                }
+                None => shadow.is_none(),
+            };
+            if shim {
+                return rest.strip_prefix("::").unwrap_or(rest).to_string();
+            }
+            // A shadowed head resolves to the file's own module: the
+            // outer import is invisible at the call site, so the map
+            // must not rewrite it either.
+            if shadow.is_some() {
+                return call.to_string();
+            }
+        }
         match aliases.get(head) {
             Some((path, _)) => format!("{path}{rest}"),
             None => call.to_string(),
         }
+    }
+
+    /// The path the file-top scope binds `bindings` to, if any: a root
+    /// `use` names the same name a `crate::bindings` path resolves, so a
+    /// non-shim one shadows the shim exactly like a local module does.
+    /// Last in tree order wins, matching the alias admission.
+    fn root_bindings_path(aliases: &[UseAlias]) -> Option<&str> {
+        aliases
+            .iter()
+            .rev()
+            .find(|alias| {
+                alias.name == "bindings" && alias.func.is_none() && alias.scope.is_empty()
+            })
+            .map(|alias| alias.path.as_str())
+    }
+
+    /// The scopes declaring `mod bindings`: the file root, plus the
+    /// nearest enclosing module of the definition. A sibling subtree's
+    /// module does not shadow, so only each enclosing scope's own
+    /// children count. Returns root presence separately from the nearest
+    /// shadow position (-1 for the root itself, else the index into the
+    /// definition's scope ids): a `crate::` path resolves from the root,
+    /// so an inner shadow must not mask a root declaration. Doc-comment
+    /// doctests (`/// # mod bindings`) are comments, never items, so
+    /// they cannot shadow here.
+    fn bindings_shadow_at(
+        tree: &Tree,
+        source: &str,
+        func_scope: &[usize],
+        defined_at: Option<tree_sitter::Node>,
+    ) -> (bool, Option<isize>) {
+        let declares_bindings = |scope: tree_sitter::Node| {
+            // A module's items hang under its body, not directly under
+            // the `mod` node; the file root lists its own children.
+            let body = scope.child_by_field_name("body").unwrap_or(scope);
+            let mut cursor = body.walk();
+            let mut found = false;
+            for child in body.children(&mut cursor) {
+                if child.kind() == "mod_item"
+                    && child
+                        .child_by_field_name("name")
+                        .is_some_and(|n| &source[n.byte_range()] == "bindings")
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        let root_declares = declares_bindings(tree.root_node());
+        // The definition's own body is the innermost scope: a module
+        // declared there shadows the head for the function's calls.
+        if let Some(body) = defined_at.and_then(|node| node.child_by_field_name("body")) {
+            if declares_bindings(body) {
+                return (root_declares, Some(func_scope.len() as isize));
+            }
+        }
+        let mut enclosing = defined_at.and_then(|node| node.parent());
+        while let Some(node) = enclosing {
+            if node.kind() == "mod_item" && declares_bindings(node) {
+                // A mod ancestor sits in the scope chain by
+                // construction; a miss keeps the spelling, fail-closed.
+                let k = func_scope
+                    .iter()
+                    .position(|id| *id == node.id())
+                    .map(|k| k as isize)
+                    .unwrap_or(func_scope.len() as isize);
+                return (root_declares, Some(k));
+            }
+            enclosing = node.parent();
+        }
+        if root_declares {
+            return (true, Some(-1));
+        }
+        (false, None)
     }
 
     /// A member call through `this` (C++) or `self` (Python) as a tagged
@@ -5360,12 +5491,27 @@ impl TreeSitterAnalyzer {
                 qualifier.as_deref(),
             );
             // Rewrite the head through aliases holding at this definition.
+            let func_scope = Self::item_scope_ids(defined_at);
             let admitted = Self::effective_aliases(
                 &rust_aliases,
-                &Self::item_scope_ids(defined_at),
+                &func_scope,
                 defined_at.map(|node| node.id()),
             );
-            let mut calls = Self::rewrite_rust_use_aliases(calls, &admitted);
+            // The `use`-head rewrite, shim strip included, reads Rust
+            // imports: every other language keeps its heads as written.
+            // The root scope binds what a `crate::` path resolves: its
+            // own module, or a non-shim import of the name, shadows the
+            // shim for the whole file.
+            let mut calls = if ctx.language == Language::Rust {
+                let (root_declares, shadow) =
+                    Self::bindings_shadow_at(ctx.tree, ctx.source, &func_scope, defined_at);
+                let root_shadows = root_declares
+                    || Self::root_bindings_path(&rust_aliases)
+                        .is_some_and(|path| path != "bindings" && path != "kernel::bindings");
+                Self::rewrite_rust_use_aliases(calls, &admitted, root_shadows, shadow)
+            } else {
+                calls
+            };
             // A bare call beside its `this`/`self` twin names the same
             // edge twice; the store keeps one.
             calls.extend(tagged);
@@ -11586,6 +11732,434 @@ mod rust_receiver_tests {
             vec![plain("m::H::assoc"), plain("other::O::run")],
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn rust_bindings_heads_strip_to_the_c_function() {
+        // The shim is a rename, not an owner: `bindings::seq_printf`
+        // reads as `seq_printf` (the `use` binds the generated shim,
+        // so the head must shed it to match the C definition — even
+        // where a local function shares the name, which then reads as
+        // an honest ambiguity).
+        let found = call_edges_of(
+            "use crate::bindings;\n\
+             fn seq_printf() -> u32 { 1 }\n\
+             fn user() -> u32 { bindings::seq_printf() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("user"), vec![plain("seq_printf")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_only_the_shim() {
+        // A top-level `mod bindings` is the owner the file means: the
+        // module shadows every head in the file, so each spelling stays
+        // (an explicit `as` rename binds a different head and is
+        // unaffected). Any other import keeps its rewritten path for
+        // the same reason: only the `crate::` and `kernel::` shim forms
+        // strip.
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use other::bindings as B;\n\
+             fn a() -> u32 { bindings::foo() }\n\
+             fn b() -> u32 { B::foo() }\n\
+             fn seq_printf() -> u32 { 1 }\n\
+             fn c() -> u32 { bindings::seq_printf() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("a"), vec![plain("bindings::foo")], "{found:?}");
+        assert_eq!(get("b"), vec![plain("other::bindings::foo")], "{found:?}");
+        assert_eq!(get("c"), vec![plain("bindings::seq_printf")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_keeps_a_competing_import() {
+        // `use other::bindings` binds the head itself to another
+        // module: the head keeps its rewritten path (a strip-everything
+        // variant strips here, so this pins the map check, not just the
+        // shadow flag).
+        let found = call_edges_of(
+            "use other::bindings;\n\
+             fn d() -> u32 { bindings::foo() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("d"), vec![plain("other::bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_body_import_reads_in_its_function_only() {
+        // A body import shadows the shim inside its own function, but
+        // the sibling call beside it still strips: the map must not
+        // leak across functions (the top-level `use` in the previous
+        // test reads file-wide by contrast, which is why it lives in
+        // its own fixture).
+        let found = call_edges_of(
+            "fn e() -> u32 { use other::bindings; bindings::bar() }\n\
+             fn f() -> u32 { bindings::baz() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("e"), vec![plain("other::bindings::bar")], "{found:?}");
+        assert_eq!(get("f"), vec![plain("baz")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_shadow_is_lexical() {
+        // The module shadows only its own subtree: the call inside
+        // `outer` keeps its spelling while the top-level call beside
+        // it strips (a file-wide flag would hold both off).
+        let found = call_edges_of(
+            "mod outer {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn inner() -> u32 { bindings::foo() }\n\
+             }\n\
+             fn top() -> u32 { bindings::bar() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        let inner = found
+            .iter()
+            .find(|(n, _)| n.ends_with("inner"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(inner, vec![plain("bindings::foo")], "{found:?}");
+        assert_eq!(get("top"), vec![plain("bar")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_past_a_glob() {
+        // A glob names no alias, so the head still strips: the kernel's
+        // own import-free files all sit beside a prelude glob, and no
+        // in-tree glob provides a `bindings` name (prelude, super, and
+        // uapi globs were censused).
+        let found = call_edges_of(
+            "use other::*;\n\
+             use crate::prelude::*;\n\
+             fn g() -> u32 { bindings::qux() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("g"), vec![plain("qux")], "{found:?}");
+    }
+
+    #[test]
+    fn bindings_heads_keep_their_spelling_outside_rust() {
+        // The rewrite handles Rust imports only: a C++ `bindings::`
+        // head is a genuine qualifier and keeps its spelling.
+        let found = call_edges_of("int foo();\nint f() { return bindings::foo(); }\n", "x.cc");
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_full_crate_path_strips_like_an_import() {
+        // A spelled-out `crate::bindings::` head takes the imported
+        // decision: the shim where the root declares no module of its
+        // own, the file's spelling where it does.
+        let found = call_edges_of("fn w() -> u32 { crate::bindings::wibble() }\n", "lib.rs");
+        let shadowed = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn wobble() -> u32 { 1 }\n\
+             }\n\
+             fn v() -> u32 { crate::bindings::wobble() }\n",
+            "shadow.rs",
+        );
+        let get = |found: &[(String, Vec<crate::types::CallEdge>)], name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get(&found, "w"), vec![plain("wibble")], "{found:?}");
+        assert_eq!(
+            get(&shadowed, "v"),
+            vec![plain("crate::bindings::wobble")],
+            "{shadowed:?}"
+        );
+    }
+
+    #[test]
+    fn rust_bindings_outer_crate_import_loses_to_inner_module() {
+        // A file-level `use crate::bindings` reads outside the nested
+        // module, so the inner module wins at the call site and the head
+        // keeps its spelling (position alone would strip here, since no
+        // root module exists).
+        let found = call_edges_of(
+            "use crate::bindings;\n\
+             mod a {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn f() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let f = found
+            .iter()
+            .find(|(n, _)| n == "f" || n.ends_with("::f"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(f, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_function_body_module_shadows() {
+        // A module declared in the function body is the innermost scope:
+        // the call names it, not the shim, with no import anywhere.
+        let found = call_edges_of(
+            "fn f() -> u32 {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tbindings::foo()\n\
+             }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_root_import_names_the_local_module() {
+        // The root scope binds `bindings` to the file's own module
+        // through an import: a `crate::` path resolves that binding, so
+        // the full-path call keeps its spelling (position alone would
+        // strip it, since no module declaration exists).
+        let found = call_edges_of(
+            "mod alt {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use crate::alt as bindings;\n\
+             fn f() -> u32 { crate::bindings::foo() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("crate::bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_child_crate_import_follows_the_root_binding() {
+        // The child's `use crate::bindings` resolves the root scope's
+        // binding, which names the local module: the call keeps the
+        // written spelling (the import path alone reads as the shim).
+        let found = call_edges_of(
+            "mod alt {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use crate::alt as bindings;\n\
+             mod child {\n\
+             \tuse crate::bindings;\n\
+             \tpub fn g() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let g = found
+            .iter()
+            .find(|(n, _)| n == "g" || n.ends_with("::g"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(g, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_inner_shadow_masks_no_root_declaration() {
+        // Both scopes declare the module: the `crate::` path resolves
+        // from the root, where the module sits, so the full-path call
+        // keeps its spelling even though an inner shadow is nearer. The
+        // function-local import names that same root module, so its call
+        // keeps the written spelling too (a root-blind rule strips both).
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             mod child {\n\
+             \tmod bindings {\n\
+             \t\tpub fn bar() -> u32 { 2 }\n\
+             \t}\n\
+             \tpub fn f() -> u32 { crate::bindings::foo() }\n\
+             \tpub fn g() -> u32 { use crate::bindings; bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name || n.ends_with(&format!("::{name}")))
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("crate::bindings::foo")], "{found:?}");
+        assert_eq!(get("g"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_child_import_names_the_file_module() {
+        // `use crate::bindings` inside a child module names the file's
+        // own top-level module, not the shim: the absolute path resolves
+        // from the root, where the module sits. The head keeps its
+        // spelling (position alone would strip here, since the import
+        // reads inside the shadowing scope).
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             mod child {\n\
+             \tuse crate::bindings;\n\
+             \tpub fn f() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let f = found
+            .iter()
+            .find(|(n, _)| n == "f" || n.ends_with("::f"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(f, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_inner_module_wins_over_outer_import() {
+        // The inverse of the import-wins test: a file-level shim import
+        // reads outside the child's own module, so the inner module
+        // wins at the call site and the head keeps its spelling.
+        let found = call_edges_of(
+            "use kernel::bindings;\n\
+             mod child {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn g() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let g = found
+            .iter()
+            .find(|(n, _)| n == "g" || n.ends_with("::g"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(g, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_import_wins_over_an_outer_module() {
+        // The import reads in its own scope ahead of the file's
+        // module: the call strips where the body names the shim, while
+        // the top-level call beside it keeps its spelling.
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             fn h() -> u32 { use kernel::bindings; bindings::foo() }\n\
+             fn i() -> u32 { bindings::bar() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("h"), vec![plain("foo")], "{found:?}");
+        assert_eq!(get("i"), vec![plain("bindings::bar")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_without_an_import() {
+        // No `use` binds `bindings`, and no local module shadows it:
+        // the head is the extern crate the kernel passes with
+        // `--extern bindings` — the pattern of `rust/kernel/print.rs`,
+        // which names no import — and strips. `use kernel::bindings`
+        // names the same shim through the crate root's re-export.
+        // Bare `use bindings;` records no alias, so it runs this same
+        // unmapped branch; the fixture pins the spelling anyway.
+        let found = call_edges_of(
+            "use crate::fmt;\n\
+             fn a() -> u32 { bindings::seq_printf() }\n",
+            "print.rs",
+        );
+        let kernel = call_edges_of(
+            "use kernel::bindings;\n\
+             fn b() -> u32 { bindings::seq_printf() }\n",
+            "node.rs",
+        );
+        let bare = call_edges_of(
+            "use bindings;\n\
+             fn c() -> u32 { bindings::seq_printf() }\n",
+            "param.rs",
+        );
+        let get = |found: &[(String, Vec<crate::types::CallEdge>)], name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get(&found, "a"), vec![plain("seq_printf")], "{found:?}");
+        assert_eq!(get(&kernel, "b"), vec![plain("seq_printf")], "{kernel:?}");
+        assert_eq!(get(&bare, "c"), vec![plain("seq_printf")], "{bare:?}");
     }
 
     #[test]
