@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 6;
+pub const EXTRACTOR_VERSION: u32 = 7;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -2739,6 +2739,36 @@ impl TreeSitterAnalyzer {
             // the one place the source states the answer outright.
             if let (Some(name), Some(args)) = (macro_name, macro_args) {
                 let name = &source_code[name.byte_range()];
+                if let Some(kind) = match name {
+                    "call_int_hook" => Some(DispatchKind::LsmHookInt),
+                    "call_void_hook" => Some(DispatchKind::LsmHookVoid),
+                    _ => None,
+                } {
+                    // The hook is the first argument: a bare slot name. The
+                    // dispatch macros' own definition spells it `HOOK`, and
+                    // that parameter is never a slot.
+                    let mut cursor = args.walk();
+                    let first = args.named_children(&mut cursor).next();
+                    if let Some(hook) = first {
+                        if hook.kind() == "identifier" {
+                            let slot = source_code[hook.byte_range()].to_string();
+                            if !slot.is_empty() && slot != "HOOK" {
+                                extraction.member_sites.push(RawDispatchSite {
+                                    member: slot,
+                                    receiver_expr: None,
+                                    receiver_type: None,
+                                    receiver_base_type: None,
+                                    receiver_field: None,
+                                    receiver_bound: None,
+                                    kind,
+                                    byte_start: hook.start_byte(),
+                                    line: hook.start_position().row as u32 + 1,
+                                    target: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(candidates) = Self::indirect_call_candidate_count(name) {
                     extraction.member_sites.extend(Self::indirect_call_sites(
                         args,
@@ -4509,6 +4539,68 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    /// An LSM hook implementation filed in its hook slot:
+    ///
+    /// ```text
+    /// LSM_HOOK_INIT(file_open, selinux_file_open),
+    /// ```
+    ///
+    /// The macro puts `{ .scalls = static_calls_table.file_open, .hook =
+    /// { .file_open = selinux_file_open } }` in the LSM's hook array, so a
+    /// `call_int_hook(file_open, ...)` site can reach it. The slot
+    /// namespace is global (`static_calls_table`), shared by every LSM, so
+    /// the container holds the table, not a struct. A pasted target
+    /// (`bpf_lsm_##NAME`) resolves to nothing until the preprocessor runs:
+    /// it records no row. `NAME` is the bpf template's parameter, never a
+    /// hook, and records nothing either.
+    fn lsm_hook_install(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
+        let call = match node.kind() {
+            "expression_statement" => node.named_child(0)?,
+            "call_expression" => node,
+            _ => return None,
+        };
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let name = call.child_by_field_name("function")?;
+        if name.kind() != "identifier" || &source[name.byte_range()] != "LSM_HOOK_INIT" {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
+        let [hook, target] = named[..] else {
+            return None;
+        };
+        if hook.kind() != "identifier" || target.kind() != "identifier" {
+            return None;
+        }
+        let (hook, target) = (
+            source[hook.byte_range()].to_string(),
+            source[target.byte_range()].to_string(),
+        );
+        if hook.is_empty() || hook == "NAME" || target.is_empty() {
+            return None;
+        }
+        // The paste halves (`bpf_lsm_`, `##`, `NAME`) never form one
+        // identifier node, but a guard on the raw text keeps the probe
+        // working where the grammar changes under it.
+        let call_text = &source[call.byte_range()];
+        if call_text.contains("##") {
+            return None;
+        }
+        Some(RawRegistration {
+            container_type: "static_calls_table".to_string(),
+            container_base_type: None,
+            container_field: None,
+            member: hook,
+            target,
+            byte_start: call.start_byte(),
+            line: call.start_position().row as u32 + 1,
+            kind: RegistrationKind::LsmHook,
+        })
+    }
+
     /// A function the kernel runs at boot, named by the macro that files it.
     ///
     /// ```text
@@ -4910,6 +5002,8 @@ impl TreeSitterAnalyzer {
             if let Some(registration) = Self::initcall(node, source) {
                 facts.registrations.push(registration);
             } else if let Some(registration) = Self::static_call_install(node, source) {
+                facts.registrations.push(registration);
+            } else if let Some(registration) = Self::lsm_hook_install(node, source) {
                 facts.registrations.push(registration);
             } else if node.kind() == "initializer_list" {
                 if let Some(table) = Self::function_pointer_table(node, source) {

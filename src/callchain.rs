@@ -918,9 +918,8 @@ fn show_indirect_callers(
     // member of that name anywhere in the tree, which for a name like
     // `handler` is most of the kernel. Those are reported as a count, not as
     // an answer.
-    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
-        .iter()
-        .partition(|caller| caller.evidence.is_type_matched());
+    let (confident, by_name_only): (Vec<_>, Vec<_>) =
+        indirect.iter().partition(|caller| caller.is_confident());
 
     if confident.is_empty() && by_name_only.is_empty() {
         return Ok(());
@@ -968,8 +967,19 @@ fn show_indirect_callers(
                 registration_count,
                 type_matched,
             } => {
+                // An LSM slot has no receiver to match: the wording states
+                // what the dispatch does instead. An int hook stops at the
+                // first non-default return, so later implementations may
+                // never run; a void hook runs every installed
+                // implementation. Both are possible implementations under
+                // stacking, never guaranteed execution.
                 let confidence = if *type_matched {
                     "receiver type matches"
+                } else if caller.site_kind == crate::types::DispatchKind::LsmHookInt.as_str() {
+                    "hook slot match; first non-default return wins, later \
+                     implementations possibly shadowed"
+                } else if caller.site_kind == crate::types::DispatchKind::LsmHookVoid.as_str() {
+                    "hook slot match; every installed implementation runs"
                 } else {
                     "member name matches, receiver type unknown"
                 };
@@ -1552,9 +1562,8 @@ pub async fn write_indirect_reverse_chain(
     // member of that name anywhere in the tree: the callers command reports
     // those as a count, not as an answer, and this section does the same. A
     // site that names the target outright counts as confident.
-    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
-        .iter()
-        .partition(|caller| caller.evidence.is_type_matched());
+    let (confident, by_name_only): (Vec<_>, Vec<_>) =
+        indirect.iter().partition(|caller| caller.is_confident());
 
     // One entry per dispatching function: a function dispatching through the
     // same member twice is one way in, not two.

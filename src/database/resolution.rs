@@ -29,6 +29,19 @@ pub struct IndirectCaller {
     pub evidence: Evidence,
 }
 
+impl IndirectCaller {
+    /// Whether the leg shows as an answer rather than a weak-match count.
+    /// A type-matched or stated leg does; so does an LSM hook leg — the
+    /// slot namespace is global and kind-gated, so the match is exact and
+    /// only execution (stacking, short-circuit) is decided at runtime,
+    /// which the display wording holds instead of the bucket.
+    pub fn is_confident(&self) -> bool {
+        self.evidence.is_type_matched()
+            || self.site_kind == crate::types::DispatchKind::LsmHookInt.as_str()
+            || self.site_kind == crate::types::DispatchKind::LsmHookVoid.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Evidence {
     /// The site itself names the target: a macro's declared candidate, or a
@@ -98,6 +111,44 @@ pub fn indirect_callers(
         };
 
         for site in sites {
+            // An LSM hook site joins only an LSM registration, and an LSM
+            // registration joins only an LSM site: the slot namespace is
+            // global, so a member-name match would link every `file_open`
+            // in the tree to every LSM `file_open` implementation and back.
+            // `ops.file_open()` matches its own struct;
+            // `call_int_hook` matches its slot.
+            let site_is_lsm = matches!(
+                site.kind,
+                crate::types::DispatchKind::LsmHookInt | crate::types::DispatchKind::LsmHookVoid
+            );
+            let registration_is_lsm = registration.kind == crate::types::RegistrationKind::LsmHook;
+            if site_is_lsm != registration_is_lsm {
+                continue;
+            }
+            if site_is_lsm {
+                let key = (
+                    site.caller_name.clone(),
+                    site.file_path.clone(),
+                    site.line,
+                    site.byte_start,
+                    site.member.clone(),
+                    site.kind.as_str().to_string(),
+                    registration.container_type.clone(),
+                    false,
+                );
+                by_site
+                    .entry(key)
+                    .and_modify(|(exemplar, count)| {
+                        *count += 1;
+                        if (&registration.file_path, registration.line)
+                            < (&exemplar.file_path, exemplar.line)
+                        {
+                            *exemplar = registration;
+                        }
+                    })
+                    .or_insert((registration, 1));
+                continue;
+            }
             // A site that states its receiver type only matches the type the
             // function was installed in; one that does not is a member-name
             // match, which is weaker but is what the reader asked for.

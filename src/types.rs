@@ -1214,6 +1214,12 @@ pub enum DispatchKind {
     /// `static_call(key)(...)`: a direct call patched at run time to whatever
     /// was installed in the key.
     StaticCall,
+    /// `call_int_hook(hook, ...)`: dispatches to every implementation
+    /// installed in the hook slot; the first non-default return wins.
+    LsmHookInt,
+    /// `call_void_hook(hook, ...)`: dispatches to every implementation
+    /// installed in the hook slot; every implementation runs.
+    LsmHookVoid,
 }
 
 impl DispatchKind {
@@ -1227,6 +1233,8 @@ impl DispatchKind {
             DispatchKind::MacroDeclared => "macro_declared",
             DispatchKind::ArrayElement => "array_element",
             DispatchKind::StaticCall => "static_call",
+            DispatchKind::LsmHookInt => "lsm_hook_int",
+            DispatchKind::LsmHookVoid => "lsm_hook_void",
         }
     }
 
@@ -1243,6 +1251,8 @@ impl DispatchKind {
             "macro_declared" => Some(DispatchKind::MacroDeclared),
             "array_element" => Some(DispatchKind::ArrayElement),
             "static_call" => Some(DispatchKind::StaticCall),
+            "lsm_hook_int" => Some(DispatchKind::LsmHookInt),
+            "lsm_hook_void" => Some(DispatchKind::LsmHookVoid),
             _ => None,
         }
     }
@@ -1400,6 +1410,10 @@ pub enum RegistrationKind {
     Assignment,
     /// A method installed in its trait slot. The trait join reads it.
     TraitImpl,
+    /// `LSM_HOOK_INIT(hook, implementation)`: the implementation installed
+    /// in a Linux Security Module hook slot. The LSM join uses it; the
+    /// slot namespace is global, so no container type constrains it.
+    LsmHook,
 }
 
 impl RegistrationKind {
@@ -1408,6 +1422,7 @@ impl RegistrationKind {
             RegistrationKind::DesignatedInit => "designated_init",
             RegistrationKind::Assignment => "assignment",
             RegistrationKind::TraitImpl => "trait_impl",
+            RegistrationKind::LsmHook => "lsm_hook",
         }
     }
 
@@ -1416,6 +1431,7 @@ impl RegistrationKind {
             "designated_init" => Some(RegistrationKind::DesignatedInit),
             "assignment" => Some(RegistrationKind::Assignment),
             "trait_impl" => Some(RegistrationKind::TraitImpl),
+            "lsm_hook" => Some(RegistrationKind::LsmHook),
             _ => None,
         }
     }

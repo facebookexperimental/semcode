@@ -582,9 +582,8 @@ async fn write_indirect_callers(
         return Ok(());
     }
 
-    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
-        .iter()
-        .partition(|caller| caller.evidence.is_type_matched());
+    let (confident, by_name_only): (Vec<_>, Vec<_>) =
+        indirect.iter().partition(|caller| caller.is_confident());
 
     if !confident.is_empty() {
         writeln!(buffer, "\n=== Indirect Callers ===")?;
