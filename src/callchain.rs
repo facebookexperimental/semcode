@@ -901,6 +901,22 @@ pub async fn show_callers_to_writer_in(
     Ok(())
 }
 
+/// The stacking-semantics phrase for an LSM slot leg: an int hook stops
+/// at the first non-default return, so later implementations may never
+/// run; a void hook runs every installed implementation. Both forward
+/// surfaces render it; it mirrors the reverse legs' wording.
+pub fn lsm_dispatch_phrase(kind: crate::types::DispatchKind) -> &'static str {
+    match kind {
+        crate::types::DispatchKind::LsmHookInt => {
+            "hook slot match; first non-default return wins, later implementations possibly shadowed"
+        }
+        crate::types::DispatchKind::LsmHookVoid => {
+            "hook slot match; every installed implementation runs"
+        }
+        _ => "hook slot match",
+    }
+}
+
 /// Callers that reach the function without naming it, with the evidence for
 /// each: a reader has to be able to check the claim, since a member call can
 /// reach anything installed in that member.

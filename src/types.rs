@@ -1235,6 +1235,10 @@ pub struct ResolvedDispatch {
     /// target that is not a function in the tree drops out when the caller
     /// looks it up.
     pub targets: Vec<String>,
+    /// The hook slot kind when the dispatch runs through an LSM slot
+    /// (Some), rather than a receiver's member (None). Both forward
+    /// surfaces render the slot's first-wins/run-all wording from it.
+    pub lsm_kind: Option<DispatchKind>,
 }
 
 /// The member recorded for a call through, or an installation into, an

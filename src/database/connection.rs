@@ -1247,6 +1247,58 @@ impl DatabaseManager {
 
             let mut dispatches = Vec::new();
             for site in sites {
+                // An LSM hook site files under its slot, not a receiver:
+                // the dispatch macro's first argument is the slot, and no
+                // receiver fields are recorded. It joins the
+                // implementations installed in static_calls_table under
+                // its member, gated on the slot kind on both sides exactly
+                // like the reverse join. A bound needs a receiver
+                // expression, which these sites never carry, so the arms
+                // below never see one; ordinary untyped sites still match
+                // nothing.
+                let lsm_macro = match site.kind {
+                    crate::types::DispatchKind::LsmHookInt => Some("call_int_hook"),
+                    crate::types::DispatchKind::LsmHookVoid => Some("call_void_hook"),
+                    _ => None,
+                };
+                if let Some(macro_name) = lsm_macro {
+                    let key = ("static_calls_table".to_string(), site.member.clone());
+                    let targets = match slots.get(&key) {
+                        Some(known) => known.clone(),
+                        None => {
+                            let mut targets: Vec<String> = at_revision(
+                                self.registration_store
+                                    .find_by_slot("static_calls_table", &site.member)
+                                    .await?,
+                                &manifest,
+                                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                            )
+                            .into_iter()
+                            .filter(|registration| {
+                                registration.kind == crate::types::RegistrationKind::LsmHook
+                            })
+                            .map(|registration| registration.target)
+                            .collect();
+                            targets.sort();
+                            targets.dedup();
+                            slots.insert(key, targets.clone());
+                            targets
+                        }
+                    };
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    dispatches.push(crate::types::ResolvedDispatch {
+                        receiver_expr: macro_name.to_string(),
+                        container_type: "static_calls_table".to_string(),
+                        member: site.member.clone(),
+                        file_path: site.file_path.clone(),
+                        line: site.line,
+                        targets,
+                        lsm_kind: Some(site.kind),
+                    });
+                    continue;
+                }
                 // A bound-only site (a generic parameter's method) has no
                 // receiver type to look a slot up by: it joins the trait
                 // implementations of its member whose container the bound
@@ -1318,6 +1370,7 @@ impl DatabaseManager {
                     file_path: site.file_path.clone(),
                     line: site.line,
                     targets,
+                    lsm_kind: None,
                 });
             }
 

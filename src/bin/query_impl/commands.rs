@@ -701,6 +701,12 @@ async fn show_callchain_with_limits(
                     site.member.cyan(),
                     where_.bright_black()
                 );
+                if let Some(kind) = site.lsm_kind {
+                    println!(
+                        "      {}",
+                        semcode::callchain::lsm_dispatch_phrase(kind).bright_black()
+                    );
+                }
 
                 for target in site.targets.iter().take(3) {
                     println!("   └─ {}", target.yellow());

@@ -2393,6 +2393,13 @@ async fn mcp_show_callchain_with_limits(
                             "{} {}->{} ({}:{})",
                             from, site.receiver_expr, site.member, site.file_path, site.line
                         )?;
+                        if let Some(kind) = site.lsm_kind {
+                            writeln!(
+                                buffer,
+                                "     {}",
+                                semcode::callchain::lsm_dispatch_phrase(kind)
+                            )?;
+                        }
                         for target in site.targets.iter().take(3) {
                             writeln!(buffer, "   └─ {target}")?;
                         }
