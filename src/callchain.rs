@@ -966,6 +966,7 @@ fn show_indirect_callers(
                 registration_line,
                 registration_count,
                 type_matched,
+                via_bound,
             } => {
                 // An LSM slot has no receiver to match: the wording states
                 // what the dispatch does instead. An int hook stops at the
@@ -973,7 +974,13 @@ fn show_indirect_callers(
                 // never run; a void hook runs every installed
                 // implementation. Both are possible implementations under
                 // stacking, never guaranteed execution.
-                let confidence = if *type_matched {
+                //
+                // A bound leg matched the trait, not a receiver type: it
+                // records that, or the reader assumes a typed match
+                // happened.
+                let confidence = if *via_bound {
+                    "bound match"
+                } else if *type_matched {
                     "receiver type matches"
                 } else if caller.site_kind == crate::types::DispatchKind::LsmHookInt.as_str() {
                     "hook slot match; first non-default return wins, later \
@@ -2446,6 +2453,7 @@ mod tests {
                 registration_line: 556,
                 registration_count: 1,
                 type_matched,
+                via_bound: false,
             },
         }
     }

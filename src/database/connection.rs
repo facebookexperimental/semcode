@@ -1247,33 +1247,65 @@ impl DatabaseManager {
 
             let mut dispatches = Vec::new();
             for site in sites {
-                // A site whose receiver type is unknown reaches every member
-                // of that name in the tree, which is not an answer a chain
-                // can follow. `callers` reports those as a count.
-                let Some(container_type) = site.receiver_type.clone() else {
-                    continue;
-                };
-
-                let key = (container_type.clone(), site.member.clone());
-                let targets = match slots.get(&key) {
-                    Some(known) => known.clone(),
-                    None => {
-                        let mut targets: Vec<String> = at_revision(
-                            self.registration_store
-                                .find_by_slot(&container_type, &site.member)
-                                .await?,
-                            &manifest,
-                            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
-                        )
-                        .into_iter()
-                        .map(|registration| registration.target)
-                        .collect();
-                        targets.sort();
-                        targets.dedup();
-                        slots.insert(key, targets.clone());
-                        targets
-                    }
-                };
+                // A bound-only site (a generic parameter's method) has no
+                // receiver type to look a slot up by: it joins the trait
+                // implementations of its member whose container the bound
+                // names. Only where the receiver type is missing — a typed
+                // site takes the slot path it always took.
+                let (container_type, targets) =
+                    match (site.receiver_type.clone(), site.receiver_bound.clone()) {
+                        (None, Some(bound)) => {
+                            let mut targets: Vec<String> = at_revision(
+                                self.registration_store
+                                    .find_trait_impls_by_member(&site.member)
+                                    .await?,
+                                &manifest,
+                                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                            )
+                            .into_iter()
+                            .filter(|registration| {
+                                crate::types::each_bound(&bound).iter().any(|piece| {
+                                    crate::types::trait_names_match(
+                                        piece,
+                                        &registration.container_type,
+                                    )
+                                })
+                            })
+                            .map(|registration| registration.target)
+                            .collect();
+                            targets.sort();
+                            targets.dedup();
+                            (bound, targets)
+                        }
+                        (Some(container_type), _) => {
+                            // A site whose receiver type is unknown reaches
+                            // every member of that name in the tree, which is
+                            // not an answer a chain can follow. `callers`
+                            // reports those as a count.
+                            let key = (container_type.clone(), site.member.clone());
+                            let targets = match slots.get(&key) {
+                                Some(known) => known.clone(),
+                                None => {
+                                    let mut targets: Vec<String> = at_revision(
+                                        self.registration_store
+                                            .find_by_slot(&container_type, &site.member)
+                                            .await?,
+                                        &manifest,
+                                        |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                                    )
+                                    .into_iter()
+                                    .map(|registration| registration.target)
+                                    .collect();
+                                    targets.sort();
+                                    targets.dedup();
+                                    slots.insert(key, targets.clone());
+                                    targets
+                                }
+                            };
+                            (container_type, targets)
+                        }
+                        (None, None) => continue,
+                    };
 
                 if targets.is_empty() {
                     continue;

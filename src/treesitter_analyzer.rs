@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 7;
+pub const EXTRACTOR_VERSION: u32 = 8;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -2810,6 +2810,15 @@ impl TreeSitterAnalyzer {
             }
         }
 
+        if language == Language::Rust {
+            Self::rust_head_dispatch(
+                tree.root_node(),
+                source_code,
+                &mut extraction.calls,
+                &mut extraction.member_sites,
+            );
+        }
+
         let bound = Self::value_names(tree.root_node(), source_code);
         let locals = Self::collect_local_struct_types(tree.root_node(), source_code);
         let walk_b = Self::collect_walk_b_facts(tree.root_node(), source_code, &bound, &locals);
@@ -2853,10 +2862,259 @@ impl TreeSitterAnalyzer {
         Ok(extraction)
     }
 
+    /// A declared Rust type with references and qualifiers peeled: `&Buf`
+    /// is `Buf`, `*const Device` is `Device`. `mut` and `const` fall with
+    /// the operator they modify.
+    fn strip_rust_ref(ty: &str) -> String {
+        let mut rest = ty.trim();
+        loop {
+            rest = rest.trim();
+            if let Some(tail) = rest.strip_prefix("&mut").or_else(|| rest.strip_prefix('&')) {
+                rest = tail;
+                continue;
+            }
+            if let Some(tail) = rest.strip_prefix("*mut").or_else(|| rest.strip_prefix('*')) {
+                rest = tail;
+                continue;
+            }
+            if let Some(tail) = rest
+                .strip_prefix("mut ")
+                .or_else(|| rest.strip_prefix("const "))
+            {
+                rest = tail;
+                continue;
+            }
+            break;
+        }
+        rest.to_string()
+    }
+
+    /// Whether a type spells a plain path: identifiers, `::`, generics,
+    /// lifetimes and references only. Tuples, arrays, closures, fn
+    /// pointers and `impl`/`dyn` types keep their spelling: renaming to
+    /// one of those matches no owner.
+    fn is_plain_rust_path(ty: &str) -> bool {
+        let ty = ty.trim();
+        if ty.is_empty()
+            || ty.starts_with("impl ")
+            || ty.starts_with("dyn ")
+            || !ty.chars().any(|c| c.is_alphanumeric())
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        for c in ty.chars() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                '(' | ')' | '|' | ';' | '{' | '}' | '!' | '=' => return false,
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// Rust call heads that have their own dispatch: turbofish methods
+    /// and bound-parameter calls. It looks in the merged impl+fn scope
+    /// per function (the same layering receiver typing uses) and at the
+    /// callee node behind each recorded head:
+    ///
+    /// - `recv.m::<T>()` (`generic_function` over a `field_expression`)
+    ///   rewrites the head to the receiver's declared type
+    ///   (`Buf::cast`), which the owner match resolves exactly. The
+    ///   turbofish args drop: an argument-less head addresses every
+    ///   instantiation. Where the receiver has no declared plain type,
+    ///   the head keeps its spelling.
+    /// - `P::method` (`scoped_identifier` over one bare identifier)
+    ///   records a member site on `method` with `receiver_bound` where P
+    ///   is a bounded generic parameter, beside the kept plain edge.
+    ///   Unbounded P records nothing: resolvers leave the head alone.
+    ///
+    /// A rewritten head is a site-less rename, not a new row: inherent
+    /// methods have no installation rows for a site to join, so a site
+    /// would dangle where the renamed edge resolves.
+    ///
+    /// Runs before receiver typing so the new sites type like the rest.
+    fn rust_head_dispatch(
+        root: tree_sitter::Node,
+        source: &str,
+        calls: &mut [(String, usize, usize)],
+        sites: &mut Vec<RawDispatchSite>,
+    ) {
+        // Merged bounds and declared types per function range: impl
+        // bounds underneath, the function's own on top.
+        type ScopeMaps = (
+            usize,
+            usize,
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, String>,
+        );
+        let mut scopes: Vec<ScopeMaps> = Vec::new();
+        let mut stack = vec![(
+            root,
+            None::<String>,
+            None::<std::collections::HashMap<String, String>>,
+        )];
+        while let Some((node, self_type, impl_bounds)) = stack.pop() {
+            let (self_type, impl_bounds) = if node.kind() == "impl_item" {
+                let bounds = Self::rust_generic_bounds_in(node, source);
+                let bounds = bounds
+                    .into_iter()
+                    .chain(Self::rust_impl_trait_bounds_in(node, source))
+                    .collect();
+                (
+                    node.child_by_field_name("type")
+                        .and_then(|t| Self::rust_type_name(t, source))
+                        .or(self_type),
+                    Some(bounds),
+                )
+            } else {
+                (self_type, impl_bounds)
+            };
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push((child, self_type.clone(), impl_bounds.clone()));
+            }
+            if node.kind() == "function_item" {
+                let bounds =
+                    Self::merge_fn_bounds(impl_bounds.clone().unwrap_or_default(), node, source);
+                let mut declared = std::collections::HashMap::new();
+                if let Some(self_type) = &self_type {
+                    declared.insert("self".to_string(), self_type.clone());
+                }
+                Self::rust_declared_types_in(node, source, &mut declared);
+                scopes.push((node.start_byte(), node.end_byte(), declared, bounds));
+            }
+        }
+        let scope_at = |byte: usize| {
+            scopes
+                .iter()
+                .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+                .min_by_key(|(start, end, _, _)| end - start)
+        };
+        for (name, start, end) in calls.iter_mut() {
+            let (start, end) = (*start, *end);
+            let Some(head) = root.descendant_for_byte_range(start, end) else {
+                continue;
+            };
+            match head.kind() {
+                "generic_function" => {
+                    let function = head.child_by_field_name("function");
+                    let is_method = function.is_some_and(|f| f.kind() == "field_expression");
+                    if !is_method {
+                        continue;
+                    }
+                    let function = function.unwrap();
+                    let (Some(value), Some(field)) = (
+                        function.child_by_field_name("value"),
+                        function.child_by_field_name("field"),
+                    ) else {
+                        continue;
+                    };
+                    // Only a bare-variable receiver renames: field chains
+                    // and temporaries need field-type lookup the file may
+                    // not have, and the head keeps its spelling for those.
+                    if value.kind() != "identifier" {
+                        continue;
+                    }
+                    let recv = source[value.byte_range()].to_string();
+                    let method = source[field.byte_range()].to_string();
+                    if method.is_empty() {
+                        continue;
+                    }
+                    let scope = scope_at(start);
+                    let renamed = scope
+                        .and_then(|(_, _, declared, _)| declared.get(&recv))
+                        .map(|ty| Self::strip_rust_ref(ty))
+                        .filter(|ty| Self::is_plain_rust_path(ty))
+                        .map(|ty| format!("{ty}::{method}"));
+                    if let Some(renamed) = renamed {
+                        *name = renamed;
+                    }
+                }
+                "scoped_identifier" => {
+                    let (Some(path), Some(name)) = (
+                        head.child_by_field_name("path"),
+                        head.child_by_field_name("name"),
+                    ) else {
+                        continue;
+                    };
+                    if path.kind() != "identifier" {
+                        continue;
+                    }
+                    let owner = source[path.byte_range()].to_string();
+                    if owner.contains('<') || owner.contains("::") || owner == "Self" {
+                        continue;
+                    }
+                    let method = source[name.byte_range()].to_string();
+                    if method.is_empty() {
+                        continue;
+                    }
+                    let bound = scope_at(start)
+                        .and_then(|(_, _, _, bounds)| bounds.get(&owner).cloned())
+                        .unwrap_or_default();
+                    if bound.is_empty() {
+                        continue;
+                    }
+                    sites.push(RawDispatchSite {
+                        member: method,
+                        receiver_expr: Some(owner),
+                        receiver_type: None,
+                        receiver_base_type: None,
+                        receiver_field: None,
+                        receiver_bound: Some(bound),
+                        kind: DispatchKind::MemberDot,
+                        byte_start: start,
+                        line: head.start_position().row as u32 + 1,
+                        target: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Give each Rust dispatch site the type of its receiver.
     ///
     /// Rust states the type of every parameter and of every annotated
     /// binding, and `self` is whatever the enclosing `impl` names, so a
+    /// One function's merged generic bounds: the enclosing impl's bounds
+    /// underneath, the function's own on top, joined piece-wise where a
+    /// method `where` constrains an impl parameter. Shared by receiver
+    /// typing and call-head dispatch so both read the same scope.
+    fn merge_fn_bounds(
+        mut bounds: std::collections::HashMap<String, String>,
+        node: tree_sitter::Node,
+        source: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let own = Self::rust_own_generic_params(node, source);
+        for (param, bound) in Self::rust_generic_bounds_in(node, source) {
+            if bound.is_empty() || own.contains(&param) {
+                // The function's own parameters keep their own bounds.
+                bounds.insert(param, bound);
+                continue;
+            }
+            // A method `where` on an impl parameter joins both bounds.
+            bounds
+                .entry(param)
+                .and_modify(|held| {
+                    if held.is_empty() {
+                        *held = bound.clone();
+                    } else {
+                        for piece in bound.split(" + ") {
+                            if !held.split(" + ").any(|have| have == piece) {
+                                held.push_str(" + ");
+                                held.push_str(piece);
+                            }
+                        }
+                    }
+                })
+                .or_insert(bound);
+        }
+        bounds.extend(Self::rust_impl_trait_bounds_in(node, source));
+        bounds
+    }
+
     /// receiver that is a plain name can be typed without leaving the file.
     /// C needs its own pass because the shapes differ; this one reads
     /// `function_item`, `parameter` and `let_declaration`.
@@ -2901,35 +3159,8 @@ impl TreeSitterAnalyzer {
                 declared.insert("self".to_string(), self_type.clone());
             }
             Self::rust_declared_types_in(node, source, &mut declared);
-            // Bounds read beside declarations: a bare parameter resolves
-            // through its bound, with impl bounds underneath and
-            // function bounds on top.
-            let mut bounds = impl_bounds.clone().unwrap_or_default();
-            let own = Self::rust_own_generic_params(node, source);
-            for (param, bound) in Self::rust_generic_bounds_in(node, source) {
-                if bound.is_empty() || own.contains(&param) {
-                    // The function's own parameters keep their own bounds.
-                    bounds.insert(param, bound);
-                    continue;
-                }
-                // A method `where` on an impl parameter joins both bounds.
-                bounds
-                    .entry(param)
-                    .and_modify(|held| {
-                        if held.is_empty() {
-                            *held = bound.clone();
-                        } else {
-                            for piece in bound.split(" + ") {
-                                if !held.split(" + ").any(|have| have == piece) {
-                                    held.push_str(" + ");
-                                    held.push_str(piece);
-                                }
-                            }
-                        }
-                    })
-                    .or_insert(bound);
-            }
-            bounds.extend(Self::rust_impl_trait_bounds_in(node, source));
+            let bounds =
+                Self::merge_fn_bounds(impl_bounds.clone().unwrap_or_default(), node, source);
             scopes.push((node.start_byte(), node.end_byte(), declared, bounds));
         }
 

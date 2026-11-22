@@ -303,6 +303,8 @@ pub fn target_owner_matches(target: &str, receiver: &str) -> bool {
 /// so `From<u8>::from` names one. The same holds for an inherent owner
 /// with arguments: `Split::m` finds `Split<&T>` and `Split<&mut T>`.
 pub fn qualifier_matches_path(qualifier: &str, path: &str) -> bool {
+    let path = strip_self_args(path);
+    let path = path.as_str();
     if qualifier == path || qualifier.ends_with(&format!("::{path}")) {
         return true;
     }
@@ -376,6 +378,66 @@ fn strip_instantiations(qualifier: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("::")
+}
+
+/// Query-side `<Self>` erasure: `Config::<Self>` addresses `Config`.
+/// `Self` is a keyword and never a concrete argument, so erasing an
+/// all-`Self` list cannot conflate two instantiations the way stripping
+/// general args would (`From<u16>` keeps its args and still misses
+/// `From<u8>`). Mixed lists (`Pair<Self, u8>`) stay verbatim — resolving
+/// those needs extraction-time markers, which ride separately.
+fn strip_self_args(path: &str) -> String {
+    // A turbofish segment (`::<Self>`) splits off its type: fold it back
+    // onto the segment it instantiates before erasing.
+    let mut segments: Vec<String> = Vec::new();
+    for segment in top_level_segments(path) {
+        if segment.starts_with('<') {
+            if let Some(previous) = segments.pop() {
+                segments.push(format!("{previous}{segment}"));
+                continue;
+            }
+        }
+        segments.push(segment.to_string());
+    }
+    segments
+        .iter()
+        .map(|segment| match segment.find('<') {
+            None => segment.to_string(),
+            Some(open) => {
+                let (head, args) = segment.split_at(open);
+                let args = args[1..].strip_suffix('>').unwrap_or(&args[1..]);
+                if split_top_level_args(args).iter().all(|arg| *arg == "Self") {
+                    head.to_string()
+                } else {
+                    segment.to_string()
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Split an argument list on commas outside angle brackets.
+fn split_top_level_args(args: &str) -> Vec<&str> {
+    let bytes = args.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(args[start..at].trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    parts.push(args[start..].trim());
+    parts
 }
 
 /// Split on `::` outside angle brackets: the `::` in `Foo<Bar::Baz>` is an
@@ -1756,6 +1818,27 @@ mod ambiguity_note_tests {
         assert_eq!((bare, path), ("new", None));
         let (bare, path) = split_callee_edge("::new");
         assert_eq!((bare, path), ("::new", None));
+    }
+
+    #[test]
+    fn self_args_erase_but_concrete_args_stay_exact() {
+        // `Self` is a keyword, never a concrete argument: erasing it
+        // cannot conflate two instantiations. Everything else keeps
+        // the exactness the tests above pin.
+        assert!(qualifier_matches_path("m::Config<T>", "Config::<Self>"));
+        assert!(qualifier_matches_path("m::Config<T>", "Config"));
+        // Erasing `Self` is erasing to an argument-less query, which
+        // addresses every instantiation by design.
+        assert!(qualifier_matches_path(
+            "fmt::<Error as From<u8>>",
+            "From<Self>"
+        ));
+        // Concrete CamelCase is not a parameter: `String` stays.
+        assert!(!qualifier_matches_path("m::Foo<T>", "Foo<String>"));
+        assert!(!qualifier_matches_path("m::Foo<u8>", "Foo<String>"));
+        // Mixed lists stay verbatim: resolving those needs
+        // extraction-time markers, which ride separately.
+        assert!(!qualifier_matches_path("m::Pair<T, u8>", "Pair<Self, u8>"));
     }
 
     #[test]

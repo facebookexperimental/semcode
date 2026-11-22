@@ -63,6 +63,10 @@ pub enum Evidence {
         /// the function was installed in. False means the member names match
         /// and nothing contradicts it, which is weaker.
         type_matched: bool,
+        /// True when the match ran through the site's bound rather than a
+        /// receiver type: the bound's trait selects the slot, so the leg
+        /// is exact and execution is decided only at runtime.
+        via_bound: bool,
     },
 }
 
@@ -73,6 +77,15 @@ impl Evidence {
             Evidence::Registered { type_matched, .. } => *type_matched,
         }
     }
+}
+
+/// Whether a bound cites the trait a row installs: any piece of a `+`
+/// list matching the row's container. Shared by the typed and bound-only
+/// arms so both read one rule.
+fn bound_matches_trait(bound: &str, container: &str) -> bool {
+    crate::types::each_bound(bound)
+        .iter()
+        .any(|piece| crate::types::trait_names_match(piece, container))
 }
 
 /// Match dispatch sites against the places a function is installed.
@@ -102,7 +115,7 @@ pub fn indirect_callers(
     // places install the function there: seq_read sits in file_operations
     // ::read in 430 of them, and listing fs/read_write.c once per
     // registration buries the three call sites that matter.
-    type SiteKey = (String, String, u32, u64, String, String, String, bool);
+    type SiteKey = (String, String, u32, u64, String, String, String, bool, bool);
     let mut by_site: HashMap<SiteKey, (&Registration, usize)> = HashMap::new();
 
     for registration in registrations {
@@ -135,6 +148,7 @@ pub fn indirect_callers(
                     site.kind.as_str().to_string(),
                     registration.container_type.clone(),
                     false,
+                    false,
                 );
                 by_site
                     .entry(key)
@@ -154,20 +168,26 @@ pub fn indirect_callers(
             // match, which is weaker but is what the reader asked for.
             //
             // Trait rows join through the bound, or through the target
-            // owner where the site carries no bound. An untyped site
-            // joins nothing: member names alone over-match.
-            let type_matched = match site.receiver_type.as_deref() {
-                Some(receiver_type) if receiver_type == registration.container_type => true,
+            // owner where the site has no bound.
+            //
+            // A bound-only site (a generic parameter's method, or an
+            // `impl Trait` receiver) joins only through its bound: it
+            // never takes the member-name weak match, which would link
+            // it to every same-named member in the tree, and it never
+            // joins a non-trait row.
+            let (type_matched, via_bound) = match site.receiver_type.as_deref() {
+                Some(receiver_type) if receiver_type == registration.container_type => {
+                    (true, false)
+                }
                 Some(receiver_type)
                     if registration.kind == crate::types::RegistrationKind::TraitImpl =>
                 {
                     match site.receiver_bound.as_deref() {
                         Some(bound) => {
-                            if !crate::types::each_bound(bound).iter().any(|piece| {
-                                crate::types::trait_names_match(piece, &registration.container_type)
-                            }) {
+                            if !bound_matches_trait(bound, &registration.container_type) {
                                 continue;
                             }
+                            (true, true)
                         }
                         None => {
                             if !crate::types::target_owner_matches(
@@ -176,15 +196,30 @@ pub fn indirect_callers(
                             ) {
                                 continue;
                             }
+                            (true, false)
                         }
                     }
-                    true
                 }
                 Some(_) => continue,
-                None if registration.kind == crate::types::RegistrationKind::TraitImpl => {
-                    continue;
-                }
-                None => false,
+                None => match site.receiver_bound.as_deref() {
+                    Some(bound) => {
+                        if registration.kind != crate::types::RegistrationKind::TraitImpl {
+                            continue;
+                        }
+                        if !bound_matches_trait(bound, &registration.container_type) {
+                            continue;
+                        }
+                        (true, true)
+                    }
+                    // An untyped, unbound site joins nothing: member names
+                    // alone over-match.
+                    None => {
+                        if registration.kind == crate::types::RegistrationKind::TraitImpl {
+                            continue;
+                        }
+                        (false, false)
+                    }
+                },
             };
 
             // An array subscript names no member: `table[i](...)` in one
@@ -205,6 +240,7 @@ pub fn indirect_callers(
                 site.kind.as_str().to_string(),
                 registration.container_type.clone(),
                 type_matched,
+                via_bound,
             );
 
             by_site
@@ -233,6 +269,7 @@ pub fn indirect_callers(
             site_kind,
             container_type,
             type_matched,
+            via_bound,
         ),
         (exemplar, count),
     ) in by_site
@@ -250,6 +287,7 @@ pub fn indirect_callers(
                 registration_line: exemplar.line,
                 registration_count: count,
                 type_matched,
+                via_bound,
             },
         });
     }
