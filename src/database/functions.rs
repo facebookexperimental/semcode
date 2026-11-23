@@ -453,25 +453,22 @@ impl FunctionStore {
         let table = self.connection.open_table("functions").execute().await?;
         let escaped_name = name.replace("'", "''");
         let escaped_file_path = file_path.replace("'", "''");
+        let escaped_hash = git_file_hash.replace("'", "''");
 
-        // Git hashes are now stored as hex strings directly without padding
-        let git_hash_to_match = git_file_hash;
-
+        // Filter on the blob in the query, so bodies are fetched only for
+        // this file version and not for every version the index holds.
         let results = table
             .query()
             .only_if(format!(
-                "name = '{escaped_name}' AND file_path = '{escaped_file_path}'"
+                "name = '{escaped_name}' AND file_path = '{escaped_file_path}' \
+                 AND git_file_hash = '{escaped_hash}'"
             ))
             .execute()
             .await?
             .try_collect::<Vec<_>>()
             .await?;
 
-        let functions = self.extract_functions_from_batches(&results).await?;
-        let mut arms: Vec<FunctionInfo> = functions
-            .into_iter()
-            .filter(|f| f.git_file_hash == git_hash_to_match)
-            .collect();
+        let mut arms = self.extract_functions_from_batches(&results).await?;
         arms.sort_by_key(|f| f.line_start);
         Ok(arms)
     }
