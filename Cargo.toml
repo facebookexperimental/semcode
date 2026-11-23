@@ -88,6 +88,13 @@ path = "src/bin/semcode-lsp.rs"
 name = "analyzer"
 harness = false
 
+# Generates bench/workload.jsonl; benchmark tooling, so it lives in bench/.
+# test = false: cargo test need not build and link it.
+[[example]]
+name = "bench_workload"
+path = "bench/workload.rs"
+test = false
+
 [profile.dev]
 debug = "line-tables-only"
 
