@@ -86,6 +86,40 @@ impl PerfStats {
         println!("\nTotal time tracked: {:.2}s", total_time.as_secs_f64());
     }
 
+    /// The metrics as JSON, keyed by name, with durations in milliseconds.
+    ///
+    /// Durations recorded on worker threads overlap, so a per-file metric's
+    /// `total_ms` is CPU-side time summed across threads, not wall time.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut sorted_metrics: Vec<_> = self.metrics.iter().collect();
+        sorted_metrics.sort_by_key(|(name, _)| name.as_str());
+
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let metrics: serde_json::Map<String, serde_json::Value> = sorted_metrics
+            .into_iter()
+            .map(|(name, data)| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "count": data.count,
+                        "total_ms": ms(data.total_duration),
+                        "mean_ms": ms(data.total_duration) / data.count.max(1) as f64,
+                        "min_ms": ms(data.min_duration.unwrap_or_default()),
+                        "max_ms": ms(data.max_duration.unwrap_or_default()),
+                    }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(metrics)
+    }
+
+    /// Write [`Self::to_json`] to `path`.
+    pub fn write_json(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let text = serde_json::to_string_pretty(&self.to_json())?;
+        std::fs::write(path, text + "\n")
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))
+    }
+
     pub fn reset(&mut self) {
         self.metrics.clear();
     }

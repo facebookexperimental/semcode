@@ -100,6 +100,11 @@ struct Args {
     #[arg(long)]
     perf: bool,
 
+    /// Write the performance statistics as JSON to this file (implies --perf;
+    /// source and vector indexing only)
+    #[arg(long, value_name = "FILE")]
+    perf_json: Option<PathBuf>,
+
     /// Index files modified in git commit range without checking them out.
     /// Accepts range format only (SHA1..SHA2). Reads files directly from git blobs.
     /// Uses incremental processing and deduplication with parallel streaming pipeline.
@@ -1340,9 +1345,33 @@ async fn async_main() -> Result<()> {
     // SAFETY: the handler touches only atomics.
     unsafe { gix::interrupt::init_handler(1, || {}) }?;
 
-    // Enable performance monitoring if --perf flag is set
-    if args.perf {
+    // Enable performance monitoring if --perf or --perf-json is set
+    if args.perf || args.perf_json.is_some() {
         semcode::perf_monitor::enable_performance_monitoring();
+    }
+    // The statistics are written where source and vector indexing finish;
+    // the lore, commits-only and branch modes return before that point.
+    if args.perf_json.is_some()
+        && (args.lore.is_some()
+            || args.commits.is_some()
+            || !args.branch.is_empty()
+            || !args.branches.is_empty()
+            || args.all_branches)
+    {
+        anyhow::bail!(
+            "--perf-json is supported for source and vector indexing, not with --lore, --commits or branch indexing"
+        );
+    }
+    // Checked now rather than when the statistics are written, after the
+    // whole indexing run.
+    if let Some(path) = &args.perf_json {
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if !dir.is_dir() {
+            anyhow::bail!("--perf-json: directory {} does not exist", dir.display());
+        }
     }
 
     // Set up parallelism
@@ -2341,10 +2370,13 @@ async fn run_pipeline(args: Args) -> Result<()> {
     println!("  semcode --database {database_path}");
 
     // Print performance statistics if requested
-    if args.perf {
+    if args.perf || args.perf_json.is_some() {
         println!("\nPrinting performance statistics...");
         let stats = PERF_STATS.lock().unwrap();
         stats.print_summary();
+    }
+    if let Some(path) = &args.perf_json {
+        PERF_STATS.lock().unwrap().write_json(path)?;
     }
 
     if args.vectors {
