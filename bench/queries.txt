@@ -1,0 +1,31 @@
+# One-shot queries for the "cli" scenario, one per line:
+#   name<TAB>expected<TAB>query
+# `query` is passed to `semcode -q`.  `expected` must appear in its output
+# (checked once before timing): a query that finds nothing
+# returns quickly, and without the check would read as a speedup.  It must
+# be something only a result prints: semcode echoes the query, even into
+# the answer that found nothing and into errors.  Names
+# identify benchmarks across runs; keep them stable.
+#
+# Real queries go to the kernel's core API, so the set leans heavy: the
+# most called functions and most used types, next to a few light lookups
+# that keep the per-process floor visible.  It mixes unique and multiply
+# defined names (most kernel names are also defined in tools/ and
+# selftests), and for grep: early exit on a common match, a full scan with
+# few hits, and a path-filtered scan.  Nothing here needs vectors.  The
+# mcp scenarios replay bench/workload.jsonl, a larger sampled workload.
+func_unique	fs/read_write.c	func vfs_read
+func_large	kernel/sched/core.c	func __schedule
+func_ambiguous	kernel/locking/mutex.c	func mutex_lock
+macro	include/linux/container_of.h	func container_of
+type	include/linux/sched.h	type task_struct
+callers_light	ksys_read	callers vfs_read
+callers_heavy	functions directly call	callers mutex_lock
+calls	filemap_get_pages	calls filemap_read
+callchain	do_file_open	callchain do_sys_openat2
+grep_common	limit hit (50 results)	grep --limit 50 copy_from_user\\(.*sizeof
+grep_rare	mm/memremap.c:get_dev_pagemap:	grep --limit 0 percpu_ref_tryget_live_rcu
+grep_path	fs/ext4/super.c:	grep -p ^fs/ext4/ --limit 0 brelse
+func_top	mm/slub.c	func kfree
+callers_top	functions directly call 'kfree'	callers kfree
+type_top	include/linux/skbuff.h	type sk_buff
