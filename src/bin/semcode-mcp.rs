@@ -9,11 +9,11 @@ use semcode::{
 };
 use serde_json::{json, Value};
 use std::future::Future;
-use std::io::Write;
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 /// Truncate output at 3,000 lines with a warning message
@@ -2311,12 +2311,15 @@ struct Args {
     max_concurrent_requests: usize,
 }
 
+// Tool workers wait on I/O that also uses Tokio's blocking pool. Leave
+// headroom in the default 512-thread pool for database and stdout operations.
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+
 fn parse_request_limit(value: &str) -> Result<usize> {
     let limit = value.parse()?;
     anyhow::ensure!(
-        (1..=Semaphore::MAX_PERMITS).contains(&limit),
-        "expected a request limit between 1 and {}",
-        Semaphore::MAX_PERMITS
+        (1..=MAX_CONCURRENT_REQUESTS).contains(&limit),
+        "expected a request limit between 1 and {MAX_CONCURRENT_REQUESTS}"
     );
     Ok(limit)
 }
@@ -2353,6 +2356,39 @@ impl IndexingState {
             started_at: None,
             completed_at: None,
         }
+    }
+
+    fn database_query_error(&self, is_empty: bool) -> Option<String> {
+        match &self.status {
+            IndexingStatus::InProgress { phase, .. } => Some(format!(
+                "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
+                phase
+            )),
+            IndexingStatus::Failed { error } => Some(format!(
+                "Database indexing failed: {}. The database may be incomplete or empty.",
+                error
+            )),
+            IndexingStatus::NotStarted if is_empty => Some(
+                "Database is empty. Background indexing hasn't started yet. Please wait a moment and try again.".to_string()
+            ),
+            IndexingStatus::Completed { .. } if is_empty => Some(
+                "Database is empty. This repository may not contain any C/C++ source files, or indexing didn't find any functions.".to_string()
+            ),
+            _ => None,
+        }
+    }
+
+    async fn check_database_status(
+        state: &Mutex<Self>,
+        count_functions: impl Future<Output = Result<usize>>,
+    ) -> Option<String> {
+        if let Some(message) = state.lock().await.database_query_error(false) {
+            return Some(message);
+        }
+
+        // Indexing can start or fail while the database count is pending.
+        let is_empty = matches!(count_functions.await, Ok(0));
+        state.lock().await.database_query_error(is_empty)
     }
 }
 
@@ -3301,21 +3337,7 @@ impl McpServer {
     }
 
     async fn check_database_status(&self) -> Option<String> {
-        // The table count can yield to other requests and background indexing.
-        let status = self.indexing_state.lock().await.status.clone();
-        let empty_message = match status {
-            IndexingStatus::InProgress { phase, .. } => return Some(format!(
-                "Database is currently being indexed ({}). Please wait for indexing to complete and try again. Use the indexing_status tool to check progress.",
-                phase
-            )),
-            IndexingStatus::Failed { error } => return Some(format!(
-                "Database indexing failed: {}. The database may be incomplete or empty.",
-                error
-            )),
-            IndexingStatus::NotStarted => "Database is empty. Background indexing hasn't started yet. Please wait a moment and try again.",
-            IndexingStatus::Completed { .. } => "Database is empty. This repository may not contain any C/C++ source files, or indexing didn't find any functions.",
-        };
-        matches!(self.db.count_functions().await, Ok(0)).then(|| empty_message.to_string())
+        IndexingState::check_database_status(&self.indexing_state, self.db.count_functions()).await
     }
 
     async fn handle_request(&self, request: Value) -> Value {
@@ -6200,14 +6222,13 @@ async fn write_response<W: AsyncWrite + Unpin>(stdout: &Mutex<W>, response: &Val
     write_message(&mut *stdout.lock().await, &message).await
 }
 
-async fn serve_requests<R, W, F, Fut>(
-    stdin: R,
+async fn serve_requests<W, F, Fut>(
+    mut lines: mpsc::Receiver<io::Result<String>>,
     stdout: Arc<Mutex<W>>,
     limit: usize,
     handle_request: F,
 ) -> Result<()>
 where
-    R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
     F: Fn(Value) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Value>,
@@ -6215,7 +6236,6 @@ where
     let runtime = tokio::runtime::Handle::current();
     let capacity = Arc::new(Semaphore::new(limit));
     let mut requests = JoinSet::new();
-    let mut lines = stdin.lines();
 
     loop {
         let line = tokio::select! {
@@ -6224,11 +6244,12 @@ where
                 finished??;
                 continue;
             }
-            line = lines.next_line() => line?,
+            line = lines.recv() => line,
         };
         let Some(line) = line else {
             break;
         };
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
@@ -6323,31 +6344,42 @@ where
 }
 
 async fn run_stdio_server(server: Arc<McpServer>, limit: usize) -> Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
+    let (stdin_tx, lines) = mpsc::channel(1);
+    // A pending stdin read can outlive the transport when writing fails.
+    // Keep it on a detached thread so it cannot hold up runtime shutdown.
+    std::thread::Builder::new()
+        .name("semcode-mcp-stdin".into())
+        .spawn(move || {
+            for line in io::stdin().lock().lines() {
+                let failed = line.is_err();
+                if stdin_tx.blocking_send(line).is_err() || failed {
+                    break;
+                }
+            }
+        })?;
+
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
-    let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (notification_tx, mut notification_rx) = mpsc::unbounded_channel::<String>();
     *server.notification_tx.lock().await = Some(notification_tx);
 
     let stdout_for_notifications = stdout.clone();
-    let notifications = tokio::spawn(async move {
+    let notifications = async move {
         while let Some(notification) = notification_rx.recv().await {
             let mut stdout = stdout_for_notifications.lock().await;
-            if let Err(error) = write_message(&mut *stdout, &notification).await {
-                eprintln!("[Notification] Failed to write: {error}");
-                break;
-            }
+            write_message(&mut *stdout, &notification).await?;
         }
-    });
+        Ok(())
+    };
 
     eprintln!("MCP server ready on stdin/stdout");
-    let result = serve_requests(stdin, stdout, limit, move |request| {
+    let requests = serve_requests(lines, stdout, limit, move |request| {
         let server = server.clone();
         async move { server.handle_request(request).await }
-    })
-    .await;
-    notifications.abort();
-    let _ = notifications.await;
-    result
+    });
+    tokio::select! {
+        result = requests => result,
+        result = notifications => result,
+    }
 }
 
 #[tokio::main]
@@ -6424,7 +6456,7 @@ mod tests {
     use std::env;
 
     #[test]
-    fn request_limit_must_fit_the_semaphore() {
+    fn request_limit_preserves_blocking_pool_headroom() {
         assert_eq!(
             Args::try_parse_from(["semcode-mcp"])
                 .unwrap()
@@ -6432,29 +6464,69 @@ mod tests {
             2
         );
         assert!(Args::try_parse_from(["semcode-mcp", "--max-concurrent-requests", "0"]).is_err());
-        let too_large = (Semaphore::MAX_PERMITS + 1).to_string();
+        let max = MAX_CONCURRENT_REQUESTS.to_string();
+        assert_eq!(
+            Args::try_parse_from(["semcode-mcp", "--max-concurrent-requests", &max])
+                .unwrap()
+                .max_concurrent_requests,
+            MAX_CONCURRENT_REQUESTS
+        );
+        let too_large = (MAX_CONCURRENT_REQUESTS + 1).to_string();
         assert!(
             Args::try_parse_from(["semcode-mcp", "--max-concurrent-requests", &too_large]).is_err()
         );
     }
 
+    #[tokio::test]
+    async fn queries_recheck_indexing_after_counting_functions() {
+        for (status, expected) in [
+            (
+                IndexingStatus::InProgress {
+                    phase: "Indexing files".into(),
+                    current: 0,
+                    total: None,
+                },
+                "currently being indexed (Indexing files)",
+            ),
+            (
+                IndexingStatus::Failed {
+                    error: "could not index files".into(),
+                },
+                "indexing failed: could not index files",
+            ),
+        ] {
+            let state = Mutex::new(IndexingState::new());
+            let message = IndexingState::check_database_status(&state, async {
+                state.lock().await.status = status;
+                Ok(1)
+            })
+            .await
+            .unwrap();
+            assert!(message.contains(expected), "{message}");
+
+            let message = IndexingState::check_database_status(&state, async {
+                panic!("a blocked query should skip the database count");
+            })
+            .await
+            .unwrap();
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdio_overlaps_tools_and_keeps_protocol_responsive() {
         use std::time::Duration;
-        use tokio::io::{duplex, split, Lines};
+        use tokio::io::{duplex, AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
         use tokio::time::timeout;
 
-        async fn send<W: AsyncWrite + Unpin>(writer: &mut W, id: u32, method: &str, name: &str) {
+        async fn send(lines: &mpsc::Sender<io::Result<String>>, id: u32, method: &str, name: &str) {
             let request = json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": method,
                 "params": {"name": name}
             });
-            writer
-                .write_all(format!("{request}\n").as_bytes())
-                .await
-                .unwrap();
+            lines.send(Ok(request.to_string())).await.unwrap();
         }
 
         async fn receive<R: AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> Value {
@@ -6467,16 +6539,15 @@ mod tests {
         }
 
         for limit in [1, 2] {
-            let (client, server) = duplex(4096);
-            let (client_reader, mut client_writer) = split(client);
+            let (client_reader, server_writer) = duplex(4096);
             let mut responses = BufReader::new(client_reader).lines();
-            let (server_reader, server_writer) = split(server);
+            let (client_writer, lines) = mpsc::channel(1);
             let started = Arc::new(tokio::sync::Notify::new());
             let started_by_worker = started.clone();
             let (release, hold) = std::sync::mpsc::channel();
             let hold = Arc::new(std::sync::Mutex::new(hold));
             let server = tokio::spawn(serve_requests(
-                BufReader::new(server_reader),
+                lines,
                 Arc::new(Mutex::new(server_writer)),
                 limit,
                 move |request| {
@@ -6495,14 +6566,14 @@ mod tests {
                 },
             ));
 
-            send(&mut client_writer, 1, "tools/call", "slow").await;
+            send(&client_writer, 1, "tools/call", "slow").await;
             timeout(Duration::from_secs(5), started.notified())
                 .await
                 .unwrap();
-            send(&mut client_writer, 2, "ping", "").await;
+            send(&client_writer, 2, "ping", "").await;
             assert_eq!(receive(&mut responses).await["id"], 2);
 
-            send(&mut client_writer, 3, "tools/call", "quick").await;
+            send(&client_writer, 3, "tools/call", "quick").await;
             let reply = receive(&mut responses).await;
             assert_eq!(reply["id"], 3);
             if limit == 1 {
@@ -6512,7 +6583,7 @@ mod tests {
                 assert_eq!(reply["result"], json!({}));
             }
 
-            client_writer.shutdown().await.unwrap();
+            drop(client_writer);
             release.send(()).unwrap();
             assert_eq!(receive(&mut responses).await["id"], 1);
             timeout(Duration::from_secs(5), server)
