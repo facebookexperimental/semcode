@@ -9,27 +9,28 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/facebookexperimental/semcode"
 
 [dependencies]
-lancedb = "0.27"
-arrow = "57"
-arrow-array = "57"
-arrow-schema = "57"
-tokio = { version = "1.50.0", features = ["full"] }
-serde = { version = "1.0.228", features = ["derive"] }
+lancedb = "0.41"
+# Match LanceDB's Arrow major so record batches use the same types.
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
+tokio = { version = "1.54.1", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 anyhow = "1.0"
 walkdir = "2.5"
-indicatif = "0.18.4"
+indicatif = "0.18.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rustyline = "17.0"
+rustyline = "19.0"
 colored = "3.1"
-futures = "0.3.32"
-regex = "1.12"
-rayon = "1.11"
-dirs = "6.0"
+futures = "0.3.34"
+regex = "1.13"
+rayon = "1.12"
+dirs = "7.0"
 num_cpus = "1.17"
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-rust = "0.24"
@@ -38,35 +39,34 @@ tree-sitter-zig = "1.1"
 streaming-iterator = "0.1"
 once_cell = "1.21"
 crossbeam-channel = "0.5"
-sha1 = "0.10"
-blake3 = "1.8.3"
+sha1 = "0.11"
+blake3 = "1.8.7"
 hex = "0.4"
-dashmap = "6.1"
+dashmap = "6.2"
 tempfile = "3.27"
 tower = "0.5"
-tokio-tungstenite = "0.29"
 anstream = "1.0"        # Auto TTY/NO_COLOR handling; print!/println! and Write adapters [web:17]
 owo-colors = { version = "4", features = ["supports-colors"] }  # .red().bold(), optional detection helpers [web:27]
-gix = { version = "0.83", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl-openssl"] }
+gix = { version = "0.91", features = ["blocking-network-client", "worktree-mutation", "blocking-http-transport-curl-openssl"] }
 # gix pulls gix-pack with default features off, which leaves out the
 # "generate" feature that gates pack writing.  Repacking the lore
 # archives needs it.
-gix-pack = { version = "0.70", default-features = false, features = ["generate", "streaming-input"] }
-model2vec-rs = "0.1.4"
+gix-pack = { version = "0.78", default-features = false, features = ["generate", "streaming-input"] }
+model2vec-rs = "0.5.0"
 tower-lsp-server = "0.23"  # Language Server Protocol framework for LSP server
-similar = { version = "2.7", features = ["text"] }  # Proper diff algorithm for commit diffs
-shlex = "1.3"           # Shell-like parsing for quoted strings in CLI
+similar = { version = "3.2", features = ["text"] }  # Proper diff algorithm for commit diffs
+shlex = "2.0"           # Shell-like parsing for quoted strings in CLI
 reqwest = { version = "0.13", features = ["blocking", "gzip"] }  # HTTP client for manifest downloads
 flate2 = "1.1"          # gzip compression/decompression
-chrono = "0.4.44"
-chrono-english = "0.1"  # Natural language date parsing
-base64 = "0.22"         # Base64 decoding for MIME-encoded email bodies
+chrono = "0.4.45"
+chrono-english = "0.2"  # Natural language date parsing
+base64 = "0.23"         # Base64 decoding for MIME-encoded email bodies
 
 [dev-dependencies]
 axum = "0.8"
 # Tests reach lance's WriteParams, which lancedb does not re-export.  Pin
 # the exact version lancedb resolves to, so the two cannot drift apart.
-lance = { version = "=4.0.0", default-features = false }
+lance = { version = "=14.0.2", default-features = false }
 
 [[bin]]
 name = "semcode-index"

@@ -1132,7 +1132,7 @@ fn generate_commit_diff_with_symbols(
                 } => {
                     // Skip non-blob modifications
                     if !previous_entry_mode.is_blob() || !entry_mode.is_blob() {
-                        return Ok::<_, anyhow::Error>(Action::Continue(()));
+                        return Ok(Action::Continue(()));
                     }
 
                     let path = location.to_string();
@@ -1228,7 +1228,7 @@ fn generate_commit_diff_with_symbols(
                 gix::object::tree::diff::Change::Rewrite { .. } => {
                     // Rewrite represents a complete file replacement - rare in practice
                     // Skip for now as it's complex to handle properly
-                    Ok::<_, anyhow::Error>(Action::Continue(()))
+                    Ok(Action::Continue(()))
                 }
             }
         })?;
@@ -1335,7 +1335,9 @@ pub fn find_merge_base<P: AsRef<Path>>(repo_path: P, ref_a: &str, ref_b: &str) -
     let commit_b = resolve_to_commit(&repo, ref_b)?;
 
     // Use gix's merge_base method to find the common ancestor
-    let base = repo.merge_base(commit_a.id, commit_b.id)?;
+    let base = repo
+        .merge_base(commit_a.id, commit_b.id)?
+        .ok_or_else(|| anyhow::anyhow!("No merge base found for '{ref_a}' and '{ref_b}'"))?;
 
     Ok(base.to_string())
 }

@@ -32,8 +32,10 @@ impl CodeVectorizer {
     pub async fn new_with_config(_use_gpu: bool, model_path: Option<String>) -> Result<Self> {
         // model2vec-rs doesn't use GPU acceleration, so we ignore the gpu flag
 
-        // Download and setup model
-        let model = Self::load_model(model_path).await?;
+        // Preserve the 512-token limit for single-input encodes.
+        let model = Self::load_model(model_path)
+            .await?
+            .with_max_length(Some(512));
 
         tracing::info!("Initialized CodeVectorizer using model2vec-rs");
 
@@ -121,7 +123,7 @@ impl CodeVectorizer {
         let batch_size = get_batch_size();
         let vectors = self
             .model
-            .encode_with_args(&processed_snippets, None, batch_size);
+            .encode_with_args(&processed_snippets, None, batch_size, None);
 
         // Verify all vectors have the expected dimension
         for (i, vector) in vectors.iter().enumerate() {

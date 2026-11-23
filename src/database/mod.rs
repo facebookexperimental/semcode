@@ -28,6 +28,23 @@ use anyhow::Result;
 use arrow::array::RecordBatch;
 use arrow::array::StringArray;
 
+/// Open a table while tolerating absence. A listed table with a missing
+/// manifest is corrupt, and a stray file at the table path can fail to open
+/// even though LanceDB omits it from the listing.
+async fn open_table_if_present(
+    connection: &lancedb::Connection,
+    table_names: &[String],
+    name: &str,
+) -> lancedb::Result<Option<lancedb::Table>> {
+    match connection.open_table(name).execute().await {
+        Ok(table) => Ok(Some(table)),
+        Err(lancedb::Error::TableNotFound { .. }) if !table_names.iter().any(|n| n == name) => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// One row per merge key, keeping the last.
 ///
 /// `merge_insert` refuses a batch in which two source rows match the same
