@@ -247,6 +247,17 @@ pub struct DatabaseManager {
     /// scan, just not re-run.
     callers_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<(String, String)>>>,
     callees_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<String>>>,
+    /// The git repo, opened once: `is_checked_out` below runs per file
+    /// (every overlay read gates on it), and a fresh discover per call
+    /// revalidates the pack index every time — minutes on caller
+    /// listings with thousands of files. The cached fingerprint decides
+    /// re-discovery, not correctness: branch switches, worktree swaps,
+    /// and packed-refs rewrites change its files and re-open. Everyday
+    /// commits rewrite a loose ref (neither HEAD nor packed-refs), which
+    /// the fingerprint misses — but the fast path re-resolves HEAD
+    /// through the shared handle on every call, and loose refs read
+    /// live, so the answer stays current either way.
+    git_repo: std::sync::RwLock<Option<(gix::ThreadSafeRepository, Vec<u8>)>>,
 }
 
 /// The URI to give lancedb for a local database path.
@@ -314,6 +325,7 @@ impl DatabaseManager {
             workdir_index_generation: AtomicU64::new(u64::MAX),
             callers_memo: std::sync::RwLock::new(HashMap::new()),
             callees_memo: std::sync::RwLock::new(HashMap::new()),
+            git_repo: std::sync::RwLock::new(None),
         })
     }
 
@@ -356,13 +368,66 @@ impl DatabaseManager {
         if git_sha.is_empty() {
             return false;
         }
-        match gix::discover(&self.git_repo_path) {
-            Ok(repo) => repo
-                .head_commit()
-                .map(|c| c.id().to_string() == git_sha)
-                .unwrap_or(false),
-            Err(_) => false,
+        self.cached_head_id().is_some_and(|head| head == git_sha)
+    }
+
+    /// The workdir's HEAD commit id through the shared repo handle:
+    /// one discovery per process while the HEAD file's bytes are
+    /// unchanged, a re-discovery on any workdir move. `None` where the
+    /// repo does not open or HEAD does not resolve — callers treat that
+    /// as not-checked-out, exactly as the per-call discover did.
+    fn cached_head_id(&self) -> Option<String> {
+        // Fast path under the read lock: same fingerprint, shared store,
+        // so no discovery and no pack-index revalidation.
+        {
+            let guard = self.git_repo.read().unwrap();
+            if let Some((repo, fingerprint)) = guard.as_ref() {
+                if Self::git_fingerprint(&self.git_repo_path, repo.path()) == *fingerprint {
+                    return repo
+                        .to_thread_local()
+                        .head_commit()
+                        .ok()
+                        .map(|c| c.id().to_string());
+                }
+            }
         }
+        // Miss or workdir move: open without holding the lock (no worker
+        // ever blocks on discovery I/O), then cache for the next call.
+        let fresh = gix::ThreadSafeRepository::discover(&self.git_repo_path).ok()?;
+        let fingerprint = Self::git_fingerprint(&self.git_repo_path, fresh.path());
+        let head = fresh.to_thread_local().head_commit().ok()?.id().to_string();
+        *self.git_repo.write().unwrap() = Some((fresh, fingerprint));
+        Some(head)
+    }
+
+    /// Bytes that change on any workdir move: the workdir's `.git` entry
+    /// (a linked-worktree swap rewrites the pointer file), the HEAD file
+    /// (checkouts and commits rewrite it), and packed-refs (a ref rewrite
+    /// that leaves HEAD's bytes alone still changes these). Linked
+    /// worktrees keep packed-refs in the common dir — the worktree gitdir
+    /// has none — so it is read through `commondir` there. All tiny
+    /// reads; a missing file reads empty, a `.git` directory marks
+    /// itself distinctly.
+    fn git_fingerprint(repo_path: &str, git_dir: &std::path::Path) -> Vec<u8> {
+        let dotgit = std::path::Path::new(repo_path).join(".git");
+        let mut fp = match std::fs::read(&dotgit) {
+            Ok(bytes) => bytes,
+            Err(_) if dotgit.is_dir() => b"dir".to_vec(),
+            Err(_) => Vec::new(),
+        };
+        fp.push(0);
+        fp.extend(std::fs::read(git_dir.join("HEAD")).unwrap_or_default());
+        fp.push(0);
+        // The commondir pointer itself: retargeting it between stores
+        // with identical packed-refs bytes resolves refs elsewhere, so
+        // its bytes join the fingerprint (absent outside worktrees).
+        fp.extend(std::fs::read(git_dir.join("commondir")).unwrap_or_default());
+        fp.push(0);
+        let packed_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .map(|rel| git_dir.join(rel.trim()))
+            .unwrap_or_else(|_| git_dir.to_path_buf());
+        fp.extend(std::fs::read(packed_dir.join("packed-refs")).unwrap_or_default());
+        fp
     }
 
     /// Whether the working-copy overlay may be consulted for a query naming
@@ -9172,6 +9237,184 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The checkout cache stays current across workdir moves: an
+    /// everyday commit (loose ref) flips the answer through live HEAD
+    /// resolution, and a packed-refs rewrite flips the fingerprint so
+    /// the handle is re-discovered. The decision always resolves HEAD
+    /// live, so a missed fingerprint costs a re-discovery, never a
+    /// wrong overlay; the fingerprint still covers packed-refs so the
+    /// miss does not happen.
+    #[tokio::test]
+    async fn checkout_cache_tracks_workdir_moves() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "first"]);
+        let sha1 = head_of(repo);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            db_dir.path().to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        // First call populates the cache; a wrong SHA reads false.
+        assert!(db.is_checked_out(&sha1));
+        assert!(!db.is_checked_out(&"0".repeat(40)));
+        // An everyday commit moves a loose ref: HEAD bytes unchanged,
+        // answer must still flip through live resolution.
+        std::fs::write(repo.join("b.txt"), "two\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "second"]);
+        let sha2 = head_of(repo);
+        assert_ne!(sha1, sha2);
+        assert!(db.is_checked_out(&sha2));
+        assert!(!db.is_checked_out(&sha1));
+        // A packed-refs rewrite with HEAD bytes unchanged: the
+        // fingerprint must catch it, not go stale. The loose ref is
+        // removed first so the packed one governs.
+        git(repo, &["pack-refs", "--all"]);
+        // `pack-refs` prunes the loose refs it packs; remove in case.
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/main"));
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/master"));
+        // Point every packed branch at the first commit (the fixture
+        // has no tags): HEAD's bytes do not change, only packed-refs.
+        repoint_packed_refs(repo, &sha2, &sha1);
+        assert!(db.is_checked_out(&sha1));
+        assert!(!db.is_checked_out(&sha2));
+        // A linked worktree keeps packed-refs in the common dir: the
+        // same rewrite there must move a manager pointed at the
+        // worktree. The worktree HEAD (a symref) does not change bytes;
+        // only the common packed-refs does, at the same mtime, so bytes
+        // — not stat — must drive the fingerprint.
+        let wt = repo_dir.path().join("wt");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wtbr",
+                wt.to_str().unwrap(),
+                sha2.as_str(),
+            ],
+        );
+        let wtdb_dir = tempfile::tempdir().unwrap();
+        let wtdb = DatabaseManager::new(
+            wtdb_dir.path().to_str().unwrap(),
+            wt.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(wtdb.is_checked_out(&sha2));
+        git(repo, &["pack-refs", "--all"]);
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/wtbr"));
+        let packed = repo.join(".git/packed-refs");
+        let mtime = std::fs::metadata(&packed).unwrap().modified().unwrap();
+        repoint_common_packed_refs(repo, &sha2, &sha1);
+        std::fs::File::options()
+            .write(true)
+            .open(&packed)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert!(wtdb.is_checked_out(&sha1));
+        assert!(!wtdb.is_checked_out(&sha2));
+        // Retargeting commondir between stores with identical
+        // packed-refs bytes but different loose refs must move the
+        // manager: the pointer bytes join the fingerprint, so the
+        // rewrite re-discovers instead of serving the old store.
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "third"]);
+        let sha3 = head_of(repo);
+        let repo2dir = tempfile::tempdir().unwrap();
+        git(
+            repo,
+            &[
+                "clone",
+                "-q",
+                repo.to_str().unwrap(),
+                repo2dir.path().to_str().unwrap(),
+            ],
+        );
+        let repo2 = repo2dir.path();
+        git(repo2, &["branch", "wtbr", &sha3]);
+        std::fs::copy(
+            repo.join(".git/packed-refs"),
+            repo2.join(".git/packed-refs"),
+        )
+        .unwrap();
+        let wt_gitdir = std::fs::read_to_string(wt.join(".git"))
+            .unwrap()
+            .trim()
+            .strip_prefix("gitdir: ")
+            .unwrap()
+            .to_string();
+        std::fs::write(
+            std::path::Path::new(&wt_gitdir).join("commondir"),
+            repo2.join(".git").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(wtdb.is_checked_out(&sha3));
+        assert!(!wtdb.is_checked_out(&sha1));
+    }
+
+    /// Point every packed ref currently at `from` to `to` in the COMMON
+    /// packed-refs (linked worktrees share it): the worktree gitdir has
+    /// no packed-refs of its own.
+    fn repoint_common_packed_refs(repo: &std::path::Path, from: &str, to: &str) {
+        let path = repo.join(".git/packed-refs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.len() < 41 {
+                lines.push(line.to_string());
+                continue;
+            }
+            let (old, rest) = line.split_at(40);
+            if old == from {
+                lines.push(format!("{to}{rest}"));
+            } else {
+                lines.push(format!("{old}{rest}"));
+            }
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+
+    fn head_of(repo: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Point every packed ref currently at `from` to `to`, keeping
+    /// HEAD's bytes exactly as they were.
+    fn repoint_packed_refs(repo: &std::path::Path, from: &str, to: &str) {
+        let path = repo.join(".git/packed-refs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.len() < 41 {
+                lines.push(line.to_string());
+                continue;
+            }
+            let (old, rest) = line.split_at(40);
+            if old == from {
+                lines.push(format!("{to}{rest}"));
+            } else {
+                lines.push(format!("{old}{rest}"));
+            }
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
     }
 
     #[tokio::test]

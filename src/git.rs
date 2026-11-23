@@ -836,6 +836,24 @@ where
     }
 }
 
+/// Resolve one file path against an already-open repo: the tree walk
+/// without the per-call discovery. `None` where the path names no blob
+/// at this commit.
+pub fn resolve_file_at_commit_with_repo(
+    repo: &gix::Repository,
+    commit_sha: &str,
+    file_path: &str,
+) -> Result<Option<String>> {
+    let commit = resolve_to_commit(repo, commit_sha)?;
+    let tree = commit
+        .tree()
+        .map_err(|e| anyhow::anyhow!("Failed to get tree for commit '{commit_sha}': {e}"))?;
+    match tree.lookup_entry_by_path(Path::new(file_path)) {
+        Ok(Some(entry)) => Ok(Some(entry.object_id().to_string())),
+        Ok(None) | Err(_) => Ok(None),
+    }
+}
+
 /// Resolve multiple file paths to their git hashes at a specific commit
 pub fn resolve_files_at_commit<P: AsRef<Path>>(
     repo_path: P,

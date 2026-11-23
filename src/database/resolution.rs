@@ -435,6 +435,13 @@ pub struct RevisionPaths {
     inner: RwLock<Inner>,
     threshold: usize,
     valid: bool,
+    /// The git repo, opened once on first per-path need: a fresh
+    /// discover per lookup revalidates the pack index every time,
+    /// which stalls caller listings with thousands of rows. The
+    /// thread-safe handle is shared (it is `Sync`, unlike the plain
+    /// repository); each resolve takes a thread-local view of it.
+    /// Boxed: the handle is large and this struct rides in an `Arc`.
+    repo: RwLock<Option<Box<gix::ThreadSafeRepository>>>,
 }
 
 impl Default for RevisionPaths {
@@ -447,6 +454,7 @@ impl Default for RevisionPaths {
             inner: RwLock::new(Inner::default()),
             threshold: LAZY_THRESHOLD,
             valid: true,
+            repo: RwLock::new(None),
         }
     }
 }
@@ -462,6 +470,9 @@ impl Clone for RevisionPaths {
             inner: RwLock::new(inner),
             threshold: self.threshold,
             valid: self.valid,
+            // A clone reopens on need: it starts closed while the original
+            // keeps its handle.
+            repo: RwLock::new(None),
         }
     }
 }
@@ -482,6 +493,7 @@ impl RevisionPaths {
             }),
             threshold: LAZY_THRESHOLD,
             valid,
+            repo: RwLock::new(None),
         }
     }
 
@@ -502,7 +514,27 @@ impl RevisionPaths {
             inner: RwLock::new(Inner::default()),
             threshold: LAZY_THRESHOLD,
             valid,
+            repo: RwLock::new(None),
         }
+    }
+
+    /// The manifest's git handle, opened once: the read guard stays
+    /// alive in the caller across its resolve, so concurrent lookups
+    /// share the open repo and its loaded pack index. `None` where the
+    /// repo does not open, which callers resolve as a miss.
+    fn shared_repo(
+        &self,
+    ) -> Option<std::sync::RwLockReadGuard<'_, Option<Box<gix::ThreadSafeRepository>>>> {
+        if self.repo.read().unwrap().is_none() {
+            // Open without holding the lock; a lost race just wastes
+            // one open, and no worker ever blocks on discovery I/O.
+            if let Ok(fresh) = gix::ThreadSafeRepository::discover(&self.repo_path) {
+                *self.repo.write().unwrap() = Some(Box::new(fresh));
+            } else {
+                return None;
+            }
+        }
+        Some(self.repo.read().unwrap())
     }
 
     /// The content this path holds, or None when the revision does not have
@@ -566,14 +598,16 @@ impl RevisionPaths {
             }
             return None;
         }
-        // Per-path resolve.
-        let resolved = crate::git::resolve_files_at_commit(
-            &self.repo_path,
-            &self.git_sha,
-            &[path.to_string()],
-        )
-        .ok()
-        .and_then(|m| m.get(path).cloned());
+        // Per-path resolve through the shared handle: one discovery
+        // per manifest, not per row. A failed open resolves like the
+        // old whole-call failure: unresolvable, cached as a miss.
+        let resolved = self
+            .shared_repo()
+            .and_then(|guard| {
+                let owned = guard.as_deref()?.to_thread_local();
+                crate::git::resolve_file_at_commit_with_repo(&owned, &self.git_sha, path).ok()
+            })
+            .flatten();
         let mut inner = self.inner.write().unwrap();
         // If fallback was populated concurrently, prefer it.
         if let Some(fb) = &inner.fallback {

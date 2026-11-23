@@ -2052,6 +2052,13 @@ pub struct ViaSnapshot {
     /// run. Parsed once from workdir text where dirty and the committed
     /// blob otherwise.
     pub deadlines: std::cell::RefCell<std::collections::HashMap<String, Vec<(u32, u32)>>>,
+    /// The git repo, opened once per query on first blob need: every
+    /// committed-text read shares it instead of discovering per file.
+    /// Plain (not thread-safe) handle: blob reads are synchronous, so
+    /// it never crosses an await while borrowed. Boxed: a Repository
+    /// is large, and `ViaSnapshot` lives by value in every deep
+    /// recursion level, so the handle stays on the heap.
+    pub repo: std::cell::RefCell<Option<Box<gix::Repository>>>,
     /// The proof budget for this query: charged by every proof path
     /// through the methods below, tripped at the shared limit. Past
     /// the limit proofs end and drop their legs; the aggregation
@@ -2285,6 +2292,7 @@ pub async fn snapshot_for(db: &DatabaseManager, git_sha: &str) -> Result<ViaSnap
         summary_active: std::cell::RefCell::new(std::collections::HashSet::new()),
         arities: std::cell::RefCell::new(std::collections::HashMap::new()),
         deadlines: std::cell::RefCell::new(std::collections::HashMap::new()),
+        repo: std::cell::RefCell::new(None),
         budget: std::cell::RefCell::new(ViaBudget::default()),
     })
 }
@@ -2319,9 +2327,18 @@ fn row_in_snapshot(
 
 /// Blob text at the snapshot revision. `None` where the file is absent or
 /// unreadable there; the caller falls back to overlay rows.
-fn blob_text_at(repo_path: &str, commit_sha: &str, file_path: &str) -> Result<Option<String>> {
-    let repo = gix::discover(repo_path)?;
-    let commit = crate::git::resolve_to_commit(&repo, commit_sha)?;
+fn blob_text_at(
+    repo_path: &str,
+    commit_sha: &str,
+    file_path: &str,
+    repo_cache: &std::cell::RefCell<Option<Box<gix::Repository>>>,
+) -> Result<Option<String>> {
+    if repo_cache.borrow().is_none() {
+        *repo_cache.borrow_mut() = Some(Box::new(gix::discover(repo_path)?));
+    }
+    let repo = repo_cache.borrow();
+    let repo = repo.as_ref().expect("cached above");
+    let commit = crate::git::resolve_to_commit(repo, commit_sha)?;
     let tree = commit
         .tree()
         .map_err(|e| anyhow::anyhow!("tree for '{commit_sha}': {e}"))?;
@@ -2374,7 +2391,7 @@ pub async fn file_scopes(
         map
     } else if overlay_macros.is_empty() {
         snapshot.note_blob();
-        let map = blob_text_at(db.repo_path(), &snapshot.git_sha, file_path)?
+        let map = blob_text_at(db.repo_path(), &snapshot.git_sha, file_path, &snapshot.repo)?
             .map(|text| rescan_preprocessor(&text));
         snapshot
             .rescans
@@ -4567,7 +4584,7 @@ async fn site_binding_evaluates(
             .and_then(|path| std::fs::read_to_string(path).ok())
     } else {
         snapshot.note_blob();
-        blob_text_at(db.repo_path(), &snapshot.git_sha, site_file)?
+        blob_text_at(db.repo_path(), &snapshot.git_sha, site_file, &snapshot.repo)?
     };
     let Some(text) = text else {
         return Ok(true);
@@ -5945,7 +5962,9 @@ async fn enclosing_body_for(
         }
     } else {
         snapshot.note_blob();
-        if let Some(text) = blob_text_at(db.repo_path(), &snapshot.git_sha, site_file)? {
+        if let Some(text) =
+            blob_text_at(db.repo_path(), &snapshot.git_sha, site_file, &snapshot.repo)?
+        {
             out.push((text, 1));
         }
     }
@@ -6684,7 +6703,7 @@ pub fn call_arities(
         std::fs::read_to_string(std::path::Path::new(db.repo_path()).join(file)).ok()
     } else {
         snapshot.note_blob();
-        blob_text_at(db.repo_path(), &snapshot.git_sha, file).unwrap_or(None)
+        blob_text_at(db.repo_path(), &snapshot.git_sha, file, &snapshot.repo).unwrap_or(None)
     };
     if let Some(text) = text {
         let mut parser = tree_sitter::Parser::new();
@@ -6780,7 +6799,7 @@ pub fn site_is_live(db: &DatabaseManager, snapshot: &ViaSnapshot, file: &str, li
         std::fs::read_to_string(std::path::Path::new(db.repo_path()).join(file)).ok()
     } else {
         snapshot.note_blob();
-        blob_text_at(db.repo_path(), &snapshot.git_sha, file).unwrap_or(None)
+        blob_text_at(db.repo_path(), &snapshot.git_sha, file, &snapshot.repo).unwrap_or(None)
     };
     let dead = text
         .map(|text| rescan_preprocessor(&text).dead)
