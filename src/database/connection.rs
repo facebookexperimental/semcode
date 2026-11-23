@@ -9,8 +9,7 @@ use lancedb::connection::Connection;
 use lancedb::connection::LanceFileVersion;
 use lancedb::database::listing::ListingDatabaseOptions;
 use lancedb::index::scalar::FullTextSearchQuery;
-use lancedb::query::ExecutableQuery;
-use lancedb::query::QueryBase;
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
 use crate::database::branches::IndexedBranchStore;
 use crate::database::functions::FunctionStore;
@@ -5595,6 +5594,7 @@ impl DatabaseManager {
             let content_table = self.connection.open_table(&table_name).execute().await?;
             let content_results = content_table
                 .query()
+                .select(Select::columns(&["blake3_hash"]))
                 .only_if(&where_clause)
                 .execute()
                 .await?
