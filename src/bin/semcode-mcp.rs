@@ -1933,6 +1933,7 @@ async fn mcp_show_all_commits(
 /// Hop three of the MCP reverse display: macro edges recurse with the
 /// extended via chain, function edges show ordinary callers carrying the
 /// chain they arrived on. Present at `--up=3`, absent at `--up=2`.
+#[allow(clippy::too_many_arguments)]
 async fn mcp_third_level(
     db: &DatabaseManager,
     git_sha: &str,
@@ -1941,10 +1942,11 @@ async fn mcp_third_level(
     chain_context: Context,
     calls_limit: usize,
     buffer: &mut Vec<u8>,
+    snapshot: &semcode::ViaSnapshot,
 ) {
     use std::io::Write;
     if let Ok((is_macro, edges)) =
-        semcode::callchain::caller_level_edges(db, git_sha, second_name, via_chain, chain_context)
+        semcode::callchain::caller_level_edges(db, snapshot, second_name, via_chain, chain_context)
             .await
     {
         if is_macro {
@@ -1956,6 +1958,13 @@ async fn mcp_third_level(
             }
             return;
         }
+    }
+    // A spent budget leaves the names below unproven, and the raw
+    // fallback below would list them with the inherited via chain, so
+    // it runs only where the budget still has room. The loop-level
+    // marker reports the cut once for the whole level.
+    if snapshot.exhausted() {
+        return;
     }
     if let Ok(third) = db
         .get_function_callers_in(second_name, git_sha, chain_context)
@@ -2135,11 +2144,15 @@ async fn mcp_show_callchain_with_limits(
             // One batched pass for the whole level: macro callers expand
             // through their admitted second level below.
             let caller_names: Vec<String> = limited_callers.clone();
-            let (macro_levels, _) =
+            let (macro_levels, second_truncated) =
                 semcode::callchain::macro_second_levels(db, git_sha, &caller_names, chain_context)
                     .await
                     .unwrap_or_default();
 
+            // One snapshot for the whole third level below: its budget
+            // is shared across every edge, so per-edge budgets cannot
+            // re-arm the limit and hot callers trip it.
+            let third_snapshot = semcode::snapshot_for(db, git_sha).await?;
             for (i, caller) in limited_callers.iter().enumerate() {
                 writeln!(buffer, "{}. {}", i + 1, caller)?;
 
@@ -2180,6 +2193,7 @@ async fn mcp_show_callchain_with_limits(
                                     chain_context,
                                     calls_limit,
                                     &mut buffer,
+                                    &third_snapshot,
                                 )
                                 .await;
                             }
@@ -2187,10 +2201,15 @@ async fn mcp_show_callchain_with_limits(
                         if shown.len() > 3 {
                             writeln!(buffer, "      └─ ... and {} more", shown.len() - 3)?;
                         }
-                    } else if let Ok(second_level_callers) = db
-                        .get_function_callers_in(caller, git_sha, chain_context)
-                        .await
-                    {
+                    } else if let Ok(second_level_callers) = if second_truncated {
+                        // A spent budget leaves the names below unproven, so no
+                        // raw edges render. The loop marker after the loop
+                        // reports the cut once.
+                        Ok(Vec::new())
+                    } else {
+                        db.get_function_callers_in(caller, git_sha, chain_context)
+                            .await
+                    } {
                         let limited_second: Vec<_> = if calls_limit == 0 {
                             second_level_callers
                         } else {
@@ -2213,6 +2232,7 @@ async fn mcp_show_callchain_with_limits(
                                     chain_context,
                                     calls_limit,
                                     &mut buffer,
+                                    &third_snapshot,
                                 )
                                 .await;
                             }
@@ -2222,6 +2242,18 @@ async fn mcp_show_callchain_with_limits(
                         }
                     }
                 }
+            }
+            // One marker for the whole second level: where the budget
+            // trips, edges drop and every name stays unproven, which the
+            // raw fallback above then skips.
+            if second_truncated {
+                let _ = writeln!(buffer, "      └─ {}", semcode::TRUNCATED_WORK_MARKER);
+            }
+            // One marker for the whole third level, however the cut
+            // landed (see the CLI twin): a trip inside the macro branch
+            // returns before any per-call marker could render.
+            if third_snapshot.exhausted() {
+                let _ = writeln!(buffer, "        └─ {}", semcode::TRUNCATED_WORK_MARKER);
             }
 
             if calls_limit > 0 && callers.len() > calls_limit {
@@ -2321,9 +2353,13 @@ async fn mcp_show_callchain_with_limits(
                                     )?;
                                 }
                                 let more = total.saturating_sub(legs.len());
-                                if truncated && more > 0 {
+                                // A trip shortens the total itself: the
+                                // count is a lower bound, so it prints
+                                // with its marker, never alone.
+                                if more > 0 {
                                     writeln!(buffer, "        └─ ... and {more} more")?;
-                                } else if truncated {
+                                }
+                                if truncated {
                                     writeln!(
                                         buffer,
                                         "        └─ ... (forward legs truncated by work limit)"
@@ -2354,9 +2390,11 @@ async fn mcp_show_callchain_with_limits(
                         )?;
                     }
                     let more = total.saturating_sub(legs.len());
-                    if truncated && more > 0 {
+                    // As above: the count is a lower bound under a cut.
+                    if more > 0 {
                         writeln!(buffer, "      └─ ... and {more} more")?;
-                    } else if truncated {
+                    }
+                    if truncated {
                         writeln!(
                             buffer,
                             "      └─ ... (forward legs truncated by work limit)"

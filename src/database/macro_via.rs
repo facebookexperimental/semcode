@@ -1503,6 +1503,19 @@ pub fn scope_at_file(map: &PreprocMap, file: &str, name: &str, line: u32) -> Opt
 mod scope_tests {
     use super::*;
 
+    #[test]
+    fn work_budget_trips_at_limit() {
+        let snapshot = ViaSnapshot::default();
+        for _ in 0..WORK_LIMIT_CLASSIFIED - 1 {
+            assert!(!snapshot.charge_work());
+        }
+        assert!(!snapshot.exhausted());
+        assert!(snapshot.charge_work());
+        assert!(snapshot.exhausted());
+        assert!(snapshot.tripped_since(WORK_LIMIT_CLASSIFIED - 1));
+        assert!(!snapshot.tripped_since(WORK_LIMIT_CLASSIFIED));
+    }
+
     fn husk(name: &str) -> ViaNode {
         ViaNode {
             hop: ViaHop {
@@ -1998,6 +2011,7 @@ pub const TRUNCATED_DEPTH_MARKER: &str =
 /// cannot change what the hops below see. Cache identity comes from the
 /// manifest revision plus the workdir command generation inside the
 /// memoized lookups; the snapshot's own guarantee is single resolution.
+#[derive(Default)]
 pub struct ViaSnapshot {
     pub git_sha: String,
     pub manifest: std::sync::Arc<crate::database::resolution::RevisionPaths>,
@@ -2038,6 +2052,90 @@ pub struct ViaSnapshot {
     /// run. Parsed once from workdir text where dirty and the committed
     /// blob otherwise.
     pub deadlines: std::cell::RefCell<std::collections::HashMap<String, Vec<(u32, u32)>>>,
+    /// The proof budget for this query: charged by every proof path
+    /// through the methods below, tripped at the shared limit. Past
+    /// the limit proofs end and drop their legs; the aggregation
+    /// points mark the results truncated.
+    pub budget: std::cell::RefCell<ViaBudget>,
+}
+
+impl ViaSnapshot {
+    /// Charge one unit of proof work: true when the shared limit
+    /// trips. Loops break on true; aggregation points OR exhaustion
+    /// into their truncated flags, so counts stay lower bounds.
+    pub fn charge_work(&self) -> bool {
+        let mut budget = self.budget.borrow_mut();
+        budget.classified += 1;
+        budget.classified >= WORK_LIMIT_CLASSIFIED
+    }
+
+    /// Charge bulk-admitted work (a classified chunk and its rows):
+    /// true when the shared limit trips.
+    pub fn charge_many(&self, n: usize) -> bool {
+        let mut budget = self.budget.borrow_mut();
+        budget.classified += n;
+        budget.classified >= WORK_LIMIT_CLASSIFIED
+    }
+
+    /// Whether the shared limit already tripped: aggregation points
+    /// OR this into their truncated flags even where the trip fired
+    /// in an earlier phase, since later phases then run partial.
+    pub fn exhausted(&self) -> bool {
+        self.budget.borrow().classified >= WORK_LIMIT_CLASSIFIED
+    }
+
+    /// Whether this call tripped the limit: true when exhausted now
+    /// but the budget still had room on entry. Third-level displays
+    /// render the work marker exactly once through it, however many
+    /// edges follow.
+    pub fn tripped_since(&self, was: usize) -> bool {
+        self.exhausted() && was < WORK_LIMIT_CLASSIFIED
+    }
+
+    /// One dispatch-site read, for sizing: no trip semantics.
+    pub fn note_dispatch(&self) {
+        self.budget.borrow_mut().dispatch_calls += 1;
+    }
+
+    /// One committed-blob open, for sizing: no trip semantics.
+    pub fn note_blob(&self) {
+        self.budget.borrow_mut().blob_opens += 1;
+    }
+
+    /// One named-hop descent, for sizing: no trip semantics. Paired
+    /// with `leave_hop` below: the hop cap bounds depth, not work.
+    pub fn note_hop(&self) {
+        self.budget.borrow_mut().named_hops += 1;
+    }
+
+    /// Ascend one named hop on the way out: no trip semantics.
+    pub fn leave_hop(&self) {
+        self.budget.borrow_mut().named_hops -= 1;
+    }
+
+    /// Current named-hop depth, for the nesting backstop.
+    pub fn hop_depth(&self) -> usize {
+        self.budget.borrow().named_hops
+    }
+
+    /// Work charged so far, for trip-transition checks.
+    pub fn classified(&self) -> usize {
+        self.budget.borrow().classified
+    }
+
+    /// Counter readout for sizing work: prints to stderr when
+    /// SEMCODE_VIA_STATS is set, silent otherwise. `rescans` is the
+    /// snapshot's rescan-cache size (no increments needed — the map
+    /// only grows on misses).
+    pub fn dump_stats(&self, label: &str, rescans: usize) {
+        if std::env::var("SEMCODE_VIA_STATS").is_ok() {
+            let budget = self.budget.borrow();
+            eprintln!(
+                "via-stats {label}: classified={} named_hops={} dispatch_calls={} blob_opens={} rescans={}",
+                budget.classified, budget.named_hops, budget.dispatch_calls, budget.blob_opens, rescans,
+            );
+        }
+    }
 }
 
 /// One call's arity: the callee, its 1-based line, how many actuals it
@@ -2187,6 +2285,7 @@ pub async fn snapshot_for(db: &DatabaseManager, git_sha: &str) -> Result<ViaSnap
         summary_active: std::cell::RefCell::new(std::collections::HashSet::new()),
         arities: std::cell::RefCell::new(std::collections::HashMap::new()),
         deadlines: std::cell::RefCell::new(std::collections::HashMap::new()),
+        budget: std::cell::RefCell::new(ViaBudget::default()),
     })
 }
 
@@ -2274,6 +2373,7 @@ pub async fn file_scopes(
             .insert(file_path.to_string(), map.clone());
         map
     } else if overlay_macros.is_empty() {
+        snapshot.note_blob();
         let map = blob_text_at(db.repo_path(), &snapshot.git_sha, file_path)?
             .map(|text| rescan_preprocessor(&text));
         snapshot
@@ -2305,6 +2405,11 @@ pub async fn scope_at_site(
     name: &str,
     line: u32,
 ) -> Result<Option<ActiveScope>> {
+    // Budget spent: no scope to admit the callers with, so the edge
+    // drops and the aggregation points mark it.
+    if snapshot.charge_work() {
+        return Ok(None);
+    }
     let scopes = file_scopes(db, snapshot, file_path).await?;
     if let Some(map) = scopes.map.as_ref() {
         if let Some(scope) = scope_at_file(map, file_path, name, line) {
@@ -2455,8 +2560,15 @@ pub fn prune_husk_nodes(nodes: &mut Vec<ViaNode>) {
 pub struct ViaBudget {
     pub classified: usize,
     pub named_hops: usize,
+    /// Observability counters (no trip semantics): per-op volumes that
+    /// size future batching work. Read by tests and the stats dump;
+    /// only `classified` trips.
+    pub dispatch_calls: usize,
+    pub blob_opens: usize,
 }
 
+/// Query-scoped proof accounting: every proof path holds the snapshot,
+/// which holds the budget, so no signature takes a budget parameter.
 /// Classify one frontier in a single batched read: metadata for every name,
 /// bodies bulk-fetched only for empty-return-type rows. Returns the macro
 /// rows (manifest- or overlay-filtered) keyed by name, and whether the work
@@ -2465,7 +2577,6 @@ pub async fn classify_frontier(
     db: &DatabaseManager,
     snapshot: &ViaSnapshot,
     names: &[String],
-    budget: &mut ViaBudget,
 ) -> Result<(
     std::collections::HashMap<String, Vec<crate::types::FunctionInfo>>,
     bool,
@@ -2481,19 +2592,18 @@ pub async fn classify_frontier(
     let mut truncated = false;
     let mut todo: Vec<String> = Vec::new();
     for chunk in sorted.chunks(100) {
-        if budget.classified >= WORK_LIMIT_CLASSIFIED {
+        if snapshot.exhausted() {
             truncated = true;
             break;
         }
-        budget.classified += chunk.len();
+        snapshot.charge_many(chunk.len());
         todo.extend(chunk.iter().cloned());
     }
     for chunk in todo.chunks(100) {
         let rows = db.macro_candidates(chunk).await?;
         // Fetched rows charge too: the name count above admits the chunks,
         // the row count pays for what they return.
-        budget.classified += rows.len();
-        if budget.classified >= WORK_LIMIT_CLASSIFIED {
+        if snapshot.charge_many(rows.len()) {
             truncated = true;
             break;
         }
@@ -2592,7 +2702,6 @@ pub async fn reverse_body_layer(
     snapshot: &ViaSnapshot,
     target: &str,
     walk_context: crate::domain::Context,
-    budget: &mut ViaBudget,
 ) -> Result<Vec<ViaNode>> {
     let mut pairs: Vec<(String, String)> = db
         .get_function_callers_with_manifest(target, &snapshot.manifest)
@@ -2606,9 +2715,9 @@ pub async fn reverse_body_layer(
         return Ok(Vec::new());
     }
     let names: Vec<String> = pairs.iter().map(|(name, _)| name.clone()).collect();
-    let (macros, truncated) = classify_frontier(db, snapshot, &names, budget).await?;
+    let (macros, truncated) = classify_frontier(db, snapshot, &names).await?;
     let mut nodes: Vec<ViaNode> = Vec::new();
-    for (macro_name, rows) in &macros {
+    'outer: for (macro_name, rows) in &macros {
         // One node per file: same-file arms merge with unioned guards
         // (different configurations of one macro); different files stay
         // separate builds (another arch's macro sharing a spelling).
@@ -2642,6 +2751,12 @@ pub async fn reverse_body_layer(
             own.dedup();
             let mut callers: Vec<(String, String)> = Vec::new();
             for (caller, caller_file) in &own {
+                // Each caller costs two proofs below; a trip drops the
+                // rest of this macro's callers, and reverse_closure
+                // marks through the shared budget below.
+                if snapshot.charge_work() {
+                    break 'outer;
+                }
                 // A caller whose own file defines the name binds that
                 // definition, never this file's: it belongs under its own
                 // file's node, if any.
@@ -2758,8 +2873,9 @@ async fn resolved_live_rows(
     file: &str,
     line: u32,
     callee: &str,
-) -> Result<Vec<crate::types::FunctionInfo>> {
-    let (rows, scope_name) = alias_macro_rows(db, snapshot, pin, file, line, callee).await?;
+) -> Result<(Vec<crate::types::FunctionInfo>, bool)> {
+    let was = snapshot.classified();
+    let (rows, scope_name, cut) = alias_macro_rows(db, snapshot, pin, file, line, callee).await?;
     let mut out = Vec::new();
     if let Some(scope) = scope_at_site(db, snapshot, file, &scope_name, line).await? {
         for row in &rows {
@@ -2772,7 +2888,9 @@ async fn resolved_live_rows(
     }
     out.sort_by(|a, b| (&a.file_path, a.line_start).cmp(&(&b.file_path, b.line_start)));
     out.dedup_by(|a, b| a.file_path == b.file_path && a.line_start == b.line_start);
-    Ok(out)
+    // A cut in the scope lookup empties the same way: report it, or two
+    // empties read as agreement below.
+    Ok((out, cut || snapshot.tripped_since(was)))
 }
 
 fn row_key(row: &crate::types::FunctionInfo) -> (String, u32) {
@@ -2796,6 +2914,11 @@ async fn macro_expands_at_site(
     depth: u32,
     visited: &mut std::collections::HashSet<(String, u32)>,
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if snapshot.exhausted() {
+        return Ok(false);
+    }
     if depth == 0 {
         return Ok(true);
     }
@@ -2804,18 +2927,45 @@ async fn macro_expands_at_site(
         return Ok(true);
     }
     let mut transfers = true;
-    for (_, callee, _) in executing_calls(db, snapshot, row, pin).await? {
+    let calls = executing_calls(db, snapshot, row, pin).await?;
+    if snapshot.exhausted() {
+        // Partial inventory: the omitted nested calls may disprove
+        // transfer, so the check below would agree on survivors only.
+        // Budget spent: this leg claims nothing; aggregation points
+        // mark the truncation.
+        visited.remove(&key);
+        return Ok(false);
+    }
+    for (_, callee, _) in calls {
         if callee == row.name {
             continue;
         }
-        let defined =
+        let (defined, defined_cut) =
             resolved_live_rows(db, snapshot, pin, &row.file_path, row.line_start, &callee).await?;
-        let used = resolved_live_rows(db, snapshot, pin, site_file, site_line, &callee).await?;
+        let (used, used_cut) =
+            resolved_live_rows(db, snapshot, pin, site_file, site_line, &callee).await?;
+        // A trip on either side breaks the agreement: the child drops.
+        if defined_cut || used_cut {
+            transfers = false;
+            break;
+        }
         let defined_keys: Vec<(String, u32)> = defined.iter().map(row_key).collect();
         let used_keys: Vec<(String, u32)> = used.iter().map(row_key).collect();
         if defined_keys != used_keys {
             transfers = false;
             break;
+        }
+        if defined_keys.is_empty() {
+            // No resolution on either side: an ordinary callee (no
+            // macro rows anywhere) transfers vacuously, but a macro
+            // callee that resolves nowhere proves nothing — cut, or
+            // dead at both ends — so the child drops and the
+            // aggregation points mark it.
+            let has_rows = !macro_rows_for(db, snapshot, &callee).await?.is_empty();
+            if has_rows {
+                transfers = false;
+                break;
+            }
         }
         for nested in &defined {
             if !Box::pin(macro_expands_at_site(
@@ -2860,10 +3010,14 @@ pub async fn stored_child_expands(
 ) -> Result<bool> {
     let sites = macro_use_sites(db, snapshot, parent).await?;
     if sites.is_empty() {
-        return Ok(true);
+        // No sites is no evidence, so the child stands — unless the
+        // budget is exhausted, when the emptiness is never trustworthy
+        // (some collection loop broke). Budget spent: the child drops
+        // instead, and aggregation points mark the truncation.
+        return Ok(!snapshot.exhausted());
     }
     for (site_file, site_line) in &sites {
-        let (rows, _) =
+        let (rows, _, _cut) =
             alias_macro_rows(db, snapshot, pin, site_file, *site_line, child_name).await?;
         for row in &rows {
             if !admit_definition(row, &rows, site_file, pin) {
@@ -2920,7 +3074,16 @@ pub async fn macro_use_sites(
     pairs.sort();
     pairs.dedup();
     for (caller, file) in &pairs {
+        if snapshot.charge_work() {
+            break;
+        }
+        snapshot.note_dispatch();
         for site in db.dispatch_sites_for_caller(caller).await? {
+            // Each scanned row costs a snapshot check below: a cut
+            // stops the scan, and the live pass runs on the prefix.
+            if snapshot.charge_work() {
+                break;
+            }
             if site.caller_name != *caller || site.file_path != *file {
                 continue;
             }
@@ -2944,6 +3107,9 @@ pub async fn macro_use_sites(
     // live at the site, and the site itself running.
     let mut live_sites = Vec::new();
     for (file, line) in sites {
+        if snapshot.charge_work() {
+            break;
+        }
         let live = scope_at_site(db, snapshot, &file, &m.name, line)
             .await?
             .is_some_and(|scope| scope.defines_at(&m.file_path, m.line_start));
@@ -2985,13 +3151,18 @@ async fn named_chain_expands(
     macro_name: &str,
     chain: &[EnclosingHop],
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if snapshot.exhausted() {
+        return Ok(false);
+    }
     let mut visited = std::collections::HashSet::new();
     for (outer, slot, actuals) in chain {
         if outer.is_empty() {
             // Ordinary functions evaluate every argument they receive.
             continue;
         }
-        let (rows, scope_name) =
+        let (rows, scope_name, _cut) =
             alias_macro_rows(db, snapshot, pin, site_file, site_line, outer).await?;
         if rows.is_empty() {
             continue;
@@ -3083,6 +3254,12 @@ pub async fn named_edge_expands(
     macro_name: &str,
 ) -> Result<bool> {
     let mut lines: Vec<u32> = Vec::new();
+    snapshot.note_dispatch();
+    // One charge for the dispatch read above: a trip before any proof
+    // claims nothing.
+    if snapshot.charge_work() {
+        return Ok(false);
+    }
     for site in db.dispatch_sites_for_caller(caller_fn).await? {
         if site.caller_name != caller_fn || site.file_path != site_file {
             continue;
@@ -3129,6 +3306,11 @@ pub async fn named_edge_expands(
         }
     }
     for site_line in lines {
+        // Each line's proofs (body walk, slot chains) cost real work:
+        // a spent budget ends the lines left.
+        if snapshot.charge_work() {
+            return Ok(false);
+        }
         if !site_is_live(db, snapshot, site_file, site_line) {
             continue;
         }
@@ -3176,7 +3358,13 @@ async fn caller_call_live(
     macro_name: &str,
 ) -> Result<bool> {
     let mut sites = 0u32;
+    snapshot.note_dispatch();
     for site in db.dispatch_sites_for_caller(caller_name).await? {
+        // Budget spent: the caller drops, and aggregation points mark
+        // the truncation.
+        if snapshot.charge_work() {
+            return Ok(false);
+        }
         if site.caller_name != caller_name {
             continue;
         }
@@ -3239,6 +3427,11 @@ pub async fn second_level_edges(
     }
     let mut edges: Vec<CallerEdge> = Vec::new();
     for (caller, file) in &pairs {
+        // Each caller costs up to three proofs below; a trip drops the
+        // rest, and the aggregation points mark it.
+        if snapshot.charge_work() {
+            break;
+        }
         // A caller whose own file defines the name binds that definition,
         // never this file's.
         if file != macro_file && file_defines_macro(db, snapshot, file, macro_name).await? {
@@ -3419,10 +3612,9 @@ pub async fn macro_rows_for(
         return Ok(cached.clone());
     }
     let mut rows: Vec<crate::types::FunctionInfo> = Vec::new();
-    for row in db
-        .find_all_functions_git_aware(name, &snapshot.git_sha)
-        .await?
-    {
+    // Boxed: the LanceDB planning subtree would otherwise live
+    // inline in every ancestor future on the query thread's stack.
+    for row in Box::pin(db.find_all_functions_git_aware(name, &snapshot.git_sha)).await? {
         if !row_in_snapshot(snapshot, &row.file_path, &row.git_file_hash, false) {
             continue;
         }
@@ -3477,22 +3669,33 @@ async fn alias_macro_rows(
     site_file: &str,
     site_line: u32,
     name: &str,
-) -> Result<(Vec<crate::types::FunctionInfo>, String)> {
+) -> Result<(Vec<crate::types::FunctionInfo>, String, bool)> {
+    let was = snapshot.classified();
     let mut seen = vec![name.to_string()];
     let mut current = name.to_string();
+    // The boolean is a cut flag, not a third row state: a trip empties
+    // resolutions, and empty must not pass as ordinary below. Callers
+    // drop on a trip; genuine emptiness retains its longstanding
+    // meaning.
     loop {
+        // Each hop fires its own queries: a trip resolves nothing
+        // further, and the empty rows read as not-a-macro below.
+        if snapshot.charge_work() {
+            return Ok((Vec::new(), current, true));
+        }
         let rows = macro_rows_for(db, snapshot, &current).await?;
         if !rows.is_empty() {
-            return Ok((rows, current));
+            return Ok((rows, current, snapshot.tripped_since(was)));
         }
         if seen.len() > 8 {
-            return Ok((Vec::new(), current));
+            return Ok((Vec::new(), current, snapshot.tripped_since(was)));
         }
         // Object-like rows for this name, committed and overlay alike.
+        // Boxed with the leaf above: the planning subtree would
+        // otherwise live inline in the ancestor futures.
         let mut objects: Vec<crate::types::FunctionInfo> = Vec::new();
-        if let Ok(candidates) = db
-            .find_all_functions_git_aware(&current, &snapshot.git_sha)
-            .await
+        if let Ok(candidates) =
+            Box::pin(db.find_all_functions_git_aware(&current, &snapshot.git_sha)).await
         {
             objects.extend(candidates.into_iter().filter(|row| {
                 row_in_snapshot(snapshot, &row.file_path, &row.git_file_hash, false)
@@ -3587,7 +3790,7 @@ async fn alias_macro_rows(
             }
         }
         if !advanced {
-            return Ok((Vec::new(), current));
+            return Ok((Vec::new(), current, snapshot.tripped_since(was)));
         }
     }
 }
@@ -3662,6 +3865,11 @@ async fn mark_executing_call(
     evaluated: &mut std::collections::HashSet<String>,
     proof_visited: &mut std::collections::HashSet<String>,
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if ctx.snapshot.exhausted() {
+        return Ok(false);
+    }
     let mut grown = false;
     // A parameter in callee position of a running call is invoked: the
     // call runs, so the value runs.
@@ -4026,10 +4234,15 @@ async fn slot_evaluates(
     called: &std::collections::HashSet<String>,
     proof_visited: &mut std::collections::HashSet<String>,
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if ctx.snapshot.exhausted() {
+        return Ok(false);
+    }
     if m.parameters.iter().any(|p| p.name == callee) {
         return Ok(called.contains(callee));
     }
-    let (rows, scope_name) = alias_macro_rows(
+    let (rows, scope_name, cut) = alias_macro_rows(
         ctx.db,
         ctx.snapshot,
         ctx.pin,
@@ -4041,7 +4254,11 @@ async fn slot_evaluates(
     if rows.is_empty() {
         // An ordinary function (or an unknown name): C evaluates every
         // argument before the call. A pointer call (`callee == ""`) lands
-        // here too: its arguments evaluate when it runs.
+        // here too: its arguments evaluate when it runs. But where a
+        // trip produced the emptiness, the slot drops.
+        if cut {
+            return Ok(false);
+        }
         return Ok(true);
     }
     for row in &rows {
@@ -4108,10 +4325,15 @@ async fn bundle_invokes(
     arg: usize,
     proof_visited: &mut std::collections::HashSet<String>,
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if ctx.snapshot.exhausted() {
+        return Ok(false);
+    }
     if callee.is_empty() || m.parameters.iter().any(|p| p.name == callee) {
         return Ok(false);
     }
-    let (rows, scope_name) = alias_macro_rows(
+    let (rows, scope_name, _cut) = alias_macro_rows(
         ctx.db,
         ctx.snapshot,
         ctx.pin,
@@ -4186,7 +4408,12 @@ async fn macro_slot_invoked(
     arg: usize,
     proof_visited: &mut std::collections::HashSet<String>,
 ) -> Result<bool> {
-    let (rows, scope_name) = alias_macro_rows(
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if ctx.snapshot.exhausted() {
+        return Ok(false);
+    }
+    let (rows, scope_name, _cut) = alias_macro_rows(
         ctx.db,
         ctx.snapshot,
         ctx.pin,
@@ -4339,6 +4566,7 @@ async fn site_binding_evaluates(
             .to_str()
             .and_then(|path| std::fs::read_to_string(path).ok())
     } else {
+        snapshot.note_blob();
         blob_text_at(db.repo_path(), &snapshot.git_sha, site_file)?
     };
     let Some(text) = text else {
@@ -4452,9 +4680,14 @@ async fn site_binding_evaluates(
         if m.parameters.iter().any(|p| p.name == bound) {
             return Ok(true);
         }
-        let (rows, scope_name) =
+        let (rows, scope_name, cut) =
             alias_macro_rows(db, snapshot, pin, site_file, site_line, &bound).await?;
         if rows.is_empty() {
+            // An ordinary binding evaluates everything — unless a cut
+            // produced the emptiness, which proves no evaluation.
+            if cut {
+                return Ok(false);
+            }
             return Ok(true);
         }
         for row in &rows {
@@ -4495,9 +4728,13 @@ async fn site_binding_evaluates(
     // (`w <- DROP` kills the slot; unresolvable keeps).
     if no_bounds {
         if let Some(bound) = resolve_subst(db, snapshot, subst, &m.name, param).await? {
-            let (rows, scope_name) =
+            let (rows, scope_name, cut) =
                 alias_macro_rows(db, snapshot, pin, site_file, site_line, &bound).await?;
             if rows.is_empty() {
+                // As above: unresolvable keeps, a trip drops.
+                if cut {
+                    return Ok(false);
+                }
                 return Ok(true);
             }
             for row in &rows {
@@ -4699,6 +4936,11 @@ pub async fn call_executes_at_site(
     subst: &SubstMap,
     visited: &mut std::collections::HashSet<(String, String)>,
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if snapshot.exhausted() {
+        return Ok(false);
+    }
     let mut proof_visited = std::collections::HashSet::new();
     let summary = summarize_macro(db, snapshot, m, pin, &mut proof_visited).await?;
     let mut idx = tree_idx;
@@ -4770,11 +5012,15 @@ pub async fn call_executes_at_site(
             idx = parent;
             continue;
         }
-        let (rows, scope_name) =
+        let (rows, scope_name, cut) =
             alias_macro_rows(db, snapshot, pin, site_file, site_line, callee).await?;
         if callee.is_empty() || rows.is_empty() {
             // Ordinary functions and pointer calls evaluate every
-            // argument they receive.
+            // argument they receive — unless a trip produced the
+            // emptiness, which climbs past an unproven level.
+            if !callee.is_empty() && cut {
+                return Ok(false);
+            }
             idx = parent;
             continue;
         }
@@ -4841,6 +5087,13 @@ pub async fn summarize_macro(
     if let Some(cached) = snapshot.summaries.borrow().get(&key) {
         return Ok(cached.clone());
     }
+    // Budget spent: this summary stays empty and uncached, so later
+    // sites re-prove (fast, through the entry checks above) instead
+    // of reusing a tripped proof.
+    if snapshot.exhausted() {
+        return Ok(MacroSummary::default());
+    }
+    let summarize_was = snapshot.classified();
     // A cycle proves nothing: a definition already under proof above
     // summarizes empty rather than recursing forever. The empty answer is
     // partial by construction, so it poisons the shared set against
@@ -4881,7 +5134,9 @@ pub async fn summarize_macro(
     // answer is whole under its key no matter how deep the frame. A
     // poisoned computation may still be *right*, but caching it would
     // starve later full proofs, so it stays uncached.
-    if !proof_visited.contains(CYCLE_POISON) {
+    // A fixpoint that trips mid-run converges short: its partial answer
+    // must not poison the cache for later sites, which re-prove instead.
+    if !proof_visited.contains(CYCLE_POISON) && !snapshot.tripped_since(summarize_was) {
         snapshot.summaries.borrow_mut().insert(key, summary.clone());
     }
     Ok(summary)
@@ -4971,6 +5226,11 @@ async fn invoked_params(
     m: &crate::types::FunctionInfo,
     pin: crate::domain::Context,
 ) -> Result<Vec<(String, u32)>> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if snapshot.exhausted() {
+        return Ok(Vec::new());
+    }
     let mut proof_visited = std::collections::HashSet::new();
     invoked_params_inner(db, snapshot, m, pin, &mut proof_visited).await
 }
@@ -5511,6 +5771,11 @@ async fn site_executes(
     enclosing: &str,
     target: &str,
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if snapshot.exhausted() {
+        return Ok(false);
+    }
     for (body, body_start) in
         enclosing_body_for(db, snapshot, site_file, site_line, enclosing).await?
     {
@@ -5531,8 +5796,13 @@ async fn site_executes(
                 // A call through a pointer value evaluates its arguments.
                 continue;
             }
-            let (rows, scope_name) =
+            let (rows, scope_name, cut) =
                 alias_macro_rows(db, snapshot, pin, site_file, site_line, outer).await?;
+            // A tripped outer drops the site; an ordinary outer with no
+            // rows even whole skips below.
+            if cut {
+                return Ok(false);
+            }
             if rows.is_empty() {
                 continue;
             }
@@ -5673,8 +5943,11 @@ async fn enclosing_body_for(
         if let Ok(text) = std::fs::read_to_string(&path) {
             out.push((text, 1));
         }
-    } else if let Some(text) = blob_text_at(db.repo_path(), &snapshot.git_sha, site_file)? {
-        out.push((text, 1));
+    } else {
+        snapshot.note_blob();
+        if let Some(text) = blob_text_at(db.repo_path(), &snapshot.git_sha, site_file)? {
+            out.push((text, 1));
+        }
     }
     Ok(out)
 }
@@ -5816,7 +6089,7 @@ async fn param_invoked_proof(
             if actual.as_deref() != Some(param) && !marker {
                 continue;
             }
-            let (rows, scope_name) =
+            let (rows, scope_name, _cut) =
                 alias_macro_rows(db, snapshot, pin, site_file, site_line, callee).await?;
             // The handing call itself must execute at this site: a handover
             // nested in a slot the site's definitions drop hands nothing.
@@ -5943,6 +6216,11 @@ async fn evaluated_proof(
     pack: PackState,
     visited: &mut std::collections::HashSet<(String, String)>,
 ) -> Result<bool> {
+    // Budget spent: this leg claims nothing; aggregation points
+    // mark the truncation.
+    if snapshot.exhausted() {
+        return Ok(false);
+    }
     let is_bundle = param == "...";
     let mut proof_visited = std::collections::HashSet::new();
     let summary = summarize_macro(db, snapshot, m, pin, &mut proof_visited).await?;
@@ -6080,7 +6358,7 @@ async fn evaluated_proof(
                             // row exists; a callee with rows uses them
                             // directly. Bare function calls still pay the
                             // walk (measured costless on the printk gate).
-                            let (rows, scope_name) = if macro_rows_for(db, snapshot, callee)
+                            let (rows, scope_name, cut) = if macro_rows_for(db, snapshot, callee)
                                 .await?
                                 .is_empty()
                             {
@@ -6090,13 +6368,18 @@ async fn evaluated_proof(
                                 (
                                     macro_rows_for(db, snapshot, callee).await?,
                                     callee.to_string(),
+                                    false,
                                 )
                             };
                             if rows.is_empty() {
                                 // No function-like rows and no object alias
                                 // behind the name: an ordinary call. An
                                 // object alias still expands, so it never
-                                // takes this arm.
+                                // takes this arm. Where the proof tripped,
+                                // the parameter drops.
+                                if cut {
+                                    return Ok(false);
+                                }
                                 return Ok(true);
                             }
                             if bound.is_none() && m.parameters.iter().any(|p| p.name == callee) {
@@ -6193,7 +6476,7 @@ async fn evaluated_proof(
             if actual.as_deref() != Some(param) && !marker {
                 continue;
             }
-            let (rows, scope_name) =
+            let (rows, scope_name, _cut) =
                 alias_macro_rows(db, snapshot, pin, site_file, site_line, callee).await?;
             if !call_executes_at_site(
                 db, snapshot, pin, m, index, site_file, site_line, site_index, pack.width, subst,
@@ -6400,6 +6683,7 @@ pub fn call_arities(
     let text = if snapshot.dirty.contains(file) {
         std::fs::read_to_string(std::path::Path::new(db.repo_path()).join(file)).ok()
     } else {
+        snapshot.note_blob();
         blob_text_at(db.repo_path(), &snapshot.git_sha, file).unwrap_or(None)
     };
     if let Some(text) = text {
@@ -6495,6 +6779,7 @@ pub fn site_is_live(db: &DatabaseManager, snapshot: &ViaSnapshot, file: &str, li
     let text = if snapshot.dirty.contains(file) {
         std::fs::read_to_string(std::path::Path::new(db.repo_path()).join(file)).ok()
     } else {
+        snapshot.note_blob();
         blob_text_at(db.repo_path(), &snapshot.git_sha, file).unwrap_or(None)
     };
     let dead = text
@@ -6552,7 +6837,6 @@ pub async fn reverse_handover_legs(
     snapshot: &ViaSnapshot,
     target: &str,
     walk_context: crate::domain::Context,
-    budget: &mut ViaBudget,
 ) -> Result<(Vec<HandoverLeg>, bool, bool)> {
     let mut sites: Vec<HandoverSite> = Vec::new();
     // Set by the chain's depth backstop; returned beside the legs so the
@@ -6563,8 +6847,7 @@ pub async fn reverse_handover_legs(
         // Every site read charges the shared work limit: a name handed at
         // thousands of sites (printk's `_printk`) must stop somewhere, and
         // the display caps below mark what the reader sees.
-        budget.classified += 1;
-        if budget.classified >= WORK_LIMIT_CLASSIFIED {
+        if snapshot.charge_work() {
             truncated = true;
             break;
         }
@@ -6612,8 +6895,7 @@ pub async fn reverse_handover_legs(
             if site.target != target {
                 continue;
             }
-            budget.classified += 1;
-            if budget.classified >= WORK_LIMIT_CLASSIFIED {
+            if snapshot.charge_work() {
                 truncated = true;
                 break;
             }
@@ -6678,7 +6960,6 @@ pub async fn reverse_handover_legs(
         db,
         snapshot,
         walk_context,
-        budget,
     };
     for site in &sites {
         let mut visited = std::collections::HashSet::new();
@@ -6710,7 +6991,9 @@ pub async fn reverse_handover_legs(
             && a.param == b.param
             && a.position == b.position
     });
-    Ok((legs, truncated, depth_cut))
+    // A trip inside the last site's executability proof lists that site
+    // under handed-not-reached with no other marker in the section.
+    Ok((legs, truncated || snapshot.exhausted(), depth_cut))
 }
 
 /// The shared state of one reverse handover walk: database handles plus
@@ -6719,7 +7002,6 @@ struct ReverseWalk<'a> {
     db: &'a DatabaseManager,
     snapshot: &'a ViaSnapshot,
     walk_context: crate::domain::Context,
-    budget: &'a mut ViaBudget,
 }
 
 impl ReverseWalk<'_> {
@@ -6744,13 +7026,19 @@ impl ReverseWalk<'_> {
         // Depth backstop beside the path-local visited set below.
         // Adversarial nesting stops here and says so: a cut chain is a
         // lower bound, never a complete answer.
-        if self.budget.named_hops >= MAX_NAMED_HOPS {
+        if self.snapshot.hop_depth() >= MAX_NAMED_HOPS {
             *depth_cut = true;
             return Ok(());
         }
-        self.budget.named_hops += 1;
+        self.snapshot.note_hop();
         let rows = macro_rows_for(self.db, self.snapshot, &site.callee).await?;
         for m in &rows {
+            // Each definition costs scope + invocation proofs below; a
+            // cut stops the walk, and the flag says so.
+            if self.snapshot.charge_work() {
+                *truncated = true;
+                break;
+            }
             if !admit_definition(m, &rows, &site.file, self.walk_context) {
                 continue;
             }
@@ -6965,7 +7253,7 @@ impl ReverseWalk<'_> {
                 }
             }
         }
-        self.budget.named_hops -= 1;
+        self.snapshot.leave_hop();
         Ok(())
     }
 }
@@ -6978,11 +7266,12 @@ pub async fn forward_legs_for_row(
     snapshot: &ViaSnapshot,
     m: &crate::types::FunctionInfo,
     pin: crate::domain::Context,
-    budget: &mut ViaBudget,
 ) -> Result<(Vec<ForwardLeg>, bool)> {
     let invoked = invoked_params(db, snapshot, m, pin).await?;
     if invoked.is_empty() {
-        return Ok((Vec::new(), false));
+        // No invocations — or a trip before any resolved: the trip
+        // silences every leg below, so it marks.
+        return Ok((Vec::new(), snapshot.exhausted()));
     }
     let mut legs: Vec<ForwardLeg> = Vec::new();
     let mut truncated = false;
@@ -6994,8 +7283,7 @@ pub async fn forward_legs_for_row(
         }
         // Charged like the reverse sites: thousands of call sites must
         // stop somewhere short of never.
-        budget.classified += 1;
-        if budget.classified >= WORK_LIMIT_CLASSIFIED {
+        if snapshot.charge_work() {
             truncated = true;
             break;
         }
@@ -7129,8 +7417,7 @@ pub async fn forward_legs_for_row(
             if site.callee != m.name {
                 continue;
             }
-            budget.classified += 1;
-            if budget.classified >= WORK_LIMIT_CLASSIFIED {
+            if snapshot.charge_work() {
                 truncated = true;
                 break;
             }
@@ -7230,7 +7517,6 @@ pub async fn reverse_closure(
     snapshot: &ViaSnapshot,
     target: &str,
     walk_context: crate::domain::Context,
-    budget: &mut ViaBudget,
     visited: &mut std::collections::HashSet<(String, String)>,
 ) -> Result<ReverseClosure> {
     let mut closure = ReverseClosure {
@@ -7241,15 +7527,15 @@ pub async fn reverse_closure(
         depth_cut: false,
     };
     let (handovers, handover_truncated, handover_depth) =
-        reverse_handover_legs(db, snapshot, target, walk_context, budget).await?;
+        reverse_handover_legs(db, snapshot, target, walk_context).await?;
     closure.handovers = handovers;
     closure.truncated = handover_truncated;
     closure.depth_cut = handover_depth;
-    let mut nodes = reverse_body_layer(db, snapshot, target, walk_context, budget).await?;
+    let mut nodes = reverse_body_layer(db, snapshot, target, walk_context).await?;
     let mut node_truncated = false;
     let mut node_depth = false;
     for node in &mut nodes {
-        if budget.named_hops >= MAX_NAMED_HOPS {
+        if snapshot.hop_depth() >= MAX_NAMED_HOPS {
             // A nesting cut, not a work cut: its own marker below.
             node.depth_cut = true;
             node_depth = true;
@@ -7258,14 +7544,18 @@ pub async fn reverse_closure(
         // Partition this macro's callers: functions stop the branch,
         // macros recurse. One batched classification for the partition.
         let caller_names: Vec<String> = node.callers.iter().map(|(name, _)| name.clone()).collect();
-        let (macros, truncated) = classify_frontier(db, snapshot, &caller_names, budget).await?;
+        let (macros, truncated) = classify_frontier(db, snapshot, &caller_names).await?;
         node_truncated = node_truncated || truncated;
         let mut functions: Vec<(String, String)> = Vec::new();
         let mut macro_names: Vec<String> = Vec::new();
         for (caller, file) in std::mem::take(&mut node.callers) {
             if macros.contains_key(&caller) {
                 macro_names.push(caller);
-            } else {
+            } else if !truncated {
+                // Unclassified under a cut is neither proven function
+                // nor proven macro: keeping it would assert a reach-through
+                // the proof never examined. The truncation flag above marks
+                // the silence.
                 functions.push((caller, file));
             }
         }
@@ -7281,8 +7571,14 @@ pub async fn reverse_closure(
             crate::domain::Context::Any => crate::domain::Context::In(caller_domain),
             pinned => pinned,
         };
-        budget.named_hops += 1;
+        snapshot.note_hop();
         for macro_name in macro_names {
+            // Breadth is unbounded (only depth has a backstop): each arm
+            // charges, and a cut keeps the arms done so far, marked.
+            if snapshot.charge_work() {
+                node_truncated = true;
+                break;
+            }
             let key = (macro_name.clone(), node.hop.file_path.clone());
             if !visited.insert(key.clone()) {
                 continue;
@@ -7292,7 +7588,6 @@ pub async fn reverse_closure(
                 snapshot,
                 &macro_name,
                 child_context,
-                budget,
                 visited,
             ))
             .await?;
@@ -7337,14 +7632,38 @@ pub async fn reverse_closure(
                         Some(guards.join(" || "))
                     },
                 },
-                callers: std::mem::take(&mut deeper.ordinary),
+                callers: {
+                    // Ordinary callers reach through this macro only
+                    // where it expands at their site: the recursion
+                    // lists name-callers unproven (a weaker claim, fine
+                    // at the top level), but a via node asserts
+                    // reach-through. A spent budget drops the unproven.
+                    let filter_was = snapshot.classified();
+                    let mut proven: Vec<(String, String)> = Vec::new();
+                    for (caller, file) in std::mem::take(&mut deeper.ordinary) {
+                        if Box::pin(named_edge_expands(
+                            db,
+                            snapshot,
+                            child_context,
+                            &file,
+                            &caller,
+                            &macro_name,
+                        ))
+                        .await?
+                        {
+                            proven.push((caller, file));
+                        }
+                    }
+                    node_truncated = node_truncated || snapshot.tripped_since(filter_was);
+                    proven
+                },
                 deeper: std::mem::take(&mut deeper.via_nodes),
                 truncated: deeper.truncated,
                 depth_cut: deeper.depth_cut,
             });
             visited.remove(&key);
         }
-        budget.named_hops -= 1;
+        snapshot.leave_hop();
     }
     // Ordinary callers of the target: every caller no macro layer claimed.
     let mut pairs: Vec<(String, String)> = db
@@ -7360,12 +7679,14 @@ pub async fn reverse_closure(
             .iter()
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>(),
-        budget,
     )
     .await?;
     node_truncated = node_truncated || truncated;
     for (caller, file) in pairs {
-        if !macros.contains_key(&caller) {
+        // Unclassified under a cut is unproven: a macro caller kept
+        // here would print as an ordinary caller downstream. The flag
+        // above marks the silence.
+        if !truncated && !macros.contains_key(&caller) {
             closure.ordinary.push((caller, file));
         }
     }
@@ -7373,7 +7694,7 @@ pub async fn reverse_closure(
     closure.ordinary.dedup();
     prune_husk_nodes(&mut nodes);
     closure.via_nodes = nodes;
-    closure.truncated = handover_truncated || node_truncated;
+    closure.truncated = handover_truncated || node_truncated || snapshot.exhausted();
     closure.depth_cut = closure.depth_cut || handover_depth || node_depth;
     Ok(closure)
 }
@@ -7398,7 +7719,6 @@ pub async fn forward_closure(
     snapshot: &ViaSnapshot,
     m: &crate::types::FunctionInfo,
     pin: crate::domain::Context,
-    budget: &mut ViaBudget,
     visited: &mut std::collections::HashSet<(String, String)>,
     subst: &std::collections::HashMap<String, ResolvedActual>,
 ) -> Result<ForwardClosure> {
@@ -7406,7 +7726,6 @@ pub async fn forward_closure(
         db,
         snapshot,
         pin,
-        budget,
         visited,
         subst: subst.clone(),
     };
@@ -7421,7 +7740,6 @@ struct ForwardWalk<'a> {
     db: &'a DatabaseManager,
     snapshot: &'a ViaSnapshot,
     pin: crate::domain::Context,
-    budget: &'a mut ViaBudget,
     visited: &'a mut std::collections::HashSet<(String, String)>,
     subst: std::collections::HashMap<String, ResolvedActual>,
 }
@@ -7499,7 +7817,6 @@ impl ForwardWalk<'_> {
             db: self.db,
             snapshot: self.snapshot,
             pin: self.pin,
-            budget: &mut *self.budget,
             visited: &mut *self.visited,
             subst,
         }
@@ -7513,11 +7830,11 @@ impl ForwardWalk<'_> {
             truncated: false,
             total_legs: 0,
         };
-        if self.budget.named_hops >= MAX_NAMED_HOPS {
+        if self.snapshot.hop_depth() >= MAX_NAMED_HOPS {
             closure.truncated = true;
             return Ok(closure);
         }
-        self.budget.named_hops += 1;
+        self.snapshot.note_hop();
         let all_rows = macro_rows_for(self.db, self.snapshot, &m.name).await?;
         self.direct_legs(m, &all_rows, &mut closure).await?;
         self.nested_legs(m, &mut closure).await?;
@@ -7549,6 +7866,9 @@ impl ForwardWalk<'_> {
                 && a.site_file == b.site_file
                 && a.site_line == b.site_line
         });
+        // A cut anywhere below silences legs the display would show:
+        // mark even where the legs that did render fit the cap.
+        closure.truncated = closure.truncated || self.snapshot.exhausted();
         if closure.legs.len() > MAX_FORWARD_LEGS {
             closure.total_legs = closure.legs.len();
             closure.legs.truncate(MAX_FORWARD_LEGS);
@@ -7556,7 +7876,7 @@ impl ForwardWalk<'_> {
         } else {
             closure.total_legs = closure.legs.len();
         }
-        self.budget.named_hops -= 1;
+        self.snapshot.leave_hop();
         Ok(closure)
     }
 
@@ -7570,7 +7890,7 @@ impl ForwardWalk<'_> {
         closure: &mut ForwardClosure,
     ) -> Result<()> {
         let (row_legs, row_truncated) =
-            forward_legs_for_row(self.db, self.snapshot, m, self.pin, self.budget).await?;
+            forward_legs_for_row(self.db, self.snapshot, m, self.pin).await?;
         closure.truncated = closure.truncated || row_truncated;
         for leg in row_legs {
             if admit_definition(m, all_rows, &leg.site_file, self.pin) {
@@ -7607,7 +7927,7 @@ impl ForwardWalk<'_> {
                 // A self-named body call is never an expansion.
                 continue;
             }
-            let (rows, _scope_name) = alias_macro_rows(
+            let (rows, _scope_name, _cut) = alias_macro_rows(
                 self.db,
                 self.snapshot,
                 self.pin,
@@ -7619,8 +7939,7 @@ impl ForwardWalk<'_> {
             if rows.is_empty() {
                 continue;
             }
-            self.budget.classified += rows.len();
-            if self.budget.classified >= WORK_LIMIT_CLASSIFIED {
+            if self.snapshot.charge_many(rows.len()) {
                 closure.truncated = true;
                 break;
             }
@@ -7829,7 +8148,7 @@ impl ForwardWalk<'_> {
             // value rides: a rebound (`MID` → 0) ends the hop even though
             // the call text still stands. Re-resolve at the carried site
             // and require this row, live, among the answer.
-            let (site_rows, scope_name) = alias_macro_rows(
+            let (site_rows, scope_name, _cut) = alias_macro_rows(
                 self.db,
                 self.snapshot,
                 self.pin,
@@ -8132,7 +8451,7 @@ impl ForwardWalk<'_> {
         // row at the carried site. An `#undef` there ends the hop even
         // though the final row is still live (`OUT` through a rebound
         // `ALIAS` hands a pointer, never invokes it).
-        let (site_rows, _) = alias_macro_rows(
+        let (site_rows, _, _) = alias_macro_rows(
             self.db,
             self.snapshot,
             self.pin,

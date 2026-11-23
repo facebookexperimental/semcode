@@ -663,19 +663,12 @@ pub async fn show_callers_to_writer_in(
                         ))
                 })
                 .collect();
-            let mut via_budget = crate::database::macro_via::ViaBudget::default();
             // Reached is keyed per site (macro and slot): one proved slot
             // must not cover an unproved slot of the same
             // macro at the same site.
             let (handover_legs, handover_truncated, handover_depth) =
-                crate::database::macro_via::reverse_handover_legs(
-                    db,
-                    &via_snapshot,
-                    name,
-                    pin,
-                    &mut via_budget,
-                )
-                .await?;
+                crate::database::macro_via::reverse_handover_legs(db, &via_snapshot, name, pin)
+                    .await?;
             let proved: std::collections::HashSet<(String, u32, String, u32)> =
                 handover_legs.iter().map(|leg| leg.site_key()).collect();
             let site_text = |argument: &crate::types::ArgumentFunction| {
@@ -1994,10 +1987,17 @@ pub async fn write_via_callers(
 ) -> Result<()> {
     use crate::database::macro_via;
     let snapshot = macro_via::snapshot_for(db, git_sha).await?;
-    let mut budget = macro_via::ViaBudget::default();
     let mut visited = std::collections::HashSet::new();
-    let closure =
-        macro_via::reverse_closure(db, &snapshot, name, pin, &mut budget, &mut visited).await?;
+    let mut closure = macro_via::reverse_closure(db, &snapshot, name, pin, &mut visited).await?;
+    // Trips inside any phase record here: the snapshot holds the
+    // budget, so a spent budget means some phase stopped early.
+    if snapshot.exhausted() {
+        closure.truncated = true;
+    }
+    snapshot.dump_stats(
+        &format!("reverse_closure:{name}"),
+        snapshot.rescans.borrow().len(),
+    );
     if closure.via_nodes.is_empty()
         && closure.handovers.is_empty()
         && !closure.truncated
@@ -2024,16 +2024,7 @@ pub async fn write_via_callers(
     if closure.depth_cut {
         writeln!(writer, "{}", macro_via::TRUNCATED_DEPTH_MARKER)?;
     }
-    write_handover_chains(
-        db,
-        &snapshot,
-        pin,
-        name,
-        &closure.handovers,
-        &mut budget,
-        writer,
-    )
-    .await?;
+    write_handover_chains(db, &snapshot, pin, name, &closure.handovers, writer).await?;
     Ok(())
 }
 
@@ -2117,13 +2108,16 @@ fn handover_header(
     )
 }
 
-async fn write_handover_chains(
+/// One handover chain per enclosing name: the ordinary callers that
+/// reach the target through it, with the macro filter's cut marker.
+/// Public for the budget-sweep regression test, which drives it with a
+/// precharged snapshot the display entry points build internally.
+pub async fn write_handover_chains(
     db: &DatabaseManager,
     snapshot: &crate::database::macro_via::ViaSnapshot,
     pin: crate::domain::Context,
     target: &str,
     handovers: &[crate::database::macro_via::HandoverLeg],
-    budget: &mut crate::database::macro_via::ViaBudget,
     writer: &mut dyn Write,
 ) -> Result<()> {
     use crate::database::macro_via;
@@ -2168,13 +2162,15 @@ async fn write_handover_chains(
         }
         let mut visited = std::collections::HashSet::new();
         visited.insert((enclosing.clone(), String::new()));
-        let inner =
-            macro_via::reverse_closure(db, snapshot, enclosing, pin, budget, &mut visited).await?;
+        let inner = macro_via::reverse_closure(db, snapshot, enclosing, pin, &mut visited).await?;
         // The enclosing name's own ordinary callers are new answers: they
         // reach the target through this handover. Where the enclosing
         // name is itself a macro, each caller must expand it where the
         // caller stands: a rebound wrapper between the definition and
         // the call site ends the reachability even though the call stands.
+        // The filter below spends budget: a trip inside it drops callers
+        // the pre-filter flag never saw, so the marker follows the filter.
+        let filter_was = snapshot.classified();
         for (caller, file) in inner.ordinary.iter().take(10) {
             if !macro_via::macro_rows_for(db, snapshot, enclosing)
                 .await?
@@ -2193,6 +2189,12 @@ async fn write_handover_chains(
             write_via_node(node, 1, writer)?;
         }
         if inner.truncated {
+            writeln!(writer, "  {}", macro_via::TRUNCATED_WORK_MARKER)?;
+        }
+        // A trip inside the filter above drops callers with no other
+        // marker: the pre-filter flag cannot see it. Guarded against a
+        // duplicate where the flag already fired.
+        if !inner.truncated && snapshot.tripped_since(filter_was) {
             writeln!(writer, "  {}", macro_via::TRUNCATED_WORK_MARKER)?;
         }
         if inner.depth_cut {
@@ -2219,15 +2221,13 @@ pub async fn annotate_tree_with_via(
 ) -> Result<()> {
     use crate::database::macro_via;
     let snapshot = macro_via::snapshot_for(db, git_sha).await?;
-    let mut budget = macro_via::ViaBudget::default();
-    annotate_node_with_via(db, &snapshot, node, &mut budget, forward).await
+    annotate_node_with_via(db, &snapshot, node, forward).await
 }
 
 async fn annotate_node_with_via(
     db: &DatabaseManager,
     snapshot: &crate::database::macro_via::ViaSnapshot,
     node: &mut CallNode,
-    budget: &mut crate::database::macro_via::ViaBudget,
     forward: bool,
 ) -> Result<()> {
     use crate::database::macro_via;
@@ -2242,6 +2242,7 @@ async fn annotate_node_with_via(
     // their own per-site proofs, so only these structural children gate.
     if is_macro {
         let mut kept: Vec<bool> = Vec::with_capacity(node.children.len());
+        let was = snapshot.classified();
         for child in node.children.iter() {
             let mut keep = true;
             if !child.name.is_empty()
@@ -2271,12 +2272,19 @@ async fn annotate_node_with_via(
         let mut dropping = kept.iter();
         node.children
             .retain(|_| dropping.next().is_some_and(|keep| *keep));
+        // A trip drops children the proof never examined: mark it, so
+        // readers read the silence as partial, never complete.
+        if snapshot.tripped_since(was) {
+            node.children.push(CallNode::named(
+                "... (forward legs truncated by work limit)",
+            ));
+        }
     }
     for child in node.children.iter_mut() {
         if is_macro && child.via.is_none() && !node.name.is_empty() {
             child.via = Some(node.name.clone());
         }
-        Box::pin(annotate_node_with_via(db, snapshot, child, budget, forward)).await?;
+        Box::pin(annotate_node_with_via(db, snapshot, child, forward)).await?;
     }
     if is_macro {
         // Forward handover closure at this macro's live sites, nested
@@ -2289,7 +2297,6 @@ async fn annotate_node_with_via(
                 snapshot,
                 m,
                 crate::domain::Context::Any,
-                budget,
                 &mut visited,
                 &subst,
             )
@@ -2338,9 +2345,7 @@ pub async fn macro_second_levels(
 )> {
     use crate::database::macro_via;
     let snapshot = macro_via::snapshot_for(db, git_sha).await?;
-    let mut budget = macro_via::ViaBudget::default();
-    let (macros, truncated) =
-        macro_via::classify_frontier(db, &snapshot, callers, &mut budget).await?;
+    let (macros, truncated) = macro_via::classify_frontier(db, &snapshot, callers).await?;
     let mut out: std::collections::HashMap<String, Vec<crate::database::macro_via::CallerEdge>> =
         std::collections::HashMap::new();
     for (name, rows) in &macros {
@@ -2355,6 +2360,8 @@ pub async fn macro_second_levels(
         edges.dedup_by(|a, b| a.name == b.name && a.file == b.file);
         out.insert(name.clone(), edges);
     }
+    let truncated = truncated || snapshot.exhausted();
+    snapshot.dump_stats("macro_second_levels", snapshot.rescans.borrow().len());
     Ok((out, truncated))
 }
 
@@ -2366,17 +2373,14 @@ pub async fn macro_second_levels(
 /// an asm-generic hop.
 pub async fn caller_level_edges(
     db: &DatabaseManager,
-    git_sha: &str,
+    snapshot: &crate::database::macro_via::ViaSnapshot,
     caller_name: &str,
     chain: &[String],
     context: crate::domain::Context,
 ) -> Result<(bool, Vec<crate::database::macro_via::CallerEdge>)> {
     use crate::database::macro_via;
-    let snapshot = macro_via::snapshot_for(db, git_sha).await?;
-    let mut budget = macro_via::ViaBudget::default();
     let (macros, _) =
-        macro_via::classify_frontier(db, &snapshot, &[caller_name.to_string()], &mut budget)
-            .await?;
+        macro_via::classify_frontier(db, snapshot, &[caller_name.to_string()]).await?;
     let Some(rows) = macros.get(caller_name) else {
         return Ok((false, Vec::new()));
     };
@@ -2385,7 +2389,7 @@ pub async fn caller_level_edges(
         edges.extend(
             macro_via::second_level_edges(
                 db,
-                &snapshot,
+                snapshot,
                 caller_name,
                 &row.file_path,
                 chain,
@@ -2396,6 +2400,10 @@ pub async fn caller_level_edges(
     }
     edges.sort_by(|a, b| a.name.cmp(&b.name).then(a.file.cmp(&b.file)));
     edges.dedup_by(|a, b| a.name == b.name && a.file == b.file);
+    snapshot.dump_stats(
+        &format!("caller_level_edges:{caller_name}"),
+        snapshot.rescans.borrow().len(),
+    );
     Ok((true, edges))
 }
 
@@ -2417,7 +2425,6 @@ pub async fn forward_handover_display(
     let mut out: Vec<ForwardLegDisplay> = Vec::new();
     let mut total = 0usize;
     let mut truncated = false;
-    let mut budget = macro_via::ViaBudget::default();
     for m in macro_via::macro_rows_for(db, &snapshot, callee_name).await? {
         let mut visited = std::collections::HashSet::new();
         let subst = std::collections::HashMap::new();
@@ -2426,7 +2433,6 @@ pub async fn forward_handover_display(
             &snapshot,
             &m,
             crate::domain::Context::Any,
-            &mut budget,
             &mut visited,
             &subst,
         )
@@ -2447,6 +2453,11 @@ pub async fn forward_handover_display(
             ));
         }
     }
+    let truncated = truncated || snapshot.exhausted();
+    snapshot.dump_stats(
+        &format!("forward_handover:{callee_name}"),
+        snapshot.rescans.borrow().len(),
+    );
     Ok((out, total, truncated))
 }
 

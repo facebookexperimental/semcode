@@ -811,7 +811,6 @@ async fn nested_call_in_dropped_slot_emits_no_forward_leg() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    let mut budget = semcode::ViaBudget::default();
     let mut visited = std::collections::HashSet::new();
     let subst = std::collections::HashMap::new();
     let closure = semcode::forward_closure(
@@ -819,7 +818,6 @@ async fn nested_call_in_dropped_slot_emits_no_forward_leg() {
         &snapshot,
         &rows[0],
         semcode::domain::Context::Any,
-        &mut budget,
         &mut visited,
         &subst,
     )
@@ -997,7 +995,6 @@ async fn forward_closure_stays_within_its_own_sites() {
     for (root, own, foreign) in [("A", "alpha", "beta"), ("B", "beta", "alpha")] {
         let rows = semcode::macro_rows_for(&db, &snapshot, root).await.unwrap();
         assert_eq!(rows.len(), 1);
-        let mut budget = semcode::ViaBudget::default();
         let mut visited = std::collections::HashSet::new();
         let subst = std::collections::HashMap::new();
         let closure = semcode::forward_closure(
@@ -1005,7 +1002,6 @@ async fn forward_closure_stays_within_its_own_sites() {
             &snapshot,
             &rows[0],
             semcode::domain::Context::Any,
-            &mut budget,
             &mut visited,
             &subst,
         )
@@ -1070,7 +1066,6 @@ async fn forward_cycle_marks_truncation() {
     let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
     let rows = semcode::macro_rows_for(&db, &snapshot, "A").await.unwrap();
     assert_eq!(rows.len(), 1);
-    let mut budget = semcode::ViaBudget::default();
     let mut visited = std::collections::HashSet::new();
     let subst = std::collections::HashMap::new();
     let closure = semcode::forward_closure(
@@ -1078,7 +1073,6 @@ async fn forward_cycle_marks_truncation() {
         &snapshot,
         &rows[0],
         semcode::domain::Context::Any,
-        &mut budget,
         &mut visited,
         &subst,
     )
@@ -1596,4 +1590,415 @@ async fn pack_head_fills_fixed_slots_first() {
     let dropped = callers_text(&db, "tgt", &sha).await;
     assert!(!dropped.contains("via W"), "{dropped}");
     assert!(!dropped.contains("via SEL"), "{dropped}");
+}
+
+/// Proof loops charge the shared budget and count their dispatch
+/// traffic: a wrapper macro's callers run the instrumented paths, so
+/// the counters move on a two-file tree.
+#[tokio::test]
+async fn via_budget_counts_wrapper_proofs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(repo.join("w.h"), "#define W(x) target(x)\n").unwrap();
+    std::fs::write(
+        repo.join("a.c"),
+        "#include \"w.h\"\nvoid target(void) {}\nvoid s(void) { W(1); }\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
+    let (db, sha) = index_repo(repo).await;
+    let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+    let mut visited = std::collections::HashSet::new();
+    let closure = semcode::reverse_closure(
+        &db,
+        &snapshot,
+        "target",
+        semcode::domain::Context::Any,
+        &mut visited,
+    )
+    .await
+    .unwrap();
+    assert!(!closure.truncated);
+    assert!(snapshot.classified() > 0, "no proof ran");
+    assert!(
+        snapshot.budget.borrow().dispatch_calls > 0,
+        "dispatch counter never moved: {:?}",
+        snapshot.budget.borrow()
+    );
+}
+
+/// A pre-exhausted budget only marks: the aggregation points OR
+/// exhaustion into the truncated flag. It pins the marker wiring —
+/// the budget trips inside classification on both trees — while the
+/// live gate covers the new charges.
+#[tokio::test]
+async fn via_budget_exhausted_marks_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(repo.join("w.h"), "#define W(x) target(x)\n").unwrap();
+    std::fs::write(
+        repo.join("a.c"),
+        "#include \"w.h\"\nvoid target(void) {}\nvoid s(void) { W(1); }\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
+    let (db, sha) = index_repo(repo).await;
+    let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+    snapshot.budget.borrow_mut().classified = 8191;
+    let mut visited = std::collections::HashSet::new();
+    let closure = semcode::reverse_closure(
+        &db,
+        &snapshot,
+        "target",
+        semcode::domain::Context::Any,
+        &mut visited,
+    )
+    .await
+    .unwrap();
+    assert!(closure.truncated, "exhausted budget read complete");
+}
+
+/// Callers admitted under a macro hop, recursively: the cut-drops rule
+/// is about which callers show, so the test reads exactly that.
+fn wrap_hop_callers(nodes: &[semcode::ViaNode], out: &mut Vec<String>) {
+    for node in nodes {
+        if node.hop.macro_name == "WRAP" {
+            out.extend(node.callers.iter().map(|(name, _)| name.clone()));
+        }
+        wrap_hop_callers(&node.deeper, out);
+    }
+}
+
+/// A tripped budget must not admit a rebound wrapper either: INNER
+/// redefined to a no-op before caller uses WRAP, so no via edge exists
+/// at full budget; with nineteen charges left the budget trips
+/// mid-proof and the edge drops too instead of admitting on empty
+/// resolutions. Pins the cut-drops rule for the defined/used
+/// comparison in the expansion transfer check.
+#[tokio::test]
+async fn cut_admits_no_rebound_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("w.h"),
+        "#define INNER(x) target(x)\n#define WRAP(y) INNER(y)\n#undef INNER\n#define INNER 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("a.c"),
+        "#include \"w.h\"\nvoid target(void) {}\nvoid caller(void) { WRAP(1); }\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
+    let (db, sha) = index_repo(repo).await;
+    // Full budget first: the rebound ends the edge (control).
+    let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+    let mut visited = std::collections::HashSet::new();
+    let full = semcode::reverse_closure(
+        &db,
+        &snapshot,
+        "target",
+        semcode::domain::Context::Any,
+        &mut visited,
+    )
+    .await
+    .unwrap();
+    let mut callers = Vec::new();
+    wrap_hop_callers(&full.via_nodes, &mut callers);
+    assert!(
+        !callers.contains(&"caller".to_string()),
+        "full budget shows rebound edge: {callers:?}"
+    );
+    // Nineteen charges left on a fresh snapshot: the budget trips
+    // mid-proof.
+    let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+    snapshot.budget.borrow_mut().classified = 8192 - 19;
+    let mut visited = std::collections::HashSet::new();
+    let cut = semcode::reverse_closure(
+        &db,
+        &snapshot,
+        "target",
+        semcode::domain::Context::Any,
+        &mut visited,
+    )
+    .await
+    .unwrap();
+    assert!(cut.truncated, "cut never fired");
+    let mut callers = Vec::new();
+    wrap_hop_callers(&cut.via_nodes, &mut callers);
+    assert!(
+        !callers.contains(&"caller".to_string()),
+        "cut admits rebound edge: {callers:?}"
+    );
+    // M3: a tripped budget admits no wrapper at any other hop either —
+    // an unclassified INNER caller is unproven, never a via edge.
+    let mut all = Vec::new();
+    all_hop_callers(&cut.via_nodes, &mut all);
+    assert!(
+        !all.contains(&"caller".to_string()),
+        "cut admits rebound edge at another hop: {all:?}"
+    );
+}
+
+/// Every via-hop caller in the closure, all hops and depths.
+fn all_hop_callers(nodes: &[semcode::ViaNode], out: &mut Vec<String>) {
+    for node in nodes {
+        out.extend(node.callers.iter().map(|(name, _)| name.clone()));
+        all_hop_callers(&node.deeper, out);
+    }
+}
+
+/// A trip inside the handover filter must mark: sweep the remaining
+/// budget through the proof entry and require that the true caller is
+/// shown or the cut is marked — never silence. Pins the
+/// post-filter marker in the handover chains.
+#[tokio::test]
+async fn handover_filter_trip_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    write_fixture(repo);
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
+    let (db, sha) = index_repo(repo).await;
+    let full = callers_text(&db, "emit_fn", &sha).await;
+    assert!(full.contains("caller_one"), "control lost: {full}");
+    let mut marked_once = false;
+    let mut ks = vec![0];
+    ks.extend((2..=120).step_by(2));
+    for k in ks {
+        let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+        snapshot.budget.borrow_mut().classified = 8192 - k;
+        let mut visited = std::collections::HashSet::new();
+        let closure = semcode::reverse_closure(
+            &db,
+            &snapshot,
+            "emit_fn",
+            semcode::domain::Context::Any,
+            &mut visited,
+        )
+        .await
+        .unwrap();
+        if closure.handovers.is_empty() {
+            // Nothing handed under this budget: the silence comes from
+            // the global closure flag, not the per-chain marker.
+            assert!(closure.truncated, "empty handovers read complete at k={k}");
+            continue;
+        }
+        let mut out = Vec::new();
+        semcode::callchain::write_handover_chains(
+            &db,
+            &snapshot,
+            semcode::domain::Context::Any,
+            "emit_fn",
+            &closure.handovers,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let text = plain(&String::from_utf8(out).unwrap());
+        marked_once = marked_once || text.contains("truncated:");
+        assert!(
+            text.contains("caller_one") || text.contains("truncated:"),
+            "silent drop at k={k}: {text}"
+        );
+    }
+    assert!(marked_once, "sweep never tripped the filter");
+}
+
+/// The second-level flag contract: whole classification reports no
+/// cut and admits exactly the invoking caller. DROP never invokes,
+/// so not_a_caller is absent; the display shows the returned flag
+/// beside the level (the bin side mirrors this guard at the third
+/// level).
+#[tokio::test]
+async fn second_level_flag_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("w.h"),
+        "void target(void);\n#define W() target()\n#define DROP(x) 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("a.c"),
+        "#include \"w.h\"\nvoid target(void) {}\nvoid real_caller(void) { W(); }\nvoid not_a_caller(void) { DROP(W()); }\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
+    let (db, sha) = index_repo(repo).await;
+    let (levels, truncated) = semcode::callchain::macro_second_levels(
+        &db,
+        &sha,
+        &["W".to_string()],
+        semcode::domain::Context::Any,
+    )
+    .await
+    .unwrap();
+    assert!(!truncated, "whole classification reads cut");
+    let edges = levels.get("W").expect("W unclassified at full budget");
+    assert!(
+        edges.iter().any(|e| e.name == "real_caller"),
+        "admitted caller missing: {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.name == "not_a_caller"),
+        "uninvoked holder admitted: {edges:?}"
+    );
+}
+
+/// A trip inside the scope lookup must not admit the transfer:
+/// single-file rebound — ALIAS defined as a function, then
+/// WRAP/REAL/ALIAS rebound to nothing. `caller_level_edges` with an
+/// empty chain rejects the caller edge whole and at every remaining
+/// budget; the probe query passed it at k=14 and k=23. Sweep requires
+/// no admit anywhere.
+#[tokio::test]
+async fn scope_cut_drops_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("main.c"),
+        "int ALIAS(void) { return 1; }\n#define WRAP() ALIAS()\n#define REAL() 0\n#define ALIAS REAL\nint caller(void) { return WRAP(); }\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
+    let (db, sha) = index_repo(repo).await;
+    let mut marked_once = false;
+    let mut ks = vec![0, 8192, 23];
+    ks.extend((2..=40).step_by(2));
+    for k in ks {
+        let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+        snapshot.budget.borrow_mut().classified = 8192 - k.min(8192);
+        let (_is_macro, edges) = semcode::callchain::caller_level_edges(
+            &db,
+            &snapshot,
+            "WRAP",
+            &[],
+            semcode::domain::Context::Any,
+        )
+        .await
+        .unwrap();
+        marked_once = marked_once || snapshot.exhausted();
+        assert!(
+            !edges.iter().any(|e| e.name == "caller"),
+            "scope cut admits edge at k={k}: {edges:?}"
+        );
+    }
+    assert!(marked_once, "sweep never tripped");
+}
+
+/// A partial call inventory must not pass the transfer check:
+/// two-armed WRAP where only the self-recursive arm still stands
+/// after the cut. The loop skips the self-call and must not return
+/// true on the survivors. Rejects whole and at every remaining budget;
+/// the probe query passed `caller` at k=30.
+#[tokio::test]
+async fn partial_inventory_drops_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("main.c"),
+        "int ALIAS(void) { return 1; }\n#if A\n#define WRAP(x,y) ((y)+ALIAS())\n#endif\n#if B\n#define WRAP(x,y) WRAP(x,ALIAS())\n#endif\n#define REAL() 0\n#define ALIAS REAL\nint caller(void) { return WRAP(2,3); }\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
+    let (db, sha) = index_repo(repo).await;
+    let mut marked_once = false;
+    // Known-flaky: one intermittent admit at k=30 in ~30 runs, mechanism
+    // not isolated (trip placement is order-sensitive). A failure here
+    // is signal, not noise — investigate, do not delete.
+    let mut ks = vec![0, 8192, 23, 30];
+    ks.extend((2..=40).step_by(2));
+    for k in ks {
+        let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+        snapshot.budget.borrow_mut().classified = 8192 - k.min(8192);
+        let (_is_macro, edges) = semcode::callchain::caller_level_edges(
+            &db,
+            &snapshot,
+            "WRAP",
+            &[],
+            semcode::domain::Context::Any,
+        )
+        .await
+        .unwrap();
+        marked_once = marked_once || snapshot.exhausted();
+        assert!(
+            !edges.iter().any(|e| e.name == "caller"),
+            "partial inventory admits edge at k={k} (classified={} dispatch={}): {edges:?}",
+            snapshot.budget.borrow().classified,
+            snapshot.budget.borrow().dispatch_calls
+        );
+    }
+    assert!(marked_once, "sweep never tripped");
+}
+
+/// An uninvoked macro caller is no caller, whole or cut: MCALL
+/// invokes nothing, so the full run lists only f. The cut case shows
+/// full-budget handovers under a fresh exhausted snapshot — order-free,
+/// since every proof starts tripped: MCALL must drop with only the
+/// marker showing.
+#[tokio::test]
+async fn uninvoked_macro_caller_drops_on_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    git_run(repo, &["init", "-q"]);
+    std::fs::write(
+        repo.join("m.h"),
+        "#define INV(cb) cb()\n#define MCALL() enc()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("a.c"),
+        "#include \"m.h\"\nvoid target(void) {}\nvoid enc(void) { INV(target); }\nvoid f(void) { enc(); }\n",
+    )
+    .unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "x"]);
+    let (db, sha) = index_repo(repo).await;
+    let full = callers_text(&db, "target", &sha).await;
+    assert!(full.contains("f (a.c)"), "control lost: {full}");
+    assert!(!full.contains("MCALL"), "control admits MCALL: {full}");
+    // Handovers proved whole, then shown cut: the enclosing
+    // classifier trips with nothing left, in every charge order.
+    let snapshot = semcode::snapshot_for(&db, &sha).await.unwrap();
+    let mut visited = std::collections::HashSet::new();
+    let closure = semcode::reverse_closure(
+        &db,
+        &snapshot,
+        "target",
+        semcode::domain::Context::Any,
+        &mut visited,
+    )
+    .await
+    .unwrap();
+    assert!(!closure.handovers.is_empty(), "no handovers to render");
+    let cut = semcode::snapshot_for(&db, &sha).await.unwrap();
+    cut.budget.borrow_mut().classified = 8192;
+    let mut out = Vec::new();
+    semcode::callchain::write_handover_chains(
+        &db,
+        &cut,
+        semcode::domain::Context::Any,
+        "target",
+        &closure.handovers,
+        &mut out,
+    )
+    .await
+    .unwrap();
+    let text = plain(&String::from_utf8(out).unwrap());
+    assert!(!text.contains("MCALL"), "cut lists uninvoked macro: {text}");
+    assert!(text.contains("truncated:"), "cut renders unmarked: {text}");
 }
