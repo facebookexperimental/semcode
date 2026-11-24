@@ -72,7 +72,7 @@ since those are what queries go to and what costs the most.
 regenerated when the tag moves:
 
 ```bash
-cargo run --release --example bench_workload -- ~/.cache/semcode-bench/db/full.db bench/workload.jsonl
+cargo run --release --features bench --example bench_workload -- ~/.cache/semcode-bench/db/full.db bench/workload.jsonl
 ```
 
 ## Criterion

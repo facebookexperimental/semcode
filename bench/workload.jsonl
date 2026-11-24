@@ -1,4 +1,4 @@
-{"meta":{"generator":"cargo run --release --example bench_workload","seed":"semcode-bench-workload-v1","calls":94}}
+{"meta":{"generator":"cargo run --release --features bench --example bench_workload","seed":"semcode-bench-workload-v1","calls":94}}
 {"id":1,"tool":"find_function","kind":"fanin_mid","args":{"name":"IS_APPEND"},"expect":["include/linux/fs.h"]}
 {"id":2,"tool":"find_calls","kind":"fanout_high","args":{"name":"vortex_probe1"},"expect":["AUTOSELECT"]}
 {"id":3,"tool":"find_function","kind":"fanin_high","args":{"name":"hid_dbg"},"expect":["include/linux/hid.h"]}

@@ -88,12 +88,16 @@ path = "src/bin/semcode-lsp.rs"
 name = "analyzer"
 harness = false
 
+[features]
+# Builds the bench_workload example.
+bench = []
+
 # Generates bench/workload.jsonl; benchmark tooling, so it lives in bench/.
-# test = false: cargo test need not build and link it.
+# Behind a feature, since cargo test otherwise builds and links every example.
 [[example]]
 name = "bench_workload"
 path = "bench/workload.rs"
-test = false
+required-features = ["bench"]
 
 [profile.dev]
 debug = "line-tables-only"

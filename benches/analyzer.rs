@@ -42,6 +42,9 @@ const FILES: &[&str] = &[
 
 /// About this many files in the corpus sample.
 const CORPUS_SIZE: usize = 200;
+/// The extensions the corpus samples: pinned, not the indexer's defaults,
+/// which would change the sample under the same benchmark ID.
+const CORPUS_EXTENSIONS: &[&str] = &["c", "h", "rs", "zig"];
 
 const NO_HASH: &str = "0000000000000000000000000000000000000000";
 
@@ -96,7 +99,6 @@ impl Tree {
 /// in path order: the same files on every run of the same tree, from
 /// every subsystem.
 fn corpus(tree: &Tree) -> Vec<Source> {
-    let extensions = semcode::file_extensions::default_extensions();
     // BTreeMap keys: already in path order.
     let paths: Vec<&String> = tree
         .blobs
@@ -105,7 +107,7 @@ fn corpus(tree: &Tree) -> Vec<Source> {
             Path::new(p.as_str())
                 .extension()
                 .and_then(|x| x.to_str())
-                .is_some_and(|x| extensions.iter().any(|want| want == x))
+                .is_some_and(|x| CORPUS_EXTENSIONS.contains(&x))
         })
         .collect();
     let stride = (paths.len() / CORPUS_SIZE).max(1);

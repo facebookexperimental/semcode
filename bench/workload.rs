@@ -3,7 +3,7 @@
 // Generate bench/workload.jsonl: the tool calls the MCP read benchmarks in
 // bench/bench.py replay.
 //
-//   cargo run --release --example bench_workload -- <index> <output>
+//   cargo run --release --features bench --example bench_workload -- <index> <output>
 //
 // <index> is a full index of the pinned kernel tree.  The workload is
 // committed, like the tag: the same calls on every run, and only rerun
@@ -194,7 +194,10 @@ async fn load(path: &str) -> Result<Index> {
     )
     .await?;
 
-    // Invert callees into callers once every caller is known.
+    // Invert callees into callers once every caller is known.  A name defined
+    // in several files has its callees merged, and each caller is credited
+    // with its first kernel definition, not the one that made the call; the
+    // grep:path majority vote over caller paths tolerates that.
     let edges: Vec<(String, String)> = ix
         .functions
         .iter()
@@ -482,7 +485,7 @@ async fn main() -> Result<()> {
         file,
         "{}",
         json!({ "meta": {
-            "generator": "cargo run --release --example bench_workload",
+            "generator": "cargo run --release --features bench --example bench_workload",
             "seed": SEED,
             "calls": calls.len(),
         }})

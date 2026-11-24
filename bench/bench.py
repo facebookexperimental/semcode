@@ -172,11 +172,18 @@ def build() -> Path:
     """Build the checkout this script is in; returns where its binaries are."""
     step("Building semcode")
     names = ("semcode-index", "semcode", "semcode-mcp")
-    subprocess.run(["cargo", "build", "--release", "--quiet",
-                    *[a for n in names for a in ("--bin", n)]], cwd=REPO, check=True)
-    meta = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps"],
-                          cwd=REPO, capture_output=True, text=True, check=True).stdout
-    return Path(json.loads(meta)["target_directory"]) / "release"
+    # The paths cargo reports, not reconstructed ones: a build target puts
+    # the binaries under target/<triple>/release.
+    out = subprocess.run(["cargo", "build", "--release", "--quiet",
+                          "--message-format=json-render-diagnostics",
+                          *[a for n in names for a in ("--bin", n)]],
+                         cwd=REPO, stdout=subprocess.PIPE, text=True, check=True).stdout
+    dirs = {Path(m["executable"]).parent for m in map(json.loads, out.splitlines())
+            if m.get("reason") == "compiler-artifact" and m.get("executable")
+            and m["target"]["name"] in names}
+    if len(dirs) != 1:
+        die(f"cargo built the binaries into {sorted(map(str, dirs)) or 'nowhere'}")
+    return dirs.pop()
 
 
 def hyperfine(name: str, argv: list[str], runs: int, prepare: str | None = None,
@@ -252,7 +259,8 @@ def index_scenario(run: Run, scenario: str, built: set[str]) -> dict:
     """An untimed warm-up run, then the timed runs.  The warm-up brings the
     kernel's git objects into the page cache, records the phase breakdown
     (--perf-json, so the timed runs are not instrumented), and checks the
-    index it wrote: one with no functions fails the run."""
+    index it wrote: one with no functions, or for update one no different
+    from the index it started from, fails the run."""
     name, args, prepare, start = INDEX_SCENARIOS[scenario]
     if start:
         ensure(run, start, built)
@@ -264,6 +272,8 @@ def index_scenario(run: Run, scenario: str, built: set[str]) -> dict:
     counts = table_counts(run, path)
     if not counts.get("Functions"):
         die(f"{scenario}: wrote an index with no functions; see {log}")
+    if start and counts == table_counts(run, db(start)):
+        die(f"{scenario}: left {start} unchanged; see {log}")
     argv = [run.bin("semcode-index"), *args, "-d", str(path)]
     runs = hyperfine(scenario, argv, run.runs_for(scenario), prepare)
     if scenario == "full":
@@ -408,11 +418,12 @@ class McpSession:
         self.proc.kill()
         die(f"semcode-mcp not ready after {MCP_TIMEOUT}s; see {self.log}")
 
-    def peak_rss(self) -> int:
+    def peak_rss(self) -> int | None:
+        """None where /proc/<pid>/status has no VmHWM, as off Linux."""
         for line in read_file(f"/proc/{self.proc.pid}/status").splitlines():
             if line.startswith("VmHWM:"):
                 return int(line.split()[1]) * 1024
-        return 0
+        return None
 
     def close(self) -> None:
         self.proc.stdin.close()
@@ -584,8 +595,8 @@ def report_index(scenario: str, r: dict) -> list[str]:
              f"| {statistics.fmean(col('memory_peak_resident')) / 2**20:.0f} "
              f"| {r['counts'].get('Functions')} | {r['counts'].get('Types')} "
              f"| {r['db_bytes'] / 2**20:.0f} |",
-             "", "<details><summary>Phases (warm-up run; per-file phases are CPU time "
-             "summed across threads)</summary>", "", "| Phase | [s] |", "|:--|--:|"]
+             "", "<details><summary>Phases (warm-up run; per-file phases are elapsed "
+             "time summed across threads)</summary>", "", "| Phase | [s] |", "|:--|--:|"]
     lines += [f"| {k} | {v['total_ms'] / 1000:.1f} |" for k, v in sorted(r["phases"].items())]
     return lines + ["", "</details>"]
 
@@ -602,13 +613,14 @@ def report_mcp(scenario: str, r: dict) -> list[str]:
     sessions = r["sessions"]
     passes = list(sessions[0]["passes"])
     calls = read_workload()
+    rss = [s["rss"] for s in sessions if s["rss"] is not None]
     lines = [f"## {scenario}", "",
              "| Ready [s] |" + "".join(f" {p.capitalize()} pass [s] |" for p in passes)
              + " Peak RSS [MiB] |",
              "|--:" * (len(passes) + 2) + "|",
              f"| {mean_sd([s['ready'] for s in sessions])} |"
              + "".join(f" {mean_sd([s['passes'][p]['total'] for s in sessions])} |" for p in passes)
-             + f" {statistics.fmean(s['rss'] for s in sessions) / 2**20:.0f} |"]
+             + (f" {statistics.fmean(rss) / 2**20:.0f} |" if rss else " n/a |")]
 
     # Per tool: each call's median over sessions, then p50/p95/max over calls.
     shown = [p for p in ("warm", "parallel") if p in passes] or ["first"]
