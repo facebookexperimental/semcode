@@ -84,5 +84,8 @@ path = "src/bin/semcode-mcp.rs"
 name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
 
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 debug = false
