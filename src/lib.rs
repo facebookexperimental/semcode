@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Module declarations
+pub mod asm;
 mod database;
 pub mod database_utils;
 pub mod date_utils;
@@ -30,6 +31,11 @@ pub mod pages;
 pub mod search;
 
 // Re-export the main types and structs
+pub use database::macro_via::{
+    call_actuals, call_arities, forward_closure, is_macro_row, macro_rows_for, reverse_closure,
+    snapshot_for, CallerEdge, ResolvedActual, ReverseClosure, ViaBudget, ViaHop, ViaNode,
+    ViaSnapshot, TRUNCATED_WORK_MARKER,
+};
 pub use database::processed_files::ProcessedFileRecord;
 pub use database::resolution::{Evidence, IndirectCaller};
 pub use database::SCHEMA_VERSION;

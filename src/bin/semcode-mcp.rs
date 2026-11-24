@@ -12,13 +12,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Truncate output at 3,000 lines with a warning message
 /// "Under: <guard>" as its own line for a definition inside a conditional,
 /// nothing at file scope.
 fn under_line(guard: Option<&str>) -> String {
     guard.map_or_else(String::new, |guard| format!("Under: {guard}\n"))
 }
 
+/// Truncate output at 3,000 lines with a warning message
 fn truncate_output(output: String) -> String {
     const MAX_LINES: usize = 3000;
 
@@ -97,7 +97,7 @@ async fn mcp_query_function_or_macro(
         // Single definition found
         let entity = &definitions[0];
 
-        if entity.return_type.is_empty() {
+        if semcode::is_macro_row(entity) {
             // Found macro (stored as function with empty return_type)
             let params_str = entity
                 .parameters
@@ -169,7 +169,7 @@ async fn mcp_query_function_or_macro(
                 definitions.len()
             ));
 
-            if entity.return_type.is_empty() {
+            if semcode::is_macro_row(entity) {
                 // Macro
                 let params_str = entity
                     .parameters
@@ -461,7 +461,7 @@ async fn mcp_show_callers(
                 writeln!(buffer, "Ambiguous: {note}")?;
             }
             let entity = chosen.function;
-            let is_macro = entity.return_type.is_empty();
+            let is_macro = semcode::is_macro_row(&entity);
             let entity_type = if is_macro { "macro" } else { "function" };
 
             // Callers of THIS definition, not of the name: a caller in
@@ -513,7 +513,7 @@ async fn mcp_show_callers(
                     {
                         Ok(Resolution::Chosen(caller_chosen)) => {
                             let caller_entity = caller_chosen.function;
-                            if caller_entity.return_type.is_empty() {
+                            if semcode::is_macro_row(&caller_entity) {
                                 writeln!(
                                     buffer,
                                     "     macro ({}:{})",
@@ -560,6 +560,9 @@ async fn mcp_show_callers(
 
     write_indirect_callers(db, function_name, git_sha, &mut buffer).await?;
 
+    // Same macro-via edges as the REPL callers path.
+    semcode::callchain::write_via_callers(db, function_name, git_sha, pin, &mut buffer).await?;
+
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
@@ -579,9 +582,8 @@ async fn write_indirect_callers(
         return Ok(());
     }
 
-    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
-        .iter()
-        .partition(|caller| caller.evidence.is_type_matched());
+    let (confident, by_name_only): (Vec<_>, Vec<_>) =
+        indirect.iter().partition(|caller| caller.is_confident());
 
     if !confident.is_empty() {
         writeln!(buffer, "\n=== Indirect Callers ===")?;
@@ -667,7 +669,7 @@ async fn mcp_show_calls(
                 writeln!(buffer, "Ambiguous: {note}")?;
             }
             let entity = chosen.function;
-            let is_macro = entity.return_type.is_empty();
+            let is_macro = semcode::is_macro_row(&entity);
             let entity_type = if is_macro { "Macro" } else { "Function" };
 
             // What this definition calls is answered within its own build:
@@ -718,7 +720,7 @@ async fn mcp_show_calls(
                     {
                         Ok(Resolution::Chosen(callee_chosen)) => {
                             let callee_entity = callee_chosen.function;
-                            if callee_entity.return_type.is_empty() {
+                            if semcode::is_macro_row(&callee_entity) {
                                 writeln!(
                                     buffer,
                                     "     macro ({}:{})",
@@ -1928,6 +1930,66 @@ async fn mcp_show_all_commits(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+/// Hop three of the MCP reverse display: macro edges recurse with the
+/// extended via chain, function edges show ordinary callers carrying the
+/// chain they arrived on. Present at `--up=3`, absent at `--up=2`.
+#[allow(clippy::too_many_arguments)]
+async fn mcp_third_level(
+    db: &DatabaseManager,
+    git_sha: &str,
+    second_name: &str,
+    via_chain: &[String],
+    chain_context: Context,
+    calls_limit: usize,
+    buffer: &mut Vec<u8>,
+    snapshot: &semcode::ViaSnapshot,
+) {
+    use std::io::Write;
+    if let Ok((is_macro, edges)) =
+        semcode::callchain::caller_level_edges(db, snapshot, second_name, via_chain, chain_context)
+            .await
+    {
+        if is_macro {
+            for edge in edges.iter().take(3) {
+                let _ = writeln!(buffer, "        └─ {}{}", edge.name, edge.via_suffix());
+            }
+            if edges.len() > 3 {
+                let _ = writeln!(buffer, "        └─ ... and {} more", edges.len() - 3);
+            }
+            return;
+        }
+    }
+    // A spent budget leaves the names below unproven, and the raw
+    // fallback below would list them with the inherited via chain, so
+    // it runs only where the budget still has room. The loop-level
+    // marker reports the cut once for the whole level.
+    if snapshot.exhausted() {
+        return;
+    }
+    if let Ok(third) = db
+        .get_function_callers_in(second_name, git_sha, chain_context)
+        .await
+    {
+        let shown: Vec<_> = if calls_limit == 0 {
+            third
+        } else {
+            third.into_iter().take(calls_limit).collect()
+        };
+        let via = if via_chain.is_empty() {
+            String::new()
+        } else {
+            let chain: Vec<String> = via_chain.iter().map(|m| format!("via {m}")).collect();
+            format!(" [{}]", chain.join(" "))
+        };
+        for name in shown.iter().take(3) {
+            let _ = writeln!(buffer, "        └─ {name}{via}");
+        }
+        if shown.len() > 3 {
+            let _ = writeln!(buffer, "        └─ ... and {} more", shown.len() - 3);
+        }
+    }
+}
+
 async fn mcp_show_callchain_with_limits(
     db: &DatabaseManager,
     function_name: &str,
@@ -2079,6 +2141,18 @@ async fn mcp_show_callchain_with_limits(
                 callers.iter().take(calls_limit).cloned().collect()
             };
 
+            // One batched pass for the whole level: macro callers expand
+            // through their admitted second level below.
+            let caller_names: Vec<String> = limited_callers.clone();
+            let (macro_levels, second_truncated) =
+                semcode::callchain::macro_second_levels(db, git_sha, &caller_names, chain_context)
+                    .await
+                    .unwrap_or_default();
+
+            // One snapshot for the whole third level below: its budget
+            // is shared across every edge, so per-edge budgets cannot
+            // re-arm the limit and hot callers trip it.
+            let third_snapshot = semcode::snapshot_for(db, git_sha).await?;
             for (i, caller) in limited_callers.iter().enumerate() {
                 writeln!(buffer, "{}. {}", i + 1, caller)?;
 
@@ -2097,12 +2171,45 @@ async fn mcp_show_callchain_with_limits(
                     )?;
                 }
 
-                // For multi-level depth, show second-level callers
+                // For multi-level depth, show second-level callers. A macro
+                // caller expands through its admitted second level with the
+                // via chain on every line; admission and depth apply before
+                // anything renders.
                 if up_levels > 1 {
-                    if let Ok(second_level_callers) = db
-                        .get_function_callers_in(caller, git_sha, chain_context)
-                        .await
-                    {
+                    if let Some(edges) = macro_levels.get(caller) {
+                        let shown: Vec<_> = if calls_limit == 0 {
+                            edges.clone()
+                        } else {
+                            edges.iter().take(calls_limit).cloned().collect()
+                        };
+                        for edge in shown.iter().take(3) {
+                            writeln!(buffer, "      └─ {}{}", edge.name, edge.via_suffix())?;
+                            if up_levels > 2 {
+                                mcp_third_level(
+                                    db,
+                                    git_sha,
+                                    &edge.name,
+                                    &edge.via,
+                                    chain_context,
+                                    calls_limit,
+                                    &mut buffer,
+                                    &third_snapshot,
+                                )
+                                .await;
+                            }
+                        }
+                        if shown.len() > 3 {
+                            writeln!(buffer, "      └─ ... and {} more", shown.len() - 3)?;
+                        }
+                    } else if let Ok(second_level_callers) = if second_truncated {
+                        // A spent budget leaves the names below unproven, so no
+                        // raw edges render. The loop marker after the loop
+                        // reports the cut once.
+                        Ok(Vec::new())
+                    } else {
+                        db.get_function_callers_in(caller, git_sha, chain_context)
+                            .await
+                    } {
                         let limited_second: Vec<_> = if calls_limit == 0 {
                             second_level_callers
                         } else {
@@ -2116,12 +2223,37 @@ async fn mcp_show_callchain_with_limits(
                         for second_caller in limited_second.iter().take(3) {
                             // Show up to 3 second-level callers
                             writeln!(buffer, "      └─ {second_caller}")?;
+                            if up_levels > 2 {
+                                mcp_third_level(
+                                    db,
+                                    git_sha,
+                                    second_caller,
+                                    &[],
+                                    chain_context,
+                                    calls_limit,
+                                    &mut buffer,
+                                    &third_snapshot,
+                                )
+                                .await;
+                            }
                         }
                         if limited_second.len() > 3 {
                             writeln!(buffer, "      └─ ... and {} more", limited_second.len() - 3)?;
                         }
                     }
                 }
+            }
+            // One marker for the whole second level: where the budget
+            // trips, edges drop and every name stays unproven, which the
+            // raw fallback above then skips.
+            if second_truncated {
+                let _ = writeln!(buffer, "      └─ {}", semcode::TRUNCATED_WORK_MARKER);
+            }
+            // One marker for the whole third level, however the cut
+            // landed (see the CLI twin): a trip inside the macro branch
+            // returns before any per-call marker could render.
+            if third_snapshot.exhausted() {
+                let _ = writeln!(buffer, "        └─ {}", semcode::TRUNCATED_WORK_MARKER);
             }
 
             if calls_limit > 0 && callers.len() > calls_limit {
@@ -2199,10 +2331,74 @@ async fn mcp_show_callchain_with_limits(
                         for second_callee in limited_second.iter().take(3) {
                             // Show up to 3 second-level callees
                             writeln!(buffer, "      └─ {second_callee}")?;
+                            // Macro callees invoke their parameters: legs
+                            // at the live sites, same as the first level.
+                            if let Ok((legs, total, truncated)) =
+                                semcode::callchain::forward_handover_display(
+                                    db,
+                                    git_sha,
+                                    second_callee,
+                                )
+                                .await
+                            {
+                                for (actual, site_file, site_line, via, guard) in &legs {
+                                    let guard_text = if guard.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" [{guard}]")
+                                    };
+                                    writeln!(
+                                        buffer,
+                                        "        └─ {actual} ({site_file}:{site_line}) {via}{guard_text}"
+                                    )?;
+                                }
+                                let more = total.saturating_sub(legs.len());
+                                // A trip shortens the total itself: the
+                                // count is a lower bound, so it prints
+                                // with its marker, never alone.
+                                if more > 0 {
+                                    writeln!(buffer, "        └─ ... and {more} more")?;
+                                }
+                                if truncated {
+                                    writeln!(
+                                        buffer,
+                                        "        └─ ... (forward legs truncated by work limit)"
+                                    )?;
+                                }
+                            }
                         }
                         if limited_second.len() > 3 {
                             writeln!(buffer, "      └─ ... and {} more", limited_second.len() - 3)?;
                         }
+                    }
+                }
+
+                // A macro callee invokes its parameters: the handover legs
+                // at its live sites, with their call-site evidence.
+                if let Ok((legs, total, truncated)) =
+                    semcode::callchain::forward_handover_display(db, git_sha, callee).await
+                {
+                    for (actual, site_file, site_line, via, guard) in &legs {
+                        let guard_text = if guard.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{guard}]")
+                        };
+                        writeln!(
+                            buffer,
+                            "      └─ {actual} ({site_file}:{site_line}) {via}{guard_text}"
+                        )?;
+                    }
+                    let more = total.saturating_sub(legs.len());
+                    // As above: the count is a lower bound under a cut.
+                    if more > 0 {
+                        writeln!(buffer, "      └─ ... and {more} more")?;
+                    }
+                    if truncated {
+                        writeln!(
+                            buffer,
+                            "      └─ ... (forward legs truncated by work limit)"
+                        )?;
                     }
                 }
             }
@@ -2235,6 +2431,13 @@ async fn mcp_show_callchain_with_limits(
                             "{} {}->{} ({}:{})",
                             from, site.receiver_expr, site.member, site.file_path, site.line
                         )?;
+                        if let Some(kind) = site.lsm_kind {
+                            writeln!(
+                                buffer,
+                                "     {}",
+                                semcode::callchain::lsm_dispatch_phrase(kind)
+                            )?;
+                        }
                         for target in site.targets.iter().take(3) {
                             writeln!(buffer, "   └─ {target}")?;
                         }
@@ -6042,59 +6245,50 @@ async fn index_current_commit_background(
 
     let repo_path = PathBuf::from(&git_repo);
 
-    // Quick check: if a file changed in the current commit is already indexed with
-    // its current SHA, we can skip indexing entirely (nothing new to process)
-    // Compare HEAD with HEAD~1 (parent) to find changed files
-    match semcode::git::get_changed_files(&repo_path, "HEAD~1", "HEAD") {
+    // Quick check: look at files changed in the current commit.
+    // One shared decision: run with the recorded options (or every
+    // supported extension when the index records none); skip only when
+    // an indexable change exists and all of it is indexed. An empty
+    // change list still runs: the range walks HEAD's whole manifest, so
+    // a tip with nothing new still picks up files a missed run left
+    // behind. A metadata read error fails visibly instead of
+    // defaulting to every extension with macros on, which would
+    // silently ignore recorded opt-outs.
+    let fail_background = |error: String| {
+        let indexing_state = indexing_state.clone();
+        async move {
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed { error };
+            state.completed_at = Some(std::time::SystemTime::now());
+        }
+    };
+    let (extensions_vec, no_macros) = match semcode::git::get_changed_files(
+        &repo_path, "HEAD~1", "HEAD",
+    ) {
         Ok(changed_files) => {
-            if !changed_files.is_empty() {
-                // Find first C/C++/Rust file that was changed (added or modified)
-                if let Some(changed_file) = changed_files.iter().find(|cf| {
-                    matches!(
-                        cf.change_type,
-                        semcode::git::ChangeType::Added | semcode::git::ChangeType::Modified
-                    ) && cf.new_file_hash.is_some()
-                        && semcode::file_extensions::is_supported_for_analysis(&cf.path)
-                }) {
-                    if let Some(new_hash) = &changed_file.new_file_hash {
-                        // Get already processed files from database
-                        match db_manager.get_processed_file_pairs().await {
-                            Ok(processed_pairs) => {
-                                // Check if this changed file with its new SHA is already in database
-                                if processed_pairs
-                                    .contains(&(changed_file.path.clone(), new_hash.clone()))
-                                {
-                                    eprintln!(
-                                        "[Background] Changed file '{}' (SHA: {}) already indexed, skipping auto-indexing",
-                                        changed_file.path,
-                                        &new_hash[..8]
-                                    );
-                                    let mut state = indexing_state.lock().await;
-                                    state.status = IndexingStatus::Completed { files_processed: 0 };
-                                    state.completed_at = Some(std::time::SystemTime::now());
-                                    return;
-                                } else {
-                                    eprintln!(
-                                        "[Background] Changed file '{}' (SHA: {}) needs indexing",
-                                        changed_file.path,
-                                        &new_hash[..8]
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[Background] Warning: Failed to get processed files: {}; continuing with indexing",
-                                    e
-                                );
-                            }
-                        }
-                    }
+            match semcode::git_range::startup_decision(&db_manager, &changed_files).await {
+                Ok(semcode::git_range::StartupDecision::Skip) => {
+                    eprintln!(
+                        "[Background] Index already covers the current commit, skipping auto-indexing"
+                    );
+                    let mut state = indexing_state.lock().await;
+                    state.status = IndexingStatus::Completed { files_processed: 0 };
+                    state.completed_at = Some(std::time::SystemTime::now());
+                    return;
                 }
-            } else {
-                // No changes in this commit (might be initial commit or root commit)
-                eprintln!(
-                    "[Background] No changed files found in current commit, will check all files"
-                );
+                Ok(semcode::git_range::StartupDecision::Run {
+                    extensions,
+                    no_macros,
+                }) => {
+                    eprintln!("[Background] Indexing current commit...");
+                    (extensions, no_macros)
+                }
+                Err(e) => {
+                    let error = format!("Startup state check failed: {e}");
+                    eprintln!("[Background] {error}; skipping auto-indexing");
+                    fail_background(error).await;
+                    return;
+                }
             }
         }
         Err(e) => {
@@ -6103,8 +6297,17 @@ async fn index_current_commit_background(
                 "[Background] Could not get changed files ({}), will check all files",
                 e
             );
+            match semcode::git_range::incremental_options(&db_manager).await {
+                Ok(options) => options,
+                Err(e) => {
+                    let error = format!("Startup state check failed: {e}");
+                    eprintln!("[Background] {error}; skipping auto-indexing");
+                    fail_background(error).await;
+                    return;
+                }
+            }
         }
-    }
+    };
 
     // Run git range indexing using the shared library function
     // This uses the same code path as semcode-index -s .
@@ -6123,20 +6326,19 @@ async fn index_current_commit_background(
 
     // Create synthetic range for current commit: HEAD^..HEAD
     let git_range = format!("{}^..{}", _git_sha, _git_sha);
-    let extensions_vec = semcode::file_extensions::supported_extensions();
 
     match semcode::git_range::process_git_range(
         &repo_path,
         &git_range,
         &extensions_vec,
         db_manager.clone(),
-        false, // no_macros = false (index macros)
-        4,     // db_threads
+        no_macros,
+        4, // db_threads
         &[],
     )
     .await
     {
-        Ok(()) => {
+        Ok(_) => {
             eprintln!("[Background] Indexing complete");
             send_notification("Semcode: Indexing complete".to_string());
 
@@ -6391,6 +6593,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use semcode::FunctionInfo;
     use std::env;
 
     // Combined into a single test so the three cases don't race on the
@@ -6411,6 +6614,53 @@ mod tests {
         env::remove_var(key);
         let args = Args::try_parse_from(["semcode-mcp"]).unwrap();
         assert_eq!(args.git_repo, ".");
+    }
+
+    #[test]
+    fn assembly_rows_are_functions_not_macros() {
+        // Macros read as functions with no return type, but so do
+        // assembly definitions: the file path distinguishes them. And
+        // `SYSCALL_DEFINE` functions have no return type either: only the
+        // `#define NAME(` text settles whether a row is a macro.
+        let row = |path: &str, return_type: &str, body: &str| FunctionInfo {
+            name: "f".to_string(),
+            file_path: path.to_string(),
+            git_file_hash: "hash".to_string(),
+            line_start: 1,
+            line_end: 2,
+            return_type: return_type.to_string(),
+            parameters: Vec::new(),
+            body: body.to_string(),
+            calls: None,
+            types: None,
+            guard: None,
+            qualifier: None,
+        };
+        assert!(semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "",
+            "#define f(x) (x)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "arch/x86/entry.S",
+            "",
+            "SYM_FUNC_START(f)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "int",
+            "int f(void)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "",
+            "asmlinkage long sys_f(void)"
+        )));
+        assert!(!semcode::is_macro_row(&row(
+            "kernel/fork.c",
+            "",
+            "#define f 0"
+        )));
     }
 
     #[test]
@@ -7556,5 +7806,387 @@ mod tests {
             state.status
         );
         assert!(state.completed_at.is_some());
+    }
+
+    async fn background_state() -> (
+        std::sync::Arc<tokio::sync::Mutex<IndexingState>>,
+        std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    ) {
+        (
+            std::sync::Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        )
+    }
+
+    /// A HEAD that only adds an opted-out file never indexes it through
+    /// the background path: the shared trigger drops it, so the run is
+    /// skipped and the file stays out of the index.
+    #[tokio::test]
+    async fn background_indexer_skips_opted_out_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_run(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int keep_fn(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v1"]);
+        let sha1 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = std::sync::Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+        // Built for C only: the record pins what later runs may read.
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha1,
+            &["c".to_string()],
+            db_manager.clone(),
+            true,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(repo.join("b.py"), "def py_fn():\n    return 1\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v2 adds python"]);
+        let sha2 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let (state, tx) = background_state().await;
+        index_current_commit_background(
+            db_manager.clone(),
+            repo.to_string_lossy().into_owned(),
+            state,
+            tx,
+        )
+        .await;
+
+        assert!(
+            db_manager
+                .find_function_git_aware("py_fn", &sha2)
+                .await
+                .unwrap()
+                .is_none(),
+            "opted-out .py must stay out of the index"
+        );
+        assert!(
+            db_manager
+                .find_function_git_aware("keep_fn", &sha2)
+                .await
+                .unwrap()
+                .is_some(),
+            "the C row stays visible at the new SHA"
+        );
+    }
+
+    /// A rename-only HEAD through the background path: the destination
+    /// indexes even though its blob did not change.
+    #[tokio::test]
+    async fn background_indexer_indexes_a_rename_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_run(repo, &["init", "-q"]);
+        std::fs::write(
+            repo.join("old.c"),
+            "int moved_fn(void)\n{\n\treturn 1;\n}\n",
+        )
+        .unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v1"]);
+        let sha1 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = std::sync::Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha1,
+            &semcode::file_extensions::default_extensions(),
+            db_manager.clone(),
+            false,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        git_run(repo, &["mv", "old.c", "new.c"]);
+        git_run(repo, &["commit", "-q", "-m", "v2 rename"]);
+        let sha2 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let (state, tx) = background_state().await;
+        index_current_commit_background(
+            db_manager.clone(),
+            repo.to_string_lossy().into_owned(),
+            state,
+            tx,
+        )
+        .await;
+
+        let blob = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", &format!("{sha2}:new.c")])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert!(
+            db_manager
+                .is_file_processed_at_path(&blob, "new.c")
+                .await
+                .unwrap(),
+            "renamed destination must record as processed"
+        );
+        let found = db_manager
+            .find_function_git_aware("moved_fn", &sha2)
+            .await
+            .unwrap()
+            .expect("moved_fn must resolve at the new SHA");
+        assert_eq!(found.file_path, "new.c");
+    }
+
+    /// An empty HEAD over a fresh index still indexes through the
+    /// background path: skipping on "no changes" would leave a fresh
+    /// database empty.
+    #[tokio::test]
+    async fn background_indexer_empty_head_over_fresh_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_run(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int keep_fn(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v1"]);
+        git_run(repo, &["commit", "-q", "--allow-empty", "-m", "v2 empty"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = std::sync::Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+
+        let (state, tx) = background_state().await;
+        index_current_commit_background(
+            db_manager.clone(),
+            repo.to_string_lossy().into_owned(),
+            state,
+            tx,
+        )
+        .await;
+
+        assert!(
+            db_manager
+                .find_function_git_aware("keep_fn", &sha)
+                .await
+                .unwrap()
+                .is_some(),
+            "empty HEAD must not leave a fresh index empty"
+        );
+    }
+
+    /// A tip with nothing new still picks up missed files: v1 indexed,
+    /// a C change missed in v2, a Makefile-only v3 as HEAD. The run
+    /// walks HEAD's whole manifest and finds the missed file; skipping
+    /// on "no indexable
+    /// change" would leave it missing at HEAD.
+    #[tokio::test]
+    async fn background_indexer_barren_tip_catches_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_run(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int keep_fn(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v1"]);
+        let sha1 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = std::sync::Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha1,
+            &semcode::file_extensions::default_extensions(),
+            db_manager.clone(),
+            false,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // v2 goes unindexed: no run happens between the commits.
+        std::fs::write(repo.join("b.c"), "int new_fn(void)\n{\n\treturn 2;\n}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v2 adds c, missed"]);
+        std::fs::write(repo.join("Makefile"), "all:\n\ttrue\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v3 makefile only"]);
+        let sha3 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let (state, tx) = background_state().await;
+        index_current_commit_background(
+            db_manager.clone(),
+            repo.to_string_lossy().into_owned(),
+            state,
+            tx,
+        )
+        .await;
+
+        assert!(
+            db_manager
+                .find_function_git_aware("new_fn", &sha3)
+                .await
+                .unwrap()
+                .is_some(),
+            "a tip with nothing new must still pick up the missed C change"
+        );
+    }
+
+    /// A metadata read error marks Failed instead of widening: without
+    /// readable options the run must not index under guessed ones.
+    #[tokio::test]
+    async fn background_indexer_metadata_error_marks_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_run(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.c"), "int keep_fn(void)\n{\n\treturn 1;\n}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v1"]);
+        let sha1 = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let db_manager = std::sync::Arc::new(
+            semcode::DatabaseManager::new(
+                repo.join("t.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db_manager.create_tables().await.unwrap();
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha1,
+            &semcode::file_extensions::default_extensions(),
+            db_manager.clone(),
+            false,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(repo.join("a.c"), "int keep_fn(void)\n{\n\treturn 2;\n}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "v2 touch"]);
+        // Corrupt the options table past reading: a missing table reads
+        // as no record, but garbage must error.
+        std::fs::remove_dir_all(repo.join("t.db").join("schema_meta.lance")).unwrap();
+        std::fs::write(repo.join("t.db").join("schema_meta.lance"), b"garbage").unwrap();
+
+        let (state, tx) = background_state().await;
+        index_current_commit_background(
+            db_manager.clone(),
+            repo.to_string_lossy().into_owned(),
+            state.clone(),
+            tx,
+        )
+        .await;
+
+        let state = state.lock().await;
+        match &state.status {
+            IndexingStatus::Failed { error } => assert!(
+                error.contains("Startup state check"),
+                "must fail at startup, not later: {error}"
+            ),
+            other => panic!("metadata error must mark Failed, got {other:?}"),
+        }
+    }
+
+    /// The MCP callers surface carries the same macro-via edges as the
+    /// REPL: a handover chain with per-hop evidence on a macro fixture.
+    #[tokio::test]
+    async fn mcp_callers_shows_macro_via_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.join("m.h"),
+            "#define WRAP(_fn, x) _fn(x)\n#define LOGM(s) WRAP(efn, s)\nvoid efn(const char *s);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("u.c"),
+            "#include \"m.h\"\nint c1(void) { LOGM(\"hi\"); return 0; }\nvoid efn(const char *s) { (void)s; }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+        let db = std::sync::Arc::new(
+            DatabaseManager::new(
+                repo.join(".semcode.db").to_str().unwrap(),
+                repo.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        db.create_tables().await.unwrap();
+        semcode::git_range::process_git_tree(
+            repo,
+            &sha,
+            &["c".to_string(), "h".to_string()],
+            db.clone(),
+            false,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+        let text = mcp_show_callers(&db, "efn", &sha, Context::Any)
+            .await
+            .unwrap();
+        assert!(text.contains("Via Macros"), "{text}");
+        assert!(text.contains("via WRAP"), "{text}");
+        assert!(text.contains("c1"), "{text}");
     }
 }

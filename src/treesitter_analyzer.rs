@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 4;
+pub const EXTRACTOR_VERSION: u32 = 8;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -97,6 +97,11 @@ pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
 /// reads records the shared version alone: no grammar is involved, so a
 /// grammar bump must not re-read it while a shared bump must.
 pub fn extractor_version_for_file(path: &std::path::Path, headers_as_cpp: bool) -> String {
+    if crate::asm::is_asm_path(path) {
+        // The scanner versions alone: a scanner fix re-reads only `.S`
+        // (which records `N+asm-M`), never the grammars' rows.
+        return format!("{EXTRACTOR_VERSION}+asm-{}", crate::asm::ASM_VERSION);
+    }
     match Language::from_path_with_headers(path, headers_as_cpp) {
         Some(language) => extractor_version(language),
         None => EXTRACTOR_VERSION.to_string(),
@@ -1706,12 +1711,23 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         source_root: Option<&Path>,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+        let source_code = std::fs::read_to_string(file_path)?;
+
+        // Assembly reads through the line scanner, not the grammars: no
+        // tree-sitter grammar parses GAS-macro sources.
+        if crate::asm::is_asm_path(file_path) {
+            let git_hash = compute_file_hash(file_path)?.unwrap_or_default();
+            let relative_path = self.make_relative_path(file_path, source_root);
+            let functions = crate::asm::scan(&source_code, &relative_path, &git_hash);
+            let functions = self.deduplicate_functions_within_file(functions, Language::C);
+            return Ok((functions, Vec::new(), Vec::new()));
+        }
+
         // Detect language from file extension
         let language = self
             .language_for(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
 
-        let source_code = std::fs::read_to_string(file_path)?;
         let parser = self.get_parser(language);
         let tree = parser
             .parse(&source_code, None)
@@ -1819,6 +1835,23 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
     ) -> Result<FileAnalysis> {
+        // Assembly reads through the line scanner, not the grammars.
+        if crate::asm::is_asm_path(file_path) {
+            let relative_path = self.make_relative_path(file_path, source_root);
+            let functions = crate::asm::scan(source_code, &relative_path, git_hash);
+            let functions = self.deduplicate_functions_within_file(functions, Language::C);
+            return Ok(FileAnalysis {
+                functions,
+                types: Vec::new(),
+                macros: Vec::new(),
+                dispatch_sites: Vec::new(),
+                registrations: Vec::new(),
+                argument_functions: Vec::new(),
+                unresolved_edges: Vec::new(),
+                globals: Vec::new(),
+            });
+        }
+
         // Detect language from file extension
         let language = self
             .language_for(file_path)
@@ -2706,6 +2739,36 @@ impl TreeSitterAnalyzer {
             // the one place the source states the answer outright.
             if let (Some(name), Some(args)) = (macro_name, macro_args) {
                 let name = &source_code[name.byte_range()];
+                if let Some(kind) = match name {
+                    "call_int_hook" => Some(DispatchKind::LsmHookInt),
+                    "call_void_hook" => Some(DispatchKind::LsmHookVoid),
+                    _ => None,
+                } {
+                    // The hook is the first argument: a bare slot name. The
+                    // dispatch macros' own definition spells it `HOOK`, and
+                    // that parameter is never a slot.
+                    let mut cursor = args.walk();
+                    let first = args.named_children(&mut cursor).next();
+                    if let Some(hook) = first {
+                        if hook.kind() == "identifier" {
+                            let slot = source_code[hook.byte_range()].to_string();
+                            if !slot.is_empty() && slot != "HOOK" {
+                                extraction.member_sites.push(RawDispatchSite {
+                                    member: slot,
+                                    receiver_expr: None,
+                                    receiver_type: None,
+                                    receiver_base_type: None,
+                                    receiver_field: None,
+                                    receiver_bound: None,
+                                    kind,
+                                    byte_start: hook.start_byte(),
+                                    line: hook.start_position().row as u32 + 1,
+                                    target: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(candidates) = Self::indirect_call_candidate_count(name) {
                     extraction.member_sites.extend(Self::indirect_call_sites(
                         args,
@@ -2745,6 +2808,15 @@ impl TreeSitterAnalyzer {
                     target: None,
                 });
             }
+        }
+
+        if language == Language::Rust {
+            Self::rust_head_dispatch(
+                tree.root_node(),
+                source_code,
+                &mut extraction.calls,
+                &mut extraction.member_sites,
+            );
         }
 
         let bound = Self::value_names(tree.root_node(), source_code);
@@ -2790,10 +2862,259 @@ impl TreeSitterAnalyzer {
         Ok(extraction)
     }
 
+    /// A declared Rust type with references and qualifiers peeled: `&Buf`
+    /// is `Buf`, `*const Device` is `Device`. `mut` and `const` fall with
+    /// the operator they modify.
+    fn strip_rust_ref(ty: &str) -> String {
+        let mut rest = ty.trim();
+        loop {
+            rest = rest.trim();
+            if let Some(tail) = rest.strip_prefix("&mut").or_else(|| rest.strip_prefix('&')) {
+                rest = tail;
+                continue;
+            }
+            if let Some(tail) = rest.strip_prefix("*mut").or_else(|| rest.strip_prefix('*')) {
+                rest = tail;
+                continue;
+            }
+            if let Some(tail) = rest
+                .strip_prefix("mut ")
+                .or_else(|| rest.strip_prefix("const "))
+            {
+                rest = tail;
+                continue;
+            }
+            break;
+        }
+        rest.to_string()
+    }
+
+    /// Whether a type spells a plain path: identifiers, `::`, generics,
+    /// lifetimes and references only. Tuples, arrays, closures, fn
+    /// pointers and `impl`/`dyn` types keep their spelling: renaming to
+    /// one of those matches no owner.
+    fn is_plain_rust_path(ty: &str) -> bool {
+        let ty = ty.trim();
+        if ty.is_empty()
+            || ty.starts_with("impl ")
+            || ty.starts_with("dyn ")
+            || !ty.chars().any(|c| c.is_alphanumeric())
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        for c in ty.chars() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                '(' | ')' | '|' | ';' | '{' | '}' | '!' | '=' => return false,
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// Rust call heads that have their own dispatch: turbofish methods
+    /// and bound-parameter calls. It looks in the merged impl+fn scope
+    /// per function (the same layering receiver typing uses) and at the
+    /// callee node behind each recorded head:
+    ///
+    /// - `recv.m::<T>()` (`generic_function` over a `field_expression`)
+    ///   rewrites the head to the receiver's declared type
+    ///   (`Buf::cast`), which the owner match resolves exactly. The
+    ///   turbofish args drop: an argument-less head addresses every
+    ///   instantiation. Where the receiver has no declared plain type,
+    ///   the head keeps its spelling.
+    /// - `P::method` (`scoped_identifier` over one bare identifier)
+    ///   records a member site on `method` with `receiver_bound` where P
+    ///   is a bounded generic parameter, beside the kept plain edge.
+    ///   Unbounded P records nothing: resolvers leave the head alone.
+    ///
+    /// A rewritten head is a site-less rename, not a new row: inherent
+    /// methods have no installation rows for a site to join, so a site
+    /// would dangle where the renamed edge resolves.
+    ///
+    /// Runs before receiver typing so the new sites type like the rest.
+    fn rust_head_dispatch(
+        root: tree_sitter::Node,
+        source: &str,
+        calls: &mut [(String, usize, usize)],
+        sites: &mut Vec<RawDispatchSite>,
+    ) {
+        // Merged bounds and declared types per function range: impl
+        // bounds underneath, the function's own on top.
+        type ScopeMaps = (
+            usize,
+            usize,
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, String>,
+        );
+        let mut scopes: Vec<ScopeMaps> = Vec::new();
+        let mut stack = vec![(
+            root,
+            None::<String>,
+            None::<std::collections::HashMap<String, String>>,
+        )];
+        while let Some((node, self_type, impl_bounds)) = stack.pop() {
+            let (self_type, impl_bounds) = if node.kind() == "impl_item" {
+                let bounds = Self::rust_generic_bounds_in(node, source);
+                let bounds = bounds
+                    .into_iter()
+                    .chain(Self::rust_impl_trait_bounds_in(node, source))
+                    .collect();
+                (
+                    node.child_by_field_name("type")
+                        .and_then(|t| Self::rust_type_name(t, source))
+                        .or(self_type),
+                    Some(bounds),
+                )
+            } else {
+                (self_type, impl_bounds)
+            };
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push((child, self_type.clone(), impl_bounds.clone()));
+            }
+            if node.kind() == "function_item" {
+                let bounds =
+                    Self::merge_fn_bounds(impl_bounds.clone().unwrap_or_default(), node, source);
+                let mut declared = std::collections::HashMap::new();
+                if let Some(self_type) = &self_type {
+                    declared.insert("self".to_string(), self_type.clone());
+                }
+                Self::rust_declared_types_in(node, source, &mut declared);
+                scopes.push((node.start_byte(), node.end_byte(), declared, bounds));
+            }
+        }
+        let scope_at = |byte: usize| {
+            scopes
+                .iter()
+                .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+                .min_by_key(|(start, end, _, _)| end - start)
+        };
+        for (name, start, end) in calls.iter_mut() {
+            let (start, end) = (*start, *end);
+            let Some(head) = root.descendant_for_byte_range(start, end) else {
+                continue;
+            };
+            match head.kind() {
+                "generic_function" => {
+                    let function = head.child_by_field_name("function");
+                    let is_method = function.is_some_and(|f| f.kind() == "field_expression");
+                    if !is_method {
+                        continue;
+                    }
+                    let function = function.unwrap();
+                    let (Some(value), Some(field)) = (
+                        function.child_by_field_name("value"),
+                        function.child_by_field_name("field"),
+                    ) else {
+                        continue;
+                    };
+                    // Only a bare-variable receiver renames: field chains
+                    // and temporaries need field-type lookup the file may
+                    // not have, and the head keeps its spelling for those.
+                    if value.kind() != "identifier" {
+                        continue;
+                    }
+                    let recv = source[value.byte_range()].to_string();
+                    let method = source[field.byte_range()].to_string();
+                    if method.is_empty() {
+                        continue;
+                    }
+                    let scope = scope_at(start);
+                    let renamed = scope
+                        .and_then(|(_, _, declared, _)| declared.get(&recv))
+                        .map(|ty| Self::strip_rust_ref(ty))
+                        .filter(|ty| Self::is_plain_rust_path(ty))
+                        .map(|ty| format!("{ty}::{method}"));
+                    if let Some(renamed) = renamed {
+                        *name = renamed;
+                    }
+                }
+                "scoped_identifier" => {
+                    let (Some(path), Some(name)) = (
+                        head.child_by_field_name("path"),
+                        head.child_by_field_name("name"),
+                    ) else {
+                        continue;
+                    };
+                    if path.kind() != "identifier" {
+                        continue;
+                    }
+                    let owner = source[path.byte_range()].to_string();
+                    if owner.contains('<') || owner.contains("::") || owner == "Self" {
+                        continue;
+                    }
+                    let method = source[name.byte_range()].to_string();
+                    if method.is_empty() {
+                        continue;
+                    }
+                    let bound = scope_at(start)
+                        .and_then(|(_, _, _, bounds)| bounds.get(&owner).cloned())
+                        .unwrap_or_default();
+                    if bound.is_empty() {
+                        continue;
+                    }
+                    sites.push(RawDispatchSite {
+                        member: method,
+                        receiver_expr: Some(owner),
+                        receiver_type: None,
+                        receiver_base_type: None,
+                        receiver_field: None,
+                        receiver_bound: Some(bound),
+                        kind: DispatchKind::MemberDot,
+                        byte_start: start,
+                        line: head.start_position().row as u32 + 1,
+                        target: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Give each Rust dispatch site the type of its receiver.
     ///
     /// Rust states the type of every parameter and of every annotated
     /// binding, and `self` is whatever the enclosing `impl` names, so a
+    /// One function's merged generic bounds: the enclosing impl's bounds
+    /// underneath, the function's own on top, joined piece-wise where a
+    /// method `where` constrains an impl parameter. Shared by receiver
+    /// typing and call-head dispatch so both read the same scope.
+    fn merge_fn_bounds(
+        mut bounds: std::collections::HashMap<String, String>,
+        node: tree_sitter::Node,
+        source: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let own = Self::rust_own_generic_params(node, source);
+        for (param, bound) in Self::rust_generic_bounds_in(node, source) {
+            if bound.is_empty() || own.contains(&param) {
+                // The function's own parameters keep their own bounds.
+                bounds.insert(param, bound);
+                continue;
+            }
+            // A method `where` on an impl parameter joins both bounds.
+            bounds
+                .entry(param)
+                .and_modify(|held| {
+                    if held.is_empty() {
+                        *held = bound.clone();
+                    } else {
+                        for piece in bound.split(" + ") {
+                            if !held.split(" + ").any(|have| have == piece) {
+                                held.push_str(" + ");
+                                held.push_str(piece);
+                            }
+                        }
+                    }
+                })
+                .or_insert(bound);
+        }
+        bounds.extend(Self::rust_impl_trait_bounds_in(node, source));
+        bounds
+    }
+
     /// receiver that is a plain name can be typed without leaving the file.
     /// C needs its own pass because the shapes differ; this one reads
     /// `function_item`, `parameter` and `let_declaration`.
@@ -2838,35 +3159,8 @@ impl TreeSitterAnalyzer {
                 declared.insert("self".to_string(), self_type.clone());
             }
             Self::rust_declared_types_in(node, source, &mut declared);
-            // Bounds read beside declarations: a bare parameter resolves
-            // through its bound, with impl bounds underneath and
-            // function bounds on top.
-            let mut bounds = impl_bounds.clone().unwrap_or_default();
-            let own = Self::rust_own_generic_params(node, source);
-            for (param, bound) in Self::rust_generic_bounds_in(node, source) {
-                if bound.is_empty() || own.contains(&param) {
-                    // The function's own parameters keep their own bounds.
-                    bounds.insert(param, bound);
-                    continue;
-                }
-                // A method `where` on an impl parameter joins both bounds.
-                bounds
-                    .entry(param)
-                    .and_modify(|held| {
-                        if held.is_empty() {
-                            *held = bound.clone();
-                        } else {
-                            for piece in bound.split(" + ") {
-                                if !held.split(" + ").any(|have| have == piece) {
-                                    held.push_str(" + ");
-                                    held.push_str(piece);
-                                }
-                            }
-                        }
-                    })
-                    .or_insert(bound);
-            }
-            bounds.extend(Self::rust_impl_trait_bounds_in(node, source));
+            let bounds =
+                Self::merge_fn_bounds(impl_bounds.clone().unwrap_or_default(), node, source);
             scopes.push((node.start_byte(), node.end_byte(), declared, bounds));
         }
 
@@ -3466,8 +3760,7 @@ impl TreeSitterAnalyzer {
             let Some(arguments) = node.child_by_field_name("arguments") else {
                 return true;
             };
-            let mut cursor = arguments.walk();
-            for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+            for (index, argument) in crate::call_actuals(arguments).into_iter().enumerate() {
                 let named = match argument.kind() {
                     "identifier" => Some(argument),
                     "pointer_expression" => argument
@@ -4013,14 +4306,18 @@ impl TreeSitterAnalyzer {
     fn rewrite_rust_use_aliases(
         calls: Vec<CallEdge>,
         aliases: &HashMap<&str, (&str, usize)>,
+        root_shadows: bool,
+        shadow: Option<isize>,
     ) -> Vec<CallEdge> {
-        if aliases.is_empty() {
-            return calls;
-        }
+        // No empty-map early return: an unmapped `bindings::` head still
+        // strips where no local module shadows it, resolving as the
+        // extern crate.
         calls
             .into_iter()
             .map(|edge| match edge {
-                CallEdge::Plain(call) => CallEdge::Plain(Self::rewrite_use_head(&call, aliases)),
+                CallEdge::Plain(call) => {
+                    CallEdge::Plain(Self::rewrite_use_head(&call, aliases, root_shadows, shadow))
+                }
                 tagged => tagged,
             })
             .collect()
@@ -4044,7 +4341,30 @@ impl TreeSitterAnalyzer {
         None
     }
 
-    fn rewrite_use_head(call: &str, aliases: &HashMap<&str, (&str, usize)>) -> String {
+    fn rewrite_use_head(
+        call: &str,
+        aliases: &HashMap<&str, (&str, usize)>,
+        root_shadows: bool,
+        shadow: Option<isize>,
+    ) -> String {
+        // A spelled-out `crate::bindings::` head resolves from the root
+        // scope: the shim unless the root binds the name to its own
+        // module or a non-shim import. Enclosing modules cannot shadow
+        // an absolute path, but a root binding still wins however deep
+        // the call sits. Anything else keeps the written spelling: a
+        // root import marks the shadow, but the rewrite does not follow
+        // it to its target.
+        if let Some(after) = call.strip_prefix("crate::bindings::") {
+            if !root_shadows
+                && after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                return after.to_string();
+            }
+            return call.to_string();
+        }
         let Some(at) = Self::first_top_level_scope(call) else {
             return call.to_string();
         };
@@ -4052,10 +4372,114 @@ impl TreeSitterAnalyzer {
         if matches!(head, "crate" | "self" | "super" | "Self") {
             return call.to_string();
         }
+        // The FFI shim is a rename, not an owner: `bindings::seq_printf`
+        // names the C function `seq_printf`. A `kernel::bindings` import
+        // names the extern crate and strips where the import reads
+        // inside the shadowing scope; a `crate::bindings` import starts
+        // from the crate root and strips where the root binds nothing of
+        // its own. A bare head is the shim where no enclosing module,
+        // the definition's own body, or the root declares the module —
+        // the kernel crate builds with `--extern bindings`, so it
+        // resolves with no import in scope. Anything else keeps its
+        // spelling, as does a shadow with no import.
+        if head == "bindings" {
+            let shim = match aliases.get("bindings") {
+                Some((path, depth)) => {
+                    let in_scope = shadow.is_none_or(|k| *depth as isize > k + 1);
+                    in_scope
+                        && (*path == "kernel::bindings" || *path == "bindings" && !root_shadows)
+                }
+                None => shadow.is_none(),
+            };
+            if shim {
+                return rest.strip_prefix("::").unwrap_or(rest).to_string();
+            }
+            // A shadowed head resolves to the file's own module: the
+            // outer import is invisible at the call site, so the map
+            // must not rewrite it either.
+            if shadow.is_some() {
+                return call.to_string();
+            }
+        }
         match aliases.get(head) {
             Some((path, _)) => format!("{path}{rest}"),
             None => call.to_string(),
         }
+    }
+
+    /// The path the file-top scope binds `bindings` to, if any: a root
+    /// `use` names the same name a `crate::bindings` path resolves, so a
+    /// non-shim one shadows the shim exactly like a local module does.
+    /// Last in tree order wins, matching the alias admission.
+    fn root_bindings_path(aliases: &[UseAlias]) -> Option<&str> {
+        aliases
+            .iter()
+            .rev()
+            .find(|alias| {
+                alias.name == "bindings" && alias.func.is_none() && alias.scope.is_empty()
+            })
+            .map(|alias| alias.path.as_str())
+    }
+
+    /// The scopes declaring `mod bindings`: the file root, plus the
+    /// nearest enclosing module of the definition. A sibling subtree's
+    /// module does not shadow, so only each enclosing scope's own
+    /// children count. Returns root presence separately from the nearest
+    /// shadow position (-1 for the root itself, else the index into the
+    /// definition's scope ids): a `crate::` path resolves from the root,
+    /// so an inner shadow must not mask a root declaration. Doc-comment
+    /// doctests (`/// # mod bindings`) are comments, never items, so
+    /// they cannot shadow here.
+    fn bindings_shadow_at(
+        tree: &Tree,
+        source: &str,
+        func_scope: &[usize],
+        defined_at: Option<tree_sitter::Node>,
+    ) -> (bool, Option<isize>) {
+        let declares_bindings = |scope: tree_sitter::Node| {
+            // A module's items hang under its body, not directly under
+            // the `mod` node; the file root lists its own children.
+            let body = scope.child_by_field_name("body").unwrap_or(scope);
+            let mut cursor = body.walk();
+            let mut found = false;
+            for child in body.children(&mut cursor) {
+                if child.kind() == "mod_item"
+                    && child
+                        .child_by_field_name("name")
+                        .is_some_and(|n| &source[n.byte_range()] == "bindings")
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        let root_declares = declares_bindings(tree.root_node());
+        // The definition's own body is the innermost scope: a module
+        // declared there shadows the head for the function's calls.
+        if let Some(body) = defined_at.and_then(|node| node.child_by_field_name("body")) {
+            if declares_bindings(body) {
+                return (root_declares, Some(func_scope.len() as isize));
+            }
+        }
+        let mut enclosing = defined_at.and_then(|node| node.parent());
+        while let Some(node) = enclosing {
+            if node.kind() == "mod_item" && declares_bindings(node) {
+                // A mod ancestor sits in the scope chain by
+                // construction; a miss keeps the spelling, fail-closed.
+                let k = func_scope
+                    .iter()
+                    .position(|id| *id == node.id())
+                    .map(|k| k as isize)
+                    .unwrap_or(func_scope.len() as isize);
+                return (root_declares, Some(k));
+            }
+            enclosing = node.parent();
+        }
+        if root_declares {
+            return (true, Some(-1));
+        }
+        (false, None)
     }
 
     /// A member call through `this` (C++) or `self` (Python) as a tagged
@@ -4343,6 +4767,68 @@ impl TreeSitterAnalyzer {
             byte_start: call.start_byte(),
             line: call.start_position().row as u32 + 1,
             kind: RegistrationKind::Assignment,
+        })
+    }
+
+    /// An LSM hook implementation filed in its hook slot:
+    ///
+    /// ```text
+    /// LSM_HOOK_INIT(file_open, selinux_file_open),
+    /// ```
+    ///
+    /// The macro puts `{ .scalls = static_calls_table.file_open, .hook =
+    /// { .file_open = selinux_file_open } }` in the LSM's hook array, so a
+    /// `call_int_hook(file_open, ...)` site can reach it. The slot
+    /// namespace is global (`static_calls_table`), shared by every LSM, so
+    /// the container holds the table, not a struct. A pasted target
+    /// (`bpf_lsm_##NAME`) resolves to nothing until the preprocessor runs:
+    /// it records no row. `NAME` is the bpf template's parameter, never a
+    /// hook, and records nothing either.
+    fn lsm_hook_install(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
+        let call = match node.kind() {
+            "expression_statement" => node.named_child(0)?,
+            "call_expression" => node,
+            _ => return None,
+        };
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let name = call.child_by_field_name("function")?;
+        if name.kind() != "identifier" || &source[name.byte_range()] != "LSM_HOOK_INIT" {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
+        let [hook, target] = named[..] else {
+            return None;
+        };
+        if hook.kind() != "identifier" || target.kind() != "identifier" {
+            return None;
+        }
+        let (hook, target) = (
+            source[hook.byte_range()].to_string(),
+            source[target.byte_range()].to_string(),
+        );
+        if hook.is_empty() || hook == "NAME" || target.is_empty() {
+            return None;
+        }
+        // The paste halves (`bpf_lsm_`, `##`, `NAME`) never form one
+        // identifier node, but a guard on the raw text keeps the probe
+        // working where the grammar changes under it.
+        let call_text = &source[call.byte_range()];
+        if call_text.contains("##") {
+            return None;
+        }
+        Some(RawRegistration {
+            container_type: "static_calls_table".to_string(),
+            container_base_type: None,
+            container_field: None,
+            member: hook,
+            target,
+            byte_start: call.start_byte(),
+            line: call.start_position().row as u32 + 1,
+            kind: RegistrationKind::LsmHook,
         })
     }
 
@@ -4748,6 +5234,8 @@ impl TreeSitterAnalyzer {
                 facts.registrations.push(registration);
             } else if let Some(registration) = Self::static_call_install(node, source) {
                 facts.registrations.push(registration);
+            } else if let Some(registration) = Self::lsm_hook_install(node, source) {
+                facts.registrations.push(registration);
             } else if node.kind() == "initializer_list" {
                 if let Some(table) = Self::function_pointer_table(node, source) {
                     facts
@@ -4835,8 +5323,8 @@ impl TreeSitterAnalyzer {
                         Some((base_type.clone(), source[member.byte_range()].to_string()))
                     });
 
-                    let mut cursor = arguments.walk();
-                    for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+                    for (index, argument) in crate::call_actuals(arguments).into_iter().enumerate()
+                    {
                         let (identifier, taken_address) = match argument.kind() {
                             "identifier" => (Some(argument), false),
                             "pointer_expression" => (
@@ -5360,12 +5848,27 @@ impl TreeSitterAnalyzer {
                 qualifier.as_deref(),
             );
             // Rewrite the head through aliases holding at this definition.
+            let func_scope = Self::item_scope_ids(defined_at);
             let admitted = Self::effective_aliases(
                 &rust_aliases,
-                &Self::item_scope_ids(defined_at),
+                &func_scope,
                 defined_at.map(|node| node.id()),
             );
-            let mut calls = Self::rewrite_rust_use_aliases(calls, &admitted);
+            // The `use`-head rewrite, shim strip included, reads Rust
+            // imports: every other language keeps its heads as written.
+            // The root scope binds what a `crate::` path resolves: its
+            // own module, or a non-shim import of the name, shadows the
+            // shim for the whole file.
+            let mut calls = if ctx.language == Language::Rust {
+                let (root_declares, shadow) =
+                    Self::bindings_shadow_at(ctx.tree, ctx.source, &func_scope, defined_at);
+                let root_shadows = root_declares
+                    || Self::root_bindings_path(&rust_aliases)
+                        .is_some_and(|path| path != "bindings" && path != "kernel::bindings");
+                Self::rewrite_rust_use_aliases(calls, &admitted, root_shadows, shadow)
+            } else {
+                calls
+            };
             // A bare call beside its `this`/`self` twin names the same
             // edge twice; the store keeps one.
             calls.extend(tagged);
@@ -9167,6 +9670,21 @@ mod leading_comment_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn assembly_versions_apart_from_the_grammars() {
+        // `.S` records `N+asm-M`: a scanner fix re-reads only assembly,
+        // never the grammars' rows. Anything with a grammar keeps its
+        // language version.
+        let asm = extractor_version_for_file(Path::new("arch/x86/entry.S"), false);
+        assert!(
+            asm.starts_with(&format!("{EXTRACTOR_VERSION}+asm-")),
+            "asm version must ride the shared one: {asm}"
+        );
+        let c = extractor_version_for_file(Path::new("kernel/fork.c"), false);
+        assert!(!c.contains("+asm-"), "{c}");
+        assert!(c.starts_with(&format!("{EXTRACTOR_VERSION}+")), "{c}");
+    }
+
     fn fields_of(source: &str, type_name: &str) -> Vec<(String, String)> {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
         let analysis = analyzer
@@ -11586,6 +12104,434 @@ mod rust_receiver_tests {
             vec![plain("m::H::assoc"), plain("other::O::run")],
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn rust_bindings_heads_strip_to_the_c_function() {
+        // The shim is a rename, not an owner: `bindings::seq_printf`
+        // reads as `seq_printf` (the `use` binds the generated shim,
+        // so the head must shed it to match the C definition — even
+        // where a local function shares the name, which then reads as
+        // an honest ambiguity).
+        let found = call_edges_of(
+            "use crate::bindings;\n\
+             fn seq_printf() -> u32 { 1 }\n\
+             fn user() -> u32 { bindings::seq_printf() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("user"), vec![plain("seq_printf")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_only_the_shim() {
+        // A top-level `mod bindings` is the owner the file means: the
+        // module shadows every head in the file, so each spelling stays
+        // (an explicit `as` rename binds a different head and is
+        // unaffected). Any other import keeps its rewritten path for
+        // the same reason: only the `crate::` and `kernel::` shim forms
+        // strip.
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use other::bindings as B;\n\
+             fn a() -> u32 { bindings::foo() }\n\
+             fn b() -> u32 { B::foo() }\n\
+             fn seq_printf() -> u32 { 1 }\n\
+             fn c() -> u32 { bindings::seq_printf() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("a"), vec![plain("bindings::foo")], "{found:?}");
+        assert_eq!(get("b"), vec![plain("other::bindings::foo")], "{found:?}");
+        assert_eq!(get("c"), vec![plain("bindings::seq_printf")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_keeps_a_competing_import() {
+        // `use other::bindings` binds the head itself to another
+        // module: the head keeps its rewritten path (a strip-everything
+        // variant strips here, so this pins the map check, not just the
+        // shadow flag).
+        let found = call_edges_of(
+            "use other::bindings;\n\
+             fn d() -> u32 { bindings::foo() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("d"), vec![plain("other::bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_body_import_reads_in_its_function_only() {
+        // A body import shadows the shim inside its own function, but
+        // the sibling call beside it still strips: the map must not
+        // leak across functions (the top-level `use` in the previous
+        // test reads file-wide by contrast, which is why it lives in
+        // its own fixture).
+        let found = call_edges_of(
+            "fn e() -> u32 { use other::bindings; bindings::bar() }\n\
+             fn f() -> u32 { bindings::baz() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("e"), vec![plain("other::bindings::bar")], "{found:?}");
+        assert_eq!(get("f"), vec![plain("baz")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_shadow_is_lexical() {
+        // The module shadows only its own subtree: the call inside
+        // `outer` keeps its spelling while the top-level call beside
+        // it strips (a file-wide flag would hold both off).
+        let found = call_edges_of(
+            "mod outer {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn inner() -> u32 { bindings::foo() }\n\
+             }\n\
+             fn top() -> u32 { bindings::bar() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        let inner = found
+            .iter()
+            .find(|(n, _)| n.ends_with("inner"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(inner, vec![plain("bindings::foo")], "{found:?}");
+        assert_eq!(get("top"), vec![plain("bar")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_past_a_glob() {
+        // A glob names no alias, so the head still strips: the kernel's
+        // own import-free files all sit beside a prelude glob, and no
+        // in-tree glob provides a `bindings` name (prelude, super, and
+        // uapi globs were censused).
+        let found = call_edges_of(
+            "use other::*;\n\
+             use crate::prelude::*;\n\
+             fn g() -> u32 { bindings::qux() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("g"), vec![plain("qux")], "{found:?}");
+    }
+
+    #[test]
+    fn bindings_heads_keep_their_spelling_outside_rust() {
+        // The rewrite handles Rust imports only: a C++ `bindings::`
+        // head is a genuine qualifier and keeps its spelling.
+        let found = call_edges_of("int foo();\nint f() { return bindings::foo(); }\n", "x.cc");
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_full_crate_path_strips_like_an_import() {
+        // A spelled-out `crate::bindings::` head takes the imported
+        // decision: the shim where the root declares no module of its
+        // own, the file's spelling where it does.
+        let found = call_edges_of("fn w() -> u32 { crate::bindings::wibble() }\n", "lib.rs");
+        let shadowed = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn wobble() -> u32 { 1 }\n\
+             }\n\
+             fn v() -> u32 { crate::bindings::wobble() }\n",
+            "shadow.rs",
+        );
+        let get = |found: &[(String, Vec<crate::types::CallEdge>)], name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get(&found, "w"), vec![plain("wibble")], "{found:?}");
+        assert_eq!(
+            get(&shadowed, "v"),
+            vec![plain("crate::bindings::wobble")],
+            "{shadowed:?}"
+        );
+    }
+
+    #[test]
+    fn rust_bindings_outer_crate_import_loses_to_inner_module() {
+        // A file-level `use crate::bindings` reads outside the nested
+        // module, so the inner module wins at the call site and the head
+        // keeps its spelling (position alone would strip here, since no
+        // root module exists).
+        let found = call_edges_of(
+            "use crate::bindings;\n\
+             mod a {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn f() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let f = found
+            .iter()
+            .find(|(n, _)| n == "f" || n.ends_with("::f"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(f, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_function_body_module_shadows() {
+        // A module declared in the function body is the innermost scope:
+        // the call names it, not the shim, with no import anywhere.
+        let found = call_edges_of(
+            "fn f() -> u32 {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tbindings::foo()\n\
+             }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_root_import_names_the_local_module() {
+        // The root scope binds `bindings` to the file's own module
+        // through an import: a `crate::` path resolves that binding, so
+        // the full-path call keeps its spelling (position alone would
+        // strip it, since no module declaration exists).
+        let found = call_edges_of(
+            "mod alt {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use crate::alt as bindings;\n\
+             fn f() -> u32 { crate::bindings::foo() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("crate::bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_child_crate_import_follows_the_root_binding() {
+        // The child's `use crate::bindings` resolves the root scope's
+        // binding, which names the local module: the call keeps the
+        // written spelling (the import path alone reads as the shim).
+        let found = call_edges_of(
+            "mod alt {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use crate::alt as bindings;\n\
+             mod child {\n\
+             \tuse crate::bindings;\n\
+             \tpub fn g() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let g = found
+            .iter()
+            .find(|(n, _)| n == "g" || n.ends_with("::g"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(g, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_inner_shadow_masks_no_root_declaration() {
+        // Both scopes declare the module: the `crate::` path resolves
+        // from the root, where the module sits, so the full-path call
+        // keeps its spelling even though an inner shadow is nearer. The
+        // function-local import names that same root module, so its call
+        // keeps the written spelling too (a root-blind rule strips both).
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             mod child {\n\
+             \tmod bindings {\n\
+             \t\tpub fn bar() -> u32 { 2 }\n\
+             \t}\n\
+             \tpub fn f() -> u32 { crate::bindings::foo() }\n\
+             \tpub fn g() -> u32 { use crate::bindings; bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name || n.ends_with(&format!("::{name}")))
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("crate::bindings::foo")], "{found:?}");
+        assert_eq!(get("g"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_child_import_names_the_file_module() {
+        // `use crate::bindings` inside a child module names the file's
+        // own top-level module, not the shim: the absolute path resolves
+        // from the root, where the module sits. The head keeps its
+        // spelling (position alone would strip here, since the import
+        // reads inside the shadowing scope).
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             mod child {\n\
+             \tuse crate::bindings;\n\
+             \tpub fn f() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let f = found
+            .iter()
+            .find(|(n, _)| n == "f" || n.ends_with("::f"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(f, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_inner_module_wins_over_outer_import() {
+        // The inverse of the import-wins test: a file-level shim import
+        // reads outside the child's own module, so the inner module
+        // wins at the call site and the head keeps its spelling.
+        let found = call_edges_of(
+            "use kernel::bindings;\n\
+             mod child {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn g() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let g = found
+            .iter()
+            .find(|(n, _)| n == "g" || n.ends_with("::g"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(g, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_import_wins_over_an_outer_module() {
+        // The import reads in its own scope ahead of the file's
+        // module: the call strips where the body names the shim, while
+        // the top-level call beside it keeps its spelling.
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             fn h() -> u32 { use kernel::bindings; bindings::foo() }\n\
+             fn i() -> u32 { bindings::bar() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("h"), vec![plain("foo")], "{found:?}");
+        assert_eq!(get("i"), vec![plain("bindings::bar")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_without_an_import() {
+        // No `use` binds `bindings`, and no local module shadows it:
+        // the head is the extern crate the kernel passes with
+        // `--extern bindings` — the pattern of `rust/kernel/print.rs`,
+        // which names no import — and strips. `use kernel::bindings`
+        // names the same shim through the crate root's re-export.
+        // Bare `use bindings;` records no alias, so it runs this same
+        // unmapped branch; the fixture pins the spelling anyway.
+        let found = call_edges_of(
+            "use crate::fmt;\n\
+             fn a() -> u32 { bindings::seq_printf() }\n",
+            "print.rs",
+        );
+        let kernel = call_edges_of(
+            "use kernel::bindings;\n\
+             fn b() -> u32 { bindings::seq_printf() }\n",
+            "node.rs",
+        );
+        let bare = call_edges_of(
+            "use bindings;\n\
+             fn c() -> u32 { bindings::seq_printf() }\n",
+            "param.rs",
+        );
+        let get = |found: &[(String, Vec<crate::types::CallEdge>)], name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get(&found, "a"), vec![plain("seq_printf")], "{found:?}");
+        assert_eq!(get(&kernel, "b"), vec![plain("seq_printf")], "{kernel:?}");
+        assert_eq!(get(&bare, "c"), vec![plain("seq_printf")], "{bare:?}");
     }
 
     #[test]

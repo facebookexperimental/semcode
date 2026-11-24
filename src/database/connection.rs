@@ -247,6 +247,17 @@ pub struct DatabaseManager {
     /// scan, just not re-run.
     callers_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<(String, String)>>>,
     callees_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<String>>>,
+    /// The git repo, opened once: `is_checked_out` below runs per file
+    /// (every overlay read gates on it), and a fresh discover per call
+    /// revalidates the pack index every time — minutes on caller
+    /// listings with thousands of files. The cached fingerprint decides
+    /// re-discovery, not correctness: branch switches, worktree swaps,
+    /// and packed-refs rewrites change its files and re-open. Everyday
+    /// commits rewrite a loose ref (neither HEAD nor packed-refs), which
+    /// the fingerprint misses — but the fast path re-resolves HEAD
+    /// through the shared handle on every call, and loose refs read
+    /// live, so the answer stays current either way.
+    git_repo: std::sync::RwLock<Option<(gix::ThreadSafeRepository, Vec<u8>)>>,
 }
 
 /// The URI to give lancedb for a local database path.
@@ -314,6 +325,7 @@ impl DatabaseManager {
             workdir_index_generation: AtomicU64::new(u64::MAX),
             callers_memo: std::sync::RwLock::new(HashMap::new()),
             callees_memo: std::sync::RwLock::new(HashMap::new()),
+            git_repo: std::sync::RwLock::new(None),
         })
     }
 
@@ -356,13 +368,66 @@ impl DatabaseManager {
         if git_sha.is_empty() {
             return false;
         }
-        match gix::discover(&self.git_repo_path) {
-            Ok(repo) => repo
-                .head_commit()
-                .map(|c| c.id().to_string() == git_sha)
-                .unwrap_or(false),
-            Err(_) => false,
+        self.cached_head_id().is_some_and(|head| head == git_sha)
+    }
+
+    /// The workdir's HEAD commit id through the shared repo handle:
+    /// one discovery per process while the HEAD file's bytes are
+    /// unchanged, a re-discovery on any workdir move. `None` where the
+    /// repo does not open or HEAD does not resolve — callers treat that
+    /// as not-checked-out, exactly as the per-call discover did.
+    fn cached_head_id(&self) -> Option<String> {
+        // Fast path under the read lock: same fingerprint, shared store,
+        // so no discovery and no pack-index revalidation.
+        {
+            let guard = self.git_repo.read().unwrap();
+            if let Some((repo, fingerprint)) = guard.as_ref() {
+                if Self::git_fingerprint(&self.git_repo_path, repo.path()) == *fingerprint {
+                    return repo
+                        .to_thread_local()
+                        .head_commit()
+                        .ok()
+                        .map(|c| c.id().to_string());
+                }
+            }
         }
+        // Miss or workdir move: open without holding the lock (no worker
+        // ever blocks on discovery I/O), then cache for the next call.
+        let fresh = gix::ThreadSafeRepository::discover(&self.git_repo_path).ok()?;
+        let fingerprint = Self::git_fingerprint(&self.git_repo_path, fresh.path());
+        let head = fresh.to_thread_local().head_commit().ok()?.id().to_string();
+        *self.git_repo.write().unwrap() = Some((fresh, fingerprint));
+        Some(head)
+    }
+
+    /// Bytes that change on any workdir move: the workdir's `.git` entry
+    /// (a linked-worktree swap rewrites the pointer file), the HEAD file
+    /// (checkouts and commits rewrite it), and packed-refs (a ref rewrite
+    /// that leaves HEAD's bytes alone still changes these). Linked
+    /// worktrees keep packed-refs in the common dir — the worktree gitdir
+    /// has none — so it is read through `commondir` there. All tiny
+    /// reads; a missing file reads empty, a `.git` directory marks
+    /// itself distinctly.
+    fn git_fingerprint(repo_path: &str, git_dir: &std::path::Path) -> Vec<u8> {
+        let dotgit = std::path::Path::new(repo_path).join(".git");
+        let mut fp = match std::fs::read(&dotgit) {
+            Ok(bytes) => bytes,
+            Err(_) if dotgit.is_dir() => b"dir".to_vec(),
+            Err(_) => Vec::new(),
+        };
+        fp.push(0);
+        fp.extend(std::fs::read(git_dir.join("HEAD")).unwrap_or_default());
+        fp.push(0);
+        // The commondir pointer itself: retargeting it between stores
+        // with identical packed-refs bytes resolves refs elsewhere, so
+        // its bytes join the fingerprint (absent outside worktrees).
+        fp.extend(std::fs::read(git_dir.join("commondir")).unwrap_or_default());
+        fp.push(0);
+        let packed_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .map(|rel| git_dir.join(rel.trim()))
+            .unwrap_or_else(|_| git_dir.to_path_buf());
+        fp.extend(std::fs::read(packed_dir.join("packed-refs")).unwrap_or_default());
+        fp
     }
 
     /// Whether the working-copy overlay may be consulted for a query naming
@@ -382,10 +447,15 @@ impl DatabaseManager {
         self.schema_manager.stored_schema_version().await
     }
 
-    /// Content hashes this build's extractor has read, which is the set a
-    /// later run may skip. A file read by an older extractor is missing from
-    /// it even though the file itself has not changed.
-    pub async fn processed_by_this_extractor(&self) -> Result<std::collections::HashSet<String>> {
+    /// (Blob, path) pairs this build's extractor has read, which is the
+    /// set a later run may skip. A file read by an older extractor is
+    /// missing from it even though the file itself has not changed, and
+    /// so is a file read at another path: analysis can read the path
+    /// (the assembly arch gate does), so a moved file re-analyzes even
+    /// when its blob did not change.
+    pub async fn processed_by_this_extractor(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
         let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
         Ok(self
             .get_all_processed_files()
@@ -401,7 +471,7 @@ impl DatabaseManager {
                         .as_str(),
                     )
             })
-            .map(|record| record.git_file_sha)
+            .map(|record| (record.git_file_sha, record.file))
             .collect())
     }
 
@@ -474,6 +544,12 @@ impl DatabaseManager {
         self.schema_manager.meta_value("index:tree_sha").await
     }
 
+    /// Forget the recorded build beside a data wipe; see
+    /// `SchemaManager::forget_recorded_build`.
+    pub async fn forget_recorded_build(&self) -> Result<()> {
+        self.schema_manager.forget_recorded_build().await
+    }
+
     /// How the index was built: the extensions indexed, and whether macros
     /// were skipped. `None` when the index does not say, which is every index
     /// written before this was recorded.
@@ -536,6 +612,21 @@ impl DatabaseManager {
     }
 
     pub async fn clear_all_data(&self) -> Result<()> {
+        // Forget the record first: a wipe with a record claims a build
+        // that no longer exists. A failure here aborts before anything is
+        // wiped; per-table opens below stay tolerant of absence while a
+        // delete failure aborts loudly, and retrying the wipe converges,
+        // so the next run rebuilds under current options instead of
+        // inheriting stranded ones. The schema version stays: forgetting
+        // is not migrating.
+        self.forget_recorded_build().await?;
+
+        // A wipe skips only tables that are not there: a table that
+        // exists but will not open fails loudly instead of reporting a
+        // wipe with rows left behind.
+        let names = self.connection.table_names().execute().await?;
+        let missing = |name: &str| !names.iter().any(|n| n == name);
+
         // Delete all data from each main table
         for table_name in &[
             "functions",
@@ -554,17 +645,29 @@ impl DatabaseManager {
             // attribute, so a row left behind here outlives the definition.
             "object_macros",
         ] {
-            if let Ok(table) = self.connection.open_table(*table_name).execute().await {
-                table.delete("1=1").await?;
-            }
+            let table = match self.connection.open_table(*table_name).execute().await {
+                Ok(table) => table,
+                Err(_) if missing(table_name) => continue,
+                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            };
+            table
+                .delete("1=1")
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?;
         }
 
         // Delete all data from content shard tables (content_0 through content_15)
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
-            if let Ok(table) = self.connection.open_table(&table_name).execute().await {
-                table.delete("1=1").await?;
-            }
+            let table = match self.connection.open_table(&table_name).execute().await {
+                Ok(table) => table,
+                Err(_) if missing(&table_name) => continue,
+                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            };
+            table
+                .delete("1=1")
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?;
         }
 
         Ok(())
@@ -1209,33 +1312,117 @@ impl DatabaseManager {
 
             let mut dispatches = Vec::new();
             for site in sites {
-                // A site whose receiver type is unknown reaches every member
-                // of that name in the tree, which is not an answer a chain
-                // can follow. `callers` reports those as a count.
-                let Some(container_type) = site.receiver_type.clone() else {
-                    continue;
+                // An LSM hook site files under its slot, not a receiver:
+                // the dispatch macro's first argument is the slot, and no
+                // receiver fields are recorded. It joins the
+                // implementations installed in static_calls_table under
+                // its member, gated on the slot kind on both sides exactly
+                // like the reverse join. A bound needs a receiver
+                // expression, which these sites never carry, so the arms
+                // below never see one; ordinary untyped sites still match
+                // nothing.
+                let lsm_macro = match site.kind {
+                    crate::types::DispatchKind::LsmHookInt => Some("call_int_hook"),
+                    crate::types::DispatchKind::LsmHookVoid => Some("call_void_hook"),
+                    _ => None,
                 };
-
-                let key = (container_type.clone(), site.member.clone());
-                let targets = match slots.get(&key) {
-                    Some(known) => known.clone(),
-                    None => {
-                        let mut targets: Vec<String> = at_revision(
-                            self.registration_store
-                                .find_by_slot(&container_type, &site.member)
-                                .await?,
-                            &manifest,
-                            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
-                        )
-                        .into_iter()
-                        .map(|registration| registration.target)
-                        .collect();
-                        targets.sort();
-                        targets.dedup();
-                        slots.insert(key, targets.clone());
-                        targets
+                if let Some(macro_name) = lsm_macro {
+                    let key = ("static_calls_table".to_string(), site.member.clone());
+                    let targets = match slots.get(&key) {
+                        Some(known) => known.clone(),
+                        None => {
+                            let mut targets: Vec<String> = at_revision(
+                                self.registration_store
+                                    .find_by_slot("static_calls_table", &site.member)
+                                    .await?,
+                                &manifest,
+                                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                            )
+                            .into_iter()
+                            .filter(|registration| {
+                                registration.kind == crate::types::RegistrationKind::LsmHook
+                            })
+                            .map(|registration| registration.target)
+                            .collect();
+                            targets.sort();
+                            targets.dedup();
+                            slots.insert(key, targets.clone());
+                            targets
+                        }
+                    };
+                    if targets.is_empty() {
+                        continue;
                     }
-                };
+                    dispatches.push(crate::types::ResolvedDispatch {
+                        receiver_expr: macro_name.to_string(),
+                        container_type: "static_calls_table".to_string(),
+                        member: site.member.clone(),
+                        file_path: site.file_path.clone(),
+                        line: site.line,
+                        targets,
+                        lsm_kind: Some(site.kind),
+                    });
+                    continue;
+                }
+                // A bound-only site (a generic parameter's method) has no
+                // receiver type to look a slot up by: it joins the trait
+                // implementations of its member whose container the bound
+                // names. Only where the receiver type is missing — a typed
+                // site takes the slot path it always took.
+                let (container_type, targets) =
+                    match (site.receiver_type.clone(), site.receiver_bound.clone()) {
+                        (None, Some(bound)) => {
+                            let mut targets: Vec<String> = at_revision(
+                                self.registration_store
+                                    .find_trait_impls_by_member(&site.member)
+                                    .await?,
+                                &manifest,
+                                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                            )
+                            .into_iter()
+                            .filter(|registration| {
+                                crate::types::each_bound(&bound).iter().any(|piece| {
+                                    crate::types::trait_names_match(
+                                        piece,
+                                        &registration.container_type,
+                                    )
+                                })
+                            })
+                            .map(|registration| registration.target)
+                            .collect();
+                            targets.sort();
+                            targets.dedup();
+                            (bound, targets)
+                        }
+                        (Some(container_type), _) => {
+                            // A site whose receiver type is unknown reaches
+                            // every member of that name in the tree, which is
+                            // not an answer a chain can follow. `callers`
+                            // reports those as a count.
+                            let key = (container_type.clone(), site.member.clone());
+                            let targets = match slots.get(&key) {
+                                Some(known) => known.clone(),
+                                None => {
+                                    let mut targets: Vec<String> = at_revision(
+                                        self.registration_store
+                                            .find_by_slot(&container_type, &site.member)
+                                            .await?,
+                                        &manifest,
+                                        |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                                    )
+                                    .into_iter()
+                                    .map(|registration| registration.target)
+                                    .collect();
+                                    targets.sort();
+                                    targets.dedup();
+                                    slots.insert(key, targets.clone());
+                                    targets
+                                }
+                            };
+                            (container_type, targets)
+                        }
+                        (None, None) => continue,
+                    };
 
                 if targets.is_empty() {
                     continue;
@@ -1248,6 +1435,7 @@ impl DatabaseManager {
                     file_path: site.file_path.clone(),
                     line: site.line,
                     targets,
+                    lsm_kind: None,
                 });
             }
 
@@ -2082,6 +2270,13 @@ impl DatabaseManager {
     /// path (`help` on its own) still never pays either cost.
     fn ensure_workdir_index_built(&self, git_sha: &str) {
         if !self.workdir_overlay_usable(git_sha) {
+            // A query naming a revision other than the checked-out one
+            // must never see workdir state: drop whatever an earlier
+            // query at another revision built, so every reader below
+            // finds nothing and falls back to committed rows. Without
+            // the drop, a warmed index leaks one revision's dirty text
+            // into the next revision's answer in a long-lived process.
+            *self.workdir_index.write().unwrap() = None;
             return;
         }
         let current_generation = self.workdir_command_generation.load(Ordering::Relaxed);
@@ -2169,6 +2364,70 @@ impl DatabaseManager {
         self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard.as_ref().and_then(|w| w.find_callees(name))
+    }
+
+    /// Query-time macro traversal (`macro_via`) reaches through these: the
+    /// overlay's callers and rows by name, macros by file, the repo path
+    /// for blob reads, and the overlay generation that keys the snapshot.
+    pub(crate) fn overlay_callers_of(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.workdir_find_callers(name, git_sha)
+    }
+
+    pub(crate) fn overlay_rows_named(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_all_functions(name).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn overlay_macros_in_file(
+        &self,
+        file_path: &str,
+        git_sha: &str,
+    ) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.file_macros(file_path).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn overlay_dirty_files(&self, git_sha: &str) -> Vec<String> {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().map(|w| w.dirty_files()).unwrap_or_default()
+    }
+
+    pub(crate) fn repo_path(&self) -> &str {
+        &self.git_repo_path
+    }
+
+    pub(crate) async fn macro_candidates(&self, names: &[String]) -> Result<Vec<FunctionInfo>> {
+        self.function_store.macro_candidates_by_names(names).await
+    }
+
+    pub(crate) async fn argument_rows_for_callee(
+        &self,
+        callee: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_callee(callee).await
+    }
+
+    pub(crate) async fn argument_rows_for_target(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_target(target).await
+    }
+
+    pub(crate) async fn dispatch_sites_for_caller(
+        &self,
+        caller: &str,
+    ) -> Result<Vec<crate::types::DispatchSite>> {
+        self.dispatch_site_store.find_by_caller(caller).await
     }
 
     /// Grep function bodies in the workdir overlay.
@@ -5191,6 +5450,14 @@ impl DatabaseManager {
         self.processed_file_store.is_processed(git_file_sha).await
     }
 
+    /// Check if a blob has been processed at a path. The blob alone does
+    /// not qualify: a moved file re-analyzes under its new path.
+    pub async fn is_file_processed_at_path(&self, git_file_sha: &str, file: &str) -> Result<bool> {
+        self.processed_file_store
+            .is_processed_at(git_file_sha, file)
+            .await
+    }
+
     /// Get all processed files for a specific git SHA
     pub async fn get_processed_files_for_git_sha(
         &self,
@@ -6097,6 +6364,10 @@ impl DatabaseManager {
         &self,
         git_sha: &str,
     ) -> Result<crate::database::resolution::RevisionPaths> {
+        // Through `ensure`: a query naming another revision clears a
+        // warmed index instead of reading it, so the manifest's dirty
+        // set never carries one revision's workdir state into another's.
+        self.ensure_workdir_index_built(git_sha);
         let (dirty, deleted) = {
             let guard = self.workdir_index.read().unwrap();
             match guard.as_ref() {
@@ -8966,6 +9237,184 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The checkout cache stays current across workdir moves: an
+    /// everyday commit (loose ref) flips the answer through live HEAD
+    /// resolution, and a packed-refs rewrite flips the fingerprint so
+    /// the handle is re-discovered. The decision always resolves HEAD
+    /// live, so a missed fingerprint costs a re-discovery, never a
+    /// wrong overlay; the fingerprint still covers packed-refs so the
+    /// miss does not happen.
+    #[tokio::test]
+    async fn checkout_cache_tracks_workdir_moves() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "first"]);
+        let sha1 = head_of(repo);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            db_dir.path().to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        // First call populates the cache; a wrong SHA reads false.
+        assert!(db.is_checked_out(&sha1));
+        assert!(!db.is_checked_out(&"0".repeat(40)));
+        // An everyday commit moves a loose ref: HEAD bytes unchanged,
+        // answer must still flip through live resolution.
+        std::fs::write(repo.join("b.txt"), "two\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "second"]);
+        let sha2 = head_of(repo);
+        assert_ne!(sha1, sha2);
+        assert!(db.is_checked_out(&sha2));
+        assert!(!db.is_checked_out(&sha1));
+        // A packed-refs rewrite with HEAD bytes unchanged: the
+        // fingerprint must catch it, not go stale. The loose ref is
+        // removed first so the packed one governs.
+        git(repo, &["pack-refs", "--all"]);
+        // `pack-refs` prunes the loose refs it packs; remove in case.
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/main"));
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/master"));
+        // Point every packed branch at the first commit (the fixture
+        // has no tags): HEAD's bytes do not change, only packed-refs.
+        repoint_packed_refs(repo, &sha2, &sha1);
+        assert!(db.is_checked_out(&sha1));
+        assert!(!db.is_checked_out(&sha2));
+        // A linked worktree keeps packed-refs in the common dir: the
+        // same rewrite there must move a manager pointed at the
+        // worktree. The worktree HEAD (a symref) does not change bytes;
+        // only the common packed-refs does, at the same mtime, so bytes
+        // — not stat — must drive the fingerprint.
+        let wt = repo_dir.path().join("wt");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wtbr",
+                wt.to_str().unwrap(),
+                sha2.as_str(),
+            ],
+        );
+        let wtdb_dir = tempfile::tempdir().unwrap();
+        let wtdb = DatabaseManager::new(
+            wtdb_dir.path().to_str().unwrap(),
+            wt.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(wtdb.is_checked_out(&sha2));
+        git(repo, &["pack-refs", "--all"]);
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/wtbr"));
+        let packed = repo.join(".git/packed-refs");
+        let mtime = std::fs::metadata(&packed).unwrap().modified().unwrap();
+        repoint_common_packed_refs(repo, &sha2, &sha1);
+        std::fs::File::options()
+            .write(true)
+            .open(&packed)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert!(wtdb.is_checked_out(&sha1));
+        assert!(!wtdb.is_checked_out(&sha2));
+        // Retargeting commondir between stores with identical
+        // packed-refs bytes but different loose refs must move the
+        // manager: the pointer bytes join the fingerprint, so the
+        // rewrite re-discovers instead of serving the old store.
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "third"]);
+        let sha3 = head_of(repo);
+        let repo2dir = tempfile::tempdir().unwrap();
+        git(
+            repo,
+            &[
+                "clone",
+                "-q",
+                repo.to_str().unwrap(),
+                repo2dir.path().to_str().unwrap(),
+            ],
+        );
+        let repo2 = repo2dir.path();
+        git(repo2, &["branch", "wtbr", &sha3]);
+        std::fs::copy(
+            repo.join(".git/packed-refs"),
+            repo2.join(".git/packed-refs"),
+        )
+        .unwrap();
+        let wt_gitdir = std::fs::read_to_string(wt.join(".git"))
+            .unwrap()
+            .trim()
+            .strip_prefix("gitdir: ")
+            .unwrap()
+            .to_string();
+        std::fs::write(
+            std::path::Path::new(&wt_gitdir).join("commondir"),
+            repo2.join(".git").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(wtdb.is_checked_out(&sha3));
+        assert!(!wtdb.is_checked_out(&sha1));
+    }
+
+    /// Point every packed ref currently at `from` to `to` in the COMMON
+    /// packed-refs (linked worktrees share it): the worktree gitdir has
+    /// no packed-refs of its own.
+    fn repoint_common_packed_refs(repo: &std::path::Path, from: &str, to: &str) {
+        let path = repo.join(".git/packed-refs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.len() < 41 {
+                lines.push(line.to_string());
+                continue;
+            }
+            let (old, rest) = line.split_at(40);
+            if old == from {
+                lines.push(format!("{to}{rest}"));
+            } else {
+                lines.push(format!("{old}{rest}"));
+            }
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+
+    fn head_of(repo: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Point every packed ref currently at `from` to `to`, keeping
+    /// HEAD's bytes exactly as they were.
+    fn repoint_packed_refs(repo: &std::path::Path, from: &str, to: &str) {
+        let path = repo.join(".git/packed-refs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.len() < 41 {
+                lines.push(line.to_string());
+                continue;
+            }
+            let (old, rest) = line.split_at(40);
+            if old == from {
+                lines.push(format!("{to}{rest}"));
+            } else {
+                lines.push(format!("{old}{rest}"));
+            }
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
     }
 
     #[tokio::test]

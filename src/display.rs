@@ -388,7 +388,9 @@ pub fn display_function_to_writer_with_options(
         writeln!(writer, "Under: {}", guard.yellow())?;
     }
 
-    // Construct and display function declaration/signature
+    // Construct and display function declaration/signature. Assembly
+    // rows are not C functions: print the name, not a synthesized
+    // prototype.
     let params = if func.parameters.is_empty() {
         "void".to_string()
     } else {
@@ -398,7 +400,14 @@ pub fn display_function_to_writer_with_options(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let declaration = format!("{} {}({})", func.return_type, func.name, params);
+    let declaration = if func.return_type.is_empty()
+        && func.parameters.is_empty()
+        && crate::asm::is_asm_path(std::path::Path::new(&func.file_path))
+    {
+        func.name.clone()
+    } else {
+        format!("{} {}({})", func.return_type, func.name, params)
+    };
     writeln!(writer, "\nDeclaration: {}", declaration.green())?;
 
     if show_body && !func.body.is_empty() {

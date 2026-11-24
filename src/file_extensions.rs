@@ -19,10 +19,11 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "rs",  // Rust source files
     "py",  // Python source files
     "zig", // Zig source files
+    "S",   // Assembly sources (uppercase only; lowercase `.s` is compiler output)
 ];
 
 /// Default extensions for indexing (subset of SUPPORTED_EXTENSIONS)
-pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "rs", "zig"];
+pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "rs", "zig", "S"];
 
 /// Returns a Vec<String> of all supported extensions
 pub fn supported_extensions() -> Vec<String> {
@@ -91,12 +92,12 @@ mod tests {
     #[test]
     fn test_default_extensions() {
         let exts = default_extensions();
-        assert_eq!(exts, vec!["c", "h", "rs", "zig"]);
+        assert_eq!(exts, vec!["c", "h", "rs", "zig", "S"]);
     }
 
     #[test]
     fn test_default_extensions_string() {
-        assert_eq!(default_extensions_string(), "c,h,rs,zig");
+        assert_eq!(default_extensions_string(), "c,h,rs,zig,S");
     }
 
     #[test]
@@ -107,6 +108,8 @@ mod tests {
         assert!(is_supported_for_analysis("test.hpp"));
         assert!(is_supported_for_analysis("test.py"));
         assert!(is_supported_for_analysis("test.zig"));
+        assert!(is_supported_for_analysis("test.S"));
+        assert!(!is_supported_for_analysis("test.s"));
         assert!(!is_supported_for_analysis("test.txt"));
     }
 

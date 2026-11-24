@@ -17,6 +17,9 @@ pub struct CallNode {
     /// A Kconfig term asserted higher up this path that this definition's
     /// guard negates: no configuration runs both, so the walk stops here.
     pub contradicts: Option<String>,
+    /// The macro this node is reached through, where the hop into it passes
+    /// through a macro body: `via pr_info`. `None` on ordinary hops.
+    pub via: Option<String>,
     pub children: Vec<CallNode>,
 }
 
@@ -28,6 +31,7 @@ impl CallNode {
             line: 0,
             guard: None,
             contradicts: None,
+            via: None,
             children: Vec::new(),
         }
     }
@@ -374,6 +378,9 @@ fn node_annotation(node: &CallNode) -> String {
     if let Some(fact) = &node.contradicts {
         text.push_str(&format!(" [cannot run here: {fact} holds above]"));
     }
+    if let Some(via) = &node.via {
+        text.push_str(&format!(" [via {via}]"));
+    }
     text
 }
 
@@ -622,45 +629,154 @@ pub async fn show_callers_to_writer_in(
             // name and 5,729 functions reach it. Saying "no functions call it"
             // and stopping there ends a search that should continue at the
             // macro named here.
+            //
+            // Reachability is gated on invocation: a handover the callee
+            // never invokes proves nothing, so only sites whose macro
+            // invokes the parameter keep the "reaches it" claim. The rest
+            // are listed without it.
             let handed = db
                 .find_argument_functions_of_git_aware(name, git_sha)
                 .await?;
-            if !handed.is_empty() {
-                let mut sites: Vec<String> = handed
-                    .iter()
-                    .map(|argument| {
-                        let inside = if argument.enclosing_function.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" in {}", argument.enclosing_function)
-                        };
-                        format!(
-                            "{}() argument {} at {}:{}{}",
-                            argument.callee,
-                            argument.argument_index,
-                            argument.file_path,
+            let via_snapshot = crate::database::macro_via::snapshot_for(db, git_sha).await?;
+            // Stale handovers out — with one exception. A dirty file's
+            // committed argument rows describe the text before the edit, so
+            // they never prove (the legs below never see them); but while
+            // the file's current text still shows the call on the site's
+            // line, they list as unreached rather than vanishing. A
+            // comment-only edit must not erase the very evidence it leaves
+            // unproved; a call the edit removed yields nothing. Deleted
+            // files drop out entirely.
+            let handed: Vec<_> = handed
+                .into_iter()
+                .filter(|argument| {
+                    crate::database::macro_via::row_belongs(
+                        &via_snapshot,
+                        &argument.file_path,
+                        &argument.git_file_hash,
+                    ) || (via_snapshot.dirty.contains(&argument.file_path)
+                        && crate::database::macro_via::dirty_line_contains(
+                            db,
+                            &via_snapshot,
+                            &argument.file_path,
                             argument.line,
-                            inside
-                        )
-                    })
-                    .collect();
-                sites.sort();
-                sites.dedup();
+                            &argument.callee,
+                        ))
+                })
+                .collect();
+            // Reached is keyed per site (macro and slot): one proved slot
+            // must not cover an unproved slot of the same
+            // macro at the same site.
+            let (handover_legs, handover_truncated, handover_depth) =
+                crate::database::macro_via::reverse_handover_legs(db, &via_snapshot, name, pin)
+                    .await?;
+            let proved: std::collections::HashSet<(String, u32, String, u32)> =
+                handover_legs.iter().map(|leg| leg.site_key()).collect();
+            let site_text = |argument: &crate::types::ArgumentFunction| {
+                let inside = if argument.enclosing_function.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in {}", argument.enclosing_function)
+                };
+                format!(
+                    "{}() argument {} at {}:{}{}",
+                    argument.callee,
+                    argument.argument_index,
+                    argument.file_path,
+                    argument.line,
+                    inside
+                )
+            };
+            let mut reached: Vec<String> = handed
+                .iter()
+                .filter(|argument| {
+                    proved.contains(&(
+                        argument.file_path.clone(),
+                        argument.line,
+                        argument.callee.clone(),
+                        argument.argument_index,
+                    ))
+                })
+                .map(site_text)
+                .collect();
+            // Overlay-proved sites have no committed rows: list them from
+            // the legs, or a workdir handover shows its evidence below but
+            // never up here.
+            for leg in &handover_legs {
+                let (macro_name, position) = match leg.outer.first() {
+                    Some(first) => (first.macro_name.clone(), first.position),
+                    None => (leg.macro_name.clone(), leg.position),
+                };
+                let inside = if leg.enclosing.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in {}", leg.enclosing)
+                };
+                reached.push(format!(
+                    "{}() argument {} at {}:{}{}",
+                    macro_name, position, leg.site_file, leg.site_line, inside
+                ));
+            }
+            reached.sort();
+            reached.dedup();
+            let mut listed: Vec<String> = handed
+                .iter()
+                .filter(|argument| {
+                    !proved.contains(&(
+                        argument.file_path.clone(),
+                        argument.line,
+                        argument.callee.clone(),
+                        argument.argument_index,
+                    ))
+                })
+                .map(site_text)
+                .collect();
+            listed.sort();
+            listed.dedup();
+            if !reached.is_empty() {
                 writeln!(
                     writer,
                     "{} it is handed to {} as an argument, so a caller of that reaches it:",
                     "Handed over:".bold().green(),
-                    if sites.len() == 1 {
+                    if reached.len() == 1 {
                         "another call".to_string()
                     } else {
-                        format!("{} calls", sites.len())
+                        format!("{} calls", reached.len())
                     }
                 )?;
-                for site in sites.iter().take(10) {
+                for site in reached.iter().take(10) {
                     writeln!(writer, "  {}", site.bright_black())?;
                 }
-                if sites.len() > 10 {
-                    writeln!(writer, "  ... and {} more", sites.len() - 10)?;
+                if reached.len() > 10 {
+                    writeln!(writer, "  ... and {} more", reached.len() - 10)?;
+                }
+            }
+            // A tripped budget still reports: every site lists as
+            // unreached below with no marker otherwise.
+            if handover_truncated {
+                writeln!(
+                    writer,
+                    "  {}",
+                    crate::database::macro_via::TRUNCATED_WORK_MARKER
+                )?;
+            }
+            if handover_depth {
+                writeln!(
+                    writer,
+                    "  {}",
+                    crate::database::macro_via::TRUNCATED_DEPTH_MARKER
+                )?;
+            }
+            if !listed.is_empty() {
+                writeln!(
+                    writer,
+                    "{} handed as an argument here, but never invoked there:",
+                    "Handed, not reached:".yellow()
+                )?;
+                for site in listed.iter().take(10) {
+                    writeln!(writer, "  {}", site.bright_black())?;
+                }
+                if listed.len() > 10 {
+                    writeln!(writer, "  ... and {} more", listed.len() - 10)?;
                 }
             }
 
@@ -760,6 +876,10 @@ pub async fn show_callers_to_writer_in(
             }
 
             show_indirect_callers(&indirect, writer)?;
+
+            // What passes through a macro body or a macro parameter on its
+            // way here: one shared section, same edges on every surface.
+            write_via_callers(db, name, git_sha, pin, writer).await?;
         }
         None => {
             let error_msg = format!(
@@ -772,6 +892,22 @@ pub async fn show_callers_to_writer_in(
     }
 
     Ok(())
+}
+
+/// The stacking-semantics phrase for an LSM slot leg: an int hook stops
+/// at the first non-default return, so later implementations may never
+/// run; a void hook runs every installed implementation. Both forward
+/// surfaces render it; it mirrors the reverse legs' wording.
+pub fn lsm_dispatch_phrase(kind: crate::types::DispatchKind) -> &'static str {
+    match kind {
+        crate::types::DispatchKind::LsmHookInt => {
+            "hook slot match; first non-default return wins, later implementations possibly shadowed"
+        }
+        crate::types::DispatchKind::LsmHookVoid => {
+            "hook slot match; every installed implementation runs"
+        }
+        _ => "hook slot match",
+    }
 }
 
 /// Callers that reach the function without naming it, with the evidence for
@@ -791,9 +927,8 @@ fn show_indirect_callers(
     // member of that name anywhere in the tree, which for a name like
     // `handler` is most of the kernel. Those are reported as a count, not as
     // an answer.
-    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
-        .iter()
-        .partition(|caller| caller.evidence.is_type_matched());
+    let (confident, by_name_only): (Vec<_>, Vec<_>) =
+        indirect.iter().partition(|caller| caller.is_confident());
 
     if confident.is_empty() && by_name_only.is_empty() {
         return Ok(());
@@ -840,9 +975,27 @@ fn show_indirect_callers(
                 registration_line,
                 registration_count,
                 type_matched,
+                via_bound,
             } => {
-                let confidence = if *type_matched {
+                // An LSM slot has no receiver to match: the wording states
+                // what the dispatch does instead. An int hook stops at the
+                // first non-default return, so later implementations may
+                // never run; a void hook runs every installed
+                // implementation. Both are possible implementations under
+                // stacking, never guaranteed execution.
+                //
+                // A bound leg matched the trait, not a receiver type: it
+                // records that, or the reader assumes a typed match
+                // happened.
+                let confidence = if *via_bound {
+                    "bound match"
+                } else if *type_matched {
                     "receiver type matches"
+                } else if caller.site_kind == crate::types::DispatchKind::LsmHookInt.as_str() {
+                    "hook slot match; first non-default return wins, later \
+                     implementations possibly shadowed"
+                } else if caller.site_kind == crate::types::DispatchKind::LsmHookVoid.as_str() {
+                    "hook slot match; every installed implementation runs"
                 } else {
                     "member name matches, receiver type unknown"
                 };
@@ -1356,16 +1509,22 @@ fn write_caller_above(
     writer: &mut dyn Write,
 ) -> Result<()> {
     let pad = "  ".repeat(indent);
+    let via = node
+        .via
+        .as_deref()
+        .map(|via| format!(" [via {via}]"))
+        .unwrap_or_default();
     if node.file.is_empty() {
-        writeln!(writer, "{}└─ {}", pad, node.name.yellow())?;
+        writeln!(writer, "{}└─ {}{}", pad, node.name.yellow(), via.yellow())?;
     } else {
         writeln!(
             writer,
-            "{}└─ {} ({}:{})",
+            "{}└─ {} ({}:{}){}",
             pad,
             node.name.yellow(),
             node.file.bright_black(),
-            node.line
+            node.line,
+            via.yellow()
         )?;
     }
 
@@ -1419,9 +1578,8 @@ pub async fn write_indirect_reverse_chain(
     // member of that name anywhere in the tree: the callers command reports
     // those as a count, not as an answer, and this section does the same. A
     // site that names the target outright counts as confident.
-    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
-        .iter()
-        .partition(|caller| caller.evidence.is_type_matched());
+    let (confident, by_name_only): (Vec<_>, Vec<_>) =
+        indirect.iter().partition(|caller| caller.is_confident());
 
     // One entry per dispatching function: a function dispatching through the
     // same member twice is one way in, not two.
@@ -1583,8 +1741,9 @@ pub async fn show_callchain_to_writer(
                     format!("\n{}", "=== Reverse Chain (Callers) ===".bold().magenta());
                 writeln!(writer, "{callers_header}")?;
 
-                let reverse_chain =
+                let mut reverse_chain =
                     build_reverse_callchain_with_git(db, name, 3, Some(git_sha)).await?;
+                annotate_tree_with_via(db, git_sha, &mut reverse_chain, false).await?;
                 print_callchain_tree_to_writer(&reverse_chain, 0, writer)?;
             }
 
@@ -1596,8 +1755,9 @@ pub async fn show_callchain_to_writer(
                     format!("\n{}", "=== Forward Chain (Callees) ===".bold().blue());
                 writeln!(writer, "{callees_header}")?;
 
-                let forward_chain =
+                let mut forward_chain =
                     build_forward_callchain_with_git(db, name, 3, Some(git_sha)).await?;
+                annotate_tree_with_via(db, git_sha, &mut forward_chain, true).await?;
                 print_callchain_tree_to_writer(&forward_chain, 0, writer)?;
             }
 
@@ -1812,6 +1972,495 @@ pub async fn show_callees(
     show_callees_to_writer(db, name, &mut stdout(), verbose, git_sha).await
 }
 
+/// The macro-via section for `callers`, shared by the REPL and MCP paths so
+/// both surfaces annotate the same edges: macro layers grouped by via macro
+/// with counts (top 25, then a marker), nested macro layers indented, and
+/// proved handover legs with their enclosing callers. Ordinary callers
+/// remain in the existing sections; this shows only what passes
+/// through a macro body or a macro parameter.
+pub async fn write_via_callers(
+    db: &DatabaseManager,
+    name: &str,
+    git_sha: &str,
+    pin: crate::domain::Context,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use crate::database::macro_via;
+    let snapshot = macro_via::snapshot_for(db, git_sha).await?;
+    let mut visited = std::collections::HashSet::new();
+    let mut closure = macro_via::reverse_closure(db, &snapshot, name, pin, &mut visited).await?;
+    // Trips inside any phase record here: the snapshot holds the
+    // budget, so a spent budget means some phase stopped early.
+    if snapshot.exhausted() {
+        closure.truncated = true;
+    }
+    snapshot.dump_stats(
+        &format!("reverse_closure:{name}"),
+        snapshot.rescans.borrow().len(),
+    );
+    if closure.via_nodes.is_empty()
+        && closure.handovers.is_empty()
+        && !closure.truncated
+        && !closure.depth_cut
+    {
+        return Ok(());
+    }
+    writeln!(writer, "\n=== Via Macros ===")?;
+    let total_groups = closure.via_nodes.len();
+    for node in closure.via_nodes.iter().take(macro_via::TOP_VIA_GROUPS) {
+        write_via_node(node, 0, writer)?;
+    }
+    if total_groups > macro_via::TOP_VIA_GROUPS {
+        writeln!(
+            writer,
+            "{} {} via groups)",
+            macro_via::TRUNCATED_GROUPS_MARKER,
+            total_groups
+        )?;
+    }
+    if closure.truncated {
+        writeln!(writer, "{}", macro_via::TRUNCATED_WORK_MARKER)?;
+    }
+    if closure.depth_cut {
+        writeln!(writer, "{}", macro_via::TRUNCATED_DEPTH_MARKER)?;
+    }
+    write_handover_chains(db, &snapshot, pin, name, &closure.handovers, writer).await?;
+    Ok(())
+}
+
+fn write_via_node(
+    node: &crate::database::macro_via::ViaNode,
+    indent: usize,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use crate::database::macro_via;
+    let pad = "  ".repeat(indent);
+    writeln!(
+        writer,
+        "{}{}: {} caller{}",
+        pad,
+        node.hop.render(),
+        node.callers.len(),
+        if node.callers.len() == 1 { "" } else { "s" }
+    )?;
+    for (caller, file) in node.callers.iter().take(10) {
+        writeln!(writer, "{pad}  {caller} ({file})")?;
+    }
+    if node.callers.len() > 10 {
+        writeln!(writer, "{pad}  ... and {} more", node.callers.len() - 10)?;
+    }
+    for deeper in &node.deeper {
+        write_via_node(deeper, indent + 1, writer)?;
+    }
+    if node.truncated {
+        writeln!(writer, "{pad}{}", macro_via::TRUNCATED_WORK_MARKER)?;
+    }
+    if node.depth_cut {
+        writeln!(writer, "{pad}{}", macro_via::TRUNCATED_DEPTH_MARKER)?;
+    }
+    Ok(())
+}
+
+/// Proved handover legs with the callers that reach through them: for each
+/// leg, the enclosing name's own reverse closure, shown nested. Cycles
+/// through the visited set; budgets bound the whole query.
+/// One handover display group: (enclosing function, site key, invoking
+/// macro) plus the legs shown under it.
+type HandoverGroup<'l> = (
+    (String, (String, u32, String, u32), String),
+    Vec<&'l crate::database::macro_via::HandoverLeg>,
+);
+
+/// The handover chain header: what the site handed, where it was
+/// invoked, and whose callers reach through it. Every pass-through
+/// shows its site-facing definition.
+fn handover_header(
+    target: &str,
+    leg: &crate::database::macro_via::HandoverLeg,
+    enclosing: &str,
+) -> String {
+    if leg.outer.is_empty() {
+        return format!(
+            "{target} handed to {} as argument {} ({}), invoked there; callers of {enclosing} reach it:",
+            leg.macro_name, leg.position, leg.param,
+        );
+    }
+    let first = &leg.outer[0];
+    let mut chain: Vec<String> = leg.outer[1..]
+        .iter()
+        .map(|hop| format!("{} ({}:{})", hop.macro_name, hop.macro_file, hop.macro_line))
+        .collect();
+    let mut tail = format!("{} ({}:{})", leg.macro_name, leg.macro_file, leg.macro_line);
+    if let Some(guard) = leg.macro_guard.as_deref() {
+        if !guard.is_empty() {
+            tail.push_str(&format!(" [{guard}]"));
+        }
+    }
+    chain.push(tail);
+    format!(
+        "{target} handed to {} ({}:{}) as argument {} ({}), invoked via {}; callers of {enclosing} reach it:",
+        first.macro_name,
+        first.macro_file,
+        first.macro_line,
+        first.position,
+        first.param,
+        chain.join(" → "),
+    )
+}
+
+/// One handover chain per enclosing name: the ordinary callers that
+/// reach the target through it, with the macro filter's cut marker.
+/// Public for the budget-sweep regression test, which drives it with a
+/// precharged snapshot the display entry points build internally.
+pub async fn write_handover_chains(
+    db: &DatabaseManager,
+    snapshot: &crate::database::macro_via::ViaSnapshot,
+    pin: crate::domain::Context,
+    target: &str,
+    handovers: &[crate::database::macro_via::HandoverLeg],
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use crate::database::macro_via;
+    // One chain per enclosing name, site, and invoking macro: several
+    // sites in one macro share it, but different handovers through the
+    // same function render under their own evidence.
+    let mut by_enclosing: Vec<HandoverGroup<'_>> = Vec::new();
+    for leg in handovers {
+        if leg.enclosing.is_empty() {
+            continue;
+        }
+        let key = (
+            leg.enclosing.clone(),
+            leg.site_key(),
+            leg.macro_name.clone(),
+        );
+        match by_enclosing.iter_mut().find(|(name, _)| *name == key) {
+            Some((_, legs)) => legs.push(leg),
+            None => by_enclosing.push((key, vec![leg])),
+        }
+    }
+    for ((enclosing, _, _), legs) in &by_enclosing {
+        let first = legs[0];
+        writeln!(writer, "{}", handover_header(target, first, enclosing))?;
+        for leg in legs.iter().take(5) {
+            writeln!(
+                writer,
+                "  {} at {}:{}",
+                crate::database::macro_via::ViaHop {
+                    macro_name: leg.macro_name.clone(),
+                    file_path: leg.macro_file.clone(),
+                    line: leg.macro_line,
+                    guard: leg.macro_guard.clone(),
+                }
+                .render(),
+                leg.site_file,
+                leg.site_line
+            )?;
+        }
+        if legs.len() > 5 {
+            writeln!(writer, "  ... and {} more", legs.len() - 5)?;
+        }
+        let mut visited = std::collections::HashSet::new();
+        visited.insert((enclosing.clone(), String::new()));
+        let inner = macro_via::reverse_closure(db, snapshot, enclosing, pin, &mut visited).await?;
+        // The enclosing name's own ordinary callers are new answers: they
+        // reach the target through this handover. Where the enclosing
+        // name is itself a macro, each caller must expand it where the
+        // caller stands: a rebound wrapper between the definition and
+        // the call site ends the reachability even though the call stands.
+        // The filter below spends budget: a trip inside it drops callers
+        // the pre-filter flag never saw, so the marker follows the filter.
+        let filter_was = snapshot.classified();
+        for (caller, file) in inner.ordinary.iter().take(10) {
+            if !macro_via::macro_rows_for(db, snapshot, enclosing)
+                .await?
+                .is_empty()
+                && !macro_via::named_edge_expands(db, snapshot, pin, file, caller, enclosing)
+                    .await?
+            {
+                continue;
+            }
+            writeln!(writer, "  {caller} ({file})")?;
+        }
+        if inner.ordinary.len() > 10 {
+            writeln!(writer, "  ... and {} more", inner.ordinary.len() - 10)?;
+        }
+        for node in inner.via_nodes.iter().take(macro_via::TOP_VIA_GROUPS) {
+            write_via_node(node, 1, writer)?;
+        }
+        if inner.truncated {
+            writeln!(writer, "  {}", macro_via::TRUNCATED_WORK_MARKER)?;
+        }
+        // A trip inside the filter above drops callers with no other
+        // marker: the pre-filter flag cannot see it. Guarded against a
+        // duplicate where the flag already fired.
+        if !inner.truncated && snapshot.tripped_since(filter_was) {
+            writeln!(writer, "  {}", macro_via::TRUNCATED_WORK_MARKER)?;
+        }
+        if inner.depth_cut {
+            writeln!(writer, "  {}", macro_via::TRUNCATED_DEPTH_MARKER)?;
+        }
+    }
+    Ok(())
+}
+
+/// Annotate a built callchain tree with macro hops, shared by the REPL and
+/// MCP callchain displays. Only the forward tree annotates: there a child
+/// reached through a parent's macro body gains `via M`, and forward
+/// handover legs — nested chains included — append as children with their
+/// call-site evidence. The reverse tree's edges are direct caller links,
+/// so tagging or appending there would point the wrong way; legs and
+/// tags are left out of it. Trees expand per macro, not per invocation
+/// instance: legs from every live site include their exact site
+/// evidence.
+pub async fn annotate_tree_with_via(
+    db: &DatabaseManager,
+    git_sha: &str,
+    node: &mut CallNode,
+    forward: bool,
+) -> Result<()> {
+    use crate::database::macro_via;
+    let snapshot = macro_via::snapshot_for(db, git_sha).await?;
+    annotate_node_with_via(db, &snapshot, node, forward).await
+}
+
+async fn annotate_node_with_via(
+    db: &DatabaseManager,
+    snapshot: &crate::database::macro_via::ViaSnapshot,
+    node: &mut CallNode,
+    forward: bool,
+) -> Result<()> {
+    use crate::database::macro_via;
+    // Is this node itself a macro? Its children are body callees.
+    let macros = macro_via::macro_rows_for(db, snapshot, &node.name).await?;
+    let is_macro = forward && !macros.is_empty();
+    // A rebound callee ends the stored subtree: where the parent is a
+    // macro, a macro child renders only where it still expands at some
+    // live use site of the parent (a use-site re-resolution the bare
+    // structural edge skips). No live sites keeps every child; ordinary
+    // (non-macro) children always expand. Handover legs append below with
+    // their own per-site proofs, so only these structural children gate.
+    if is_macro {
+        let mut kept: Vec<bool> = Vec::with_capacity(node.children.len());
+        let was = snapshot.classified();
+        for child in node.children.iter() {
+            let mut keep = true;
+            if !child.name.is_empty()
+                && macro_via::macro_rows_for(db, snapshot, &child.name)
+                    .await?
+                    .iter()
+                    .any(macro_via::is_macro_row)
+            {
+                keep = false;
+                for parent in &macros {
+                    if macro_via::stored_child_expands(
+                        db,
+                        snapshot,
+                        crate::domain::Context::Any,
+                        parent,
+                        &child.name,
+                    )
+                    .await?
+                    {
+                        keep = true;
+                        break;
+                    }
+                }
+            }
+            kept.push(keep);
+        }
+        let mut dropping = kept.iter();
+        node.children
+            .retain(|_| dropping.next().is_some_and(|keep| *keep));
+        // A trip drops children the proof never examined: mark it, so
+        // readers read the silence as partial, never complete.
+        if snapshot.tripped_since(was) {
+            node.children.push(CallNode::named(
+                "... (forward legs truncated by work limit)",
+            ));
+        }
+    }
+    for child in node.children.iter_mut() {
+        if is_macro && child.via.is_none() && !node.name.is_empty() {
+            child.via = Some(node.name.clone());
+        }
+        Box::pin(annotate_node_with_via(db, snapshot, child, forward)).await?;
+    }
+    if is_macro {
+        // Forward handover closure at this macro's live sites, nested
+        // chains included; every leg admitted for its own site's build.
+        for m in &macros {
+            let mut visited = std::collections::HashSet::new();
+            let subst = std::collections::HashMap::new();
+            let closure = macro_via::forward_closure(
+                db,
+                snapshot,
+                m,
+                crate::domain::Context::Any,
+                &mut visited,
+                &subst,
+            )
+            .await?;
+            for (rendered, leg) in closure.legs.iter().enumerate() {
+                if node.children.len() >= 40 {
+                    node.children.push(CallNode::named(&format!(
+                        "... and {} more",
+                        closure.legs.len().saturating_sub(rendered)
+                    )));
+                    break;
+                }
+                let mut handover = CallNode::named(&leg.actual);
+                handover.file = leg.site_file.clone();
+                handover.line = leg.site_line;
+                handover.via = Some(leg.chain_text());
+                if !leg.site_guard.is_empty() {
+                    handover.guard = Some(leg.site_guard.clone());
+                }
+                node.children.push(handover);
+            }
+            if closure.truncated {
+                node.children.push(CallNode::named(
+                    "... (forward legs truncated by work limit)",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Macro second levels for a whole caller list in one batched pass:
+/// snapshot once, one classification for every name, admitted second-level
+/// edges per macro caller. The two-level displays call this instead of
+/// resolving per caller — a `callers printk` level holds thousands of
+/// names. Returns caller name → edges (absent where the caller is no
+/// macro), plus whether any frontier hit the work limit.
+pub async fn macro_second_levels(
+    db: &DatabaseManager,
+    git_sha: &str,
+    callers: &[String],
+    context: crate::domain::Context,
+) -> Result<(
+    std::collections::HashMap<String, Vec<crate::database::macro_via::CallerEdge>>,
+    bool,
+)> {
+    use crate::database::macro_via;
+    let snapshot = macro_via::snapshot_for(db, git_sha).await?;
+    let (macros, truncated) = macro_via::classify_frontier(db, &snapshot, callers).await?;
+    let mut out: std::collections::HashMap<String, Vec<crate::database::macro_via::CallerEdge>> =
+        std::collections::HashMap::new();
+    for (name, rows) in &macros {
+        let mut edges: Vec<crate::database::macro_via::CallerEdge> = Vec::new();
+        for row in rows {
+            edges.extend(
+                macro_via::second_level_edges(db, &snapshot, name, &row.file_path, &[], context)
+                    .await?,
+            );
+        }
+        edges.sort_by(|a, b| a.name.cmp(&b.name).then(a.file.cmp(&b.file)));
+        edges.dedup_by(|a, b| a.name == b.name && a.file == b.file);
+        out.insert(name.clone(), edges);
+    }
+    let truncated = truncated || snapshot.exhausted();
+    snapshot.dump_stats("macro_second_levels", snapshot.rescans.borrow().len());
+    Ok((out, truncated))
+}
+
+/// Level edges for the two-level callchain displays, shared by the REPL and
+/// MCP paths: whether the named caller is a macro, and — where it is — its
+/// admitted, scope-checked second-level callers carrying the via chain.
+/// Admission and depth apply before anything renders. Every macro
+/// definition's file admits separately: an x86 caller never renders under
+/// an asm-generic hop.
+pub async fn caller_level_edges(
+    db: &DatabaseManager,
+    snapshot: &crate::database::macro_via::ViaSnapshot,
+    caller_name: &str,
+    chain: &[String],
+    context: crate::domain::Context,
+) -> Result<(bool, Vec<crate::database::macro_via::CallerEdge>)> {
+    use crate::database::macro_via;
+    let (macros, _) =
+        macro_via::classify_frontier(db, snapshot, &[caller_name.to_string()]).await?;
+    let Some(rows) = macros.get(caller_name) else {
+        return Ok((false, Vec::new()));
+    };
+    let mut edges: Vec<crate::database::macro_via::CallerEdge> = Vec::new();
+    for row in rows {
+        edges.extend(
+            macro_via::second_level_edges(
+                db,
+                snapshot,
+                caller_name,
+                &row.file_path,
+                chain,
+                context,
+            )
+            .await?,
+        );
+    }
+    edges.sort_by(|a, b| a.name.cmp(&b.name).then(a.file.cmp(&b.file)));
+    edges.dedup_by(|a, b| a.name == b.name && a.file == b.file);
+    snapshot.dump_stats(
+        &format!("caller_level_edges:{caller_name}"),
+        snapshot.rescans.borrow().len(),
+    );
+    Ok((true, edges))
+}
+
+/// Forward handover display legs for one callee name: `(actual, site file,
+/// site line, via text, site guard)`, capped. Shared by the REPL and MCP
+/// callchain displays; empty where the callee is no macro or invokes no
+/// parameter.
+/// One forward handover for display: the actual handed, its site, the via
+/// chain, and the site guard.
+pub type ForwardLegDisplay = (String, String, u32, String, String);
+
+pub async fn forward_handover_display(
+    db: &DatabaseManager,
+    git_sha: &str,
+    callee_name: &str,
+) -> Result<(Vec<ForwardLegDisplay>, usize, bool)> {
+    use crate::database::macro_via;
+    let snapshot = macro_via::snapshot_for(db, git_sha).await?;
+    let mut out: Vec<ForwardLegDisplay> = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    for m in macro_via::macro_rows_for(db, &snapshot, callee_name).await? {
+        let mut visited = std::collections::HashSet::new();
+        let subst = std::collections::HashMap::new();
+        let closure = macro_via::forward_closure(
+            db,
+            &snapshot,
+            &m,
+            crate::domain::Context::Any,
+            &mut visited,
+            &subst,
+        )
+        .await?;
+        truncated = truncated || closure.truncated;
+        total += closure.total_legs;
+        for leg in closure.legs {
+            if out.len() >= 10 {
+                truncated = true;
+                break;
+            }
+            out.push((
+                leg.actual.clone(),
+                leg.site_file.clone(),
+                leg.site_line,
+                format!("via {}", leg.chain_text()),
+                leg.site_guard.clone(),
+            ));
+        }
+    }
+    let truncated = truncated || snapshot.exhausted();
+    snapshot.dump_stats(
+        &format!("forward_handover:{callee_name}"),
+        snapshot.rescans.borrow().len(),
+    );
+    Ok((out, total, truncated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::show_indirect_callers;
@@ -1831,6 +2480,7 @@ mod tests {
                 registration_line: 556,
                 registration_count: 1,
                 type_matched,
+                via_bound: false,
             },
         }
     }

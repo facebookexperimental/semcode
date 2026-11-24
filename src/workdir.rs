@@ -605,6 +605,24 @@ impl WorkdirIndex {
         })
     }
 
+    /// Every macro row stored for one file: the dirty-file scope source.
+    /// A dirty file's `#define`/`#undef` intervals cannot be rescanned (the
+    /// overlay keeps rows, not text), so each overlay macro row stands as
+    /// its own single-interval scope.
+    pub(crate) fn file_macros(&self, file_path: &str) -> Vec<&FunctionInfo> {
+        self.macros
+            .values()
+            .flatten()
+            .filter(|row| row.file_path == file_path)
+            .collect()
+    }
+
+    /// Every file the overlay holds rows for: the dirty set at this
+    /// snapshot. Handover re-derivation walks these files' macro bodies.
+    pub(crate) fn dirty_files(&self) -> Vec<String> {
+        self.dirty_manifest.keys().cloned().collect()
+    }
+
     /// Check if a file path has uncommitted changes.
     pub fn is_dirty(&self, file_path: &str) -> bool {
         self.dirty_manifest.contains_key(file_path)

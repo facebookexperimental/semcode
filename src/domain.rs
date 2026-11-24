@@ -263,6 +263,15 @@ fn program_of(parts: &[&str]) -> Program {
 /// way as `arch/x86`. `arch/<host>/um/**` is um's own code -- Kbuild pulls
 /// it in with `core-y += $(HOST_DIR)/um/` -- so it is um, not the host.
 fn arch_of(parts: &[&str]) -> Option<&'static str> {
+    // Accelerated code lives under `lib/<sub>/<arch>/` (crypto, crc):
+    // that names the target architecture the same way `arch/` does.
+    if parts.first() == Some(&"lib") {
+        if let Some(named) = parts.get(2) {
+            if let Some(known) = ARCHITECTURES.iter().copied().find(|arch| arch == named) {
+                return Some(known);
+            }
+        }
+    }
     let index = parts.iter().position(|part| *part == "arch")?;
     let named = parts.get(index + 1)?;
     let known = ARCHITECTURES.iter().copied().find(|arch| arch == named);
@@ -380,6 +389,19 @@ mod tests {
             domain_of("tools/arch/x86/lib/memcpy_64.S").arch,
             Some("x86")
         );
+        // Accelerated code under `lib/<sub>/<arch>/` names its target the
+        // same way; anything else under `lib/` stays generic.
+        assert_eq!(
+            domain_of("lib/crypto/arm64/sha512-ce-glue.c").arch,
+            Some("arm64")
+        );
+        assert_eq!(domain_of("lib/crc/arm64/crc-t10dif.c").arch, Some("arm64"));
+        assert_eq!(
+            domain_of("lib/crypto/x86/sha1_ssse3_glue.c").arch,
+            Some("x86")
+        );
+        assert_eq!(domain_of("lib/crypto/sha256.c").arch, None);
+        assert_eq!(domain_of("lib/rbtree.c").arch, None);
     }
 
     #[test]

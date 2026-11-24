@@ -9,6 +9,7 @@ pub mod dispatch_sites;
 mod functions;
 pub mod globals;
 mod lore_date;
+pub mod macro_via;
 pub mod object_macros;
 pub mod processed_files;
 pub mod registrations;

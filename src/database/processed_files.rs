@@ -145,6 +145,30 @@ impl ProcessedFileStore {
         Ok(!results.is_empty() && results[0].num_rows() > 0)
     }
 
+    /// Whether the blob was read at this path: analysis can read the path,
+    /// so a blob processed elsewhere does not count.
+    pub async fn is_processed_at(&self, git_file_sha: &str, file: &str) -> Result<bool> {
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+
+        let file_escaped = file.replace('\'', "''");
+        let filter = format!("git_file_sha = '{git_file_sha}' AND file = '{file_escaped}'");
+
+        let results = table
+            .query()
+            .only_if(filter)
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok(!results.is_empty() && results[0].num_rows() > 0)
+    }
+
     /// Get all processed files for a specific git_sha
     pub async fn get_processed_files_for_git_sha(
         &self,
