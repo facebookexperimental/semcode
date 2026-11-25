@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 9;
+pub const EXTRACTOR_VERSION: u32 = 10;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -5222,13 +5222,13 @@ impl TreeSitterAnalyzer {
         false
     }
 
-    /// The bare name a C++ qualified use-site stores: follow `name` down
-    /// nested qualifiers to the leaf, then store the leaf itself. Only a
-    /// value leaf counts; a lone `::` has no owner path, so the shared
-    /// split keeps it whole and this stores nothing.
-    fn cpp_bare_use_target(node: tree_sitter::Node, source: &str) -> Option<String> {
+    /// The bare name a qualified use-site stores: `name` reaches the leaf
+    /// in both C++ `qualified_identifier` and Rust `scoped_identifier`.
+    /// Only an `identifier` leaf stores; a lone `::` has no owner path,
+    /// so the shared split keeps it whole and this stores nothing.
+    fn qualified_bare_use_target(node: tree_sitter::Node, source: &str) -> Option<String> {
         let mut leaf = node;
-        while leaf.kind() == "qualified_identifier" {
+        while matches!(leaf.kind(), "qualified_identifier" | "scoped_identifier") {
             leaf = leaf.child_by_field_name("name")?;
         }
         if leaf.kind() != "identifier" {
@@ -5277,7 +5277,7 @@ impl TreeSitterAnalyzer {
                         let target = match value.kind() {
                             "identifier" => Some(source[value.byte_range()].to_string()),
                             "qualified_identifier" if language == Language::Cpp => {
-                                Self::cpp_bare_use_target(value, source)
+                                Self::qualified_bare_use_target(value, source)
                             }
                             "pointer_expression" => match value.child_by_field_name("argument") {
                                 Some(argument) if argument.kind() == "identifier" => {
@@ -5287,7 +5287,7 @@ impl TreeSitterAnalyzer {
                                     if argument.kind() == "qualified_identifier"
                                         && language == Language::Cpp =>
                                 {
-                                    Self::cpp_bare_use_target(argument, source)
+                                    Self::qualified_bare_use_target(argument, source)
                                 }
                                 _ => None,
                             },
@@ -5370,7 +5370,15 @@ impl TreeSitterAnalyzer {
                                 false,
                             ),
                             "qualified_identifier" if language == Language::Cpp => {
-                                let Some(leaf) = Self::cpp_bare_use_target(argument, source) else {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
+                                    continue;
+                                };
+                                (argument, leaf, false, true)
+                            }
+                            "scoped_identifier" if language == Language::Rust => {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
                                     continue;
                                 };
                                 (argument, leaf, false, true)
@@ -5384,7 +5392,8 @@ impl TreeSitterAnalyzer {
                                         (inner, source[inner.byte_range()].to_string(), true, false)
                                     }
                                     "qualified_identifier" if language == Language::Cpp => {
-                                        let Some(leaf) = Self::cpp_bare_use_target(inner, source)
+                                        let Some(leaf) =
+                                            Self::qualified_bare_use_target(inner, source)
                                         else {
                                             continue;
                                         };
@@ -5433,7 +5442,7 @@ impl TreeSitterAnalyzer {
                     let target = match right.kind() {
                         "identifier" => source[right.byte_range()].to_string(),
                         "qualified_identifier" if language == Language::Cpp => {
-                            let Some(leaf) = Self::cpp_bare_use_target(right, source) else {
+                            let Some(leaf) = Self::qualified_bare_use_target(right, source) else {
                                 return true;
                             };
                             leaf
@@ -5446,7 +5455,8 @@ impl TreeSitterAnalyzer {
                                 if argument.kind() == "qualified_identifier"
                                     && language == Language::Cpp =>
                             {
-                                let Some(leaf) = Self::cpp_bare_use_target(argument, source) else {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
                                     return true;
                                 };
                                 leaf
@@ -14361,6 +14371,43 @@ mod qualified_use_site_tests {
             .unwrap_or_else(|| panic!("no row: {found:?}"));
         assert_eq!(row.target, "my_read", "{row:?}");
         assert_eq!(row.kind, RegistrationKind::DesignatedInit, "{row:?}");
+    }
+
+    #[test]
+    fn a_qualified_rust_handover_stores_the_bare_leaf() {
+        let found = handover_rows("fn f() { register(m::handler); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "handler", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_scoped_leading_rust_handover_stores_the_bare_leaf() {
+        // A scoped leading `::` still has an owner path, so the shared
+        // cut stores the leaf: one rule for both languages.
+        let found = handover_rows("fn f() { register(::m::handler); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "handler", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn an_aliased_rust_handler_records_the_alias() {
+        // The stored target is the name at the use-site: resolving the
+        // import and cutting again would store `handler` instead of `h`.
+        let found = handover_rows("use m::handler as h;\nfn f() { register(h); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "h", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
     }
 
     #[test]
