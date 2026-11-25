@@ -116,7 +116,14 @@ struct Args {
     /// Clone and index lore.kernel.org archives into <db_dir>/lore/<repo>
     /// Accepts comma-separated list of archives (e.g., --lore bpf,netdev,lkml/0)
     /// Without arguments, refreshes all previously indexed archives
-    #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 0..)]
+    /// Run branch indexing in a separate invocation.
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        num_args = 0..,
+        conflicts_with_all = ["branch", "branches", "all_branches", "remote_branches", "update_branches"]
+    )]
     lore: Option<Vec<String>>,
 
     /// Leave the lore archive git repositories unpacked after fetching
