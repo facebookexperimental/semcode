@@ -3644,6 +3644,9 @@ impl McpServer {
         if let Some(refusal) = refuse_unscopable_tool(name, arguments) {
             return refusal;
         }
+        // Each tool call is a new command: the working copy or HEAD may have
+        // changed since the last one.
+        self.db.note_repl_command();
 
         match name {
             "file_survey" => self.handle_file_survey(arguments).await,

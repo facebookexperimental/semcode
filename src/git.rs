@@ -232,17 +232,19 @@ pub fn get_git_file_hash_with_fallback<P: AsRef<Path>>(file_path: P) -> Result<S
 }
 
 /// Run `git` for a test in `dir` and return its trimmed stdout, panicking
-/// with its stderr if it fails. The command sees neither the developer's git
-/// configuration nor a `GIT_DIR` or work tree inherited from a hook or
-/// `git rebase --exec`, so it can only touch the repository in `dir`.
+/// with its stderr if it fails. Ignore inherited Git variables and user
+/// configuration so repository fixtures are independent of the caller.
 #[cfg(test)]
 pub(crate) fn test_git(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let out = command
         .args(args)
         .current_dir(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "test")
