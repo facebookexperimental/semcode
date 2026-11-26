@@ -100,7 +100,7 @@ pub fn repack_if_needed(repo_path: &Path, threshold: usize) -> Result<Option<Rep
             allow_thin_pack: false,
             ..Default::default()
         },
-    );
+    )?;
 
     let mut staged = tempfile::NamedTempFile::new_in(&pack_dir)
         .with_context(|| format!("creating a staging pack in {}", pack_dir.display()))?;
@@ -108,7 +108,7 @@ pub fn repack_if_needed(repo_path: &Path, threshold: usize) -> Result<Option<Rep
     // finish, and a delta entry names its base by the position that
     // base takes in the whole sequence.
     let mut writer = pack::data::output::bytes::FromEntriesIter::new(
-        gix::features::parallel::InOrderIter::from(chunks),
+        gix::parallel::InOrderIter::from(chunks),
         &mut staged,
         objects_written as u32,
         pack::data::Version::V2,
@@ -125,10 +125,8 @@ pub fn repack_if_needed(repo_path: &Path, threshold: usize) -> Result<Option<Rep
         &mut gix::progress::Discard,
         &gix::interrupt::IS_INTERRUPTED,
         None::<gix::odb::Handle>,
-        pack::bundle::write::Options {
-            object_hash,
-            ..Default::default()
-        },
+        object_hash,
+        pack::bundle::write::Options::default(),
     )?;
 
     // write_to_directory() creates the .keep before it moves the new
