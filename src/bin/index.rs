@@ -4,7 +4,7 @@ mod index_impl;
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
-use index_impl::result::{BranchReport, Outcome, Report, ReportSink};
+use index_impl::result::{ArchiveReport, BranchReport, Outcome, Report, ReportSink};
 use semcode::indexer::{
     list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline, KnownLoreIds,
     LoreIndexIncomplete,
@@ -151,8 +151,8 @@ struct Args {
     #[arg(long)]
     update_branches: bool,
 
-    /// Write a JSON report of per-branch outcomes to PATH.
-    /// Branch modes only; see docs/index-result.md for the format.
+    /// Write a JSON report of per-branch or per-archive outcomes to PATH.
+    /// Branch and lore modes only; see docs/index-result.md for the format.
     #[arg(long, value_name = "PATH")]
     result_json: Option<PathBuf>,
 }
@@ -714,7 +714,62 @@ struct LoreIndexResult {
     /// Rows appended to the lore table.  Emails already stored, such as
     /// crossposts, and commits that hold no message are not counted.
     new_emails: usize,
+    /// Commits of the archive that were not yet recorded as indexed.
+    /// Zero means the archive was already current.
+    new_commits: usize,
     total_emails: usize,
+}
+
+/// The report entry for one archive. An archive is current when it had no
+/// commit left to index, whether or not its new commits added emails.
+fn archive_report(name: String, indexed: &Result<LoreIndexResult>) -> ArchiveReport {
+    match indexed {
+        Ok(result) if result.new_commits == 0 => ArchiveReport::new(&name, Outcome::Current, None),
+        Ok(_) => ArchiveReport::new(&name, Outcome::Indexed, None),
+        Err(e) => failed_archive(name, e),
+    }
+}
+
+fn failed_archive(name: String, e: &anyhow::Error) -> ArchiveReport {
+    ArchiveReport::new(&name, Outcome::Failed, Some(format!("{e:#}")))
+}
+
+/// Print the failed archives of a lore run, and return the error that
+/// fails the run if there are any.
+fn lore_failure(reports: &[ArchiveReport], verb: &str) -> Option<anyhow::Error> {
+    let failed: Vec<&ArchiveReport> = reports
+        .iter()
+        .filter(|r| r.outcome == Outcome::Failed)
+        .collect();
+    if failed.is_empty() {
+        return None;
+    }
+    eprintln!("\nFailed archives:");
+    for r in &failed {
+        eprintln!("  {}: {}", r.name, r.error.as_deref().unwrap_or(""));
+    }
+    Some(anyhow::anyhow!(
+        "{} of {} lore archive(s) {}",
+        failed.len(),
+        reports.len(),
+        verb
+    ))
+}
+
+/// Publish the lore report, if one was asked for, then fail the run if
+/// any archive failed.
+fn finish_lore_run(
+    report: Option<ReportSink>,
+    reports: Vec<ArchiveReport>,
+    failure: Option<anyhow::Error>,
+) -> Result<()> {
+    if let Some(sink) = report {
+        sink.publish(&Report::archives(reports))?;
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Index a lore archive repository, filtering out already-indexed commits.
@@ -790,6 +845,7 @@ async fn index_lore_archive(
         println!("All commits in {} are already indexed!", display_name);
         return Ok(LoreIndexResult {
             new_emails: 0,
+            new_commits: 0,
             total_emails: total_commits,
         });
     }
@@ -815,6 +871,7 @@ async fn index_lore_archive(
 
     Ok(LoreIndexResult {
         new_emails,
+        new_commits: new_count,
         total_emails: total_commits,
     })
 }
@@ -867,14 +924,14 @@ fn first_branch_flag(args: &Args) -> Option<&'static str> {
     }
 }
 
-/// `--result-json` reports branch outcomes only; refuse it where another
-/// mode would run instead, before anything touches the database.
+/// `--result-json` reports branch or lore archive outcomes only; refuse it
+/// where another mode would run instead, before anything touches the
+/// database. Lore and branch flags together are refused in async_main.
 fn check_result_json_mode(args: &Args) -> Result<()> {
-    if !branch_mode_requested(args) {
-        anyhow::bail!("--result-json requires --branch, --branches or --all-branches");
+    if !branch_mode_requested(args) && args.lore.is_none() {
+        anyhow::bail!("--result-json requires --branch, --branches, --all-branches or --lore");
     }
     let conflicts = [
-        ("--lore", args.lore.is_some()),
         ("--git", args.git.is_some()),
         ("--commits", args.commits.is_some()),
         ("--vectors", args.vectors),
@@ -1362,8 +1419,7 @@ async fn async_main() -> Result<()> {
     };
 
     // Lore and branch indexing never share a run. This rides after the
-    // report takedown so a rejected mix removes a stale report first;
-    // with a report the mode check above already refused the same mix.
+    // report takedown so a rejected mix removes a stale report first.
     if let (Some(_), Some(flag)) = (&args.lore, first_branch_flag(&args)) {
         anyhow::bail!(
             "--lore cannot be used with {flag}; run branch indexing in a separate invocation"
@@ -1378,6 +1434,13 @@ async fn async_main() -> Result<()> {
         // If --lore has arguments, clone and index specified archives
         // If --lore has no arguments, refresh all existing archives
         if !lore_args.is_empty() {
+            // Deduplicate while preserving order: one report entry per
+            // distinct name, as for branches.
+            let mut seen = HashSet::new();
+            let lore_args: Vec<&String> = lore_args
+                .iter()
+                .filter(|a| seen.insert(a.as_str()))
+                .collect();
             info!(
                 "Lore archive processing requested for {} archives",
                 lore_args.len()
@@ -1396,11 +1459,11 @@ async fn async_main() -> Result<()> {
 
             let mut total_new_emails = 0usize;
             let mut total_emails_all_archives = 0usize;
-            let mut failed_archives: Vec<(String, String)> = Vec::new();
+            let mut archive_reports: Vec<ArchiveReport> = Vec::with_capacity(lore_args.len());
             let known_ids = KnownLoreIds::new();
 
             // Process each lore archive
-            for lore_url in lore_args {
+            for &lore_url in &lore_args {
                 println!("\n=== Processing lore archive: {} ===", lore_url);
                 info!("Processing lore archive: {}", lore_url);
 
@@ -1409,7 +1472,7 @@ async fn async_main() -> Result<()> {
                     Ok(path) => path,
                     Err(e) => {
                         eprintln!("Error cloning {}: {:#}", lore_url, e);
-                        failed_archives.push((lore_url.clone(), format!("{:#}", e)));
+                        archive_reports.push(failed_archive(lore_url.clone(), &e));
                         continue;
                     }
                 };
@@ -1420,7 +1483,7 @@ async fn async_main() -> Result<()> {
                     Ok(repo) => repo,
                     Err(e) => {
                         eprintln!("Error opening repository {}: {}", clone_path.display(), e);
-                        failed_archives.push((lore_url.clone(), e.to_string()));
+                        archive_reports.push(failed_archive(lore_url.clone(), &e.into()));
                         continue;
                     }
                 };
@@ -1440,18 +1503,17 @@ async fn async_main() -> Result<()> {
 
                 repack_lore_archive(&args, clone_path, lore_url, &index_result).await;
 
-                match index_result {
+                match &index_result {
                     Ok(result) => {
                         total_new_emails += result.new_emails;
                         total_emails_all_archives += result.total_emails;
                     }
                     Err(e) => {
                         eprintln!("Error indexing {}: {}", lore_url, e);
-                        total_new_emails += appended_before_failure(&e);
-                        failed_archives.push((lore_url.clone(), e.to_string()));
-                        continue;
+                        total_new_emails += appended_before_failure(e);
                     }
                 }
+                archive_reports.push(archive_report(lore_url.clone(), &index_result));
             }
             // One string per stored email: free it before compaction.
             drop(known_ids);
@@ -1462,7 +1524,10 @@ async fn async_main() -> Result<()> {
             println!("Total time: {:.1}s", total_time.as_secs_f64());
             println!(
                 "Archives processed: {}/{}",
-                lore_args.len() - failed_archives.len(),
+                archive_reports
+                    .iter()
+                    .filter(|r| r.outcome != Outcome::Failed)
+                    .count(),
                 lore_args.len()
             );
             println!("New emails indexed: {}", total_new_emails);
@@ -1471,13 +1536,7 @@ async fn async_main() -> Result<()> {
                 total_emails_all_archives
             );
 
-            // Report failed archives if any
-            if !failed_archives.is_empty() {
-                eprintln!("\nFailed archives:");
-                for (name, err) in &failed_archives {
-                    eprintln!("  {}: {}", name, err);
-                }
-            }
+            let failure = lore_failure(&archive_reports, "failed");
 
             if total_new_emails > 0 {
                 // Compact only lore tables.  The full optimize_database()
@@ -1511,15 +1570,7 @@ async fn async_main() -> Result<()> {
             println!("\nTo query this database, run:");
             println!("  semcode --database {}", database_path);
 
-            if !failed_archives.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "{} of {} lore archive(s) failed",
-                    failed_archives.len(),
-                    lore_args.len()
-                ));
-            }
-
-            return Ok(());
+            return finish_lore_run(report, archive_reports, failure);
         } else {
             // --lore without arguments: refresh all existing archives
             info!("Refreshing all existing lore archives");
@@ -1541,7 +1592,7 @@ async fn async_main() -> Result<()> {
                 println!("  semcode-index --lore linux-nfs/0     # NFS mailing list");
                 println!();
                 println!("Browse available lists at: https://lore.kernel.org/");
-                return Ok(());
+                return finish_lore_run(report, Vec::new(), None);
             }
 
             // Pre-compute lore_base and display names once
@@ -1627,18 +1678,19 @@ async fn async_main() -> Result<()> {
             let mut total_new_emails = 0usize;
             let mut total_emails_all_archives = 0usize;
             let mut archives_processed = 0usize;
-            let mut failed_archives: Vec<(String, String)> = Vec::new();
+            let mut archive_reports: Vec<ArchiveReport> = Vec::with_capacity(total_archives);
 
             for result in results {
                 match result {
-                    Ok((_, index_result)) => {
+                    Ok((name, index_result)) => {
                         total_new_emails += index_result.new_emails;
                         total_emails_all_archives += index_result.total_emails;
                         archives_processed += 1;
+                        archive_reports.push(archive_report(name, &Ok(index_result)));
                     }
                     Err((name, e)) => {
                         total_new_emails += appended_before_failure(&e);
-                        failed_archives.push((name, e.to_string()));
+                        archive_reports.push(failed_archive(name, &e));
                     }
                 }
             }
@@ -1657,13 +1709,7 @@ async fn async_main() -> Result<()> {
                 total_emails_all_archives
             );
 
-            // Report failed archives if any
-            if !failed_archives.is_empty() {
-                eprintln!("\nFailed archives:");
-                for (name, err) in &failed_archives {
-                    eprintln!("  {}: {}", name, err);
-                }
-            }
+            let failure = lore_failure(&archive_reports, "failed to refresh");
 
             if total_new_emails > 0 {
                 println!("\nCompacting lore tables...");
@@ -1723,15 +1769,7 @@ async fn async_main() -> Result<()> {
             println!("\nTo query this database, run:");
             println!("  semcode --database {}", database_path);
 
-            if !failed_archives.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "{} of {} lore archive(s) failed to refresh",
-                    failed_archives.len(),
-                    total_archives
-                ));
-            }
-
-            return Ok(());
+            return finish_lore_run(report, archive_reports, failure);
         }
     }
 
