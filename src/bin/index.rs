@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+mod index_impl;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
+use index_impl::result::{BranchReport, Outcome, Report, ReportSink};
 use semcode::indexer::{
     list_shas_in_range, process_commits_pipeline, process_lore_commits_pipeline, KnownLoreIds,
     LoreIndexIncomplete,
@@ -116,6 +119,7 @@ struct Args {
     /// Clone and index lore.kernel.org archives into <db_dir>/lore/<repo>
     /// Accepts comma-separated list of archives (e.g., --lore bpf,netdev,lkml/0)
     /// Without arguments, refreshes all previously indexed archives
+    /// Run branch indexing in a separate invocation.
     #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 0..)]
     lore: Option<Vec<String>>,
 
@@ -146,6 +150,11 @@ struct Args {
     /// (skip branches already indexed at current tip)
     #[arg(long)]
     update_branches: bool,
+
+    /// Write a JSON report of per-branch outcomes to PATH.
+    /// Branch modes only; see docs/index-result.md for the format.
+    #[arg(long, value_name = "PATH")]
+    result_json: Option<PathBuf>,
 }
 
 /// Fetch and parse the lore.kernel.org manifest
@@ -834,10 +843,68 @@ async fn cli_options(args: &Args, db_manager: &DatabaseManager) -> Result<(Vec<S
     Ok((extensions, no_macros))
 }
 
-/// Collect branches to index from the various branch-related CLI flags
-/// Returns BranchRef structs with proper is_remote/remote metadata
-fn collect_branches_to_index(args: &Args) -> Result<Vec<semcode::git::BranchRef>> {
-    use semcode::git::{get_branch_info, list_branches, BranchRef};
+/// Whether any branch flag selects branch indexing mode.
+fn branch_mode_requested(args: &Args) -> bool {
+    !args.branch.is_empty() || !args.branches.is_empty() || args.all_branches
+}
+
+/// The first branch flag on the command line, if any. Lore and branch
+/// indexing never share a run; this names the flag for the rejection so
+/// every mixed invocation fails the same way with or without a report.
+fn first_branch_flag(args: &Args) -> Option<&'static str> {
+    if !args.branch.is_empty() {
+        Some("--branch")
+    } else if !args.branches.is_empty() {
+        Some("--branches")
+    } else if args.all_branches {
+        Some("--all-branches")
+    } else if args.remote_branches {
+        Some("--remote-branches")
+    } else if args.update_branches {
+        Some("--update-branches")
+    } else {
+        None
+    }
+}
+
+/// `--result-json` reports branch outcomes only; refuse it where another
+/// mode would run instead, before anything touches the database.
+fn check_result_json_mode(args: &Args) -> Result<()> {
+    if !branch_mode_requested(args) {
+        anyhow::bail!("--result-json requires --branch, --branches or --all-branches");
+    }
+    let conflicts = [
+        ("--lore", args.lore.is_some()),
+        ("--git", args.git.is_some()),
+        ("--commits", args.commits.is_some()),
+        ("--vectors", args.vectors),
+    ];
+    if let Some((flag, _)) = conflicts.iter().find(|(_, set)| *set) {
+        anyhow::bail!("--result-json cannot be combined with {flag}");
+    }
+    Ok(())
+}
+
+/// A branch requested on the command line, resolved once up front.
+struct BranchRequest {
+    name: String,
+    branch: Result<semcode::git::BranchRef, String>,
+}
+
+impl From<semcode::git::BranchRef> for BranchRequest {
+    fn from(branch: semcode::git::BranchRef) -> Self {
+        Self {
+            name: branch.name.clone(),
+            branch: Ok(branch),
+        }
+    }
+}
+
+/// Collect branches to index from the various branch-related CLI flags.
+/// A name that does not resolve is kept as a failed request so the other
+/// branches still get indexed.
+fn collect_branches_to_index(args: &Args) -> Result<Vec<BranchRequest>> {
+    use semcode::git::{get_branch_info, list_branches};
 
     let mut branch_names = Vec::new();
 
@@ -847,18 +914,18 @@ fn collect_branches_to_index(args: &Args) -> Result<Vec<semcode::git::BranchRef>
     // Collect from --branches (comma-separated)
     branch_names.extend(args.branches.iter().cloned());
 
-    // Remove duplicates while preserving order
+    // Deduplicate while preserving order
     let mut seen = HashSet::new();
     branch_names.retain(|b| seen.insert(b.clone()));
 
-    // Convert manually-specified branch names to BranchRef with proper metadata
-    let mut branches: Vec<BranchRef> = Vec::new();
-    for name in &branch_names {
-        match get_branch_info(&args.source, name) {
-            Ok(branch_ref) => branches.push(branch_ref),
-            Err(e) => return Err(anyhow::anyhow!("Branch '{}' does not exist: {}", name, e)),
-        }
-    }
+    let mut branches: Vec<BranchRequest> = branch_names
+        .iter()
+        .map(|name| BranchRequest {
+            name: name.clone(),
+            branch: get_branch_info(&args.source, name)
+                .map_err(|e| format!("Branch '{name}' does not exist: {e}")),
+        })
+        .collect();
 
     // If --all-branches is set, get all branches from git
     if args.all_branches {
@@ -866,7 +933,7 @@ fn collect_branches_to_index(args: &Args) -> Result<Vec<semcode::git::BranchRef>
         for branch in git_branches {
             // Skip if already added from --branch/--branches
             if !branches.iter().any(|b| b.name == branch.name) {
-                branches.push(branch);
+                branches.push(branch.into());
             }
         }
     }
@@ -874,13 +941,31 @@ fn collect_branches_to_index(args: &Args) -> Result<Vec<semcode::git::BranchRef>
     Ok(branches)
 }
 
-/// Run branch indexing mode - index multiple branches
-async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>) -> Result<()> {
+/// Run branch indexing mode - index multiple branches.
+///
+/// A branch that fails is reported and the rest are still indexed; the
+/// run fails at the end if any branch did. Errors before the first branch
+/// (opening the database, --clear, refused build options) fail the run at
+/// once and publish no report.
+async fn run_branch_indexing(
+    args: Args,
+    branches: Vec<BranchRequest>,
+    report: Option<ReportSink>,
+) -> Result<()> {
     info!("Starting multi-branch indexing mode");
     info!(
         "Branches to index: {:?}",
         branches.iter().map(|b| &b.name).collect::<Vec<_>>()
     );
+
+    // A typo must not cost the whole index: --clear wipes everything
+    // before the first branch, and the misspelled one would put nothing
+    // back.
+    if args.clear {
+        if let Some(Err(e)) = branches.iter().map(|r| &r.branch).find(|b| b.is_err()) {
+            anyhow::bail!("refusing --clear: {e}");
+        }
+    }
 
     // Process database path
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
@@ -899,8 +984,6 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
     }
 
     let start_time = std::time::Instant::now();
-    let mut branches_indexed = 0;
-    let mut branches_skipped = 0;
 
     let stale_index = db_manager.index_predates_reader().await?;
     if stale_index {
@@ -910,106 +993,217 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
         );
     }
 
-    for branch in &branches {
-        let branch_name = &branch.name;
-        let tip_commit = &branch.tip_commit;
-
-        println!(
-            "\n{}",
-            format!("=== Processing branch: {} ===", branch_name).cyan()
-        );
-
-        info!("Branch {} at commit {}", branch_name, &tip_commit[..8]);
-
-        // Check if branch is already indexed at current tip (if --update-branches)
-        if args.update_branches
-            && !stale_index
-            && db_manager
-                .is_branch_current(branch_name, tip_commit)
-                .await?
-        {
-            println!(
-                "  {} Branch already indexed at current tip, skipping",
-                "→".yellow()
-            );
-            branches_skipped += 1;
-            continue;
-        }
-
-        // Get extensions for this indexing operation; see cli_options.
+    // Same rule as one-off --git ranges: an incremental branch read under
+    // flags the recorded build does not hold would poison it. Check once
+    // for the whole run: refusing one branch and then reading another's
+    // full tree under the same flags would rewrite the record and let
+    // the refused branch through on the next run.
+    if (args.extensions.is_some() || args.no_macros) && !stale_index {
         let (extensions, no_macros) = cli_options(&args, &db_manager).await?;
-
-        // An index written before this build does not hold what this build
-        // extracts, however current its recorded tip is. Indexing the commits
-        // since that tip would add nothing: the files have not changed, and
-        // it is the extractor that has. Read the tree again instead.
-        let indexed_tip = if stale_index {
-            None
-        } else {
-            db_manager.get_branch_tip(branch_name).await?
-        };
-
-        // Check if this is initial or incremental indexing
-        if let Some(indexed_tip) = indexed_tip {
-            // Incremental indexing: commits from last indexed tip to current tip
-            let range = format!("{}..{}", indexed_tip, tip_commit);
-            info!("Incremental indexing: {} for branch {}", range, branch_name);
-
-            // Same rule as one-off --git ranges: an incremental branch
-            // read under disagreeing flags would poison the build.
-            if args.extensions.is_some() || args.no_macros {
+        for request in &branches {
+            let Ok(branch) = &request.branch else {
+                continue;
+            };
+            if db_manager.get_branch_tip(&branch.name).await?.is_some() {
                 refuse_scoped_option_drift(
-                    &format!("branch {branch_name} range {range}"),
+                    &format!("branch {}", branch.name),
                     &db_manager,
                     &extensions,
                     no_macros,
                 )
                 .await?;
+                break;
             }
+        }
+    }
 
-            println!("  {} Processing range: {}", "→".blue(), range);
+    let mut results = Vec::with_capacity(branches.len());
+    for request in branches {
+        println!(
+            "\n{}",
+            format!("=== Processing branch: {} ===", request.name).cyan()
+        );
 
-            // Get commit count for this range
-            let repo = gix::discover(&args.source)
-                .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+        let result = match &request.branch {
+            Ok(branch) => index_branch(&args, &db_manager, branch, stale_index)
+                .await
+                .map(|outcome| (outcome, branch.tip_commit.clone())),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        };
 
-            let commit_shas = list_shas_in_range(&repo, &range)
-                .with_context(|| format!("Failed to get commits for {range}"))?;
+        results.push(match result {
+            Ok((outcome, tip)) => BranchReport {
+                name: request.name,
+                outcome,
+                commit: Some(tip),
+                error: None,
+            },
+            Err(e) => {
+                let message = format!("{e:#}");
+                eprintln!("  {} {}", "✗".red(), message);
+                // What queries still see for this branch, if anything.
+                let commit = db_manager
+                    .get_branch_tip(&request.name)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!("Cannot read the recorded tip of {}: {e:#}", request.name);
+                        None
+                    });
+                BranchReport {
+                    name: request.name,
+                    outcome: Outcome::Failed,
+                    commit,
+                    error: Some(message),
+                }
+            }
+        });
+    }
 
-            if commit_shas.is_empty() {
-                println!("  {} No new commits to index", "✓".green());
-            } else {
+    let count = |outcome| results.iter().filter(|r| r.outcome == outcome).count();
+    let total_time = start_time.elapsed();
+
+    if count(Outcome::Failed) == 0 {
+        println!(
+            "\n{}",
+            "=== Multi-Branch Indexing Complete ===".green().bold()
+        );
+    } else {
+        println!(
+            "\n{}",
+            "=== Multi-Branch Indexing Finished With Failures ==="
+                .red()
+                .bold()
+        );
+    }
+    println!("Total time: {:.1}s", total_time.as_secs_f64());
+    println!("Branches indexed: {}", count(Outcome::Indexed));
+    if count(Outcome::Current) > 0 {
+        println!(
+            "Branches skipped (already current): {}",
+            count(Outcome::Current)
+        );
+    }
+    let failed: Vec<&BranchReport> = results
+        .iter()
+        .filter(|r| r.outcome == Outcome::Failed)
+        .collect();
+    if !failed.is_empty() {
+        println!("Branches failed: {}", failed.len());
+        for branch in &failed {
+            println!(
+                "  {} {}: {}",
+                "✗".red(),
+                branch.name,
+                branch.error.as_deref().unwrap_or("")
+            );
+        }
+    }
+
+    // Informational only: failing to read it must not fail the run.
+    match db_manager.list_indexed_branches().await {
+        Ok(indexed) if !indexed.is_empty() => {
+            println!("\nIndexed branches:");
+            for branch in indexed {
                 println!(
-                    "  {} Found {} commits to process",
-                    "→".blue(),
-                    commit_shas.len()
+                    "  {} → {} (indexed {})",
+                    branch.branch_name.cyan(),
+                    branch.tip_commit.get(..8).unwrap_or(&branch.tip_commit),
+                    chrono::DateTime::from_timestamp(branch.indexed_at, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
                 );
-
-                semcode::git_range::process_git_range(
-                    &args.source,
-                    &range,
-                    &extensions,
-                    db_manager.clone(),
-                    no_macros,
-                    args.db_threads,
-                    &args.include,
-                )
-                .await?;
             }
+        }
+        Ok(_) => {}
+        Err(e) => warn!("Cannot list indexed branches: {e:#}"),
+    }
+
+    println!("\nTo query this database, run:");
+    println!("  semcode --database {}", database_path);
+
+    // The errors are in the summary above; name the branches only.
+    let failure = (!failed.is_empty()).then(|| {
+        let names: Vec<&str> = failed.iter().map(|b| b.name.as_str()).collect();
+        anyhow::anyhow!(
+            "{} of {} branch(es) failed: {}",
+            failed.len(),
+            results.len(),
+            names.join(", ")
+        )
+    });
+
+    if let Some(sink) = report {
+        sink.publish(&Report::branches(results))?;
+    }
+
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Index one branch at its resolved tip. Succeeds only once the database
+/// records that tip for the branch.
+async fn index_branch(
+    args: &Args,
+    db_manager: &Arc<DatabaseManager>,
+    branch: &semcode::git::BranchRef,
+    stale_index: bool,
+) -> Result<Outcome> {
+    let branch_name = &branch.name;
+    let tip_commit = &branch.tip_commit;
+
+    info!("Branch {} at commit {}", branch_name, &tip_commit[..8]);
+
+    // An index written before this build does not hold what this build
+    // extracts, however current its recorded tip is. Indexing the commits
+    // since that tip would add nothing: the files have not changed, and
+    // it is the extractor that has. Read the tree again instead.
+    let indexed_tip = if stale_index {
+        None
+    } else {
+        db_manager.get_branch_tip(branch_name).await?
+    };
+
+    // Check if branch is already indexed at current tip (if --update-branches)
+    if args.update_branches && indexed_tip.as_deref() == Some(tip_commit.as_str()) {
+        println!(
+            "  {} Branch already indexed at current tip, skipping",
+            "→".yellow()
+        );
+        return Ok(Outcome::Current);
+    }
+
+    // Get extensions for this indexing operation; see cli_options.
+    let (extensions, no_macros) = cli_options(args, db_manager).await?;
+
+    // Check if this is initial or incremental indexing
+    if let Some(indexed_tip) = indexed_tip {
+        // Incremental indexing: commits from last indexed tip to current tip
+        let range = format!("{}..{}", indexed_tip, tip_commit);
+        info!("Incremental indexing: {} for branch {}", range, branch_name);
+
+        println!("  {} Processing range: {}", "→".blue(), range);
+
+        // Get commit count for this range
+        let repo = gix::discover(&args.source)
+            .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+
+        let commit_shas = list_shas_in_range(&repo, &range)
+            .with_context(|| format!("Failed to get commits for {range}"))?;
+
+        if commit_shas.is_empty() {
+            println!("  {} No new commits to index", "✓".green());
         } else {
-            // Initial indexing: index the tree snapshot at the tip commit
-            // This is MUCH faster than walking all commits (e.g., 80k files vs 1.4M commits for Linux)
-            info!(
-                "Initial indexing for branch {} (tree at {})",
-                branch_name,
-                &tip_commit[..8]
+            println!(
+                "  {} Found {} commits to process",
+                "→".blue(),
+                commit_shas.len()
             );
 
-            println!("  {} Processing tree at {}", "→".blue(), &tip_commit[..8]);
-
-            semcode::git_range::process_git_tree(
+            semcode::git_range::process_git_range(
                 &args.source,
-                tip_commit,
+                &range,
                 &extensions,
                 db_manager.clone(),
                 no_macros,
@@ -1018,49 +1212,45 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
             )
             .await?;
         }
+    } else {
+        // Initial indexing: index the tree snapshot at the tip commit
+        // This is MUCH faster than walking all commits (e.g., 80k files vs 1.4M commits for Linux)
+        info!(
+            "Initial indexing for branch {} (tree at {})",
+            branch_name,
+            &tip_commit[..8]
+        );
 
-        // Record that this branch has been indexed at the current tip
-        // Use the proper remote info from BranchRef (not a naive string split)
-        db_manager
-            .record_branch_indexed(branch_name, tip_commit, branch.remote.as_deref())
-            .await?;
+        println!("  {} Processing tree at {}", "→".blue(), &tip_commit[..8]);
 
-        println!("  {} Branch indexed successfully", "✓".green());
-        branches_indexed += 1;
+        semcode::git_range::process_git_tree(
+            &args.source,
+            tip_commit,
+            &extensions,
+            db_manager.clone(),
+            no_macros,
+            args.db_threads,
+            &args.include,
+        )
+        .await?;
     }
 
-    let total_time = start_time.elapsed();
+    // Record that this branch has been indexed at the current tip
+    // Use the proper remote info from BranchRef (not a naive string split)
+    db_manager
+        .record_branch_indexed(branch_name, tip_commit, branch.remote.as_deref())
+        .await?;
 
-    println!(
-        "\n{}",
-        "=== Multi-Branch Indexing Complete ===".green().bold()
-    );
-    println!("Total time: {:.1}s", total_time.as_secs_f64());
-    println!("Branches indexed: {}", branches_indexed);
-    if branches_skipped > 0 {
-        println!("Branches skipped (already current): {}", branches_skipped);
+    let recorded = db_manager.get_branch_tip(branch_name).await?;
+    if recorded.as_deref() != Some(tip_commit.as_str()) {
+        anyhow::bail!(
+            "recorded tip of {branch_name} is {} after indexing {tip_commit}",
+            recorded.as_deref().unwrap_or("missing")
+        );
     }
 
-    // List all indexed branches
-    let indexed = db_manager.list_indexed_branches().await?;
-    if !indexed.is_empty() {
-        println!("\nIndexed branches:");
-        for branch in indexed {
-            println!(
-                "  {} → {} (indexed {})",
-                branch.branch_name.cyan(),
-                &branch.tip_commit[..8],
-                chrono::DateTime::from_timestamp(branch.indexed_at, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            );
-        }
-    }
-
-    println!("\nTo query this database, run:");
-    println!("  semcode --database {}", database_path);
-
-    Ok(())
+    println!("  {} Branch indexed successfully", "✓".green());
+    Ok(Outcome::Indexed)
 }
 
 // ==================== End Branch Indexing Support ====================
@@ -1159,6 +1349,26 @@ async fn async_main() -> Result<()> {
 
     // Initialize tracing with SEMCODE_DEBUG environment variable support
     semcode::logging::init_tracing();
+
+    // Take down any earlier report before anything else can fail, so a
+    // run that stops early never leaves a stale report behind.
+    let report = match &args.result_json {
+        Some(path) => {
+            let sink = ReportSink::prepare(path)?;
+            check_result_json_mode(&args)?;
+            Some(sink)
+        }
+        None => None,
+    };
+
+    // Lore and branch indexing never share a run. This rides after the
+    // report takedown so a rejected mix removes a stale report first;
+    // with a report the mode check above already refused the same mix.
+    if let (Some(_), Some(flag)) = (&args.lore, first_branch_flag(&args)) {
+        anyhow::bail!(
+            "--lore cannot be used with {flag}; run branch indexing in a separate invocation"
+        );
+    }
 
     // Process database path first (needed for lore cloning)
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));
@@ -1532,11 +1742,12 @@ async fn async_main() -> Result<()> {
         ));
     }
 
-    // Check if branch indexing mode is requested
-    let branches_to_index = collect_branches_to_index(&args)?;
-    if !branches_to_index.is_empty() {
+    // Check if branch indexing mode is requested. An empty --all-branches
+    // inventory is still branch mode: there is nothing to index.
+    if branch_mode_requested(&args) {
+        let branches_to_index = collect_branches_to_index(&args)?;
         info!("Branch indexing mode: {} branches", branches_to_index.len());
-        return run_branch_indexing(args, branches_to_index).await;
+        return run_branch_indexing(args, branches_to_index, report).await;
     }
 
     info!("Starting semantic code indexing");
@@ -2880,7 +3091,9 @@ mod cli_round_trip_tests {
 
         let build =
             Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
-        run_branch_indexing(build, vec![tip(&v1)]).await.unwrap();
+        run_branch_indexing(build, vec![tip(&v1).into()], None)
+            .await
+            .unwrap();
 
         std::fs::write(repo.join("b.c"), "int g(void)\n{\n\treturn 1;\n}\n").unwrap();
         git(&["add", "."]);
@@ -2895,7 +3108,7 @@ mod cli_round_trip_tests {
             "c",
         ])
         .unwrap();
-        let error = run_branch_indexing(foreign, vec![tip(&v2)])
+        let error = run_branch_indexing(foreign, vec![tip(&v2).into()], None)
             .await
             .unwrap_err();
         assert!(
@@ -2913,7 +3126,7 @@ mod cli_round_trip_tests {
         ])
         .unwrap();
         assert!(
-            run_branch_indexing(macros, vec![tip(&v2)])
+            run_branch_indexing(macros, vec![tip(&v2).into()], None)
                 .await
                 .map_err(|e| e.to_string())
                 .unwrap_err()
@@ -2923,7 +3136,9 @@ mod cli_round_trip_tests {
 
         let plain =
             Args::try_parse_from(["semcode-index", "--source", repo.to_str().unwrap()]).unwrap();
-        run_branch_indexing(plain, vec![tip(&v2)]).await.unwrap();
+        run_branch_indexing(plain, vec![tip(&v2).into()], None)
+            .await
+            .unwrap();
 
         let db_path = semcode::process_database_path(None, Some(repo));
         let db = semcode::DatabaseManager::new(&db_path, repo.to_string_lossy().into_owned())
