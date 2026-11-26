@@ -127,6 +127,14 @@ pub fn split_callee_edge(edge: &str) -> (&str, Option<&str>) {
     (bare, path)
 }
 
+/// The name a qualified use-site stores: the bare leaf, so the row joins
+/// the bare definition. A spelling with no owner path stores nothing:
+/// a bare name is not qualified, and a lone `::` names no owner.
+pub fn bare_use_site_target(spelling: &str) -> Option<&str> {
+    let (bare, path) = split_callee_edge(spelling);
+    path.map(|_| bare)
+}
+
 /// The byte index of the last `::` outside any `<...>` argument list, so
 /// a separator inside template arguments never splits the path.
 fn last_top_level_scope(edge: &str) -> Option<usize> {
@@ -1958,6 +1966,18 @@ mod ambiguity_note_tests {
         assert_eq!((bare, path), ("make_shared", Some("std")));
         let (bare, path) = split_callee_edge("ns::Box<double>::conv");
         assert_eq!((bare, path), ("conv", Some("ns::Box<double>")));
+    }
+
+    #[test]
+    fn qualified_use_sites_store_the_bare_leaf() {
+        // A spelling with an owner path cuts to the leaf; a bare name is
+        // not qualified, and a lone `::` names no owner, so both store
+        // nothing.
+        assert_eq!(bare_use_site_target("ns::my_read"), Some("my_read"));
+        assert_eq!(bare_use_site_target("a::b::f"), Some("f"));
+        assert_eq!(bare_use_site_target("::ns::f"), Some("f"));
+        assert_eq!(bare_use_site_target("my_read"), None);
+        assert_eq!(bare_use_site_target("::my_read"), None);
     }
 
     #[test]
