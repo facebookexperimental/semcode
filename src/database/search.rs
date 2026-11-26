@@ -2226,7 +2226,7 @@ impl VectorSearchManager {
             .query()
             .nearest_to(query_vector)?
             .refine_factor(5)
-            .nprobes(10)
+            .nprobes(10)?
             .limit(limit);
 
         // Apply additional filter if provided
@@ -3276,7 +3276,7 @@ impl VectorSearchManager {
             .query()
             .nearest_to(query_vector)?
             .refine_factor(5)
-            .nprobes(10)
+            .nprobes(10)?
             .limit(limit)
             .execute()
             .await?
@@ -3452,7 +3452,7 @@ impl VectorSearchManager {
                 .query()
                 .nearest_to(query_vector)?
                 .refine_factor(5)
-                .nprobes(10)
+                .nprobes(10)?
                 .limit(limit * fetch_multiplier)
                 .execute()
                 .await?
@@ -3545,7 +3545,7 @@ impl VectorSearchManager {
                 .query()
                 .nearest_to(query_vector)?
                 .refine_factor(5)
-                .nprobes(10)
+                .nprobes(10)?
                 .limit(search_limit)
                 .execute()
                 .await?

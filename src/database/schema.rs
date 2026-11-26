@@ -656,10 +656,11 @@ impl SchemaManager {
         // absence is tolerated: a real I/O error stays loud, or a wipe
         // could report success with the record intact.
         let names = self.connection.table_names().execute().await?;
-        if !names.iter().any(|name| name == "schema_meta") {
+        let Some(table) =
+            super::open_table_if_present(&self.connection, &names, "schema_meta").await?
+        else {
             return Ok(());
-        }
-        let table = self.connection.open_table("schema_meta").execute().await?;
+        };
         for key in keys {
             table
                 .delete(&format!("key = '{key}'"))
@@ -782,16 +783,14 @@ impl SchemaManager {
     /// The value recorded under a key, absent when the index does not say.
     pub async fn meta_value(&self, key: &str) -> Result<Option<String>> {
         let names = self.connection.table_names().execute().await?;
-        if !names.iter().any(|name| name == "schema_meta") {
+        let Some(table) =
+            super::open_table_if_present(&self.connection, &names, "schema_meta").await?
+        else {
             return Ok(None);
-        }
+        };
 
         let escaped = key.replace('\'', "''");
-        let batches: Vec<arrow::record_batch::RecordBatch> = self
-            .connection
-            .open_table("schema_meta")
-            .execute()
-            .await?
+        let batches: Vec<arrow::record_batch::RecordBatch> = table
             .query()
             .only_if(format!("key = '{escaped}'"))
             .execute()
@@ -1171,13 +1170,12 @@ impl SchemaManager {
         if schema.column_with_name("date_timestamp").is_none() {
             tracing::info!("Migrating lore table: adding 'date_timestamp' column");
             table
-                .add_columns(
-                    lancedb::table::NewColumnTransform::SqlExpressions(vec![(
-                        "date_timestamp".into(),
-                        "CAST(0 AS BIGINT)".into(),
-                    )]),
-                    None,
-                )
+                .add_columns()
+                .transform(lancedb::table::NewColumnTransform::SqlExpressions(vec![(
+                    "date_timestamp".into(),
+                    "CAST(0 AS BIGINT)".into(),
+                )]))
+                .execute()
                 .await?;
 
             // Purge lore_indexed_commits so that previously-skipped
@@ -2970,25 +2968,19 @@ mod tests {
 
         assert_covers(&btree_coverage(&db).await, 80);
         let table = db.connection().open_table("lore").execute().await.unwrap();
-        let mut fts: Vec<(String, usize)> = Vec::new();
+        let mut fts = Vec::new();
         for index in table.list_indices().await.unwrap() {
             if index.index_type == IndexType::FTS {
                 let stats = table.index_stats(&index.name).await.unwrap().unwrap();
-                fts.push((index.name, stats.num_indexed_rows));
+                fts.push((index.columns, stats.num_indexed_rows));
             }
         }
         fts.sort();
         assert_eq!(
             fts,
-            [
-                "body_idx",
-                "from_idx",
-                "recipients_idx",
-                "subject_idx",
-                "symbols_idx"
-            ]
-            .map(|name| (name.to_string(), 50))
-            .to_vec()
+            ["body", "from", "recipients", "subject", "symbols"]
+                .map(|column| (vec![column.to_string()], 50))
+                .to_vec()
         );
     }
 
