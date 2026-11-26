@@ -2418,7 +2418,11 @@ async fn mcp_show_callchain_with_limits(
         // says nothing reads as a chain that ended.
         let mut reachable: Vec<String> = vec![function_name.to_string()];
         reachable.extend(callees.iter().cloned());
-        if let Ok(dispatched) = db.resolve_dispatches_in(&reachable, git_sha).await {
+        let outgoing_dispatches = db.resolve_dispatches_in(&reachable, git_sha).await;
+        let has_outgoing_dispatches = outgoing_dispatches
+            .as_ref()
+            .is_ok_and(|sites| !sites.is_empty());
+        if let Ok(dispatched) = outgoing_dispatches {
             if !dispatched.is_empty() {
                 writeln!(buffer, "\n=== Dispatches ===")?;
                 for from in &reachable {
@@ -2471,6 +2475,7 @@ async fn mcp_show_callchain_with_limits(
 
         if callers.is_empty()
             && callees.is_empty()
+            && !has_outgoing_dispatches
             && dispatched.shown == 0
             && dispatched.by_name_only == 0
         {
@@ -7757,6 +7762,35 @@ mod tests {
             .await;
             state
         }
+    }
+
+    #[tokio::test]
+    async fn an_outgoing_dispatch_keeps_the_callchain_from_reporting_isolation() {
+        let fixture = BackgroundFixture::new().await;
+        let repo = std::path::Path::new(&fixture.repo);
+        std::fs::write(
+            repo.join("a.c"),
+            "struct ops { int (*read)(void); };\n\
+             int read_value(void) { return 1; }\n\
+             struct ops reader = { .read = read_value };\n\
+             int dispatch(struct ops *p) { return p->read(); }\n",
+        )
+        .unwrap();
+        git_run(repo, &["commit", "-q", "-am", "dispatch"]);
+        let state = fixture.run().await;
+        assert!(matches!(
+            state.lock().await.status,
+            IndexingStatus::Completed { .. }
+        ));
+        let sha = semcode::git::get_git_sha(repo).unwrap().unwrap();
+
+        let text =
+            mcp_show_callchain_with_limits(&fixture.db, "dispatch", &sha, 2, 3, 15, Context::Any)
+                .await
+                .unwrap();
+        assert!(text.contains("=== Dispatches ==="), "{text}");
+        assert!(text.contains("read_value"), "{text}");
+        assert!(!text.contains("This function is isolated"), "{text}");
     }
 
     // When HEAD is already indexed, background indexing takes the fast path

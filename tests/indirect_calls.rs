@@ -590,6 +590,34 @@ async fn the_member_call_is_not_recorded_as_a_call_to_a_function() {
 }
 
 #[tokio::test]
+async fn an_outgoing_dispatch_keeps_the_callchain_from_reporting_isolation() {
+    let dir = tempfile::tempdir().unwrap();
+    index_fixture(dir.path()).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_semcode"))
+        .current_dir(dir.path())
+        .args([
+            "--database",
+            ".semcode.db",
+            "--git-repo",
+            ".",
+            "-q",
+            "callchain deliver_plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = plain(&String::from_utf8(output.stdout).unwrap());
+    assert!(text.contains("=== Dispatches ==="), "{text}");
+    assert!(text.contains("tcp_v4_rcv"), "{text}");
+    assert!(!text.contains("This function is isolated"), "{text}");
+}
+
+#[tokio::test]
 async fn a_callback_installed_through_a_field_has_callers() {
     // `s->s_shrink->scan_objects = super_cache_scan` names no container: what
     // `s_shrink` points at is declared with struct super_block, elsewhere. The
