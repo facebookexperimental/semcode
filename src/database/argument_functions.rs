@@ -204,4 +204,56 @@ impl ArgumentFunctionStore {
         }
         Ok(out)
     }
+
+    /// Every site that handed an argument to this callee: the forward
+    /// handover leg. The `callee` column carries an index (schema.rs), so
+    /// this is an indexed lookup, not a scan on `enclosing_function`.
+    pub async fn find_by_callee(&self, callee: &str) -> Result<Vec<ArgumentFunction>> {
+        let table = self
+            .connection
+            .open_table("argument_functions")
+            .execute()
+            .await?;
+        let escaped = callee.replace('\'', "''");
+        let batches = table
+            .query()
+            .only_if(format!("callee = '{escaped}'"))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut out = Vec::new();
+        for batch in &batches {
+            let target = get_column::<StringArray>(batch, "target")?;
+            let callee = get_column::<StringArray>(batch, "callee")?;
+            let index = get_column::<arrow::array::Int64Array>(batch, "argument_index")?;
+            let address = get_column::<arrow::array::BooleanArray>(batch, "taken_address")?;
+            let file_path = get_column::<StringArray>(batch, "file_path")?;
+            let git_file_hash = get_column::<StringArray>(batch, "git_file_hash")?;
+            let byte_start = get_column::<arrow::array::Int64Array>(batch, "byte_start")?;
+            let line = get_column::<arrow::array::Int64Array>(batch, "line")?;
+            let enclosing = get_column::<StringArray>(batch, "enclosing_function")?;
+            let subject_type = get_column::<StringArray>(batch, "subject_type")?;
+            let subject_member = get_column::<StringArray>(batch, "subject_member")?;
+            for row in 0..batch.num_rows() {
+                out.push(ArgumentFunction {
+                    target: target.value(row).to_string(),
+                    callee: callee.value(row).to_string(),
+                    argument_index: index.value(row) as u32,
+                    taken_address: address.value(row),
+                    subject_type: (!subject_type.is_null(row))
+                        .then(|| subject_type.value(row).to_string()),
+                    subject_member: (!subject_member.is_null(row))
+                        .then(|| subject_member.value(row).to_string()),
+                    file_path: file_path.value(row).to_string(),
+                    git_file_hash: git_file_hash.value(row).to_string(),
+                    byte_start: byte_start.value(row) as u64,
+                    line: line.value(row) as u32,
+                    enclosing_function: enclosing.value(row).to_string(),
+                });
+            }
+        }
+        Ok(out)
+    }
 }

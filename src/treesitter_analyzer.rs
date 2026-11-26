@@ -7,9 +7,9 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
-    ArgumentFunction, CallEdge, DispatchKind, DispatchSite, FieldInfo, FunctionInfo,
-    GlobalTypeRegistry, GlobalVariable, MacroParams, ParameterInfo, Registration, RegistrationKind,
-    TypeInfo, ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
+    bare_use_site_target, ArgumentFunction, CallEdge, DispatchKind, DispatchSite, FieldInfo,
+    FunctionInfo, GlobalTypeRegistry, GlobalVariable, MacroParams, ParameterInfo, Registration,
+    RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 4;
+pub const EXTRACTOR_VERSION: u32 = 10;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -97,6 +97,11 @@ pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
 /// reads records the shared version alone: no grammar is involved, so a
 /// grammar bump must not re-read it while a shared bump must.
 pub fn extractor_version_for_file(path: &std::path::Path, headers_as_cpp: bool) -> String {
+    if crate::asm::is_asm_path(path) {
+        // The scanner versions alone: a scanner fix re-reads only `.S`
+        // (which records `N+asm-M`), never the grammars' rows.
+        return format!("{EXTRACTOR_VERSION}+asm-{}", crate::asm::ASM_VERSION);
+    }
     match Language::from_path_with_headers(path, headers_as_cpp) {
         Some(language) => extractor_version(language),
         None => EXTRACTOR_VERSION.to_string(),
@@ -223,6 +228,7 @@ struct UseAlias {
 /// are not known until query time.
 #[derive(Debug, Default)]
 struct CallExtraction {
+    /// Sorted by call start so each function can find its slice by byte range.
     calls: Vec<(String, usize, usize)>,
     member_sites: Vec<RawDispatchSite>,
     /// Call heads outside the query shapes, with where they sit. The
@@ -1705,12 +1711,23 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         source_root: Option<&Path>,
     ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+        let source_code = std::fs::read_to_string(file_path)?;
+
+        // Assembly reads through the line scanner, not the grammars: no
+        // tree-sitter grammar parses GAS-macro sources.
+        if crate::asm::is_asm_path(file_path) {
+            let git_hash = compute_file_hash(file_path)?.unwrap_or_default();
+            let relative_path = self.make_relative_path(file_path, source_root);
+            let functions = crate::asm::scan(&source_code, &relative_path, &git_hash);
+            let functions = self.deduplicate_functions_within_file(functions, Language::C);
+            return Ok((functions, Vec::new(), Vec::new()));
+        }
+
         // Detect language from file extension
         let language = self
             .language_for(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
 
-        let source_code = std::fs::read_to_string(file_path)?;
         let parser = self.get_parser(language);
         let tree = parser
             .parse(&source_code, None)
@@ -1719,29 +1736,18 @@ impl TreeSitterAnalyzer {
         // Compute git hash of the file
         let git_hash = compute_file_hash(file_path)?.unwrap_or_default();
 
-        let mut raw_functions = Vec::new();
-        let mut raw_types = Vec::new();
+        let ctx = ExtractionContext {
+            tree: &tree,
+            source: &source_code,
+            file_path,
+            git_hash: &git_hash,
+            source_root,
+            language,
+        };
+        let comments = self.extract_comments(&ctx);
+        let raw_functions = self.extract_functions(&ctx, &comments)?;
+        let mut raw_types = self.extract_types(&ctx, &comments)?;
         let mut raw_macros = Vec::new();
-
-        // Extract functions
-        raw_functions.extend(self.extract_functions(
-            &tree,
-            &source_code,
-            file_path,
-            &git_hash,
-            source_root,
-            language,
-        )?);
-
-        // Extract types
-        raw_types.extend(self.extract_types(
-            &tree,
-            &source_code,
-            file_path,
-            &git_hash,
-            source_root,
-            language,
-        )?);
 
         // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
         if language == Language::C {
@@ -1809,7 +1815,15 @@ impl TreeSitterAnalyzer {
         let dummy_path = Path::new("snippet.c");
         let git_hash = crate::hash::compute_content_hash(code);
         // No git SHA for code snippets
-        self.extract_functions(&tree, code, dummy_path, &git_hash, None, language)
+        let ctx = ExtractionContext {
+            tree: &tree,
+            source: code,
+            file_path: dummy_path,
+            git_hash: &git_hash,
+            source_root: None,
+            language,
+        };
+        self.extract_functions(&ctx, &self.extract_comments(&ctx))
     }
 
     /// Analyze source code directly with specified file path and git hash
@@ -1821,6 +1835,23 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
     ) -> Result<FileAnalysis> {
+        // Assembly reads through the line scanner, not the grammars.
+        if crate::asm::is_asm_path(file_path) {
+            let relative_path = self.make_relative_path(file_path, source_root);
+            let functions = crate::asm::scan(source_code, &relative_path, git_hash);
+            let functions = self.deduplicate_functions_within_file(functions, Language::C);
+            return Ok(FileAnalysis {
+                functions,
+                types: Vec::new(),
+                macros: Vec::new(),
+                dispatch_sites: Vec::new(),
+                registrations: Vec::new(),
+                argument_functions: Vec::new(),
+                unresolved_edges: Vec::new(),
+                globals: Vec::new(),
+            });
+        }
+
         // Detect language from file extension
         let language = self
             .language_for(file_path)
@@ -2408,6 +2439,7 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         };
+        let comments = self.extract_comments(&ctx);
 
         // Extract functions with embedded call data
         let ExtractedFunctions {
@@ -2416,17 +2448,10 @@ impl TreeSitterAnalyzer {
             mut registrations,
             mut argument_functions,
             mut unresolved_edges,
-        } = self.extract_functions_with_calls(&ctx, &extraction)?;
+        } = self.extract_functions_with_calls(&ctx, &extraction, &comments)?;
 
         // Extract types (single traversal as before)
-        let types = self.extract_types(
-            tree,
-            source_code,
-            file_path,
-            git_hash,
-            source_root,
-            language,
-        )?;
+        let types = self.extract_types(&ctx, &comments)?;
 
         // Extract macros with embedded data (single traversal)
         let (macros, macro_sites, macro_registrations, macro_arguments, macro_unresolved) = self
@@ -2714,6 +2739,36 @@ impl TreeSitterAnalyzer {
             // the one place the source states the answer outright.
             if let (Some(name), Some(args)) = (macro_name, macro_args) {
                 let name = &source_code[name.byte_range()];
+                if let Some(kind) = match name {
+                    "call_int_hook" => Some(DispatchKind::LsmHookInt),
+                    "call_void_hook" => Some(DispatchKind::LsmHookVoid),
+                    _ => None,
+                } {
+                    // The hook is the first argument: a bare slot name. The
+                    // dispatch macros' own definition spells it `HOOK`, and
+                    // that parameter is never a slot.
+                    let mut cursor = args.walk();
+                    let first = args.named_children(&mut cursor).next();
+                    if let Some(hook) = first {
+                        if hook.kind() == "identifier" {
+                            let slot = source_code[hook.byte_range()].to_string();
+                            if !slot.is_empty() && slot != "HOOK" {
+                                extraction.member_sites.push(RawDispatchSite {
+                                    member: slot,
+                                    receiver_expr: None,
+                                    receiver_type: None,
+                                    receiver_base_type: None,
+                                    receiver_field: None,
+                                    receiver_bound: None,
+                                    kind,
+                                    byte_start: hook.start_byte(),
+                                    line: hook.start_position().row as u32 + 1,
+                                    target: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(candidates) = Self::indirect_call_candidate_count(name) {
                     extraction.member_sites.extend(Self::indirect_call_sites(
                         args,
@@ -2755,9 +2810,19 @@ impl TreeSitterAnalyzer {
             }
         }
 
+        if language == Language::Rust {
+            Self::rust_head_dispatch(
+                tree.root_node(),
+                source_code,
+                &mut extraction.calls,
+                &mut extraction.member_sites,
+            );
+        }
+
         let bound = Self::value_names(tree.root_node(), source_code);
         let locals = Self::collect_local_struct_types(tree.root_node(), source_code);
-        let walk_b = Self::collect_walk_b_facts(tree.root_node(), source_code, &bound, &locals);
+        let walk_b =
+            Self::collect_walk_b_facts(tree.root_node(), source_code, &bound, &locals, language);
         extraction.pointer_vars = walk_b.pointer_vars;
         extraction.registrations = walk_b.registrations;
         extraction.argument_functions = walk_b.argument_functions;
@@ -2792,13 +2857,265 @@ impl TreeSitterAnalyzer {
             .registrations
             .retain(|registration| !Self::is_c_keyword(&registration.member));
 
+        extraction
+            .calls
+            .sort_unstable_by_key(|(_, start, _)| *start);
         Ok(extraction)
+    }
+
+    /// A declared Rust type with references and qualifiers peeled: `&Buf`
+    /// is `Buf`, `*const Device` is `Device`. `mut` and `const` fall with
+    /// the operator they modify.
+    fn strip_rust_ref(ty: &str) -> String {
+        let mut rest = ty.trim();
+        loop {
+            rest = rest.trim();
+            if let Some(tail) = rest.strip_prefix("&mut").or_else(|| rest.strip_prefix('&')) {
+                rest = tail;
+                continue;
+            }
+            if let Some(tail) = rest.strip_prefix("*mut").or_else(|| rest.strip_prefix('*')) {
+                rest = tail;
+                continue;
+            }
+            if let Some(tail) = rest
+                .strip_prefix("mut ")
+                .or_else(|| rest.strip_prefix("const "))
+            {
+                rest = tail;
+                continue;
+            }
+            break;
+        }
+        rest.to_string()
+    }
+
+    /// Whether a type spells a plain path: identifiers, `::`, generics,
+    /// lifetimes and references only. Tuples, arrays, closures, fn
+    /// pointers and `impl`/`dyn` types keep their spelling: renaming to
+    /// one of those matches no owner.
+    fn is_plain_rust_path(ty: &str) -> bool {
+        let ty = ty.trim();
+        if ty.is_empty()
+            || ty.starts_with("impl ")
+            || ty.starts_with("dyn ")
+            || !ty.chars().any(|c| c.is_alphanumeric())
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        for c in ty.chars() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                '(' | ')' | '|' | ';' | '{' | '}' | '!' | '=' => return false,
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// Rust call heads that have their own dispatch: turbofish methods
+    /// and bound-parameter calls. It looks in the merged impl+fn scope
+    /// per function (the same layering receiver typing uses) and at the
+    /// callee node behind each recorded head:
+    ///
+    /// - `recv.m::<T>()` (`generic_function` over a `field_expression`)
+    ///   rewrites the head to the receiver's declared type
+    ///   (`Buf::cast`), which the owner match resolves exactly. The
+    ///   turbofish args drop: an argument-less head addresses every
+    ///   instantiation. Where the receiver has no declared plain type,
+    ///   the head keeps its spelling.
+    /// - `P::method` (`scoped_identifier` over one bare identifier)
+    ///   records a member site on `method` with `receiver_bound` where P
+    ///   is a bounded generic parameter, beside the kept plain edge.
+    ///   Unbounded P records nothing: resolvers leave the head alone.
+    ///
+    /// A rewritten head is a site-less rename, not a new row: inherent
+    /// methods have no installation rows for a site to join, so a site
+    /// would dangle where the renamed edge resolves.
+    ///
+    /// Runs before receiver typing so the new sites type like the rest.
+    fn rust_head_dispatch(
+        root: tree_sitter::Node,
+        source: &str,
+        calls: &mut [(String, usize, usize)],
+        sites: &mut Vec<RawDispatchSite>,
+    ) {
+        // Merged bounds and declared types per function range: impl
+        // bounds underneath, the function's own on top.
+        type ScopeMaps = (
+            usize,
+            usize,
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, String>,
+        );
+        let mut scopes: Vec<ScopeMaps> = Vec::new();
+        let mut stack = vec![(
+            root,
+            None::<String>,
+            None::<std::collections::HashMap<String, String>>,
+        )];
+        while let Some((node, self_type, impl_bounds)) = stack.pop() {
+            let (self_type, impl_bounds) = if node.kind() == "impl_item" {
+                let bounds = Self::rust_generic_bounds_in(node, source);
+                let bounds = bounds
+                    .into_iter()
+                    .chain(Self::rust_impl_trait_bounds_in(node, source))
+                    .collect();
+                (
+                    node.child_by_field_name("type")
+                        .and_then(|t| Self::rust_type_name(t, source))
+                        .or(self_type),
+                    Some(bounds),
+                )
+            } else {
+                (self_type, impl_bounds)
+            };
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push((child, self_type.clone(), impl_bounds.clone()));
+            }
+            if node.kind() == "function_item" {
+                let bounds =
+                    Self::merge_fn_bounds(impl_bounds.clone().unwrap_or_default(), node, source);
+                let mut declared = std::collections::HashMap::new();
+                if let Some(self_type) = &self_type {
+                    declared.insert("self".to_string(), self_type.clone());
+                }
+                Self::rust_declared_types_in(node, source, &mut declared);
+                scopes.push((node.start_byte(), node.end_byte(), declared, bounds));
+            }
+        }
+        let scope_at = |byte: usize| {
+            scopes
+                .iter()
+                .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+                .min_by_key(|(start, end, _, _)| end - start)
+        };
+        for (name, start, end) in calls.iter_mut() {
+            let (start, end) = (*start, *end);
+            let Some(head) = root.descendant_for_byte_range(start, end) else {
+                continue;
+            };
+            match head.kind() {
+                "generic_function" => {
+                    let function = head.child_by_field_name("function");
+                    let is_method = function.is_some_and(|f| f.kind() == "field_expression");
+                    if !is_method {
+                        continue;
+                    }
+                    let function = function.unwrap();
+                    let (Some(value), Some(field)) = (
+                        function.child_by_field_name("value"),
+                        function.child_by_field_name("field"),
+                    ) else {
+                        continue;
+                    };
+                    // Only a bare-variable receiver renames: field chains
+                    // and temporaries need field-type lookup the file may
+                    // not have, and the head keeps its spelling for those.
+                    if value.kind() != "identifier" {
+                        continue;
+                    }
+                    let recv = source[value.byte_range()].to_string();
+                    let method = source[field.byte_range()].to_string();
+                    if method.is_empty() {
+                        continue;
+                    }
+                    let scope = scope_at(start);
+                    let renamed = scope
+                        .and_then(|(_, _, declared, _)| declared.get(&recv))
+                        .map(|ty| Self::strip_rust_ref(ty))
+                        .filter(|ty| Self::is_plain_rust_path(ty))
+                        .map(|ty| format!("{ty}::{method}"));
+                    if let Some(renamed) = renamed {
+                        *name = renamed;
+                    }
+                }
+                "scoped_identifier" => {
+                    let (Some(path), Some(name)) = (
+                        head.child_by_field_name("path"),
+                        head.child_by_field_name("name"),
+                    ) else {
+                        continue;
+                    };
+                    if path.kind() != "identifier" {
+                        continue;
+                    }
+                    let owner = source[path.byte_range()].to_string();
+                    if owner.contains('<') || owner.contains("::") || owner == "Self" {
+                        continue;
+                    }
+                    let method = source[name.byte_range()].to_string();
+                    if method.is_empty() {
+                        continue;
+                    }
+                    let bound = scope_at(start)
+                        .and_then(|(_, _, _, bounds)| bounds.get(&owner).cloned())
+                        .unwrap_or_default();
+                    if bound.is_empty() {
+                        continue;
+                    }
+                    sites.push(RawDispatchSite {
+                        member: method,
+                        receiver_expr: Some(owner),
+                        receiver_type: None,
+                        receiver_base_type: None,
+                        receiver_field: None,
+                        receiver_bound: Some(bound),
+                        kind: DispatchKind::MemberDot,
+                        byte_start: start,
+                        line: head.start_position().row as u32 + 1,
+                        target: None,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Give each Rust dispatch site the type of its receiver.
     ///
     /// Rust states the type of every parameter and of every annotated
     /// binding, and `self` is whatever the enclosing `impl` names, so a
+    /// One function's merged generic bounds: the enclosing impl's bounds
+    /// underneath, the function's own on top, joined piece-wise where a
+    /// method `where` constrains an impl parameter. Shared by receiver
+    /// typing and call-head dispatch so both read the same scope.
+    fn merge_fn_bounds(
+        mut bounds: std::collections::HashMap<String, String>,
+        node: tree_sitter::Node,
+        source: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let own = Self::rust_own_generic_params(node, source);
+        for (param, bound) in Self::rust_generic_bounds_in(node, source) {
+            if bound.is_empty() || own.contains(&param) {
+                // The function's own parameters keep their own bounds.
+                bounds.insert(param, bound);
+                continue;
+            }
+            // A method `where` on an impl parameter joins both bounds.
+            bounds
+                .entry(param)
+                .and_modify(|held| {
+                    if held.is_empty() {
+                        *held = bound.clone();
+                    } else {
+                        for piece in bound.split(" + ") {
+                            if !held.split(" + ").any(|have| have == piece) {
+                                held.push_str(" + ");
+                                held.push_str(piece);
+                            }
+                        }
+                    }
+                })
+                .or_insert(bound);
+        }
+        bounds.extend(Self::rust_impl_trait_bounds_in(node, source));
+        bounds
+    }
+
     /// receiver that is a plain name can be typed without leaving the file.
     /// C needs its own pass because the shapes differ; this one reads
     /// `function_item`, `parameter` and `let_declaration`.
@@ -2843,35 +3160,8 @@ impl TreeSitterAnalyzer {
                 declared.insert("self".to_string(), self_type.clone());
             }
             Self::rust_declared_types_in(node, source, &mut declared);
-            // Bounds read beside declarations: a bare parameter resolves
-            // through its bound, with impl bounds underneath and
-            // function bounds on top.
-            let mut bounds = impl_bounds.clone().unwrap_or_default();
-            let own = Self::rust_own_generic_params(node, source);
-            for (param, bound) in Self::rust_generic_bounds_in(node, source) {
-                if bound.is_empty() || own.contains(&param) {
-                    // The function's own parameters keep their own bounds.
-                    bounds.insert(param, bound);
-                    continue;
-                }
-                // A method `where` on an impl parameter joins both bounds.
-                bounds
-                    .entry(param)
-                    .and_modify(|held| {
-                        if held.is_empty() {
-                            *held = bound.clone();
-                        } else {
-                            for piece in bound.split(" + ") {
-                                if !held.split(" + ").any(|have| have == piece) {
-                                    held.push_str(" + ");
-                                    held.push_str(piece);
-                                }
-                            }
-                        }
-                    })
-                    .or_insert(bound);
-            }
-            bounds.extend(Self::rust_impl_trait_bounds_in(node, source));
+            let bounds =
+                Self::merge_fn_bounds(impl_bounds.clone().unwrap_or_default(), node, source);
             scopes.push((node.start_byte(), node.end_byte(), declared, bounds));
         }
 
@@ -3441,9 +3731,14 @@ impl TreeSitterAnalyzer {
         // reachable, and that shape is already recognised.
         let snippet_bound = Self::value_names(tree.root_node(), body);
         let snippet_locals = Self::collect_local_struct_types(tree.root_node(), body);
-        let written =
-            Self::collect_walk_b_facts(tree.root_node(), body, &snippet_bound, &snippet_locals)
-                .registrations;
+        let written = Self::collect_walk_b_facts(
+            tree.root_node(),
+            body,
+            &snippet_bound,
+            &snippet_locals,
+            Language::C,
+        )
+        .registrations;
         for registration in written {
             if registration.target == parameter {
                 fates.push(ParameterFate::StoredIn {
@@ -3471,8 +3766,7 @@ impl TreeSitterAnalyzer {
             let Some(arguments) = node.child_by_field_name("arguments") else {
                 return true;
             };
-            let mut cursor = arguments.walk();
-            for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+            for (index, argument) in crate::call_actuals(arguments).into_iter().enumerate() {
                 let named = match argument.kind() {
                     "identifier" => Some(argument),
                     "pointer_expression" => argument
@@ -3607,8 +3901,14 @@ impl TreeSitterAnalyzer {
             .collect();
 
         let mut calls: Vec<(String, usize)> = Vec::new();
-        for (call_name, call_start, call_end) in &extraction.calls {
-            if *call_start < start || *call_end > end {
+        let first = extraction
+            .calls
+            .partition_point(|(_, byte, _)| *byte < start);
+        for (call_name, call_start, call_end) in &extraction.calls[first..] {
+            if *call_start >= end {
+                break;
+            }
+            if *call_end > end {
                 continue;
             }
             match pointers.get(call_name.as_str()) {
@@ -4012,14 +4312,18 @@ impl TreeSitterAnalyzer {
     fn rewrite_rust_use_aliases(
         calls: Vec<CallEdge>,
         aliases: &HashMap<&str, (&str, usize)>,
+        root_shadows: bool,
+        shadow: Option<isize>,
     ) -> Vec<CallEdge> {
-        if aliases.is_empty() {
-            return calls;
-        }
+        // No empty-map early return: an unmapped `bindings::` head still
+        // strips where no local module shadows it, resolving as the
+        // extern crate.
         calls
             .into_iter()
             .map(|edge| match edge {
-                CallEdge::Plain(call) => CallEdge::Plain(Self::rewrite_use_head(&call, aliases)),
+                CallEdge::Plain(call) => {
+                    CallEdge::Plain(Self::rewrite_use_head(&call, aliases, root_shadows, shadow))
+                }
                 tagged => tagged,
             })
             .collect()
@@ -4043,7 +4347,30 @@ impl TreeSitterAnalyzer {
         None
     }
 
-    fn rewrite_use_head(call: &str, aliases: &HashMap<&str, (&str, usize)>) -> String {
+    fn rewrite_use_head(
+        call: &str,
+        aliases: &HashMap<&str, (&str, usize)>,
+        root_shadows: bool,
+        shadow: Option<isize>,
+    ) -> String {
+        // A spelled-out `crate::bindings::` head resolves from the root
+        // scope: the shim unless the root binds the name to its own
+        // module or a non-shim import. Enclosing modules cannot shadow
+        // an absolute path, but a root binding still wins however deep
+        // the call sits. Anything else keeps the written spelling: a
+        // root import marks the shadow, but the rewrite does not follow
+        // it to its target.
+        if let Some(after) = call.strip_prefix("crate::bindings::") {
+            if !root_shadows
+                && after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                return after.to_string();
+            }
+            return call.to_string();
+        }
         let Some(at) = Self::first_top_level_scope(call) else {
             return call.to_string();
         };
@@ -4051,10 +4378,114 @@ impl TreeSitterAnalyzer {
         if matches!(head, "crate" | "self" | "super" | "Self") {
             return call.to_string();
         }
+        // The FFI shim is a rename, not an owner: `bindings::seq_printf`
+        // names the C function `seq_printf`. A `kernel::bindings` import
+        // names the extern crate and strips where the import reads
+        // inside the shadowing scope; a `crate::bindings` import starts
+        // from the crate root and strips where the root binds nothing of
+        // its own. A bare head is the shim where no enclosing module,
+        // the definition's own body, or the root declares the module —
+        // the kernel crate builds with `--extern bindings`, so it
+        // resolves with no import in scope. Anything else keeps its
+        // spelling, as does a shadow with no import.
+        if head == "bindings" {
+            let shim = match aliases.get("bindings") {
+                Some((path, depth)) => {
+                    let in_scope = shadow.is_none_or(|k| *depth as isize > k + 1);
+                    in_scope
+                        && (*path == "kernel::bindings" || *path == "bindings" && !root_shadows)
+                }
+                None => shadow.is_none(),
+            };
+            if shim {
+                return rest.strip_prefix("::").unwrap_or(rest).to_string();
+            }
+            // A shadowed head resolves to the file's own module: the
+            // outer import is invisible at the call site, so the map
+            // must not rewrite it either.
+            if shadow.is_some() {
+                return call.to_string();
+            }
+        }
         match aliases.get(head) {
             Some((path, _)) => format!("{path}{rest}"),
             None => call.to_string(),
         }
+    }
+
+    /// The path the file-top scope binds `bindings` to, if any: a root
+    /// `use` names the same name a `crate::bindings` path resolves, so a
+    /// non-shim one shadows the shim exactly like a local module does.
+    /// Last in tree order wins, matching the alias admission.
+    fn root_bindings_path(aliases: &[UseAlias]) -> Option<&str> {
+        aliases
+            .iter()
+            .rev()
+            .find(|alias| {
+                alias.name == "bindings" && alias.func.is_none() && alias.scope.is_empty()
+            })
+            .map(|alias| alias.path.as_str())
+    }
+
+    /// The scopes declaring `mod bindings`: the file root, plus the
+    /// nearest enclosing module of the definition. A sibling subtree's
+    /// module does not shadow, so only each enclosing scope's own
+    /// children count. Returns root presence separately from the nearest
+    /// shadow position (-1 for the root itself, else the index into the
+    /// definition's scope ids): a `crate::` path resolves from the root,
+    /// so an inner shadow must not mask a root declaration. Doc-comment
+    /// doctests (`/// # mod bindings`) are comments, never items, so
+    /// they cannot shadow here.
+    fn bindings_shadow_at(
+        tree: &Tree,
+        source: &str,
+        func_scope: &[usize],
+        defined_at: Option<tree_sitter::Node>,
+    ) -> (bool, Option<isize>) {
+        let declares_bindings = |scope: tree_sitter::Node| {
+            // A module's items hang under its body, not directly under
+            // the `mod` node; the file root lists its own children.
+            let body = scope.child_by_field_name("body").unwrap_or(scope);
+            let mut cursor = body.walk();
+            let mut found = false;
+            for child in body.children(&mut cursor) {
+                if child.kind() == "mod_item"
+                    && child
+                        .child_by_field_name("name")
+                        .is_some_and(|n| &source[n.byte_range()] == "bindings")
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        let root_declares = declares_bindings(tree.root_node());
+        // The definition's own body is the innermost scope: a module
+        // declared there shadows the head for the function's calls.
+        if let Some(body) = defined_at.and_then(|node| node.child_by_field_name("body")) {
+            if declares_bindings(body) {
+                return (root_declares, Some(func_scope.len() as isize));
+            }
+        }
+        let mut enclosing = defined_at.and_then(|node| node.parent());
+        while let Some(node) = enclosing {
+            if node.kind() == "mod_item" && declares_bindings(node) {
+                // A mod ancestor sits in the scope chain by
+                // construction; a miss keeps the spelling, fail-closed.
+                let k = func_scope
+                    .iter()
+                    .position(|id| *id == node.id())
+                    .map(|k| k as isize)
+                    .unwrap_or(func_scope.len() as isize);
+                return (root_declares, Some(k));
+            }
+            enclosing = node.parent();
+        }
+        if root_declares {
+            return (true, Some(-1));
+        }
+        (false, None)
     }
 
     /// A member call through `this` (C++) or `self` (Python) as a tagged
@@ -4342,6 +4773,68 @@ impl TreeSitterAnalyzer {
             byte_start: call.start_byte(),
             line: call.start_position().row as u32 + 1,
             kind: RegistrationKind::Assignment,
+        })
+    }
+
+    /// An LSM hook implementation filed in its hook slot:
+    ///
+    /// ```text
+    /// LSM_HOOK_INIT(file_open, selinux_file_open),
+    /// ```
+    ///
+    /// The macro puts `{ .scalls = static_calls_table.file_open, .hook =
+    /// { .file_open = selinux_file_open } }` in the LSM's hook array, so a
+    /// `call_int_hook(file_open, ...)` site can reach it. The slot
+    /// namespace is global (`static_calls_table`), shared by every LSM, so
+    /// the container holds the table, not a struct. A pasted target
+    /// (`bpf_lsm_##NAME`) resolves to nothing until the preprocessor runs:
+    /// it records no row. `NAME` is the bpf template's parameter, never a
+    /// hook, and records nothing either.
+    fn lsm_hook_install(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
+        let call = match node.kind() {
+            "expression_statement" => node.named_child(0)?,
+            "call_expression" => node,
+            _ => return None,
+        };
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let name = call.child_by_field_name("function")?;
+        if name.kind() != "identifier" || &source[name.byte_range()] != "LSM_HOOK_INIT" {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
+        let [hook, target] = named[..] else {
+            return None;
+        };
+        if hook.kind() != "identifier" || target.kind() != "identifier" {
+            return None;
+        }
+        let (hook, target) = (
+            source[hook.byte_range()].to_string(),
+            source[target.byte_range()].to_string(),
+        );
+        if hook.is_empty() || hook == "NAME" || target.is_empty() {
+            return None;
+        }
+        // The paste halves (`bpf_lsm_`, `##`, `NAME`) never form one
+        // identifier node, but a guard on the raw text keeps the probe
+        // working where the grammar changes under it.
+        let call_text = &source[call.byte_range()];
+        if call_text.contains("##") {
+            return None;
+        }
+        Some(RawRegistration {
+            container_type: "static_calls_table".to_string(),
+            container_base_type: None,
+            container_field: None,
+            member: hook,
+            target,
+            byte_start: call.start_byte(),
+            line: call.start_position().row as u32 + 1,
+            kind: RegistrationKind::LsmHook,
         })
     }
 
@@ -4729,6 +5222,22 @@ impl TreeSitterAnalyzer {
         false
     }
 
+    /// The bare name a qualified use-site stores: `name` reaches the leaf
+    /// in both C++ `qualified_identifier` and Rust `scoped_identifier`.
+    /// Only an `identifier` leaf stores; a lone `::` has no owner path,
+    /// so the shared split keeps it whole and this stores nothing.
+    fn qualified_bare_use_target(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut leaf = node;
+        while matches!(leaf.kind(), "qualified_identifier" | "scoped_identifier") {
+            leaf = leaf.child_by_field_name("name")?;
+        }
+        if leaf.kind() != "identifier" {
+            return None;
+        }
+        bare_use_site_target(&source[node.byte_range()])?;
+        Some(source[leaf.byte_range()].to_string())
+    }
+
     /// Registrations, handed-over arguments, pointer variables and
     /// file-scope globals in a single preorder. `bound` and `locals` come
     /// from walk A: a call may precede its declaration textually, so the
@@ -4738,6 +5247,7 @@ impl TreeSitterAnalyzer {
         source: &str,
         bound: &ValueNames,
         locals: &std::collections::HashMap<String, String>,
+        language: Language,
     ) -> WalkBFacts {
         let mut facts = WalkBFacts::default();
         let mut visit = |node: tree_sitter::Node| -> bool {
@@ -4746,6 +5256,8 @@ impl TreeSitterAnalyzer {
             if let Some(registration) = Self::initcall(node, source) {
                 facts.registrations.push(registration);
             } else if let Some(registration) = Self::static_call_install(node, source) {
+                facts.registrations.push(registration);
+            } else if let Some(registration) = Self::lsm_hook_install(node, source) {
                 facts.registrations.push(registration);
             } else if node.kind() == "initializer_list" {
                 if let Some(table) = Self::function_pointer_table(node, source) {
@@ -4762,11 +5274,23 @@ impl TreeSitterAnalyzer {
 
                     for (member_node, value) in Self::initializer_members(node) {
                         let member = source[member_node.byte_range()].to_string();
-                        let target_node = match value.kind() {
-                            "identifier" => Some(value),
-                            "pointer_expression" => value
-                                .child_by_field_name("argument")
-                                .filter(|a| a.kind() == "identifier"),
+                        let target = match value.kind() {
+                            "identifier" => Some(source[value.byte_range()].to_string()),
+                            "qualified_identifier" if language == Language::Cpp => {
+                                Self::qualified_bare_use_target(value, source)
+                            }
+                            "pointer_expression" => match value.child_by_field_name("argument") {
+                                Some(argument) if argument.kind() == "identifier" => {
+                                    Some(source[argument.byte_range()].to_string())
+                                }
+                                Some(argument)
+                                    if argument.kind() == "qualified_identifier"
+                                        && language == Language::Cpp =>
+                                {
+                                    Self::qualified_bare_use_target(argument, source)
+                                }
+                                _ => None,
+                            },
                             _ => None,
                         };
                         if value.kind() == "initializer_list" && !container_type.is_empty() {
@@ -4778,10 +5302,9 @@ impl TreeSitterAnalyzer {
                             continue;
                         }
 
-                        let Some(target_node) = target_node else {
+                        let Some(target) = target else {
                             continue;
                         };
-                        let target = source[target_node.byte_range()].to_string();
                         if member.is_empty() || target.is_empty() {
                             continue;
                         }
@@ -4834,38 +5357,74 @@ impl TreeSitterAnalyzer {
                         Some((base_type.clone(), source[member.byte_range()].to_string()))
                     });
 
-                    let mut cursor = arguments.walk();
-                    for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
-                        let (identifier, taken_address) = match argument.kind() {
-                            "identifier" => (Some(argument), false),
-                            "pointer_expression" => (
-                                argument
-                                    .child_by_field_name("argument")
-                                    .filter(|node| node.kind() == "identifier"),
-                                true,
+                    for (index, argument) in crate::call_actuals(arguments).into_iter().enumerate()
+                    {
+                        // A local of the same name does not shadow a qualified
+                        // spelling, so the shadowing filter is skipped for
+                        // those rows; a qualified self-call is still recursion.
+                        let (anchor, name, taken_address, qualified) = match argument.kind() {
+                            "identifier" => (
+                                argument,
+                                source[argument.byte_range()].to_string(),
+                                false,
+                                false,
                             ),
-                            _ => (None, false),
+                            "qualified_identifier" if language == Language::Cpp => {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
+                                    continue;
+                                };
+                                (argument, leaf, false, true)
+                            }
+                            "scoped_identifier" if language == Language::Rust => {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
+                                    continue;
+                                };
+                                (argument, leaf, false, true)
+                            }
+                            "pointer_expression" => {
+                                let Some(inner) = argument.child_by_field_name("argument") else {
+                                    continue;
+                                };
+                                match inner.kind() {
+                                    "identifier" => {
+                                        (inner, source[inner.byte_range()].to_string(), true, false)
+                                    }
+                                    "qualified_identifier" if language == Language::Cpp => {
+                                        let Some(leaf) =
+                                            Self::qualified_bare_use_target(inner, source)
+                                        else {
+                                            continue;
+                                        };
+                                        (inner, leaf, true, true)
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            _ => continue,
                         };
-                        let Some(identifier) = identifier else {
-                            continue;
-                        };
-                        let name = &source[identifier.byte_range()];
                         // A call naming itself is recursion, not a handover.
-                        if name == callee_name || Self::is_c_keyword(name) {
+                        if name == callee_name {
                             continue;
                         }
-                        if bound.contains(name, identifier.start_byte()) {
-                            continue;
+                        if !qualified {
+                            if Self::is_c_keyword(&name) {
+                                continue;
+                            }
+                            if bound.contains(&name, anchor.start_byte()) {
+                                continue;
+                            }
                         }
                         facts.argument_functions.push(RawArgumentFunction {
                             callee: callee_name.to_string(),
-                            target: name.to_string(),
+                            target: name,
                             argument_index: index as u32,
                             taken_address,
                             subject_type: subject.as_ref().map(|(type_name, _)| type_name.clone()),
                             subject_member: subject.as_ref().map(|(_, member)| member.clone()),
-                            byte_start: identifier.start_byte(),
-                            line: identifier.start_position().row as u32 + 1,
+                            byte_start: anchor.start_byte(),
+                            line: anchor.start_position().row as u32 + 1,
                         });
                     }
                 }
@@ -4882,12 +5441,27 @@ impl TreeSitterAnalyzer {
 
                     let target = match right.kind() {
                         "identifier" => source[right.byte_range()].to_string(),
-                        "pointer_expression" => match right
-                            .child_by_field_name("argument")
-                            .filter(|a| a.kind() == "identifier")
-                        {
-                            Some(a) => source[a.byte_range()].to_string(),
-                            None => return true,
+                        "qualified_identifier" if language == Language::Cpp => {
+                            let Some(leaf) = Self::qualified_bare_use_target(right, source) else {
+                                return true;
+                            };
+                            leaf
+                        }
+                        "pointer_expression" => match right.child_by_field_name("argument") {
+                            Some(argument) if argument.kind() == "identifier" => {
+                                source[argument.byte_range()].to_string()
+                            }
+                            Some(argument)
+                                if argument.kind() == "qualified_identifier"
+                                    && language == Language::Cpp =>
+                            {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
+                                    return true;
+                                };
+                                leaf
+                            }
+                            _ => return true,
                         },
                         _ => return true,
                     };
@@ -5132,6 +5706,7 @@ impl TreeSitterAnalyzer {
         &self,
         ctx: &ExtractionContext,
         extraction: &CallExtraction,
+        comments: &LeadingComments<'_>,
     ) -> Result<ExtractedFunctions> {
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
@@ -5177,9 +5752,6 @@ impl TreeSitterAnalyzer {
         parsed.sort_by_key(|p| p.function_end_byte.saturating_sub(p.function_start_byte));
         let mut functions = Vec::new();
 
-        // Extract all comments once (used by extract_function_with_comments)
-        let comments = self.extract_comments(ctx.tree, ctx.source, ctx.language)?;
-
         for parsed in parsed {
             let ParsedFunction {
                 name,
@@ -5214,17 +5786,13 @@ impl TreeSitterAnalyzer {
             }
 
             // Extract complete function text including top comments
-            let complete_body = self.extract_function_with_comments(
-                ctx.source,
-                function_start_byte,
-                function_end_byte,
+            let complete_body = comments.with_definition(
+                &ctx.source[function_start_byte..function_end_byte],
                 line_start,
-                &comments,
             );
 
             // Only extract calls and types for functions with bodies (not just declarations)
             let (unique_calls, function_types) = if has_body {
-                // Extract calls within this function from pre-computed list (O(m) instead of O(n))
                 // Function pointers declared by this function: a call
                 // naming one of them dispatches through a value.
                 // Each site belongs to exactly one function: matches run
@@ -5365,12 +5933,27 @@ impl TreeSitterAnalyzer {
                 qualifier.as_deref(),
             );
             // Rewrite the head through aliases holding at this definition.
+            let func_scope = Self::item_scope_ids(defined_at);
             let admitted = Self::effective_aliases(
                 &rust_aliases,
-                &Self::item_scope_ids(defined_at),
+                &func_scope,
                 defined_at.map(|node| node.id()),
             );
-            let mut calls = Self::rewrite_rust_use_aliases(calls, &admitted);
+            // The `use`-head rewrite, shim strip included, reads Rust
+            // imports: every other language keeps its heads as written.
+            // The root scope binds what a `crate::` path resolves: its
+            // own module, or a non-shim import of the name, shadows the
+            // shim for the whole file.
+            let mut calls = if ctx.language == Language::Rust {
+                let (root_declares, shadow) =
+                    Self::bindings_shadow_at(ctx.tree, ctx.source, &func_scope, defined_at);
+                let root_shadows = root_declares
+                    || Self::root_bindings_path(&rust_aliases)
+                        .is_some_and(|path| path != "bindings" && path != "kernel::bindings");
+                Self::rewrite_rust_use_aliases(calls, &admitted, root_shadows, shadow)
+            } else {
+                calls
+            };
             // A bare call beside its `this`/`self` twin names the same
             // edge twice; the store keeps one.
             calls.extend(tagged);
@@ -5560,102 +6143,63 @@ impl TreeSitterAnalyzer {
     /// Legacy extract_functions method for backward compatibility with older analyze methods
     fn extract_functions(
         &self,
-        tree: &Tree,
-        source: &str,
-        file_path: &Path,
-        git_hash: &str,
-        source_root: Option<&Path>,
-        language: Language,
+        ctx: &ExtractionContext,
+        comments: &LeadingComments<'_>,
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
-        let extraction =
-            Self::extract_all_calls_optimized(self.get_queries(language), tree, source, language)?;
-        let ctx = ExtractionContext {
+        let extraction = Self::extract_all_calls_optimized(
+            self.get_queries(ctx.language),
+            ctx.tree,
+            ctx.source,
+            ctx.language,
+        )?;
+        let ExtractedFunctions { functions, .. } =
+            self.extract_functions_with_calls(ctx, &extraction, comments)?;
+
+        Ok(functions)
+    }
+
+    fn extract_comments<'a>(&self, ctx: &ExtractionContext<'a>) -> LeadingComments<'a> {
+        let queries = self.get_queries(ctx.language);
+        let mut cursor = QueryCursor::new();
+        let mut captures = cursor.captures(
+            &queries.comment_query,
+            ctx.tree.root_node(),
+            ctx.source.as_bytes(),
+        );
+        let mut comments = Vec::new();
+
+        while let Some((m, _)) = captures.next() {
+            for capture in m.captures {
+                let node = capture.node;
+                let text = &ctx.source[node.byte_range()];
+                let start_line = node.start_position().row as u32 + 1;
+                let end_line = node.end_position().row as u32 + 1;
+                comments.push((start_line, end_line, text));
+            }
+        }
+
+        LeadingComments::new(ctx.source, comments)
+    }
+
+    fn extract_types(
+        &self,
+        ctx: &ExtractionContext,
+        comments: &LeadingComments<'_>,
+    ) -> Result<Vec<TypeInfo>> {
+        let ExtractionContext {
             tree,
             source,
             file_path,
             git_hash,
             source_root,
             language,
-        };
-        let ExtractedFunctions { functions, .. } =
-            self.extract_functions_with_calls(&ctx, &extraction)?;
-
-        Ok(functions)
-    }
-
-    fn extract_comments(
-        &self,
-        tree: &Tree,
-        source: &str,
-        language: Language,
-    ) -> Result<Vec<(u32, u32, String)>> {
-        let queries = self.get_queries(language);
-        let mut cursor = QueryCursor::new();
-        let mut captures =
-            cursor.captures(&queries.comment_query, tree.root_node(), source.as_bytes());
-        let mut comments = Vec::new();
-
-        while let Some((m, _)) = captures.next() {
-            for capture in m.captures {
-                let node = capture.node;
-                let text = &source[node.byte_range()];
-                let start_line = node.start_position().row as u32 + 1;
-                let end_line = node.end_position().row as u32 + 1;
-                comments.push((start_line, end_line, text.to_string()));
-            }
-        }
-
-        // Sort comments by line number
-        comments.sort_by_key(|&(start_line, _, _)| start_line);
-        Ok(comments)
-    }
-
-    fn extract_function_with_comments(
-        &self,
-        source: &str,
-        function_start_byte: usize,
-        function_end_byte: usize,
-        function_start_line: u32,
-        comments: &[(u32, u32, String)],
-    ) -> String {
-        let top_comments = collect_leading_comments(source, function_start_line, comments);
-
-        // Get the complete function text (including the function body)
-        let function_text = &source[function_start_byte..function_end_byte];
-
-        // Combine top comments with function text
-        let mut complete_body = String::new();
-
-        if !top_comments.is_empty() {
-            for comment in &top_comments {
-                complete_body.push_str(comment);
-                complete_body.push('\n');
-            }
-            complete_body.push('\n');
-        }
-
-        complete_body.push_str(function_text);
-        complete_body
-    }
-
-    fn extract_types(
-        &self,
-        tree: &Tree,
-        source: &str,
-        file_path: &Path,
-        git_hash: &str,
-        source_root: Option<&Path>,
-        language: Language,
-    ) -> Result<Vec<TypeInfo>> {
+        } = *ctx;
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         let mut captures =
             cursor.captures(&queries.type_query, tree.root_node(), source.as_bytes());
         let mut types = Vec::new();
-
-        // Extract all comments with their positions
-        let comments = self.extract_comments(tree, source, language)?;
 
         while let Some((m, _)) = captures.next() {
             let mut type_name = None;
@@ -5755,13 +6299,8 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = type_name {
                 // Extract complete type definition including top comments
-                let complete_definition = self.extract_type_with_comments(
-                    source,
-                    type_start_byte,
-                    type_end_byte,
-                    line_start,
-                    &comments,
-                );
+                let complete_definition =
+                    comments.with_definition(&source[type_start_byte..type_end_byte], line_start);
 
                 // Extract types referenced by this type's members
                 let referenced_types = self.extract_type_referenced_types(&members);
@@ -5909,34 +6448,6 @@ impl TreeSitterAnalyzer {
         }
 
         Ok(typedef_types)
-    }
-
-    fn extract_type_with_comments(
-        &self,
-        source: &str,
-        type_start_byte: usize,
-        type_end_byte: usize,
-        type_start_line: u32,
-        comments: &[(u32, u32, String)],
-    ) -> String {
-        let top_comments = collect_leading_comments(source, type_start_line, comments);
-
-        // Get the complete type definition text (including any internal comments)
-        let type_text = &source[type_start_byte..type_end_byte];
-
-        // Combine top comments with type definition
-        let mut complete_definition = String::new();
-
-        if !top_comments.is_empty() {
-            for comment in &top_comments {
-                complete_definition.push_str(comment);
-                complete_definition.push('\n');
-            }
-            complete_definition.push('\n');
-        }
-
-        complete_definition.push_str(type_text);
-        complete_definition
     }
 
     fn extract_macros(
@@ -8962,38 +9473,64 @@ impl TreeSitterAnalyzer {
 /// documents the block, not the definition below it.
 const MAX_INTERVENING_LINES: usize = 3;
 
-/// Collect the comment block that documents the entity starting at
-/// `start_line` (1-based), walking backwards through `comments`.
-///
-/// Shared by `extract_function_with_comments` and
-/// `extract_type_with_comments`, which previously carried two verbatim
-/// copies of this walk and therefore the same defect.
-///
-/// `comments` must be sorted ascending by start line, which
-/// `extract_comments` guarantees.
-fn collect_leading_comments(
-    source: &str,
-    start_line: u32,
-    comments: &[(u32, u32, String)],
-) -> Vec<String> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut top_comments: Vec<String> = Vec::new();
-    // Last source line that may still hold a comment for this entity.
-    let mut current_line = start_line.saturating_sub(1);
+/// Source lines and comment spans shared by all definitions in a file.
+struct LeadingComments<'a> {
+    lines: Vec<&'a str>,
+    comments: Vec<(u32, u32, &'a str)>,
+}
 
-    for (comment_start_line, comment_end_line, comment_text) in comments.iter().rev() {
-        // Comments at or below the entity are not leading comments.
-        if *comment_end_line > current_line {
-            continue;
-        }
-        if !gap_is_transparent(&lines, *comment_end_line, current_line) {
-            break;
-        }
-        top_comments.insert(0, comment_text.clone());
-        current_line = comment_start_line.saturating_sub(1);
+impl<'a> LeadingComments<'a> {
+    fn new(source: &'a str, mut comments: Vec<(u32, u32, &'a str)>) -> Self {
+        comments.sort_by_key(|&(start_line, _, _)| start_line);
+        let lines = if comments.is_empty() {
+            Vec::new()
+        } else {
+            source.lines().collect()
+        };
+        Self { lines, comments }
     }
 
-    top_comments
+    fn with_definition(&self, definition: &str, start_line: u32) -> String {
+        let leading = self.leading_at(start_line);
+        if leading.is_empty() {
+            return definition.to_owned();
+        }
+
+        let comment_bytes = leading
+            .iter()
+            .map(|comment| comment.len() + 1)
+            .sum::<usize>();
+        let mut body = String::with_capacity(comment_bytes + 1 + definition.len());
+        for comment in leading {
+            body.push_str(comment);
+            body.push('\n');
+        }
+        body.push('\n');
+        body.push_str(definition);
+        body
+    }
+
+    fn leading_at(&self, start_line: u32) -> Vec<&'a str> {
+        let mut leading = Vec::new();
+        let mut current_line = start_line.saturating_sub(1);
+        let end = self
+            .comments
+            .partition_point(|&(comment_start, _, _)| comment_start <= current_line);
+
+        for &(comment_start, comment_end, text) in self.comments[..end].iter().rev() {
+            if comment_end > current_line {
+                continue;
+            }
+            if !gap_is_transparent(&self.lines, comment_end, current_line) {
+                break;
+            }
+            leading.push(text);
+            current_line = comment_start.saturating_sub(1);
+        }
+
+        leading.reverse();
+        leading
+    }
 }
 
 /// True when every line strictly after `comment_end_line` and up to and
@@ -9082,8 +9619,8 @@ fn is_forward_declaration(trimmed: &str) -> bool {
 mod leading_comment_tests {
     use super::*;
 
-    fn comment(start: u32, end: u32, text: &str) -> (u32, u32, String) {
-        (start, end, text.to_string())
+    fn comment(start: u32, end: u32, text: &str) -> (u32, u32, &str) {
+        (start, end, text)
     }
 
     #[test]
@@ -9091,8 +9628,8 @@ mod leading_comment_tests {
         let source = "/* doc */\nvoid f(void)\n{\n}\n";
         let comments = vec![comment(1, 1, "/* doc */")];
         assert_eq!(
-            collect_leading_comments(source, 2, &comments),
-            vec!["/* doc */".to_string()]
+            LeadingComments::new(source, comments).leading_at(2),
+            vec!["/* doc */"]
         );
     }
 
@@ -9114,8 +9651,8 @@ mod leading_comment_tests {
         let doc = "/*\n * Task is throttled and someone wants to dequeue it again:\n * ... task sched class change etc.\n */";
         let comments = vec![comment(1, 4, doc)];
         assert_eq!(
-            collect_leading_comments(source, 6, &comments),
-            vec![doc.to_string()],
+            LeadingComments::new(source, comments).leading_at(6),
+            vec![doc],
         );
     }
 
@@ -9131,8 +9668,8 @@ mod leading_comment_tests {
         );
         let comments = vec![comment(1, 1, "/* doc */")];
         assert_eq!(
-            collect_leading_comments(source, 4, &comments),
-            vec!["/* doc */".to_string()]
+            LeadingComments::new(source, comments).leading_at(4),
+            vec!["/* doc */"]
         );
     }
 
@@ -9146,7 +9683,9 @@ mod leading_comment_tests {
             "}\n",
         );
         let comments = vec![comment(1, 1, "/* doc for the include block */")];
-        assert!(collect_leading_comments(source, 3, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(3)
+            .is_empty());
     }
 
     #[test]
@@ -9159,7 +9698,9 @@ mod leading_comment_tests {
             "}\n",
         );
         let comments = vec![comment(1, 1, "/* doc */")];
-        assert!(collect_leading_comments(source, 3, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(3)
+            .is_empty());
     }
 
     #[test]
@@ -9175,7 +9716,9 @@ mod leading_comment_tests {
             "}\n",
         );
         let comments = vec![comment(1, 1, "/* doc for the whole group */")];
-        assert!(collect_leading_comments(source, 6, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(6)
+            .is_empty());
     }
 
     #[test]
@@ -9183,8 +9726,8 @@ mod leading_comment_tests {
         let source = "/* first */\n/* second */\nvoid f(void)\n{\n}\n";
         let comments = vec![comment(1, 1, "/* first */"), comment(2, 2, "/* second */")];
         assert_eq!(
-            collect_leading_comments(source, 3, &comments),
-            vec!["/* first */".to_string(), "/* second */".to_string()]
+            LeadingComments::new(source, comments).leading_at(3),
+            vec!["/* first */", "/* second */"]
         );
     }
 
@@ -9192,7 +9735,9 @@ mod leading_comment_tests {
     fn comments_below_the_entity_are_ignored() {
         let source = "void f(void)\n{\n}\n/* trailing */\n";
         let comments = vec![comment(4, 4, "/* trailing */")];
-        assert!(collect_leading_comments(source, 1, &comments).is_empty());
+        assert!(LeadingComments::new(source, comments)
+            .leading_at(1)
+            .is_empty());
     }
 
     #[test]
@@ -9210,6 +9755,21 @@ mod leading_comment_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn assembly_versions_apart_from_the_grammars() {
+        // `.S` records `N+asm-M`: a scanner fix re-reads only assembly,
+        // never the grammars' rows. Anything with a grammar keeps its
+        // language version.
+        let asm = extractor_version_for_file(Path::new("arch/x86/entry.S"), false);
+        assert!(
+            asm.starts_with(&format!("{EXTRACTOR_VERSION}+asm-")),
+            "asm version must ride the shared one: {asm}"
+        );
+        let c = extractor_version_for_file(Path::new("kernel/fork.c"), false);
+        assert!(!c.contains("+asm-"), "{c}");
+        assert!(c.starts_with(&format!("{EXTRACTOR_VERSION}+")), "{c}");
+    }
+
     fn fields_of(source: &str, type_name: &str) -> Vec<(String, String)> {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
         let analysis = analyzer
@@ -9226,6 +9786,56 @@ mod tests {
             .iter()
             .map(|m| (m.name.clone(), m.type_name.clone()))
             .collect()
+    }
+
+    #[test]
+    fn each_definition_carries_only_its_own_doc_comment() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "/* doc a */\n\
+                 void a(void)\n\
+                 {\n\
+                 }\n\
+                 \n\
+                 /* doc s */\n\
+                 struct s {\n\
+                 \tint x;\n\
+                 };\n\
+                 \n\
+                 /* doc b */\n\
+                 void b(void)\n\
+                 {\n\
+                 }\n",
+                Path::new("test.c"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+
+        let docs = ["/* doc a */", "/* doc s */", "/* doc b */"];
+        let text_of = |name: &str| -> &str {
+            analysis
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.body.as_str())
+                .or_else(|| {
+                    analysis
+                        .types
+                        .iter()
+                        .find(|t| t.name == name)
+                        .map(|t| t.definition.as_str())
+                })
+                .unwrap_or_else(|| panic!("{name} not extracted"))
+        };
+
+        for (name, own) in [("a", docs[0]), ("s", docs[1]), ("b", docs[2])] {
+            let text = text_of(name);
+            for doc in docs {
+                assert_eq!(text.contains(doc), doc == own, "{name}: {text}");
+            }
+        }
     }
 
     #[test]
@@ -11582,6 +12192,434 @@ mod rust_receiver_tests {
     }
 
     #[test]
+    fn rust_bindings_heads_strip_to_the_c_function() {
+        // The shim is a rename, not an owner: `bindings::seq_printf`
+        // reads as `seq_printf` (the `use` binds the generated shim,
+        // so the head must shed it to match the C definition — even
+        // where a local function shares the name, which then reads as
+        // an honest ambiguity).
+        let found = call_edges_of(
+            "use crate::bindings;\n\
+             fn seq_printf() -> u32 { 1 }\n\
+             fn user() -> u32 { bindings::seq_printf() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("user"), vec![plain("seq_printf")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_only_the_shim() {
+        // A top-level `mod bindings` is the owner the file means: the
+        // module shadows every head in the file, so each spelling stays
+        // (an explicit `as` rename binds a different head and is
+        // unaffected). Any other import keeps its rewritten path for
+        // the same reason: only the `crate::` and `kernel::` shim forms
+        // strip.
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use other::bindings as B;\n\
+             fn a() -> u32 { bindings::foo() }\n\
+             fn b() -> u32 { B::foo() }\n\
+             fn seq_printf() -> u32 { 1 }\n\
+             fn c() -> u32 { bindings::seq_printf() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("a"), vec![plain("bindings::foo")], "{found:?}");
+        assert_eq!(get("b"), vec![plain("other::bindings::foo")], "{found:?}");
+        assert_eq!(get("c"), vec![plain("bindings::seq_printf")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_keeps_a_competing_import() {
+        // `use other::bindings` binds the head itself to another
+        // module: the head keeps its rewritten path (a strip-everything
+        // variant strips here, so this pins the map check, not just the
+        // shadow flag).
+        let found = call_edges_of(
+            "use other::bindings;\n\
+             fn d() -> u32 { bindings::foo() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("d"), vec![plain("other::bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_body_import_reads_in_its_function_only() {
+        // A body import shadows the shim inside its own function, but
+        // the sibling call beside it still strips: the map must not
+        // leak across functions (the top-level `use` in the previous
+        // test reads file-wide by contrast, which is why it lives in
+        // its own fixture).
+        let found = call_edges_of(
+            "fn e() -> u32 { use other::bindings; bindings::bar() }\n\
+             fn f() -> u32 { bindings::baz() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("e"), vec![plain("other::bindings::bar")], "{found:?}");
+        assert_eq!(get("f"), vec![plain("baz")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_shadow_is_lexical() {
+        // The module shadows only its own subtree: the call inside
+        // `outer` keeps its spelling while the top-level call beside
+        // it strips (a file-wide flag would hold both off).
+        let found = call_edges_of(
+            "mod outer {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn inner() -> u32 { bindings::foo() }\n\
+             }\n\
+             fn top() -> u32 { bindings::bar() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        let inner = found
+            .iter()
+            .find(|(n, _)| n.ends_with("inner"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(inner, vec![plain("bindings::foo")], "{found:?}");
+        assert_eq!(get("top"), vec![plain("bar")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_past_a_glob() {
+        // A glob names no alias, so the head still strips: the kernel's
+        // own import-free files all sit beside a prelude glob, and no
+        // in-tree glob provides a `bindings` name (prelude, super, and
+        // uapi globs were censused).
+        let found = call_edges_of(
+            "use other::*;\n\
+             use crate::prelude::*;\n\
+             fn g() -> u32 { bindings::qux() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("g"), vec![plain("qux")], "{found:?}");
+    }
+
+    #[test]
+    fn bindings_heads_keep_their_spelling_outside_rust() {
+        // The rewrite handles Rust imports only: a C++ `bindings::`
+        // head is a genuine qualifier and keeps its spelling.
+        let found = call_edges_of("int foo();\nint f() { return bindings::foo(); }\n", "x.cc");
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_full_crate_path_strips_like_an_import() {
+        // A spelled-out `crate::bindings::` head takes the imported
+        // decision: the shim where the root declares no module of its
+        // own, the file's spelling where it does.
+        let found = call_edges_of("fn w() -> u32 { crate::bindings::wibble() }\n", "lib.rs");
+        let shadowed = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn wobble() -> u32 { 1 }\n\
+             }\n\
+             fn v() -> u32 { crate::bindings::wobble() }\n",
+            "shadow.rs",
+        );
+        let get = |found: &[(String, Vec<crate::types::CallEdge>)], name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get(&found, "w"), vec![plain("wibble")], "{found:?}");
+        assert_eq!(
+            get(&shadowed, "v"),
+            vec![plain("crate::bindings::wobble")],
+            "{shadowed:?}"
+        );
+    }
+
+    #[test]
+    fn rust_bindings_outer_crate_import_loses_to_inner_module() {
+        // A file-level `use crate::bindings` reads outside the nested
+        // module, so the inner module wins at the call site and the head
+        // keeps its spelling (position alone would strip here, since no
+        // root module exists).
+        let found = call_edges_of(
+            "use crate::bindings;\n\
+             mod a {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn f() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let f = found
+            .iter()
+            .find(|(n, _)| n == "f" || n.ends_with("::f"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(f, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_function_body_module_shadows() {
+        // A module declared in the function body is the innermost scope:
+        // the call names it, not the shim, with no import anywhere.
+        let found = call_edges_of(
+            "fn f() -> u32 {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tbindings::foo()\n\
+             }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_root_import_names_the_local_module() {
+        // The root scope binds `bindings` to the file's own module
+        // through an import: a `crate::` path resolves that binding, so
+        // the full-path call keeps its spelling (position alone would
+        // strip it, since no module declaration exists).
+        let found = call_edges_of(
+            "mod alt {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use crate::alt as bindings;\n\
+             fn f() -> u32 { crate::bindings::foo() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("crate::bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_child_crate_import_follows_the_root_binding() {
+        // The child's `use crate::bindings` resolves the root scope's
+        // binding, which names the local module: the call keeps the
+        // written spelling (the import path alone reads as the shim).
+        let found = call_edges_of(
+            "mod alt {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             use crate::alt as bindings;\n\
+             mod child {\n\
+             \tuse crate::bindings;\n\
+             \tpub fn g() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let g = found
+            .iter()
+            .find(|(n, _)| n == "g" || n.ends_with("::g"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(g, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_inner_shadow_masks_no_root_declaration() {
+        // Both scopes declare the module: the `crate::` path resolves
+        // from the root, where the module sits, so the full-path call
+        // keeps its spelling even though an inner shadow is nearer. The
+        // function-local import names that same root module, so its call
+        // keeps the written spelling too (a root-blind rule strips both).
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             mod child {\n\
+             \tmod bindings {\n\
+             \t\tpub fn bar() -> u32 { 2 }\n\
+             \t}\n\
+             \tpub fn f() -> u32 { crate::bindings::foo() }\n\
+             \tpub fn g() -> u32 { use crate::bindings; bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name || n.ends_with(&format!("::{name}")))
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("f"), vec![plain("crate::bindings::foo")], "{found:?}");
+        assert_eq!(get("g"), vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_child_import_names_the_file_module() {
+        // `use crate::bindings` inside a child module names the file's
+        // own top-level module, not the shim: the absolute path resolves
+        // from the root, where the module sits. The head keeps its
+        // spelling (position alone would strip here, since the import
+        // reads inside the shadowing scope).
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             mod child {\n\
+             \tuse crate::bindings;\n\
+             \tpub fn f() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let f = found
+            .iter()
+            .find(|(n, _)| n == "f" || n.ends_with("::f"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(f, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_inner_module_wins_over_outer_import() {
+        // The inverse of the import-wins test: a file-level shim import
+        // reads outside the child's own module, so the inner module
+        // wins at the call site and the head keeps its spelling.
+        let found = call_edges_of(
+            "use kernel::bindings;\n\
+             mod child {\n\
+             \tmod bindings {\n\
+             \t\tpub fn foo() -> u32 { 1 }\n\
+             \t}\n\
+             \tpub fn g() -> u32 { bindings::foo() }\n\
+             }\n",
+            "lib.rs",
+        );
+        let g = found
+            .iter()
+            .find(|(n, _)| n == "g" || n.ends_with("::g"))
+            .map(|(_, calls)| calls.clone())
+            .unwrap();
+        assert_eq!(g, vec![plain("bindings::foo")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_import_wins_over_an_outer_module() {
+        // The import reads in its own scope ahead of the file's
+        // module: the call strips where the body names the shim, while
+        // the top-level call beside it keeps its spelling.
+        let found = call_edges_of(
+            "mod bindings {\n\
+             \tpub fn foo() -> u32 { 1 }\n\
+             }\n\
+             fn h() -> u32 { use kernel::bindings; bindings::foo() }\n\
+             fn i() -> u32 { bindings::bar() }\n",
+            "lib.rs",
+        );
+        let get = |name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get("h"), vec![plain("foo")], "{found:?}");
+        assert_eq!(get("i"), vec![plain("bindings::bar")], "{found:?}");
+    }
+
+    #[test]
+    fn rust_bindings_strips_without_an_import() {
+        // No `use` binds `bindings`, and no local module shadows it:
+        // the head is the extern crate the kernel passes with
+        // `--extern bindings` — the pattern of `rust/kernel/print.rs`,
+        // which names no import — and strips. `use kernel::bindings`
+        // names the same shim through the crate root's re-export.
+        // Bare `use bindings;` records no alias, so it runs this same
+        // unmapped branch; the fixture pins the spelling anyway.
+        let found = call_edges_of(
+            "use crate::fmt;\n\
+             fn a() -> u32 { bindings::seq_printf() }\n",
+            "print.rs",
+        );
+        let kernel = call_edges_of(
+            "use kernel::bindings;\n\
+             fn b() -> u32 { bindings::seq_printf() }\n",
+            "node.rs",
+        );
+        let bare = call_edges_of(
+            "use bindings;\n\
+             fn c() -> u32 { bindings::seq_printf() }\n",
+            "param.rs",
+        );
+        let get = |found: &[(String, Vec<crate::types::CallEdge>)], name: &str| {
+            found
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, calls)| calls.clone())
+                .unwrap()
+        };
+        assert_eq!(get(&found, "a"), vec![plain("seq_printf")], "{found:?}");
+        assert_eq!(get(&kernel, "b"), vec![plain("seq_printf")], "{kernel:?}");
+        assert_eq!(get(&bare, "c"), vec![plain("seq_printf")], "{bare:?}");
+    }
+
+    #[test]
     fn rust_use_groups_and_nesting_resolve_to_full_paths() {
         // Groups, nesting, `self` and `as` read as full paths (the
         // fixture holds a glob and a bare call beside the rewrites to
@@ -13105,9 +14143,14 @@ mod argument_subject_tests {
         let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
         println!("locals: {locals:?}");
         let bound = TreeSitterAnalyzer::value_names(tree.root_node(), source);
-        let found =
-            TreeSitterAnalyzer::collect_walk_b_facts(tree.root_node(), source, &bound, &locals)
-                .argument_functions;
+        let found = TreeSitterAnalyzer::collect_walk_b_facts(
+            tree.root_node(),
+            source,
+            &bound,
+            &locals,
+            Language::C,
+        )
+        .argument_functions;
         println!("rows: {found:?}");
         let row = found.iter().find(|r| r.target == "i_callback").unwrap();
         assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
@@ -13143,15 +14186,312 @@ mod argument_subject_tests {
         let tree = parse(source);
         let bound = TreeSitterAnalyzer::value_names(tree.root_node(), source);
         let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
-        let found =
-            TreeSitterAnalyzer::collect_walk_b_facts(tree.root_node(), source, &bound, &locals)
-                .argument_functions;
+        let found = TreeSitterAnalyzer::collect_walk_b_facts(
+            tree.root_node(),
+            source,
+            &bound,
+            &locals,
+            Language::C,
+        )
+        .argument_functions;
         let row = found
             .iter()
             .find(|row| row.target == "i_callback")
             .unwrap_or_else(|| panic!("i_callback not recorded: {found:?}"));
         assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
         assert_eq!(row.subject_member.as_deref(), Some("i_rcu"), "{row:?}");
+    }
+}
+
+#[cfg(test)]
+mod qualified_use_site_tests {
+    use super::*;
+
+    fn handover_rows(source: &str, path: &str) -> Vec<ArgumentFunction> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap()
+            .argument_functions
+    }
+
+    fn registration_rows(source: &str, path: &str) -> Vec<Registration> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap()
+            .registrations
+    }
+
+    #[test]
+    fn a_qualified_handover_stores_the_bare_leaf() {
+        let found = handover_rows("void f() { register_dev(ns::my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_shadowing_local_does_not_hide_a_qualified_spelling() {
+        // A local `my_read` shadows the bare name, not `ns::my_read`,
+        // so the row is still recorded.
+        let found = handover_rows(
+            "void f() { int my_read = 0; register_dev(ns::my_read); }\n",
+            "t.cpp",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|row| row.callee == "register_dev" && row.target == "my_read"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_designated_init_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct file; struct file_operations { int (*read)(struct file *); };\n\
+             static const struct file_operations fops = { .read = ns::my_read };\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "read")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::DesignatedInit, "{row:?}");
+    }
+
+    #[test]
+    fn a_qualified_assignment_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct ops { int (*run)(void); };\n\
+             void setup(struct ops *o) { o->run = ns::impl_fn; }\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "run")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "impl_fn", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::Assignment, "{row:?}");
+        assert_eq!(row.container_type, "ops", "{row:?}");
+    }
+
+    #[test]
+    fn an_addressed_qualified_assignment_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct ops { int (*run)(void); };\n\
+             void setup(struct ops *o) { o->run = &ns::impl_fn; }\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "run")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "impl_fn", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::Assignment, "{row:?}");
+        assert_eq!(row.container_type, "ops", "{row:?}");
+    }
+
+    #[test]
+    fn a_spaced_qualified_handover_stores_the_bare_leaf() {
+        // Whitespace after `::` is still the same leaf: the walk holds
+        // the leaf node, so the stored target has no leading space.
+        let found = handover_rows("void f() { register_dev(ns:: my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_reduced_target_meets_its_bare_definition() {
+        // The stored target is the bare leaf, which is exactly what the
+        // definition side files under: the two meet by equality.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int my_read(void) { return 0; }\n\
+                 void f() { register_dev(ns::my_read); }\n",
+                Path::new("t.cpp"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let row = analysis
+            .argument_functions
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {:?}", analysis.argument_functions));
+        let function = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "my_read")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no definition: {:?}",
+                    analysis
+                        .functions
+                        .iter()
+                        .map(|f| &f.name)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(row.target, function.name, "{row:?} vs {function:?}");
+    }
+
+    #[test]
+    fn an_addressed_qualified_handover_marks_taken() {
+        // `&ns::my_read` records the same row with taken=true.
+        let found = handover_rows("void f() { register_dev(&ns::my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn an_addressed_qualified_designated_init_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct file; struct file_operations { int (*read)(struct file *); };\n\
+             static const struct file_operations fops = { .read = &ns::my_read };\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "read")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::DesignatedInit, "{row:?}");
+    }
+
+    #[test]
+    fn a_qualified_rust_handover_stores_the_bare_leaf() {
+        let found = handover_rows("fn f() { register(m::handler); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "handler", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_scoped_leading_rust_handover_stores_the_bare_leaf() {
+        // A scoped leading `::` still has an owner path, so the shared
+        // cut stores the leaf: one rule for both languages.
+        let found = handover_rows("fn f() { register(::m::handler); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "handler", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn an_aliased_rust_handler_records_the_alias() {
+        // The stored target is the name at the use-site: resolving the
+        // import and cutting again would store `handler` instead of `h`.
+        let found = handover_rows("use m::handler as h;\nfn f() { register(h); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "h", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_lone_leading_scope_records_nothing() {
+        // `::my_read` has no owner path, so there is no leaf to store.
+        let found = handover_rows("void f() { register_dev(::my_read); }\n", "t.cpp");
+        assert!(
+            found.iter().all(|row| row.callee != "register_dev"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn the_bare_handover_path_still_records() {
+        // The reduction must not break the existing bare path.
+        let found = handover_rows("void f() { register_dev(my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_scoped_spelling_inside_a_python_string_records_nothing() {
+        // The gate keys on the node kind, not on text: a `::` inside a
+        // Python string literal must not produce a `::` target.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "register(\"::my_read\")\n",
+                Path::new("t.py"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            analysis
+                .registrations
+                .iter()
+                .all(|row| !row.target.contains("::")),
+            "{:?}",
+            analysis.registrations
+        );
+        assert!(
+            analysis
+                .argument_functions
+                .iter()
+                .all(|row| !row.target.contains("::")),
+            "{:?}",
+            analysis.argument_functions
+        );
+    }
+
+    #[test]
+    fn dotted_spellings_record_no_dotted_target() {
+        // Python and Zig walk B store no spelled-out row at all; what
+        // matters is that no future arm stores one unreduced.
+        for (source, path) in [
+            ("register(mod.func)\n", "t.py"),
+            ("fn f() void { _ = register(mod.func); }\n", "t.zig"),
+        ] {
+            let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+            let analysis = analyzer
+                .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+                .unwrap();
+            assert!(
+                analysis
+                    .registrations
+                    .iter()
+                    .all(|row| !row.target.contains('.')),
+                "{path}: {:?}",
+                analysis.registrations
+            );
+            assert!(
+                analysis
+                    .argument_functions
+                    .iter()
+                    .all(|row| !row.target.contains('.')),
+                "{path}: {:?}",
+                analysis.argument_functions
+            );
+        }
     }
 }
 

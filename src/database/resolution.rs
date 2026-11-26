@@ -29,6 +29,19 @@ pub struct IndirectCaller {
     pub evidence: Evidence,
 }
 
+impl IndirectCaller {
+    /// Whether the leg shows as an answer rather than a weak-match count.
+    /// A type-matched or stated leg does; so does an LSM hook leg — the
+    /// slot namespace is global and kind-gated, so the match is exact and
+    /// only execution (stacking, short-circuit) is decided at runtime,
+    /// which the display wording holds instead of the bucket.
+    pub fn is_confident(&self) -> bool {
+        self.evidence.is_type_matched()
+            || self.site_kind == crate::types::DispatchKind::LsmHookInt.as_str()
+            || self.site_kind == crate::types::DispatchKind::LsmHookVoid.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Evidence {
     /// The site itself names the target: a macro's declared candidate, or a
@@ -50,6 +63,10 @@ pub enum Evidence {
         /// the function was installed in. False means the member names match
         /// and nothing contradicts it, which is weaker.
         type_matched: bool,
+        /// True when the match ran through the site's bound rather than a
+        /// receiver type: the bound's trait selects the slot, so the leg
+        /// is exact and execution is decided only at runtime.
+        via_bound: bool,
     },
 }
 
@@ -60,6 +77,15 @@ impl Evidence {
             Evidence::Registered { type_matched, .. } => *type_matched,
         }
     }
+}
+
+/// Whether a bound cites the trait a row installs: any piece of a `+`
+/// list matching the row's container. Shared by the typed and bound-only
+/// arms so both read one rule.
+fn bound_matches_trait(bound: &str, container: &str) -> bool {
+    crate::types::each_bound(bound)
+        .iter()
+        .any(|piece| crate::types::trait_names_match(piece, container))
 }
 
 /// Match dispatch sites against the places a function is installed.
@@ -89,7 +115,7 @@ pub fn indirect_callers(
     // places install the function there: seq_read sits in file_operations
     // ::read in 430 of them, and listing fs/read_write.c once per
     // registration buries the three call sites that matter.
-    type SiteKey = (String, String, u32, u64, String, String, String, bool);
+    type SiteKey = (String, String, u32, u64, String, String, String, bool, bool);
     let mut by_site: HashMap<SiteKey, (&Registration, usize)> = HashMap::new();
 
     for registration in registrations {
@@ -98,25 +124,70 @@ pub fn indirect_callers(
         };
 
         for site in sites {
+            // An LSM hook site joins only an LSM registration, and an LSM
+            // registration joins only an LSM site: the slot namespace is
+            // global, so a member-name match would link every `file_open`
+            // in the tree to every LSM `file_open` implementation and back.
+            // `ops.file_open()` matches its own struct;
+            // `call_int_hook` matches its slot.
+            let site_is_lsm = matches!(
+                site.kind,
+                crate::types::DispatchKind::LsmHookInt | crate::types::DispatchKind::LsmHookVoid
+            );
+            let registration_is_lsm = registration.kind == crate::types::RegistrationKind::LsmHook;
+            if site_is_lsm != registration_is_lsm {
+                continue;
+            }
+            if site_is_lsm {
+                let key = (
+                    site.caller_name.clone(),
+                    site.file_path.clone(),
+                    site.line,
+                    site.byte_start,
+                    site.member.clone(),
+                    site.kind.as_str().to_string(),
+                    registration.container_type.clone(),
+                    false,
+                    false,
+                );
+                by_site
+                    .entry(key)
+                    .and_modify(|(exemplar, count)| {
+                        *count += 1;
+                        if (&registration.file_path, registration.line)
+                            < (&exemplar.file_path, exemplar.line)
+                        {
+                            *exemplar = registration;
+                        }
+                    })
+                    .or_insert((registration, 1));
+                continue;
+            }
             // A site that states its receiver type only matches the type the
             // function was installed in; one that does not is a member-name
             // match, which is weaker but is what the reader asked for.
             //
             // Trait rows join through the bound, or through the target
-            // owner where the site carries no bound. An untyped site
-            // joins nothing: member names alone over-match.
-            let type_matched = match site.receiver_type.as_deref() {
-                Some(receiver_type) if receiver_type == registration.container_type => true,
+            // owner where the site has no bound.
+            //
+            // A bound-only site (a generic parameter's method, or an
+            // `impl Trait` receiver) joins only through its bound: it
+            // never takes the member-name weak match, which would link
+            // it to every same-named member in the tree, and it never
+            // joins a non-trait row.
+            let (type_matched, via_bound) = match site.receiver_type.as_deref() {
+                Some(receiver_type) if receiver_type == registration.container_type => {
+                    (true, false)
+                }
                 Some(receiver_type)
                     if registration.kind == crate::types::RegistrationKind::TraitImpl =>
                 {
                     match site.receiver_bound.as_deref() {
                         Some(bound) => {
-                            if !crate::types::each_bound(bound).iter().any(|piece| {
-                                crate::types::trait_names_match(piece, &registration.container_type)
-                            }) {
+                            if !bound_matches_trait(bound, &registration.container_type) {
                                 continue;
                             }
+                            (true, true)
                         }
                         None => {
                             if !crate::types::target_owner_matches(
@@ -125,15 +196,30 @@ pub fn indirect_callers(
                             ) {
                                 continue;
                             }
+                            (true, false)
                         }
                     }
-                    true
                 }
                 Some(_) => continue,
-                None if registration.kind == crate::types::RegistrationKind::TraitImpl => {
-                    continue;
-                }
-                None => false,
+                None => match site.receiver_bound.as_deref() {
+                    Some(bound) => {
+                        if registration.kind != crate::types::RegistrationKind::TraitImpl {
+                            continue;
+                        }
+                        if !bound_matches_trait(bound, &registration.container_type) {
+                            continue;
+                        }
+                        (true, true)
+                    }
+                    // An untyped, unbound site joins nothing: member names
+                    // alone over-match.
+                    None => {
+                        if registration.kind == crate::types::RegistrationKind::TraitImpl {
+                            continue;
+                        }
+                        (false, false)
+                    }
+                },
             };
 
             // An array subscript names no member: `table[i](...)` in one
@@ -154,6 +240,7 @@ pub fn indirect_callers(
                 site.kind.as_str().to_string(),
                 registration.container_type.clone(),
                 type_matched,
+                via_bound,
             );
 
             by_site
@@ -182,6 +269,7 @@ pub fn indirect_callers(
             site_kind,
             container_type,
             type_matched,
+            via_bound,
         ),
         (exemplar, count),
     ) in by_site
@@ -199,6 +287,7 @@ pub fn indirect_callers(
                 registration_line: exemplar.line,
                 registration_count: count,
                 type_matched,
+                via_bound,
             },
         });
     }
@@ -343,9 +432,18 @@ pub struct RevisionPaths {
     git_sha: String,
     dirty: HashMap<String, String>,
     deleted: HashSet<String>,
+    /// Identifies the installed overlay from which dirty and deleted paths came.
+    pub(super) overlay_stamp: Option<u64>,
     inner: RwLock<Inner>,
     threshold: usize,
     valid: bool,
+    /// The git repo, opened once on first per-path need: a fresh
+    /// discover per lookup revalidates the pack index every time,
+    /// which stalls caller listings with thousands of rows. The
+    /// thread-safe handle is shared (it is `Sync`, unlike the plain
+    /// repository); each resolve takes a thread-local view of it.
+    /// Boxed: the handle is large and this struct rides in an `Arc`.
+    repo: RwLock<Option<Box<gix::ThreadSafeRepository>>>,
 }
 
 impl Default for RevisionPaths {
@@ -355,9 +453,11 @@ impl Default for RevisionPaths {
             git_sha: String::new(),
             dirty: HashMap::new(),
             deleted: HashSet::new(),
+            overlay_stamp: None,
             inner: RwLock::new(Inner::default()),
             threshold: LAZY_THRESHOLD,
             valid: true,
+            repo: RwLock::new(None),
         }
     }
 }
@@ -370,9 +470,13 @@ impl Clone for RevisionPaths {
             git_sha: self.git_sha.clone(),
             dirty: self.dirty.clone(),
             deleted: self.deleted.clone(),
+            overlay_stamp: self.overlay_stamp,
             inner: RwLock::new(inner),
             threshold: self.threshold,
             valid: self.valid,
+            // A clone reopens on need: it starts closed while the original
+            // keeps its handle.
+            repo: RwLock::new(None),
         }
     }
 }
@@ -386,6 +490,7 @@ impl RevisionPaths {
             git_sha: String::new(),
             dirty: HashMap::new(),
             deleted: HashSet::new(),
+            overlay_stamp: None,
             inner: RwLock::new(Inner {
                 cache: HashMap::new(),
                 fallback: Some(paths),
@@ -393,6 +498,7 @@ impl RevisionPaths {
             }),
             threshold: LAZY_THRESHOLD,
             valid,
+            repo: RwLock::new(None),
         }
     }
 
@@ -410,10 +516,31 @@ impl RevisionPaths {
             git_sha,
             dirty,
             deleted,
+            overlay_stamp: None,
             inner: RwLock::new(Inner::default()),
             threshold: LAZY_THRESHOLD,
             valid,
+            repo: RwLock::new(None),
         }
+    }
+
+    /// The manifest's git handle, opened once: the read guard stays
+    /// alive in the caller across its resolve, so concurrent lookups
+    /// share the open repo and its loaded pack index. `None` where the
+    /// repo does not open, which callers resolve as a miss.
+    fn shared_repo(
+        &self,
+    ) -> Option<std::sync::RwLockReadGuard<'_, Option<Box<gix::ThreadSafeRepository>>>> {
+        if self.repo.read().unwrap().is_none() {
+            // Open without holding the lock; a lost race just wastes
+            // one open, and no worker ever blocks on discovery I/O.
+            if let Ok(fresh) = gix::ThreadSafeRepository::discover(&self.repo_path) {
+                *self.repo.write().unwrap() = Some(Box::new(fresh));
+            } else {
+                return None;
+            }
+        }
+        Some(self.repo.read().unwrap())
     }
 
     /// The content this path holds, or None when the revision does not have
@@ -477,14 +604,16 @@ impl RevisionPaths {
             }
             return None;
         }
-        // Per-path resolve.
-        let resolved = crate::git::resolve_files_at_commit(
-            &self.repo_path,
-            &self.git_sha,
-            &[path.to_string()],
-        )
-        .ok()
-        .and_then(|m| m.get(path).cloned());
+        // Per-path resolve through the shared handle: one discovery
+        // per manifest, not per row. A failed open resolves like the
+        // old whole-call failure: unresolvable, cached as a miss.
+        let resolved = self
+            .shared_repo()
+            .and_then(|guard| {
+                let owned = guard.as_deref()?.to_thread_local();
+                crate::git::resolve_file_at_commit_with_repo(&owned, &self.git_sha, path).ok()
+            })
+            .flatten();
         let mut inner = self.inner.write().unwrap();
         // If fallback was populated concurrently, prefer it.
         if let Some(fb) = &inner.fallback {

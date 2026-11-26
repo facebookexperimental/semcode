@@ -221,6 +221,68 @@ fn parse_verbose_flag<'a>(parts: &'a [&'a str]) -> (Vec<&'a str>, bool) {
 }
 
 /// Show callchain using git-aware methods directly (same approach as working MCP tool)
+/// Hop three of the reverse display: macro edges recurse with the extended
+/// via chain, function edges show ordinary callers carrying the chain they
+/// arrived on. Present at `--up=3`, absent at `--up=2`: display truncation
+/// and the depth cutoff are different markers.
+async fn show_third_level(
+    db: &semcode::DatabaseManager,
+    git_sha: &str,
+    second_name: &str,
+    via_chain: &[String],
+    chain_context: semcode::domain::Context,
+    calls_limit: usize,
+    snapshot: &semcode::ViaSnapshot,
+) {
+    if let Ok((is_macro, edges)) =
+        semcode::callchain::caller_level_edges(db, snapshot, second_name, via_chain, chain_context)
+            .await
+    {
+        if is_macro {
+            for edge in edges.iter().take(3) {
+                println!(
+                    "        └─ {}{}",
+                    edge.name.bright_black(),
+                    edge.via_suffix().yellow()
+                );
+            }
+            if edges.len() > 3 {
+                println!("        └─ ... and {} more", edges.len() - 3);
+            }
+            return;
+        }
+    }
+    // A spent budget leaves the names below unproven, and the raw
+    // fallback below would list them with the inherited via chain, so
+    // it runs only where the budget still has room. The loop-level
+    // marker reports the cut once for the whole level.
+    if snapshot.exhausted() {
+        return;
+    }
+    if let Ok(third) = db
+        .get_function_callers_in(second_name, git_sha, chain_context)
+        .await
+    {
+        let shown: Vec<_> = if calls_limit == 0 {
+            third
+        } else {
+            third.into_iter().take(calls_limit).collect()
+        };
+        let via = if via_chain.is_empty() {
+            String::new()
+        } else {
+            let chain: Vec<String> = via_chain.iter().map(|m| format!("via {m}")).collect();
+            format!(" [{}]", chain.join(" "))
+        };
+        for name in shown.iter().take(3) {
+            println!("        └─ {}{}", name.bright_black(), via.yellow());
+        }
+        if shown.len() > 3 {
+            println!("        └─ ... and {} more", shown.len() - 3);
+        }
+    }
+}
+
 async fn show_callchain_with_limits(
     db: &DatabaseManager,
     function_name: &str,
@@ -338,6 +400,19 @@ async fn show_callchain_with_limits(
             callers.iter().take(calls_limit).cloned().collect()
         };
 
+        // One batched pass for the whole level: macro callers expand
+        // through their admitted second level below, thousands of names
+        // in one classification rather than one query per caller.
+        let caller_names: Vec<String> = limited_callers.clone();
+        let (macro_levels, second_truncated) =
+            semcode::callchain::macro_second_levels(db, git_sha, &caller_names, chain_context)
+                .await
+                .unwrap_or_default();
+
+        // One snapshot for the whole third level below: its budget is
+        // shared across every edge, so per-edge budgets cannot re-arm
+        // the limit and hot callers trip it.
+        let third_snapshot = semcode::snapshot_for(db, git_sha).await?;
         for (i, caller) in limited_callers.iter().enumerate() {
             println!("{}. {}", (i + 1).to_string().yellow(), caller.cyan());
 
@@ -373,12 +448,52 @@ async fn show_callchain_with_limits(
                 );
             }
 
-            // For multi-level depth, show second-level callers
+            // For multi-level depth, show second-level callers. A macro
+            // caller expands through its admitted second level with the
+            // via chain on every line; admission and depth apply before
+            // anything renders, so an x86 caller never shows under an
+            // asm-generic hop.
             if up_levels > 1 {
-                if let Ok(second_level_callers) = db
-                    .get_function_callers_in(caller, git_sha, chain_context)
-                    .await
-                {
+                if let Some(edges) = macro_levels.get(caller) {
+                    let shown: Vec<_> = if calls_limit == 0 {
+                        edges.clone()
+                    } else {
+                        edges.iter().take(calls_limit).cloned().collect()
+                    };
+                    for edge in shown.iter().take(3) {
+                        println!(
+                            "      └─ {}{}",
+                            edge.name.bright_black(),
+                            edge.via_suffix().yellow()
+                        );
+                        // Hop three renders where asked: macro edges
+                        // recurse with the extended chain, function edges
+                        // show ordinary callers. Absent at `--up=2`.
+                        if up_levels > 2 {
+                            show_third_level(
+                                db,
+                                git_sha,
+                                &edge.name,
+                                &edge.via,
+                                chain_context,
+                                calls_limit,
+                                &third_snapshot,
+                            )
+                            .await;
+                        }
+                    }
+                    if shown.len() > 3 {
+                        println!("      └─ ... and {} more", shown.len() - 3);
+                    }
+                } else if let Ok(second_level_callers) = if second_truncated {
+                    // A spent budget leaves the names below unproven, so no
+                    // raw edges render. The loop marker after the loop
+                    // reports the cut once.
+                    Ok(Vec::new())
+                } else {
+                    db.get_function_callers_in(caller, git_sha, chain_context)
+                        .await
+                } {
                     let limited_second: Vec<_> = if calls_limit == 0 {
                         second_level_callers
                     } else {
@@ -391,12 +506,37 @@ async fn show_callchain_with_limits(
 
                     for second_caller in limited_second.iter().take(3) {
                         println!("      └─ {}", second_caller.bright_black());
+                        if up_levels > 2 {
+                            show_third_level(
+                                db,
+                                git_sha,
+                                second_caller,
+                                &[],
+                                chain_context,
+                                calls_limit,
+                                &third_snapshot,
+                            )
+                            .await;
+                        }
                     }
                     if limited_second.len() > 3 {
                         println!("      └─ ... and {} more", limited_second.len() - 3);
                     }
                 }
             }
+        }
+        // One marker for the whole second level: where the budget trips,
+        // edges drop and every name stays unproven, which the raw
+        // fallback above then skips.
+        if second_truncated {
+            println!("      └─ {}", semcode::TRUNCATED_WORK_MARKER);
+        }
+        // One marker for the whole third level, however the cut landed:
+        // a trip inside the macro branch above returns before any
+        // per-call marker could render, and later siblings must not
+        // re-report a trip that already happened.
+        if third_snapshot.exhausted() {
+            println!("        └─ {}", semcode::TRUNCATED_WORK_MARKER);
         }
 
         if calls_limit > 0 && callers.len() > calls_limit {
@@ -491,10 +631,74 @@ async fn show_callchain_with_limits(
 
                     for second_callee in limited_second.iter().take(3) {
                         println!("      └─ {}", second_callee.bright_black());
+                        // Macro callees invoke their parameters: legs at
+                        // the live sites, same as the first level.
+                        if let Ok((legs, total, truncated)) =
+                            semcode::callchain::forward_handover_display(db, git_sha, second_callee)
+                                .await
+                        {
+                            for (actual, site_file, site_line, via, guard) in &legs {
+                                let guard_text = if guard.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" [{guard}]")
+                                };
+                                println!(
+                                    "        └─ {} ({}:{}) {}{}",
+                                    actual.bright_black(),
+                                    site_file.bright_black(),
+                                    site_line,
+                                    via.yellow(),
+                                    guard_text.yellow()
+                                );
+                            }
+                            let more = total.saturating_sub(legs.len());
+                            // A trip shortens the total itself: the count
+                            // is a lower bound, so it prints with its
+                            // marker, never the count alone.
+                            if more > 0 {
+                                println!("        └─ ... and {more} more");
+                            }
+                            if truncated {
+                                println!("        └─ ... (forward legs truncated by work limit)");
+                            }
+                        }
                     }
                     if limited_second.len() > 3 {
                         println!("      └─ ... and {} more", limited_second.len() - 3);
                     }
+                }
+            }
+
+            // A macro callee invokes its parameters: the handover legs at
+            // its live sites, with their call-site evidence.
+            if let Ok((legs, total, truncated)) =
+                semcode::callchain::forward_handover_display(db, git_sha, callee).await
+            {
+                for (actual, site_file, site_line, via, guard) in &legs {
+                    let guard_text = if guard.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{guard}]")
+                    };
+                    println!(
+                        "      └─ {} ({}:{}) {}{}",
+                        actual.bright_black(),
+                        site_file.bright_black(),
+                        site_line,
+                        via.yellow(),
+                        guard_text.yellow()
+                    );
+                }
+                let more = total.saturating_sub(legs.len());
+                // A trip shortens the total itself: the count is a lower
+                // bound, so it prints with its marker, never the
+                // count alone.
+                if more > 0 {
+                    println!("      └─ ... and {more} more");
+                }
+                if truncated {
+                    println!("      └─ ... (forward legs truncated by work limit)");
                 }
             }
         }
@@ -537,6 +741,12 @@ async fn show_callchain_with_limits(
                     site.member.cyan(),
                     where_.bright_black()
                 );
+                if let Some(kind) = site.lsm_kind {
+                    println!(
+                        "      {}",
+                        semcode::callchain::lsm_dispatch_phrase(kind).bright_black()
+                    );
+                }
 
                 for target in site.targets.iter().take(3) {
                     println!("   └─ {}", target.yellow());

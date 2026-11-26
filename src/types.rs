@@ -127,6 +127,14 @@ pub fn split_callee_edge(edge: &str) -> (&str, Option<&str>) {
     (bare, path)
 }
 
+/// The name a qualified use-site stores: the bare leaf, so the row joins
+/// the bare definition. A spelling with no owner path stores nothing:
+/// a bare name is not qualified, and a lone `::` names no owner.
+pub fn bare_use_site_target(spelling: &str) -> Option<&str> {
+    let (bare, path) = split_callee_edge(spelling);
+    path.map(|_| bare)
+}
+
 /// The byte index of the last `::` outside any `<...>` argument list, so
 /// a separator inside template arguments never splits the path.
 fn last_top_level_scope(edge: &str) -> Option<usize> {
@@ -303,6 +311,8 @@ pub fn target_owner_matches(target: &str, receiver: &str) -> bool {
 /// so `From<u8>::from` names one. The same holds for an inherent owner
 /// with arguments: `Split::m` finds `Split<&T>` and `Split<&mut T>`.
 pub fn qualifier_matches_path(qualifier: &str, path: &str) -> bool {
+    let path = strip_self_args(path);
+    let path = path.as_str();
     if qualifier == path || qualifier.ends_with(&format!("::{path}")) {
         return true;
     }
@@ -376,6 +386,66 @@ fn strip_instantiations(qualifier: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("::")
+}
+
+/// Query-side `<Self>` erasure: `Config::<Self>` addresses `Config`.
+/// `Self` is a keyword and never a concrete argument, so erasing an
+/// all-`Self` list cannot conflate two instantiations the way stripping
+/// general args would (`From<u16>` keeps its args and still misses
+/// `From<u8>`). Mixed lists (`Pair<Self, u8>`) stay verbatim — resolving
+/// those needs extraction-time markers, which ride separately.
+fn strip_self_args(path: &str) -> String {
+    // A turbofish segment (`::<Self>`) splits off its type: fold it back
+    // onto the segment it instantiates before erasing.
+    let mut segments: Vec<String> = Vec::new();
+    for segment in top_level_segments(path) {
+        if segment.starts_with('<') {
+            if let Some(previous) = segments.pop() {
+                segments.push(format!("{previous}{segment}"));
+                continue;
+            }
+        }
+        segments.push(segment.to_string());
+    }
+    segments
+        .iter()
+        .map(|segment| match segment.find('<') {
+            None => segment.to_string(),
+            Some(open) => {
+                let (head, args) = segment.split_at(open);
+                let args = args[1..].strip_suffix('>').unwrap_or(&args[1..]);
+                if split_top_level_args(args).iter().all(|arg| *arg == "Self") {
+                    head.to_string()
+                } else {
+                    segment.to_string()
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Split an argument list on commas outside angle brackets.
+fn split_top_level_args(args: &str) -> Vec<&str> {
+    let bytes = args.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(args[start..at].trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    parts.push(args[start..].trim());
+    parts
 }
 
 /// Split on `::` outside angle brackets: the `::` in `Foo<Bar::Baz>` is an
@@ -1173,6 +1243,10 @@ pub struct ResolvedDispatch {
     /// target that is not a function in the tree drops out when the caller
     /// looks it up.
     pub targets: Vec<String>,
+    /// The hook slot kind when the dispatch runs through an LSM slot
+    /// (Some), rather than a receiver's member (None). Both forward
+    /// surfaces render the slot's first-wins/run-all wording from it.
+    pub lsm_kind: Option<DispatchKind>,
 }
 
 /// The member recorded for a call through, or an installation into, an
@@ -1214,6 +1288,12 @@ pub enum DispatchKind {
     /// `static_call(key)(...)`: a direct call patched at run time to whatever
     /// was installed in the key.
     StaticCall,
+    /// `call_int_hook(hook, ...)`: dispatches to every implementation
+    /// installed in the hook slot; the first non-default return wins.
+    LsmHookInt,
+    /// `call_void_hook(hook, ...)`: dispatches to every implementation
+    /// installed in the hook slot; every implementation runs.
+    LsmHookVoid,
 }
 
 impl DispatchKind {
@@ -1227,6 +1307,8 @@ impl DispatchKind {
             DispatchKind::MacroDeclared => "macro_declared",
             DispatchKind::ArrayElement => "array_element",
             DispatchKind::StaticCall => "static_call",
+            DispatchKind::LsmHookInt => "lsm_hook_int",
+            DispatchKind::LsmHookVoid => "lsm_hook_void",
         }
     }
 
@@ -1243,6 +1325,8 @@ impl DispatchKind {
             "macro_declared" => Some(DispatchKind::MacroDeclared),
             "array_element" => Some(DispatchKind::ArrayElement),
             "static_call" => Some(DispatchKind::StaticCall),
+            "lsm_hook_int" => Some(DispatchKind::LsmHookInt),
+            "lsm_hook_void" => Some(DispatchKind::LsmHookVoid),
             _ => None,
         }
     }
@@ -1400,6 +1484,10 @@ pub enum RegistrationKind {
     Assignment,
     /// A method installed in its trait slot. The trait join reads it.
     TraitImpl,
+    /// `LSM_HOOK_INIT(hook, implementation)`: the implementation installed
+    /// in a Linux Security Module hook slot. The LSM join uses it; the
+    /// slot namespace is global, so no container type constrains it.
+    LsmHook,
 }
 
 impl RegistrationKind {
@@ -1408,6 +1496,7 @@ impl RegistrationKind {
             RegistrationKind::DesignatedInit => "designated_init",
             RegistrationKind::Assignment => "assignment",
             RegistrationKind::TraitImpl => "trait_impl",
+            RegistrationKind::LsmHook => "lsm_hook",
         }
     }
 
@@ -1416,6 +1505,7 @@ impl RegistrationKind {
             "designated_init" => Some(RegistrationKind::DesignatedInit),
             "assignment" => Some(RegistrationKind::Assignment),
             "trait_impl" => Some(RegistrationKind::TraitImpl),
+            "lsm_hook" => Some(RegistrationKind::LsmHook),
             _ => None,
         }
     }
@@ -1743,6 +1833,27 @@ mod ambiguity_note_tests {
     }
 
     #[test]
+    fn self_args_erase_but_concrete_args_stay_exact() {
+        // `Self` is a keyword, never a concrete argument: erasing it
+        // cannot conflate two instantiations. Everything else keeps
+        // the exactness the tests above pin.
+        assert!(qualifier_matches_path("m::Config<T>", "Config::<Self>"));
+        assert!(qualifier_matches_path("m::Config<T>", "Config"));
+        // Erasing `Self` is erasing to an argument-less query, which
+        // addresses every instantiation by design.
+        assert!(qualifier_matches_path(
+            "fmt::<Error as From<u8>>",
+            "From<Self>"
+        ));
+        // Concrete CamelCase is not a parameter: `String` stays.
+        assert!(!qualifier_matches_path("m::Foo<T>", "Foo<String>"));
+        assert!(!qualifier_matches_path("m::Foo<u8>", "Foo<String>"));
+        // Mixed lists stay verbatim: resolving those needs
+        // extraction-time markers, which ride separately.
+        assert!(!qualifier_matches_path("m::Pair<T, u8>", "Pair<Self, u8>"));
+    }
+
+    #[test]
     fn trait_qualifiers_split_into_implementor_and_trait() {
         // Only `<Type as Trait>` is an installation: inherent owners,
         // trait declarations and bare names answer `None`.
@@ -1855,6 +1966,18 @@ mod ambiguity_note_tests {
         assert_eq!((bare, path), ("make_shared", Some("std")));
         let (bare, path) = split_callee_edge("ns::Box<double>::conv");
         assert_eq!((bare, path), ("conv", Some("ns::Box<double>")));
+    }
+
+    #[test]
+    fn qualified_use_sites_store_the_bare_leaf() {
+        // A spelling with an owner path cuts to the leaf; a bare name is
+        // not qualified, and a lone `::` names no owner, so both store
+        // nothing.
+        assert_eq!(bare_use_site_target("ns::my_read"), Some("my_read"));
+        assert_eq!(bare_use_site_target("a::b::f"), Some("f"));
+        assert_eq!(bare_use_site_target("::ns::f"), Some("f"));
+        assert_eq!(bare_use_site_target("my_read"), None);
+        assert_eq!(bare_use_site_target("::my_read"), None);
     }
 
     #[test]

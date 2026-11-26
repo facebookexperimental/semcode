@@ -4,7 +4,7 @@
 //! This module provides reusable indexing functions for git commits and files
 //! that can be called from different binaries (semcode-index, semcode, semcode-mcp, etc.)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gix::revision::walk::Sorting;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -16,6 +16,22 @@ use tracing::{debug, error, info, warn};
 
 use crate::git::resolve_to_commit;
 use crate::{DatabaseManager, GitCommitInfo, LoreIdState};
+
+pub(crate) fn join_failed<T>(
+    kind: &str,
+    handles: impl IntoIterator<Item = thread::JoinHandle<Result<T>>>,
+) -> usize {
+    let mut failed = 0;
+    for (id, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => error!("{kind} {id} failed: {e:#}"),
+            Err(panic) => error!("{kind} {id} thread panicked: {panic:?}"),
+        }
+        failed += 1;
+    }
+    failed
+}
 
 /// Receive from a std channel shared by several inserter tasks without
 /// holding a tokio worker while waiting.
@@ -426,20 +442,36 @@ fn parse_rfc2822_to_timestamp(date_str: &str) -> i64 {
 
 /// Parse email from a lore commit's 'm' file
 /// Extracts headers and body from an email message
+///
+/// `Ok(None)` is a commit that holds no message: public-inbox records a
+/// removed message as a commit with a 'd' file and no 'm'.  Reading it
+/// again gives the same answer.  An error means the commit could not be
+/// read -- a missing object, say -- and a later run may succeed.
 pub fn parse_email_from_commit(
     repo: &gix::Repository,
     commit_sha: &str,
-) -> Result<crate::LoreEmailInfo> {
+) -> Result<Option<crate::LoreEmailInfo>> {
     // Resolve commit
     let commit = resolve_to_commit(repo, commit_sha)?;
 
     // Get the tree
     let tree = commit.tree()?;
 
-    // Find the 'm' file in the tree
-    let m_entry = tree
-        .find_entry("m")
-        .ok_or_else(|| anyhow::anyhow!("Commit {} does not contain file 'm'", commit_sha))?;
+    // Find the 'm' file in the tree.  Tree::find_entry() drops decoding
+    // errors, which would make a malformed tree look like a removed
+    // message and get its commit recorded as indexed.
+    let mut m_entry = None;
+    for entry in tree.iter() {
+        let entry =
+            entry.with_context(|| format!("Failed to decode the tree of commit {commit_sha}"))?;
+        if entry.filename() == "m" {
+            m_entry = Some(entry);
+            break;
+        }
+    }
+    let Some(m_entry) = m_entry else {
+        return Ok(None);
+    };
 
     // Read the file content
     let object = m_entry.object()?;
@@ -504,7 +536,7 @@ pub fn parse_email_from_commit(
     // Parse date to Unix timestamp for efficient database filtering
     let date_timestamp = parse_rfc2822_to_timestamp(&headers.date);
 
-    Ok(crate::LoreEmailInfo {
+    Ok(Some(crate::LoreEmailInfo {
         git_commit_sha: commit_sha.to_string(),
         from: headers.from,
         date: headers.date,
@@ -516,7 +548,7 @@ pub fn parse_email_from_commit(
         recipients,
         body,
         symbols,
-    })
+    }))
 }
 
 /// Email header fields
@@ -888,11 +920,172 @@ impl KnownLoreIds {
     }
 }
 
+/// Pluralize `n` with `one` or `many`, for failure summaries.
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+pub(crate) fn counted_problem(count: usize, one: &str, many: &str, detail: &str) -> Option<String> {
+    (count > 0).then(|| format!("{} {detail}", plural(count, one, many)))
+}
+
+/// The error of a lore pipeline that finished without indexing every
+/// commit it was given.
+///
+/// Whatever the run did store stays stored and recorded.  Every commit
+/// counted here is left out of lore_indexed_commits, so the next run over
+/// the archive reads it again.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LoreIndexIncomplete {
+    /// Emails this run stored or found already stored.
+    pub stored: usize,
+    /// Of `stored`, the rows this run appended to the lore table.
+    pub appended: usize,
+    /// Parser, producer, and inserter threads that failed or panicked.
+    /// The commits such a thread held are counted nowhere else.
+    pub failed_threads: usize,
+    /// Commits whose message could not be read.
+    pub unread_commits: usize,
+    /// Emails that were read but could not be stored.
+    pub unstored_emails: usize,
+    /// Commits whose email was stored, or that hold no email, but that
+    /// could not be recorded as indexed.
+    pub unrecorded_commits: usize,
+}
+
+impl LoreIndexIncomplete {
+    fn has_failures(&self) -> bool {
+        self.failed_threads > 0
+            || self.unread_commits > 0
+            || self.unstored_emails > 0
+            || self.unrecorded_commits > 0
+    }
+}
+
+impl std::fmt::Display for LoreIndexIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let problems: Vec<_> = [
+            counted_problem(
+                self.failed_threads,
+                "pipeline thread",
+                "pipeline threads",
+                "failed",
+            ),
+            counted_problem(self.unread_commits, "email", "emails", "could not be read"),
+            counted_problem(
+                self.unstored_emails,
+                "email",
+                "emails",
+                "could not be stored",
+            ),
+            counted_problem(
+                self.unrecorded_commits,
+                "commit",
+                "commits",
+                "could not be recorded as indexed",
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        write!(
+            f,
+            "lore indexing incomplete: {}; indexing again retries them ({} stored)",
+            problems.join(", "),
+            plural(self.stored, "email", "emails")
+        )
+    }
+}
+
+impl std::error::Error for LoreIndexIncomplete {}
+
+/// Failure counts the threads of one lore pipeline add to.
+#[derive(Default)]
+struct LoreFailureCounts {
+    unread_commits: AtomicUsize,
+    unstored_emails: AtomicUsize,
+    unrecorded_commits: AtomicUsize,
+}
+
+/// Store one batch and record the commits of the emails now in the table.
+/// Returns how many of the batch's emails are stored, how many rows were
+/// appended for them, and the emails that were deferred because another
+/// batch holds their message_id; failures are added to `counts`.
+async fn store_lore_batch(
+    db: &DatabaseManager,
+    emails: Vec<crate::LoreEmailInfo>,
+    known_ids: &std::sync::Mutex<HashMap<String, LoreIdState>>,
+    counts: &LoreFailureCounts,
+    inserter: &str,
+) -> (usize, usize, Vec<crate::LoreEmailInfo>) {
+    let outcome = match db.insert_lore_emails(&emails, known_ids).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            error!(
+                "{} failed to insert batch of {} emails: {:#}",
+                inserter,
+                emails.len(),
+                e
+            );
+            counts
+                .unstored_emails
+                .fetch_add(emails.len(), Ordering::Relaxed);
+            return (0, 0, Vec::new());
+        }
+    };
+    counts
+        .unstored_emails
+        .fetch_add(outcome.failed.len(), Ordering::Relaxed);
+
+    // Record commit SHAs only for emails that are in the table, so that
+    // the rest are read again on the next run.
+    let not_stored: HashSet<usize> = outcome.not_stored().collect();
+    let shas: Vec<String> = emails
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !not_stored.contains(i))
+        .map(|(_, e)| e.git_commit_sha.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if !shas.is_empty() {
+        if let Err(e) = db.insert_lore_indexed_commits(&shas).await {
+            error!(
+                "{} failed to record {} indexed commits: {:#}",
+                inserter,
+                shas.len(),
+                e
+            );
+            counts
+                .unrecorded_commits
+                .fetch_add(shas.len(), Ordering::Relaxed);
+        }
+    }
+
+    let stored = emails.len() - not_stored.len();
+    let deferred_set: HashSet<usize> = outcome.deferred.into_iter().collect();
+    let deferred = emails
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| deferred_set.contains(i))
+        .map(|(_, e)| e)
+        .collect();
+    (stored, outcome.appended, deferred)
+}
+
 /// Process lore commits using a streaming pipeline
 /// Similar to process_commits_pipeline but parses email from 'm' file
 ///
 /// `known_ids` is the duplicate check for crossposts and partially failed
 /// runs; pass the same one for every archive of a run.
+///
+/// Returns `Ok` with the rows appended to the lore table only when every
+/// commit is recorded in lore_indexed_commits.  Emails found already
+/// stored, such as crossposts, and commits that hold no message add no
+/// rows.  Otherwise the error is a [`LoreIndexIncomplete`] counting what
+/// was left undone, rows appended included; the emails that were stored
+/// stay stored and recorded, and the rest are read again by the next run.
 pub async fn process_lore_commits_pipeline(
     repo_path: &std::path::Path,
     commit_shas: Vec<String>,
@@ -901,9 +1094,9 @@ pub async fn process_lore_commits_pipeline(
     num_workers: usize,
     num_inserters: usize,
     known_ids: &KnownLoreIds,
-) -> Result<()> {
+) -> Result<usize> {
     use indicatif::{ProgressBar, ProgressStyle};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, PoisonError};
 
     let known_ids = known_ids.get(&db_manager).await?;
 
@@ -927,6 +1120,11 @@ pub async fn process_lore_commits_pipeline(
     // Shared counters
     let processed_count = Arc::new(AtomicUsize::new(0));
     let inserted_count = Arc::new(AtomicUsize::new(0));
+    // Of those, the rows appended to the lore table.
+    let appended_count = Arc::new(AtomicUsize::new(0));
+    let counts = Arc::new(LoreFailureCounts::default());
+    // Commits that hold no message, recorded as indexed at the end.
+    let no_message_commits = Arc::new(Mutex::new(Vec::<String>::new()));
 
     // Spawn progress updater thread
     let pb_clone = pb.clone();
@@ -940,82 +1138,90 @@ pub async fn process_lore_commits_pipeline(
         std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
-    // Spawn worker threads to parse email metadata
+    // Spawn worker threads to parse email metadata.  A commit that cannot
+    // be read is counted and the worker goes on; an error means the worker
+    // stopped, and the caller fails the run.  The receiver lock guards
+    // nothing a panic can leave half-written, so a poisoned one is taken
+    // anyway: the panic already fails the run.
     let mut worker_handles = Vec::new();
     for worker_id in 0..num_workers {
         let worker_commit_rx = shared_commit_rx.clone();
         let worker_result_tx = result_tx.clone();
         let worker_repo_path = repo_path.to_path_buf();
         let worker_processed = processed_count.clone();
+        let counts = counts.clone();
+        let no_message_commits = no_message_commits.clone();
 
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || -> Result<()> {
             // Open repository ONCE per worker thread
-            let thread_repo = match gix::discover(&worker_repo_path) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
-                    return;
-                }
+            let thread_repo = gix::discover(&worker_repo_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to open repository {}: {}",
+                    worker_repo_path.display(),
+                    e
+                )
+            })?;
+
+            let send = |batch: Vec<crate::LoreEmailInfo>| {
+                let len = batch.len();
+                worker_result_tx.send(batch).map_err(|_| {
+                    anyhow::anyhow!("every inserter stopped; {len} parsed emails were not sent")
+                })
             };
 
             let mut batch = Vec::new();
-
             loop {
-                // Get next commit SHA
-                let commit_sha = {
-                    match worker_commit_rx.lock() {
-                        Ok(rx) => rx.recv(),
-                        Err(e) => {
-                            tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
-                            break;
+                let commit_sha = worker_commit_rx
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .recv();
+                // Channel closed: every commit has been handed out.
+                let Ok(sha) = commit_sha else { break };
+
+                match parse_email_from_commit(&thread_repo, &sha) {
+                    Ok(Some(email_info)) => {
+                        batch.push(email_info);
+                        // Send batch when it reaches batch_size
+                        if batch.len() >= batch_size {
+                            send(std::mem::take(&mut batch))?;
                         }
                     }
-                };
-
-                match commit_sha {
-                    Ok(sha) => {
-                        match parse_email_from_commit(&thread_repo, &sha) {
-                            Ok(email_info) => {
-                                batch.push(email_info);
-                                worker_processed.fetch_add(1, Ordering::Relaxed);
-
-                                // Send batch when it reaches batch_size
-                                if batch.len() >= batch_size {
-                                    if worker_result_tx.send(batch.clone()).is_err() {
-                                        break;
-                                    }
-                                    batch.clear();
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Worker {} failed to parse email for {}: {}",
-                                    worker_id, sha, e
-                                );
-                                worker_processed.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+                    Ok(None) => {
+                        info!("Commit {} holds no message, recording it as indexed", sha);
+                        no_message_commits
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(sha);
                     }
-                    Err(_) => {
-                        // Channel closed, send remaining batch
-                        if !batch.is_empty() {
-                            let _ = worker_result_tx.send(batch);
-                        }
-                        break;
+                    Err(e) => {
+                        error!(
+                            "Worker {} failed to read email for {}: {:#}",
+                            worker_id, sha, e
+                        );
+                        counts.unread_commits.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                worker_processed.fetch_add(1, Ordering::Relaxed);
             }
+            if !batch.is_empty() {
+                send(batch)?;
+            }
+            Ok(())
         });
         worker_handles.push(handle);
     }
+    // Only the workers hold the receiver now, so the producer stops if
+    // every worker has.
+    drop(shared_commit_rx);
 
     // Spawn producer thread to feed commit SHAs
-    let producer_handle = thread::spawn(move || {
+    let producer_handle = thread::spawn(move || -> Result<()> {
         for commit_sha in commit_shas {
             if commit_tx.send(commit_sha).is_err() {
                 break;
             }
         }
+        Ok(())
     });
 
     // Close original senders
@@ -1029,19 +1235,24 @@ pub async fn process_lore_commits_pipeline(
     let last_optimization_check = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let batches_inserted = Arc::new(AtomicUsize::new(0));
 
-    // Spawn multiple database inserter tasks
+    // Spawn multiple database inserter tasks.  Each returns the emails it
+    // deferred, to be stored once every inserter has finished.
     let mut inserter_handles = Vec::new();
 
     for inserter_id in 0..num_inserters {
         let db_manager_clone = Arc::clone(&db_manager);
         let inserted_clone = inserted_count.clone();
+        let appended_clone = appended_count.clone();
         let pb_clone = pb.clone();
         let result_rx_clone = shared_result_rx.clone();
         let batches_counter = batches_inserted.clone();
         let optimization_check_timer = last_optimization_check.clone();
         let known_ids = known_ids.clone();
+        let counts = counts.clone();
 
         let handle = tokio::spawn(async move {
+            let name = format!("Inserter {inserter_id}");
+            let mut deferred = Vec::new();
             loop {
                 // Get next batch from shared receiver.  A parser only
                 // sends a short batch when its input has run out, so
@@ -1050,7 +1261,7 @@ pub async fn process_lore_commits_pipeline(
                 // Otherwise each parser's last partial batch becomes
                 // its own small append, dozens of tiny fragments per
                 // archive on a refresh.
-                let batch = match recv_shared(&result_rx_clone, move |rx| {
+                let batch = recv_shared(&result_rx_clone, move |rx| {
                     rx.recv().map(|mut emails| {
                         while emails.len() < batch_size {
                             match rx.recv() {
@@ -1061,115 +1272,134 @@ pub async fn process_lore_commits_pipeline(
                         emails
                     })
                 })
-                .await
-                {
-                    Some(batch) => batch,
-                    None => {
-                        error!("Inserter {} failed to lock receiver", inserter_id);
-                        break;
-                    }
+                .await;
+
+                let emails = match batch {
+                    Some(Ok(emails)) => emails,
+                    // Channel closed: every parser has finished.
+                    Some(Err(_)) => break,
+                    None => anyhow::bail!("{name} failed to lock receiver"),
                 };
 
-                match batch {
-                    Ok(emails) => {
-                        // Insert batch into database
-                        match db_manager_clone
-                            .insert_lore_emails(&emails, &known_ids)
-                            .await
-                        {
-                            Err(e) => {
-                                error!("Inserter {} failed to insert batch: {}", inserter_id, e);
-                            }
-                            Ok(failed_indices) => {
-                                let failed_set: std::collections::HashSet<usize> =
-                                    failed_indices.into_iter().collect();
-                                let success_count = emails.len() - failed_set.len();
+                let (stored, appended, mut batch_deferred) =
+                    store_lore_batch(&db_manager_clone, emails, &known_ids, &counts, &name).await;
+                deferred.append(&mut batch_deferred);
+                appended_clone.fetch_add(appended, Ordering::Relaxed);
 
-                                // Record commit SHAs only for emails that
-                                // were actually stored, so that failed
-                                // emails are retried on the next run.
-                                let shas: Vec<String> = emails
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(i, _)| !failed_set.contains(i))
-                                    .map(|(_, e)| e.git_commit_sha.as_str())
-                                    .collect::<std::collections::HashSet<_>>()
-                                    .into_iter()
-                                    .map(String::from)
-                                    .collect();
-                                if !shas.is_empty() {
-                                    if let Err(e) =
-                                        db_manager_clone.insert_lore_indexed_commits(&shas).await
-                                    {
-                                        error!(
-                                            "Inserter {} failed to record indexed commits: {}",
-                                            inserter_id, e
-                                        );
-                                    }
-                                }
+                let count = inserted_clone.fetch_add(stored, Ordering::Relaxed);
+                pb_clone.set_message(format!("Inserted {} emails", count + stored));
 
-                                let count =
-                                    inserted_clone.fetch_add(success_count, Ordering::Relaxed);
-                                pb_clone.set_message(format!(
-                                    "Inserted {} emails",
-                                    count + success_count
-                                ));
-
-                                // Track successful batch insertions and check for periodic optimization
-                                let total_batches =
-                                    batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                check_and_optimize_if_needed(
-                                    &db_manager_clone,
-                                    inserter_id,
-                                    total_batches,
-                                    &optimization_check_timer,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Channel closed
-                        break;
-                    }
-                }
+                // Track batch insertions and check for periodic optimization
+                let total_batches = batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                check_and_optimize_if_needed(
+                    &db_manager_clone,
+                    inserter_id,
+                    total_batches,
+                    &optimization_check_timer,
+                )
+                .await;
             }
+            Ok::<_, anyhow::Error>(deferred)
         });
         inserter_handles.push(handle);
     }
+    // Only the inserters hold the receiver now, so a parser's send fails,
+    // rather than blocking forever, if every inserter has stopped.
+    drop(shared_result_rx);
 
-    // Wait for all workers to finish
-    for handle in worker_handles {
-        let _ = handle.join();
-    }
-
-    // Wait for producer
-    let _ = producer_handle.join();
+    let mut failed_threads =
+        join_failed("Worker", worker_handles) + join_failed("Producer", [producer_handle]);
 
     // Wait for all inserters to finish
-    for handle in inserter_handles {
-        let _ = handle.await;
+    let mut deferred = Vec::new();
+    for (id, handle) in inserter_handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(Ok(mut emails)) => deferred.append(&mut emails),
+            Ok(Err(e)) => {
+                error!("Inserter {id} failed: {e:#}");
+                failed_threads += 1;
+            }
+            Err(e) => {
+                error!("Inserter {id} failed: {e}");
+                failed_threads += 1;
+            }
+        }
     }
 
-    debug_assert!(
-        known_ids
+    // Every inserter has finished, so no batch holds an id pending (short
+    // of a panicked one).  A deferred email's id is now stored, and the
+    // email is skipped and its commit recorded, or was released by a
+    // failed append, and the email is stored here.
+    if !deferred.is_empty() {
+        info!("Storing {} deferred emails", deferred.len());
+        let (stored, appended, still_deferred) =
+            store_lore_batch(&db_manager, deferred, &known_ids, &counts, "Final pass").await;
+        inserted_count.fetch_add(stored, Ordering::Relaxed);
+        appended_count.fetch_add(appended, Ordering::Relaxed);
+        if !still_deferred.is_empty() {
+            error!(
+                "{} emails are still held by an inserter that did not finish",
+                still_deferred.len()
+            );
+            counts
+                .unstored_emails
+                .fetch_add(still_deferred.len(), Ordering::Relaxed);
+        }
+    }
+
+    let no_message_commits = std::mem::take(
+        &mut *no_message_commits
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .all(|state| *state == LoreIdState::Stored),
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    if let Err(e) = db_manager
+        .insert_lore_indexed_commits(&no_message_commits)
+        .await
+    {
+        error!(
+            "Failed to record {} commits without a message: {:#}",
+            no_message_commits.len(),
+            e
+        );
+        counts
+            .unrecorded_commits
+            .fetch_add(no_message_commits.len(), Ordering::Relaxed);
+    }
+
+    // A failed inserter can leave the ids of its batch pending; the
+    // emails it held are already counted as not stored.
+    debug_assert!(
+        failed_threads > 0
+            || known_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .all(|state| *state == LoreIdState::Stored),
         "lore message_id map holds pending ids after every inserter finished"
     );
+
+    let outcome = LoreIndexIncomplete {
+        stored: inserted_count.load(Ordering::Relaxed),
+        appended: appended_count.load(Ordering::Relaxed),
+        failed_threads,
+        unread_commits: counts.unread_commits.load(Ordering::Relaxed),
+        unstored_emails: counts.unstored_emails.load(Ordering::Relaxed),
+        unrecorded_commits: counts.unrecorded_commits.load(Ordering::Relaxed),
+    };
 
     pb.finish_with_message(format!(
         "Processed {} emails, inserted {}",
         processed_count.load(Ordering::Relaxed),
-        inserted_count.load(Ordering::Relaxed)
+        outcome.stored
     ));
 
     // Wait for progress thread
     progress_thread.join().unwrap();
 
-    Ok(())
+    if outcome.has_failures() {
+        return Err(outcome.into());
+    }
+    Ok(outcome.appended)
 }
 
 /// Index commits in a git range
@@ -1522,14 +1752,14 @@ mod tests {
     async fn known_lore_ids_loads_once() {
         let (_dir, db) = lore_database().await;
         let side_map = std::sync::Mutex::new(std::collections::HashMap::new());
-        let failed = db
+        let outcome = db
             .insert_lore_emails(
                 &[lore_email("1111", "<one@x>"), lore_email("2222", "<two@x>")],
                 &side_map,
             )
             .await
             .unwrap();
-        assert!(failed.is_empty());
+        assert!(outcome.is_complete());
 
         let known = KnownLoreIds::new();
         let first = known.get(&db).await.unwrap();
@@ -1540,11 +1770,11 @@ mod tests {
             assert_eq!(ids.get("<two@x>"), Some(&LoreIdState::Stored));
         }
 
-        let failed = db
+        let outcome = db
             .insert_lore_emails(&[lore_email("3333", "<three@x>")], &side_map)
             .await
             .unwrap();
-        assert!(failed.is_empty());
+        assert!(outcome.is_complete());
 
         let second = known.get(&db).await.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
@@ -1556,7 +1786,7 @@ mod tests {
     }
 
     /// A batch holding an id that another batch has pending defers that
-    /// email: its index is returned as not stored, no row is written for
+    /// email: its index is returned as deferred, no row is written for
     /// it, and the other batch's claim is left alone.  The rest of the
     /// batch is stored.
     #[tokio::test]
@@ -1567,7 +1797,7 @@ mod tests {
             LoreIdState::Pending,
         )]));
 
-        let failed = db
+        let outcome = db
             .insert_lore_emails(
                 &[
                     lore_email("4444", "<held@x>"),
@@ -1578,7 +1808,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(failed, vec![0]);
+        assert_eq!(
+            outcome,
+            crate::LoreInsertOutcome {
+                failed: Vec::new(),
+                deferred: vec![0],
+                appended: 1,
+            }
+        );
         assert_eq!(
             lore_rows(&db, Some("message_id = '<held@x>'".to_string())).await,
             0
@@ -1590,6 +1827,41 @@ mod tests {
         let map = map.lock().unwrap();
         assert_eq!(map.get("<held@x>"), Some(&LoreIdState::Pending));
         assert_eq!(map.get("<new@x>"), Some(&LoreIdState::Stored));
+    }
+
+    /// Every copy of a deferred message_id in the batch is deferred, not
+    /// only the one copy the batch tried, so that no copy's commit is
+    /// recorded as indexed while its message is not stored.
+    #[tokio::test]
+    async fn every_copy_of_a_pending_id_is_deferred() {
+        let (_dir, db) = lore_database().await;
+        let map = std::sync::Mutex::new(HashMap::from([(
+            "<held@x>".to_string(),
+            LoreIdState::Pending,
+        )]));
+
+        let outcome = db
+            .insert_lore_emails(
+                &[
+                    lore_email("1111", "<held@x>"),
+                    lore_email("2222", "<new@x>"),
+                    lore_email("3333", "<held@x>"),
+                    lore_email("4444", "<new@x>"),
+                ],
+                &map,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            crate::LoreInsertOutcome {
+                failed: Vec::new(),
+                deferred: vec![0, 2],
+                appended: 1,
+            }
+        );
+        assert_eq!(lore_rows(&db, None).await, 1);
     }
 
     /// A failed scan leaves the map unloaded: the next get() scans again.
@@ -1609,11 +1881,11 @@ mod tests {
 
         db.create_tables().await.unwrap();
         let side_map = std::sync::Mutex::new(HashMap::new());
-        let failed = db
+        let outcome = db
             .insert_lore_emails(&[lore_email("6666", "<late@x>")], &side_map)
             .await
             .unwrap();
-        assert!(failed.is_empty());
+        assert!(outcome.is_complete());
 
         let ids = known.get(&db).await.unwrap();
         assert_eq!(
@@ -1676,7 +1948,7 @@ mod tests {
         )
         .await
         .unwrap();
-        process_lore_commits_pipeline(
+        let appended = process_lore_commits_pipeline(
             archive_b.path(),
             vec![cross_b.clone(), only_b.clone()],
             db.clone(),
@@ -1687,6 +1959,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(appended, 1, "the crosspost was counted as a new row");
 
         assert_eq!(
             lore_rows(&db, Some("message_id = '<cross@x>'".to_string())).await,
@@ -1698,5 +1971,338 @@ mod tests {
         for sha in [&cross_a, &cross_b, &only_b] {
             assert!(indexed.contains(sha), "{sha} not recorded as indexed");
         }
+    }
+
+    /// A lore archive of one commit per message id, oldest first.
+    fn lore_archive(message_ids: &[&str]) -> (tempfile::TempDir, Vec<String>) {
+        let archive = tempfile::tempdir().unwrap();
+        git(archive.path(), &["init", "-q", "-b", "master"]);
+        let shas = message_ids
+            .iter()
+            .map(|id| commit_lore_message(archive.path(), id, id))
+            .collect();
+        (archive, shas)
+    }
+
+    /// Run the pipeline as `semcode-index --lore` does: a fresh duplicate
+    /// check, two parsers and two inserters, over the commits not yet
+    /// recorded as indexed.  Fails rather than hangs if the pipeline does
+    /// not finish.
+    async fn index_lore_run(
+        db: &Arc<DatabaseManager>,
+        archive: &std::path::Path,
+        commits: &[String],
+    ) -> Result<usize> {
+        let indexed = db.get_indexed_lore_commits().await.unwrap();
+        let pending = commits
+            .iter()
+            .filter(|sha| !indexed.contains(*sha))
+            .cloned()
+            .collect();
+        index_lore_commits(db, archive, pending, &KnownLoreIds::new()).await
+    }
+
+    async fn index_lore_commits(
+        db: &Arc<DatabaseManager>,
+        archive: &std::path::Path,
+        commits: Vec<String>,
+        known: &KnownLoreIds,
+    ) -> Result<usize> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            process_lore_commits_pipeline(archive, commits, db.clone(), 1, 2, 2, known),
+        )
+        .await
+        .expect("lore pipeline did not finish")
+    }
+
+    fn incomplete(result: Result<usize>) -> LoreIndexIncomplete {
+        let e = result.expect_err("a run that left commits unindexed reported success");
+        e.downcast_ref::<LoreIndexIncomplete>()
+            .unwrap_or_else(|| panic!("not a LoreIndexIncomplete: {e:#}"))
+            .clone()
+    }
+
+    async fn assert_all_recorded(db: &DatabaseManager, commits: &[String]) {
+        let indexed = db.get_indexed_lore_commits().await.unwrap();
+        for sha in commits {
+            assert!(indexed.contains(sha), "{sha} not recorded as indexed");
+        }
+    }
+
+    /// A commit whose message cannot be read fails the run.  The emails
+    /// read beside it stay stored and recorded, and the unread commit is
+    /// left unrecorded, so the next run reads it and completes the
+    /// archive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_email_fails_the_run_and_is_retried() {
+        let (_dir, db) = lore_database().await;
+        let (archive, commits) = lore_archive(&["<a@x>", "<b@x>", "<c@x>"]);
+
+        // Delete the loose blob of the middle commit's message.
+        let blob = git(archive.path(), &["rev-parse", &format!("{}:m", commits[1])]);
+        let blob_path = archive
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        let blob_bytes = std::fs::read(&blob_path).unwrap();
+        std::fs::remove_file(&blob_path).unwrap();
+
+        let outcome = incomplete(index_lore_run(&db, archive.path(), &commits).await);
+        assert_eq!(
+            outcome,
+            LoreIndexIncomplete {
+                stored: 2,
+                appended: 2,
+                unread_commits: 1,
+                ..Default::default()
+            }
+        );
+        let message = outcome.to_string();
+        assert!(
+            message.contains("1 email could not be read"),
+            "unexpected summary: {message}"
+        );
+        assert_eq!(lore_rows(&db, None).await, 2);
+        let indexed = db.get_indexed_lore_commits().await.unwrap();
+        assert!(indexed.contains(&commits[0]));
+        assert!(!indexed.contains(&commits[1]));
+        assert!(indexed.contains(&commits[2]));
+
+        std::fs::write(&blob_path, blob_bytes).unwrap();
+        assert_eq!(
+            index_lore_run(&db, archive.path(), &commits).await.unwrap(),
+            1
+        );
+        assert_eq!(lore_rows(&db, None).await, 3);
+        assert_all_recorded(&db, &commits).await;
+    }
+
+    /// Emails that cannot be stored fail the run and leave their commits
+    /// unrecorded, so the next run stores them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unstored_emails_fail_the_run_and_are_retried() {
+        let (_dir, db) = lore_database().await;
+        let (archive, commits) = lore_archive(&["<a@x>", "<b@x>"]);
+
+        // Load the duplicate check, then take the table away from the
+        // inserters.
+        let known = KnownLoreIds::new();
+        known.get(&db).await.unwrap();
+        db.connection().drop_table("lore", &[]).await.unwrap();
+
+        let outcome =
+            incomplete(index_lore_commits(&db, archive.path(), commits.clone(), &known).await);
+        assert_eq!(
+            outcome,
+            LoreIndexIncomplete {
+                unstored_emails: 2,
+                ..Default::default()
+            }
+        );
+        assert!(db.get_indexed_lore_commits().await.unwrap().is_empty());
+
+        db.create_tables().await.unwrap();
+        assert_eq!(
+            index_lore_run(&db, archive.path(), &commits).await.unwrap(),
+            2
+        );
+        assert_eq!(lore_rows(&db, None).await, 2);
+        assert_all_recorded(&db, &commits).await;
+    }
+
+    /// A failed run that found its only readable email already stored
+    /// appended nothing, so it reports no new rows for maintenance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn already_stored_email_is_not_counted_as_appended() {
+        let (_dir, db) = lore_database().await;
+        let (archive, commits) = lore_archive(&["<a@x>", "<b@x>"]);
+
+        // Store <a@x> as another archive's crosspost would, without
+        // recording this archive's commit.
+        let side_map = std::sync::Mutex::new(HashMap::new());
+        db.insert_lore_emails(&[lore_email("9999", "<a@x>")], &side_map)
+            .await
+            .unwrap();
+
+        let blob = git(archive.path(), &["rev-parse", &format!("{}:m", commits[1])]);
+        std::fs::remove_file(
+            archive
+                .path()
+                .join(".git/objects")
+                .join(&blob[..2])
+                .join(&blob[2..]),
+        )
+        .unwrap();
+
+        let outcome = incomplete(index_lore_run(&db, archive.path(), &commits).await);
+        assert_eq!(
+            outcome,
+            LoreIndexIncomplete {
+                stored: 1,
+                appended: 0,
+                unread_commits: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(lore_rows(&db, None).await, 1);
+    }
+
+    /// A commit whose tree cannot be decoded is unread, not taken for a
+    /// removed message: it fails the run and is left unrecorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_tree_is_not_recorded() {
+        let (_dir, db) = lore_database().await;
+        let (archive, mut commits) = lore_archive(&["<a@x>"]);
+
+        let bad_tree = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(bad_tree.path(), b"100644 no-nul-or-object-id").unwrap();
+        let tree = git(
+            archive.path(),
+            &[
+                "hash-object",
+                "-t",
+                "tree",
+                "--literally",
+                "-w",
+                bad_tree.path().to_str().unwrap(),
+            ],
+        );
+        let commit = git(
+            archive.path(),
+            &["commit-tree", &tree, "-p", &commits[0], "-m", "bad tree"],
+        );
+        commits.push(commit.clone());
+
+        let outcome = incomplete(index_lore_run(&db, archive.path(), &commits).await);
+        assert_eq!(
+            outcome,
+            LoreIndexIncomplete {
+                stored: 1,
+                appended: 1,
+                unread_commits: 1,
+                ..Default::default()
+            }
+        );
+        let indexed = db.get_indexed_lore_commits().await.unwrap();
+        assert!(indexed.contains(&commits[0]));
+        assert!(!indexed.contains(&commit));
+    }
+
+    /// Stored emails whose commits cannot be recorded fail the run.  The
+    /// next run reads them again, finds them stored, and records them
+    /// without storing a second copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrecorded_commits_fail_the_run_and_are_retried() {
+        let (_dir, db) = lore_database().await;
+        let (archive, commits) = lore_archive(&["<a@x>", "<b@x>"]);
+        db.connection()
+            .drop_table("lore_indexed_commits", &[])
+            .await
+            .unwrap();
+
+        let outcome = incomplete(index_lore_run(&db, archive.path(), &commits).await);
+        assert_eq!(
+            outcome,
+            LoreIndexIncomplete {
+                stored: 2,
+                appended: 2,
+                unrecorded_commits: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(lore_rows(&db, None).await, 2);
+
+        db.create_tables().await.unwrap();
+        assert_eq!(
+            index_lore_run(&db, archive.path(), &commits).await.unwrap(),
+            0
+        );
+        assert_eq!(lore_rows(&db, None).await, 2);
+        assert_all_recorded(&db, &commits).await;
+    }
+
+    /// Parsers that cannot open the archive fail the run instead of
+    /// leaving every commit unread and reporting success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_parsers_fail_the_run() {
+        let (_dir, db) = lore_database().await;
+        let (_archive, commits) = lore_archive(&["<a@x>"]);
+        let not_a_repo = tempfile::tempdir().unwrap();
+
+        let outcome = incomplete(index_lore_run(&db, not_a_repo.path(), &commits).await);
+        assert_eq!(
+            outcome,
+            LoreIndexIncomplete {
+                failed_threads: 2,
+                ..Default::default()
+            }
+        );
+        assert!(db.get_indexed_lore_commits().await.unwrap().is_empty());
+    }
+
+    /// public-inbox records a removed message as a commit with a 'd' file
+    /// and no 'm'.  Such a commit holds nothing to store: it does not fail
+    /// the run and is recorded, so later runs do not read it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_without_a_message_is_recorded() {
+        let (_dir, db) = lore_database().await;
+        let (archive, mut commits) = lore_archive(&["<a@x>"]);
+        git(archive.path(), &["rm", "-q", "m"]);
+        std::fs::write(archive.path().join("d"), "removed\n").unwrap();
+        git(archive.path(), &["add", "d"]);
+        git(archive.path(), &["commit", "-q", "-m", "remove"]);
+        commits.push(git(archive.path(), &["rev-parse", "HEAD"]));
+
+        assert_eq!(
+            index_lore_run(&db, archive.path(), &commits).await.unwrap(),
+            1
+        );
+        assert_eq!(lore_rows(&db, None).await, 1);
+        assert_all_recorded(&db, &commits).await;
+    }
+
+    /// One message id in several commits of an archive, spread over
+    /// batches that two inserters store at once.  Whichever batch defers
+    /// the id to another, the run stores one copy and records every
+    /// commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_message_ids_are_stored_once_and_recorded() {
+        let (_dir, db) = lore_database().await;
+        let (archive, commits) = lore_archive(&[
+            "<dup@x>", "<a@x>", "<dup@x>", "<b@x>", "<dup@x>", "<c@x>", "<dup@x>",
+        ]);
+
+        assert_eq!(
+            index_lore_run(&db, archive.path(), &commits).await.unwrap(),
+            4
+        );
+        assert_eq!(
+            lore_rows(&db, Some("message_id = '<dup@x>'".to_string())).await,
+            1
+        );
+        assert_eq!(lore_rows(&db, None).await, 4);
+        assert_all_recorded(&db, &commits).await;
+    }
+
+    /// The summary names each kind of failure, and the stored count.
+    #[test]
+    fn incomplete_summary_lists_each_failure() {
+        let outcome = LoreIndexIncomplete {
+            stored: 900,
+            appended: 800,
+            failed_threads: 1,
+            unread_commits: 2,
+            unstored_emails: 100,
+            unrecorded_commits: 1,
+        };
+        assert_eq!(
+            outcome.to_string(),
+            "lore indexing incomplete: 1 pipeline thread failed, \
+             2 emails could not be read, 100 emails could not be stored, \
+             1 commit could not be recorded as indexed; \
+             indexing again retries them (900 emails stored)"
+        );
     }
 }

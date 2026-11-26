@@ -108,7 +108,7 @@ async fn a_file_read_by_this_extractor_may_be_skipped() {
 
     let skippable = db.processed_by_this_extractor().await.unwrap();
     assert!(
-        skippable.contains("cafe1234"),
+        skippable.contains(&("cafe1234".to_string(), "fs/read_write.c".to_string())),
         "a file this build read is not in the skip set: {skippable:?}"
     );
     assert!(
@@ -158,7 +158,7 @@ async fn a_file_read_by_an_older_extractor_is_forgotten() {
         .processed_by_this_extractor()
         .await
         .unwrap()
-        .contains("cafe1234"));
+        .contains(&("cafe1234".to_string(), "fs/super.c".to_string())));
 
     // A row from an older extractor goes, and the index stops calling itself
     // stale on the strength of it.
@@ -173,8 +173,18 @@ async fn a_file_read_by_an_older_extractor_is_forgotten() {
     assert!(db.index_predates_reader().await.unwrap());
     db.forget_older_processed_files().await.unwrap();
     let skippable = db.processed_by_this_extractor().await.unwrap();
-    assert!(skippable.contains("cafe1234"), "{skippable:?}");
-    assert!(!skippable.contains("cafe9999"), "{skippable:?}");
+    assert!(
+        skippable.contains(&("cafe1234".to_string(), "fs/super.c".to_string())),
+        "{skippable:?}"
+    );
+    assert!(
+        !skippable.contains(&("cafe1234".to_string(), "fs/moved.c".to_string())),
+        "a moved file re-analyzes under its new path: {skippable:?}"
+    );
+    assert!(
+        !skippable.contains(&("cafe9999".to_string(), "fs/older.c".to_string())),
+        "{skippable:?}"
+    );
     assert!(!db.index_predates_reader().await.unwrap());
 }
 
@@ -560,8 +570,14 @@ async fn a_grammar_bump_re_reads_only_its_language() {
 
     assert!(db.index_predates_reader().await.unwrap());
     let skippable = db.processed_by_this_extractor().await.unwrap();
-    assert!(skippable.contains("cafe1234"), "{skippable:?}");
-    assert!(!skippable.contains("cafe9999"), "{skippable:?}");
+    assert!(
+        skippable.contains(&("cafe1234".to_string(), "fs/read_write.c".to_string())),
+        "{skippable:?}"
+    );
+    assert!(
+        !skippable.contains(&("cafe9999".to_string(), "src/older.rs".to_string())),
+        "{skippable:?}"
+    );
 
     db.forget_older_processed_files().await.unwrap();
     assert!(!db.index_predates_reader().await.unwrap());
@@ -602,8 +618,14 @@ async fn flipping_the_header_routing_rescans_the_headers() {
         .unwrap();
     assert!(db.index_predates_reader().await.unwrap());
     let skippable = db.processed_by_this_extractor().await.unwrap();
-    assert!(!skippable.contains("cafe1234"), "{skippable:?}");
-    assert!(skippable.contains("cafe9999"), "{skippable:?}");
+    assert!(
+        !skippable.contains(&("cafe1234".to_string(), "include/box.h".to_string())),
+        "{skippable:?}"
+    );
+    assert!(
+        skippable.contains(&("cafe9999".to_string(), "src/get.c".to_string())),
+        "{skippable:?}"
+    );
 
     // Read again as C++, and the index is current under the new routing.
     db.mark_files_processed(vec![semcode::ProcessedFileRecord {

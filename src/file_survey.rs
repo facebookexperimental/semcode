@@ -6,8 +6,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
-use crate::file_extensions::is_supported_for_analysis;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileSurvey {
     pub file: String,
@@ -74,15 +72,15 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
     if !path.is_file() {
         bail!("'{}' is not a regular file", path.display());
     }
-    if !is_supported_for_analysis(path.to_string_lossy().as_ref()) {
+    // Grammar-based survey only: assembly reads through the line
+    // scanner, which has no survey builder, so `.S` stays out here with
+    // the same bail as every other unscanned extension.
+    let Some(language) = SurveyLanguage::from_path(&path) else {
         bail!(
             "unsupported source file '{}'; expected C, C++, Rust, Python, or Zig",
             path.display()
         );
-    }
-
-    let language = SurveyLanguage::from_path(&path)
-        .ok_or_else(|| anyhow::anyhow!("unsupported source file '{}'", path.display()))?;
+    };
     let source = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read source file '{}'", path.display()))?;
     let mut parser = Parser::new();
@@ -635,6 +633,16 @@ pub async fn survey_file_json_with_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assembly_has_no_survey_language() {
+        // The survey is grammar-based: `.S` goes through the line
+        // scanner, never a grammar, so the survey skips the extension
+        // and the file still bails cleanly instead of parsing degraded.
+        assert!(SurveyLanguage::from_path(Path::new("entry.S")).is_none());
+        assert!(SurveyLanguage::from_path(Path::new("entry.s")).is_none());
+        assert!(SurveyLanguage::from_path(Path::new("fork.c")).is_some());
+    }
 
     #[test]
     fn surveys_c_syntax_deterministically() {

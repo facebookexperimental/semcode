@@ -9,8 +9,7 @@ use lancedb::connection::Connection;
 use lancedb::connection::LanceFileVersion;
 use lancedb::database::listing::ListingDatabaseOptions;
 use lancedb::index::scalar::FullTextSearchQuery;
-use lancedb::query::ExecutableQuery;
-use lancedb::query::QueryBase;
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
 use crate::database::branches::IndexedBranchStore;
 use crate::database::functions::FunctionStore;
@@ -146,10 +145,27 @@ fn log_absence(kind: &str, name: &str, git_sha: &str, why: Absent, elsewhere: &s
     }
 }
 
-/// Key for the per-command caller/callee memo: the queried name, the
-/// revision it was resolved at, and the overlay generation (a REPL refresh
-/// moves the generation and drops every entry).
-type CallerMemoKey = (String, String, u64);
+/// Queried name, revision, and the manifest's overlay stamp.
+type CallerMemoKey = (String, String, Option<u64>);
+
+fn memo_key(name: &str, manifest: &crate::database::resolution::RevisionPaths) -> CallerMemoKey {
+    (
+        name.to_string(),
+        manifest.revision().to_string(),
+        manifest.overlay_stamp,
+    )
+}
+
+/// The working-copy overlay and the build that produced it.
+#[derive(Default)]
+struct Workdir {
+    /// Command generation and commit of the last build attempt, failed or
+    /// not, so each command builds at most once per commit.
+    built_for: Option<(u64, String)>,
+    index: Option<WorkdirIndex>,
+    /// Changes when `index` changes its commit or overlaid paths.
+    stamp: u64,
+}
 
 /// Where a message_id stands in the duplicate check that the lore
 /// inserters share (see DatabaseManager::insert_lore_emails()).
@@ -159,6 +175,35 @@ pub enum LoreIdState {
     Stored,
     /// A batch has claimed the id and its append has not finished.
     Pending,
+}
+
+/// The emails of a batch that DatabaseManager::insert_lore_emails() did
+/// not store, by index into the batch.  Every other email of the batch is
+/// in the lore table, either from this batch or from an earlier one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LoreInsertOutcome {
+    /// Emails whose append failed.  Their ids are released, so inserting
+    /// them again tries the append again.
+    pub failed: Vec<usize>,
+    /// Emails whose id another inserter had pending.  Insert them again
+    /// once that inserter has finished.
+    pub deferred: Vec<usize>,
+    /// Rows this call appended to the table.  Emails already in the
+    /// table and copies of a message_id the batch holds more than once
+    /// are not counted.
+    pub appended: usize,
+}
+
+impl LoreInsertOutcome {
+    /// Whether every email of the batch is stored.
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty() && self.deferred.is_empty()
+    }
+
+    /// The indices of every email not stored, failed or deferred.
+    pub fn not_stored(&self) -> impl Iterator<Item = usize> + '_ {
+        self.failed.iter().chain(&self.deferred).copied()
+    }
 }
 
 pub struct DatabaseManager {
@@ -181,10 +226,11 @@ pub struct DatabaseManager {
     object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
-    workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
+    workdir_index: std::sync::RwLock<Workdir>,
     /// The last manifest generated, kept because a single query asks for the
-    /// same revision several times. Building one walks the whole tree.
-    manifest_cache: std::sync::RwLock<Option<(String, GitManifest)>>,
+    /// same revision several times. Building one walks the whole tree. Keyed
+    /// by revision and by the overlay it applied.
+    manifest_cache: std::sync::RwLock<Option<GitManifest>>,
     /// Identifiers that are compiler attributes, read once per process.
     attribute_names: std::sync::OnceLock<Arc<HashSet<String>>>,
     /// Whether the lore table carries the date_timestamp column,
@@ -198,26 +244,31 @@ pub struct DatabaseManager {
     /// per-candidate stat entirely and trust every row, the way `--git-only`
     /// always has.
     git_only: AtomicBool,
-    /// Bumped by a long-lived caller (the REPL) once per top-level command,
-    /// so `ensure_workdir_index_built` can tell "asked again within the
-    /// command that just built this" (several `_git_aware` calls in one
-    /// `func` — cheap, must stay a no-op) from "asked again in a later
-    /// command" (a REPL user had a chance to edit a file in between — must
-    /// refresh). A caller that never calls `note_repl_command` (MCP, LSP,
-    /// `-q`) leaves this at 0 forever, which builds the overlay once and
-    /// reuses it — right for a caller with no prompt to edit a file at.
+    /// Bumped once per top-level command (a REPL command, an MCP tool call,
+    /// an LSP request), so `ensure_workdir_index_built` can tell "asked
+    /// again within the command that just built this" (several `_git_aware`
+    /// calls in one `func` — cheap, must stay a no-op) from "asked again in
+    /// a later command" (the working copy or HEAD may have changed in
+    /// between — must refresh). A one-shot caller (`-q`) never bumps it and
+    /// builds the overlay once.
     workdir_command_generation: AtomicU64,
-    /// The command generation the current `workdir_index` was last built or
-    /// refreshed for. `u64::MAX` means "never built", so the first build on
-    /// generation 0 is not mistaken for already-current.
-    workdir_index_generation: AtomicU64,
     /// Per-name caller/callee memo for one command: the reverse BFS, the
     /// relationship load and the indirect walks ask about the same names.
-    /// Keyed by (name, revision, overlay generation); a REPL refresh moves
-    /// the generation and drops every entry. Output-identical: the same
-    /// scan, just not re-run.
+    /// Keyed by name, revision and the manifest's overlay stamp, and cleared
+    /// by `note_repl_command`.
     callers_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<(String, String)>>>,
     callees_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<String>>>,
+    /// The git repo, opened once: `is_checked_out` below runs per file
+    /// (every overlay read gates on it), and a fresh discover per call
+    /// revalidates the pack index every time — minutes on caller
+    /// listings with thousands of files. The cached fingerprint decides
+    /// re-discovery, not correctness: branch switches, worktree swaps,
+    /// and packed-refs rewrites change its files and re-open. Everyday
+    /// commits rewrite a loose ref (neither HEAD nor packed-refs), which
+    /// the fingerprint misses — but the fast path re-resolves HEAD
+    /// through the shared handle on every call, and loose refs read
+    /// live, so the answer stays current either way.
+    git_repo: std::sync::RwLock<Option<(gix::ThreadSafeRepository, Vec<u8>)>>,
 }
 
 /// The URI to give lancedb for a local database path.
@@ -275,16 +326,16 @@ impl DatabaseManager {
                 connection.clone(),
             ),
             branch_store: IndexedBranchStore::new(connection.clone()),
-            workdir_index: std::sync::RwLock::new(None),
+            workdir_index: std::sync::RwLock::default(),
             manifest_cache: std::sync::RwLock::new(None),
             attribute_names: std::sync::OnceLock::new(),
             lore_has_date_timestamp: std::sync::OnceLock::new(),
             working_copy: WorkingCopyHashes::new(),
             git_only: AtomicBool::new(false),
             workdir_command_generation: AtomicU64::new(0),
-            workdir_index_generation: AtomicU64::new(u64::MAX),
             callers_memo: std::sync::RwLock::new(HashMap::new()),
             callees_memo: std::sync::RwLock::new(HashMap::new()),
+            git_repo: std::sync::RwLock::new(None),
         })
     }
 
@@ -300,6 +351,8 @@ impl DatabaseManager {
     pub fn note_repl_command(&self) {
         self.workdir_command_generation
             .fetch_add(1, Ordering::Relaxed);
+        self.callers_memo.write().unwrap().clear();
+        self.callees_memo.write().unwrap().clear();
     }
 
     /// Say the caller will not be editing: candidate files are trusted
@@ -327,13 +380,66 @@ impl DatabaseManager {
         if git_sha.is_empty() {
             return false;
         }
-        match gix::discover(&self.git_repo_path) {
-            Ok(repo) => repo
-                .head_commit()
-                .map(|c| c.id().to_string() == git_sha)
-                .unwrap_or(false),
-            Err(_) => false,
+        self.cached_head_id().is_some_and(|head| head == git_sha)
+    }
+
+    /// The workdir's HEAD commit id through the shared repo handle:
+    /// one discovery per process while the HEAD file's bytes are
+    /// unchanged, a re-discovery on any workdir move. `None` where the
+    /// repo does not open or HEAD does not resolve — callers treat that
+    /// as not-checked-out, exactly as the per-call discover did.
+    fn cached_head_id(&self) -> Option<String> {
+        // Fast path under the read lock: same fingerprint, shared store,
+        // so no discovery and no pack-index revalidation.
+        {
+            let guard = self.git_repo.read().unwrap();
+            if let Some((repo, fingerprint)) = guard.as_ref() {
+                if Self::git_fingerprint(&self.git_repo_path, repo.path()) == *fingerprint {
+                    return repo
+                        .to_thread_local()
+                        .head_commit()
+                        .ok()
+                        .map(|c| c.id().to_string());
+                }
+            }
         }
+        // Miss or workdir move: open without holding the lock (no worker
+        // ever blocks on discovery I/O), then cache for the next call.
+        let fresh = gix::ThreadSafeRepository::discover(&self.git_repo_path).ok()?;
+        let fingerprint = Self::git_fingerprint(&self.git_repo_path, fresh.path());
+        let head = fresh.to_thread_local().head_commit().ok()?.id().to_string();
+        *self.git_repo.write().unwrap() = Some((fresh, fingerprint));
+        Some(head)
+    }
+
+    /// Bytes that change on any workdir move: the workdir's `.git` entry
+    /// (a linked-worktree swap rewrites the pointer file), the HEAD file
+    /// (checkouts and commits rewrite it), and packed-refs (a ref rewrite
+    /// that leaves HEAD's bytes alone still changes these). Linked
+    /// worktrees keep packed-refs in the common dir — the worktree gitdir
+    /// has none — so it is read through `commondir` there. All tiny
+    /// reads; a missing file reads empty, a `.git` directory marks
+    /// itself distinctly.
+    fn git_fingerprint(repo_path: &str, git_dir: &std::path::Path) -> Vec<u8> {
+        let dotgit = std::path::Path::new(repo_path).join(".git");
+        let mut fp = match std::fs::read(&dotgit) {
+            Ok(bytes) => bytes,
+            Err(_) if dotgit.is_dir() => b"dir".to_vec(),
+            Err(_) => Vec::new(),
+        };
+        fp.push(0);
+        fp.extend(std::fs::read(git_dir.join("HEAD")).unwrap_or_default());
+        fp.push(0);
+        // The commondir pointer itself: retargeting it between stores
+        // with identical packed-refs bytes resolves refs elsewhere, so
+        // its bytes join the fingerprint (absent outside worktrees).
+        fp.extend(std::fs::read(git_dir.join("commondir")).unwrap_or_default());
+        fp.push(0);
+        let packed_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .map(|rel| git_dir.join(rel.trim()))
+            .unwrap_or_else(|_| git_dir.to_path_buf());
+        fp.extend(std::fs::read(packed_dir.join("packed-refs")).unwrap_or_default());
+        fp
     }
 
     /// Whether the working-copy overlay may be consulted for a query naming
@@ -353,10 +459,15 @@ impl DatabaseManager {
         self.schema_manager.stored_schema_version().await
     }
 
-    /// Content hashes this build's extractor has read, which is the set a
-    /// later run may skip. A file read by an older extractor is missing from
-    /// it even though the file itself has not changed.
-    pub async fn processed_by_this_extractor(&self) -> Result<std::collections::HashSet<String>> {
+    /// (Blob, path) pairs this build's extractor has read, which is the
+    /// set a later run may skip. A file read by an older extractor is
+    /// missing from it even though the file itself has not changed, and
+    /// so is a file read at another path: analysis can read the path
+    /// (the assembly arch gate does), so a moved file re-analyzes even
+    /// when its blob did not change.
+    pub async fn processed_by_this_extractor(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
         let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
         Ok(self
             .get_all_processed_files()
@@ -372,7 +483,7 @@ impl DatabaseManager {
                         .as_str(),
                     )
             })
-            .map(|record| record.git_file_sha)
+            .map(|record| (record.git_file_sha, record.file))
             .collect())
     }
 
@@ -430,6 +541,12 @@ impl DatabaseManager {
         self.schema_manager.meta_value("index:tree_sha").await
     }
 
+    /// Forget the recorded build beside a data wipe; see
+    /// `SchemaManager::forget_recorded_build`.
+    pub async fn forget_recorded_build(&self) -> Result<()> {
+        self.schema_manager.forget_recorded_build().await
+    }
+
     /// How the index was built: the extensions indexed, and whether macros
     /// were skipped. `None` when the index does not say, which is every index
     /// written before this was recorded.
@@ -472,26 +589,51 @@ impl DatabaseManager {
     /// When set, all `_git_aware` methods will automatically merge results from the
     /// working directory overlay with database results.
     pub fn set_workdir_index(&self, workdir: WorkdirIndex) {
-        *self.workdir_index.write().unwrap() = Some(workdir);
+        let mut slot = self.workdir_index.write().unwrap();
+        slot.built_for = workdir.head_sha().map(|sha| {
+            (
+                self.workdir_command_generation.load(Ordering::Relaxed),
+                sha.to_string(),
+            )
+        });
+        Self::install_workdir(&mut slot, Some(workdir));
     }
 
     /// Check if a workdir index is set.
     pub fn has_workdir_index(&self) -> bool {
-        self.workdir_index.read().unwrap().is_some()
+        self.workdir_index.read().unwrap().index.is_some()
     }
 
-    /// Clear the working directory index.
+    /// Clear the working directory index. The next lookup rebuilds it.
     pub fn clear_workdir_index(&self) {
-        *self.workdir_index.write().unwrap() = None;
+        self.take_workdir_index();
     }
 
     /// Take the working directory index out, leaving None in its place.
-    /// Used to extract the previous index for incremental rebuilds.
+    /// Used to extract the previous index for incremental rebuilds. The next
+    /// lookup rebuilds it.
     pub fn take_workdir_index(&self) -> Option<WorkdirIndex> {
-        self.workdir_index.write().unwrap().take()
+        let mut slot = self.workdir_index.write().unwrap();
+        slot.built_for = None;
+        slot.index.take()
     }
 
     pub async fn clear_all_data(&self) -> Result<()> {
+        // Forget the record first: a wipe with a record claims a build
+        // that no longer exists. A failure here aborts before anything is
+        // wiped; per-table opens below stay tolerant of absence while a
+        // delete failure aborts loudly, and retrying the wipe converges,
+        // so the next run rebuilds under current options instead of
+        // inheriting stranded ones. The schema version stays: forgetting
+        // is not migrating.
+        self.forget_recorded_build().await?;
+
+        // A wipe skips only tables that are not there: a table that
+        // exists but will not open fails loudly instead of reporting a
+        // wipe with rows left behind.
+        let names = self.connection.table_names().execute().await?;
+        let missing = |name: &str| !names.iter().any(|n| n == name);
+
         // Delete all data from each main table
         for table_name in &[
             "functions",
@@ -510,17 +652,29 @@ impl DatabaseManager {
             // attribute, so a row left behind here outlives the definition.
             "object_macros",
         ] {
-            if let Ok(table) = self.connection.open_table(*table_name).execute().await {
-                table.delete("1=1").await?;
-            }
+            let table = match self.connection.open_table(*table_name).execute().await {
+                Ok(table) => table,
+                Err(_) if missing(table_name) => continue,
+                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            };
+            table
+                .delete("1=1")
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?;
         }
 
         // Delete all data from content shard tables (content_0 through content_15)
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
-            if let Ok(table) = self.connection.open_table(&table_name).execute().await {
-                table.delete("1=1").await?;
-            }
+            let table = match self.connection.open_table(&table_name).execute().await {
+                Ok(table) => table,
+                Err(_) if missing(&table_name) => continue,
+                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            };
+            table
+                .delete("1=1")
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?;
         }
 
         Ok(())
@@ -1165,33 +1319,117 @@ impl DatabaseManager {
 
             let mut dispatches = Vec::new();
             for site in sites {
-                // A site whose receiver type is unknown reaches every member
-                // of that name in the tree, which is not an answer a chain
-                // can follow. `callers` reports those as a count.
-                let Some(container_type) = site.receiver_type.clone() else {
-                    continue;
+                // An LSM hook site files under its slot, not a receiver:
+                // the dispatch macro's first argument is the slot, and no
+                // receiver fields are recorded. It joins the
+                // implementations installed in static_calls_table under
+                // its member, gated on the slot kind on both sides exactly
+                // like the reverse join. A bound needs a receiver
+                // expression, which these sites never carry, so the arms
+                // below never see one; ordinary untyped sites still match
+                // nothing.
+                let lsm_macro = match site.kind {
+                    crate::types::DispatchKind::LsmHookInt => Some("call_int_hook"),
+                    crate::types::DispatchKind::LsmHookVoid => Some("call_void_hook"),
+                    _ => None,
                 };
-
-                let key = (container_type.clone(), site.member.clone());
-                let targets = match slots.get(&key) {
-                    Some(known) => known.clone(),
-                    None => {
-                        let mut targets: Vec<String> = at_revision(
-                            self.registration_store
-                                .find_by_slot(&container_type, &site.member)
-                                .await?,
-                            &manifest,
-                            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
-                        )
-                        .into_iter()
-                        .map(|registration| registration.target)
-                        .collect();
-                        targets.sort();
-                        targets.dedup();
-                        slots.insert(key, targets.clone());
-                        targets
+                if let Some(macro_name) = lsm_macro {
+                    let key = ("static_calls_table".to_string(), site.member.clone());
+                    let targets = match slots.get(&key) {
+                        Some(known) => known.clone(),
+                        None => {
+                            let mut targets: Vec<String> = at_revision(
+                                self.registration_store
+                                    .find_by_slot("static_calls_table", &site.member)
+                                    .await?,
+                                &manifest,
+                                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                            )
+                            .into_iter()
+                            .filter(|registration| {
+                                registration.kind == crate::types::RegistrationKind::LsmHook
+                            })
+                            .map(|registration| registration.target)
+                            .collect();
+                            targets.sort();
+                            targets.dedup();
+                            slots.insert(key, targets.clone());
+                            targets
+                        }
+                    };
+                    if targets.is_empty() {
+                        continue;
                     }
-                };
+                    dispatches.push(crate::types::ResolvedDispatch {
+                        receiver_expr: macro_name.to_string(),
+                        container_type: "static_calls_table".to_string(),
+                        member: site.member.clone(),
+                        file_path: site.file_path.clone(),
+                        line: site.line,
+                        targets,
+                        lsm_kind: Some(site.kind),
+                    });
+                    continue;
+                }
+                // A bound-only site (a generic parameter's method) has no
+                // receiver type to look a slot up by: it joins the trait
+                // implementations of its member whose container the bound
+                // names. Only where the receiver type is missing — a typed
+                // site takes the slot path it always took.
+                let (container_type, targets) =
+                    match (site.receiver_type.clone(), site.receiver_bound.clone()) {
+                        (None, Some(bound)) => {
+                            let mut targets: Vec<String> = at_revision(
+                                self.registration_store
+                                    .find_trait_impls_by_member(&site.member)
+                                    .await?,
+                                &manifest,
+                                |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                            )
+                            .into_iter()
+                            .filter(|registration| {
+                                crate::types::each_bound(&bound).iter().any(|piece| {
+                                    crate::types::trait_names_match(
+                                        piece,
+                                        &registration.container_type,
+                                    )
+                                })
+                            })
+                            .map(|registration| registration.target)
+                            .collect();
+                            targets.sort();
+                            targets.dedup();
+                            (bound, targets)
+                        }
+                        (Some(container_type), _) => {
+                            // A site whose receiver type is unknown reaches
+                            // every member of that name in the tree, which is
+                            // not an answer a chain can follow. `callers`
+                            // reports those as a count.
+                            let key = (container_type.clone(), site.member.clone());
+                            let targets = match slots.get(&key) {
+                                Some(known) => known.clone(),
+                                None => {
+                                    let mut targets: Vec<String> = at_revision(
+                                        self.registration_store
+                                            .find_by_slot(&container_type, &site.member)
+                                            .await?,
+                                        &manifest,
+                                        |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                                    )
+                                    .into_iter()
+                                    .map(|registration| registration.target)
+                                    .collect();
+                                    targets.sort();
+                                    targets.dedup();
+                                    slots.insert(key, targets.clone());
+                                    targets
+                                }
+                            };
+                            (container_type, targets)
+                        }
+                        (None, None) => continue,
+                    };
 
                 if targets.is_empty() {
                     continue;
@@ -1204,6 +1442,7 @@ impl DatabaseManager {
                     file_path: site.file_path.clone(),
                     line: site.line,
                     targets,
+                    lsm_kind: None,
                 });
             }
 
@@ -2018,7 +2257,7 @@ impl DatabaseManager {
     /// process yet, unless it is unusable for it (see
     /// `workdir_overlay_usable`); refresh it, at most once per top-level
     /// command (see `workdir_command_generation`'s doc comment), if it
-    /// already exists.
+    /// already exists. Read it through `with_workdir`.
     ///
     /// A naive "refresh whenever asked" is wrong here: a single `func`
     /// command calls both `get_function_callees_git_aware` and
@@ -2040,23 +2279,24 @@ impl DatabaseManager {
         if !self.workdir_overlay_usable(git_sha) {
             return;
         }
-        let current_generation = self.workdir_command_generation.load(Ordering::Relaxed);
-        let built_for_generation = self
-            .workdir_index_generation
-            .swap(current_generation, Ordering::Relaxed);
-        if built_for_generation == current_generation && self.has_workdir_index() {
-            return;
-        }
-        let repo_path = Path::new(&self.git_repo_path);
+        let key = (
+            self.workdir_command_generation.load(Ordering::Relaxed),
+            git_sha.to_string(),
+        );
         let (built, refreshing) = {
-            let guard = self.workdir_index.read().unwrap();
-            let refreshing = guard.is_some();
+            let slot = self.workdir_index.read().unwrap();
+            if slot.built_for.as_ref() == Some(&key) {
+                return;
+            }
+            // Paths are relative to the commit an overlay was built at, so
+            // only an overlay from `git_sha` may seed the incremental build.
+            let prev = slot.index.as_ref().filter(|w| w.built_at(git_sha));
             (
-                WorkdirIndex::build_incremental(repo_path, guard.as_ref()),
-                refreshing,
+                WorkdirIndex::build_incremental(Path::new(&self.git_repo_path), prev),
+                prev.is_some(),
             )
         };
-        match built {
+        let built = match built {
             Ok(workdir) => {
                 tracing::info!(
                     "workdir: {} overlay: {} dirty, {} deleted, {} functions, {} types",
@@ -2070,125 +2310,164 @@ impl DatabaseManager {
                     workdir.function_count(),
                     workdir.type_count(),
                 );
-                self.set_workdir_index(workdir);
+                Some(workdir)
             }
-            Err(e) => tracing::info!(
-                "workdir: could not {} overlay: {e}",
-                if refreshing {
-                    "refresh"
-                } else {
-                    "build on demand"
-                }
-            ),
+            Err(e) => {
+                tracing::info!("workdir: could not build overlay: {e}");
+                None
+            }
+        };
+        let mut slot = self.workdir_index.write().unwrap();
+        slot.built_for = Some(key);
+        Self::install_workdir(&mut slot, built);
+    }
+
+    /// Install `index`, keeping the stamp when it overlays the same paths at
+    /// the same commit, so manifests cached against it survive a refresh
+    /// that found nothing changed.
+    fn install_workdir(slot: &mut Workdir, index: Option<WorkdirIndex>) {
+        let unchanged = match (&slot.index, &index) {
+            (Some(old), Some(new)) => {
+                old.head_sha() == new.head_sha()
+                    && old.dirty_file_paths() == new.dirty_file_paths()
+                    && old.deleted_file_paths() == new.deleted_file_paths()
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            slot.stamp += 1;
         }
+        slot.index = index;
+    }
+
+    /// Run `f` against the overlay and its stamp when it may answer for
+    /// `git_sha`: not git-only, `git_sha` checked out, and the overlay built
+    /// at `git_sha`. Otherwise return `R::default()`. Never builds.
+    fn read_workdir<R: Default>(
+        &self,
+        git_sha: &str,
+        f: impl FnOnce(&WorkdirIndex, u64) -> R,
+    ) -> R {
+        if !self.workdir_overlay_usable(git_sha) {
+            return R::default();
+        }
+        let slot = self.workdir_index.read().unwrap();
+        match &slot.index {
+            Some(w) if w.built_at(git_sha) => f(w, slot.stamp),
+            _ => R::default(),
+        }
+    }
+
+    /// Build or refresh the overlay if due, then run `f` against it (see
+    /// `read_workdir`).
+    ///
+    /// The default is "the overlay has nothing to say", never "the overlay
+    /// says no": every caller treats it as a miss and falls through to the
+    /// indexed rows (`None` callees, empty match and deletion sets).
+    fn with_workdir<R: Default>(&self, git_sha: &str, f: impl FnOnce(&WorkdirIndex) -> R) -> R {
+        self.ensure_workdir_index_built(git_sha);
+        self.read_workdir(git_sha, |w, _| f(w))
     }
 
     /// Look up a function in the workdir overlay (if set).
     fn workdir_find_function(&self, name: &str, git_sha: &str) -> Option<FunctionInfo> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard.as_ref().and_then(|w| w.find_function(name).cloned())
+        self.with_workdir(git_sha, |w| w.find_function(name).cloned())
     }
 
     /// Look up all functions matching a name in the workdir overlay.
     fn workdir_find_all_functions(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard
-            .as_ref()
-            .map(|w| w.find_all_functions(name).into_iter().cloned().collect())
-            .unwrap_or_default()
+        self.with_workdir(git_sha, |w| {
+            w.find_all_functions(name).into_iter().cloned().collect()
+        })
     }
 
     /// Look up all types matching a name in the workdir overlay.
     fn workdir_find_all_types(&self, name: &str, git_sha: &str) -> Vec<TypeInfo> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard
-            .as_ref()
-            .map(|w| w.find_all_types(name).into_iter().cloned().collect())
-            .unwrap_or_default()
+        self.with_workdir(git_sha, |w| {
+            w.find_all_types(name).into_iter().cloned().collect()
+        })
     }
 
     /// Find callers in the workdir overlay.
     fn workdir_find_callers(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard
-            .as_ref()
-            .map(|w| w.find_callers(name).into_iter().cloned().collect())
-            .unwrap_or_default()
+        self.with_workdir(git_sha, |w| {
+            w.find_callers(name).into_iter().cloned().collect()
+        })
     }
 
     /// Find callees in the workdir overlay.
     fn workdir_find_callees(&self, name: &str, git_sha: &str) -> Option<Vec<String>> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard.as_ref().and_then(|w| w.find_callees(name))
+        self.with_workdir(git_sha, |w| w.find_callees(name))
     }
 
-    /// Grep function bodies in the workdir overlay.
-    fn workdir_grep_functions(
+    /// Query-time macro traversal (`macro_via`) reaches through these: the
+    /// overlay's callers and rows by name, macros by file, and the repo path
+    /// for blob reads.
+    pub(crate) fn overlay_callers_of(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.workdir_find_callers(name, git_sha)
+    }
+
+    pub(crate) fn overlay_rows_named(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.workdir_find_all_functions(name, git_sha)
+    }
+
+    pub(crate) fn overlay_macros_in_file(
         &self,
-        pattern: &str,
-        path_pattern: Option<&str>,
+        file_path: &str,
         git_sha: &str,
     ) -> Vec<FunctionInfo> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard
-            .as_ref()
-            .map(|w| {
-                w.grep_functions(pattern, path_pattern)
-                    .into_iter()
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.with_workdir(git_sha, |w| {
+            w.file_macros(file_path).into_iter().cloned().collect()
+        })
     }
 
-    /// Regex search for functions in the workdir overlay.
-    fn workdir_find_functions_regex(&self, pattern: &str, git_sha: &str) -> Vec<FunctionInfo> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard
-            .as_ref()
-            .map(|w| {
-                w.find_functions_regex(pattern)
-                    .into_iter()
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+    pub(crate) fn overlay_dirty_files(&self, git_sha: &str) -> Vec<String> {
+        self.with_workdir(git_sha, WorkdirIndex::dirty_files)
     }
 
-    /// Regex search for types in the workdir overlay.
-    fn workdir_find_types_regex(&self, pattern: &str, git_sha: &str) -> Vec<TypeInfo> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard
-            .as_ref()
-            .map(|w| w.find_types_regex(pattern).into_iter().cloned().collect())
-            .unwrap_or_default()
+    pub(crate) fn repo_path(&self) -> &str {
+        &self.git_repo_path
     }
 
-    /// Check if a file is deleted in the workdir overlay.
-    fn workdir_is_deleted(&self, file_path: &str, git_sha: &str) -> bool {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard.as_ref().is_some_and(|w| w.is_deleted(file_path))
+    pub(crate) async fn macro_candidates(&self, names: &[String]) -> Result<Vec<FunctionInfo>> {
+        self.function_store.macro_candidates_by_names(names).await
     }
 
-    fn workdir_is_dirty(&self, file_path: &str, git_sha: &str) -> bool {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard.as_ref().is_some_and(|w| w.is_dirty(file_path))
+    pub(crate) async fn argument_rows_for_callee(
+        &self,
+        callee: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_callee(callee).await
+    }
+
+    pub(crate) async fn argument_rows_for_target(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_target(target).await
+    }
+
+    pub(crate) async fn dispatch_sites_for_caller(
+        &self,
+        caller: &str,
+    ) -> Result<Vec<crate::types::DispatchSite>> {
+        self.dispatch_site_store.find_by_caller(caller).await
+    }
+
+    /// Take matches and overlaid paths (modified or deleted) from the same overlay.
+    fn search_workdir<T: Clone>(
+        &self,
+        git_sha: &str,
+        search: impl FnOnce(&WorkdirIndex) -> Vec<&T>,
+    ) -> (Vec<T>, HashSet<String>) {
+        self.with_workdir(git_sha, |w| {
+            (search(w).into_iter().cloned().collect(), w.overlaid_paths())
+        })
     }
 
     fn workdir_dirty_count(&self, git_sha: &str) -> usize {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard.as_ref().map_or(0, |w| w.dirty_file_count())
+        self.with_workdir(git_sha, |w| w.dirty_file_count())
     }
 
     /// What one candidate file — a path a query already named, with the blob
@@ -2273,19 +2552,6 @@ impl DatabaseManager {
             .into_iter()
             .filter(|t| t.name.eq_ignore_ascii_case(name))
             .collect()
-    }
-
-    /// Merge a HEAD manifest with workdir dirty/deleted state.
-    #[allow(dead_code)]
-    fn workdir_merged_manifest(
-        &self,
-        head_manifest: std::collections::HashMap<String, String>,
-    ) -> std::collections::HashMap<String, String> {
-        let guard = self.workdir_index.read().unwrap();
-        match guard.as_ref() {
-            Some(w) => w.merged_manifest(&head_manifest),
-            None => head_manifest,
-        }
     }
 
     /// The answer when the requested revision cannot be mapped onto the files
@@ -3732,11 +3998,8 @@ impl DatabaseManager {
         pattern: &str,
         git_sha: &str,
     ) -> Result<Vec<TypeInfo>> {
-        let workdir_matches = self.workdir_find_types_regex(pattern, git_sha);
-        let workdir_files: HashSet<String> = workdir_matches
-            .iter()
-            .map(|t| t.file_path.clone())
-            .collect();
+        let (workdir_matches, overlaid) =
+            self.search_workdir(git_sha, |w| w.find_types_regex(pattern));
 
         let mut db_results = self
             .search_manager
@@ -3744,9 +4007,7 @@ impl DatabaseManager {
             .await?;
 
         // Filter out DB results from dirty/deleted files, then prepend workdir matches
-        db_results.retain(|t| {
-            !workdir_files.contains(&t.file_path) && !self.workdir_is_deleted(&t.file_path, git_sha)
-        });
+        db_results.retain(|t| !overlaid.contains(&t.file_path));
 
         let mut merged = workdir_matches;
         merged.extend(db_results);
@@ -3820,20 +4081,15 @@ impl DatabaseManager {
         pattern: &str,
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
-        let workdir_matches = self.workdir_find_functions_regex(pattern, git_sha);
-        let workdir_files: HashSet<String> = workdir_matches
-            .iter()
-            .map(|f| f.file_path.clone())
-            .collect();
+        let (workdir_matches, overlaid) =
+            self.search_workdir(git_sha, |w| w.find_functions_regex(pattern));
 
         let mut db_results = self
             .search_manager
             .search_functions_regex_git_aware(pattern, git_sha)
             .await?;
 
-        db_results.retain(|f| {
-            !workdir_files.contains(&f.file_path) && !self.workdir_is_deleted(&f.file_path, git_sha)
-        });
+        db_results.retain(|f| !overlaid.contains(&f.file_path));
 
         let mut merged = workdir_matches;
         merged.extend(db_results);
@@ -3851,19 +4107,29 @@ impl DatabaseManager {
         function_names: &[String],
         type_names: &[String],
         git_sha: &str,
-    ) -> Result<(
-        std::collections::HashMap<String, usize>,
-        std::collections::HashMap<String, usize>,
-    )> {
-        use std::collections::{HashMap, HashSet};
+    ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
+        if function_names.is_empty() && type_names.is_empty() {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
 
         let function_targets: HashSet<String> = function_names.iter().cloned().collect();
         let type_targets: HashSet<String> = type_names.iter().cloned().collect();
         let mut function_referrers: HashMap<String, HashSet<String>> = HashMap::new();
         let mut type_referrers: HashMap<String, HashSet<String>> = HashMap::new();
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        // Check overlay eligibility once before scanning. Capture modified and
+        // deleted paths together with the working-copy counts so both scans
+        // use the same overlay without holding the read lock. An overlay that
+        // may not answer for `git_sha` contributes nothing (see `with_workdir`).
+        let (overlaid_paths, (workdir_function_counts, workdir_type_counts)) =
+            self.with_workdir(git_sha, |index| {
+                (
+                    index.overlaid_paths(),
+                    index.distinct_reference_counts(&function_targets, &type_targets),
+                )
+            });
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
 
-        if !git_manifest.is_empty() && (!function_targets.is_empty() || !type_targets.is_empty()) {
+        if !git_manifest.is_empty() {
             let functions_table = self.connection.open_table("functions").execute().await?;
             let relationship_filter = match (function_targets.is_empty(), type_targets.is_empty()) {
                 (false, false) => "calls IS NOT NULL OR types IS NOT NULL",
@@ -3871,7 +4137,7 @@ impl DatabaseManager {
                 (true, false) => "types IS NOT NULL",
                 (true, true) => unreachable!(),
             };
-            let batches = functions_table
+            let mut batches = functions_table
                 .query()
                 .only_if(relationship_filter)
                 .select(lancedb::query::Select::Columns(vec![
@@ -3883,11 +4149,9 @@ impl DatabaseManager {
                     "types".to_string(),
                 ]))
                 .execute()
-                .await?
-                .try_collect::<Vec<_>>()
                 .await?;
 
-            for batch in batches {
+            while let Some(batch) = batches.try_next().await? {
                 let names: &StringArray = super::get_column(&batch, "name")?;
                 let paths: &StringArray = super::get_column(&batch, "file_path")?;
                 let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
@@ -3897,9 +4161,7 @@ impl DatabaseManager {
 
                 for row in 0..batch.num_rows() {
                     let path = paths.value(row);
-                    if self.workdir_is_dirty(path, git_sha)
-                        || self.workdir_is_deleted(path, git_sha)
-                    {
+                    if overlaid_paths.contains(path) {
                         continue;
                     }
                     if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
@@ -3939,7 +4201,7 @@ impl DatabaseManager {
 
             if !type_targets.is_empty() {
                 let types_table = self.connection.open_table("types").execute().await?;
-                let batches = types_table
+                let mut batches = types_table
                     .query()
                     .only_if("types IS NOT NULL")
                     .select(lancedb::query::Select::Columns(vec![
@@ -3950,11 +4212,9 @@ impl DatabaseManager {
                         "types".to_string(),
                     ]))
                     .execute()
-                    .await?
-                    .try_collect::<Vec<_>>()
                     .await?;
 
-                for batch in batches {
+                while let Some(batch) = batches.try_next().await? {
                     let names: &StringArray = super::get_column(&batch, "name")?;
                     let paths: &StringArray = super::get_column(&batch, "file_path")?;
                     let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
@@ -3963,9 +4223,7 @@ impl DatabaseManager {
 
                     for row in 0..batch.num_rows() {
                         let path = paths.value(row);
-                        if self.workdir_is_dirty(path, git_sha)
-                            || self.workdir_is_deleted(path, git_sha)
-                        {
+                        if overlaid_paths.contains(path) {
                             continue;
                         }
                         if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
@@ -3991,13 +4249,6 @@ impl DatabaseManager {
             }
         }
 
-        let (workdir_function_counts, workdir_type_counts) = {
-            let guard = self.workdir_index.read().unwrap();
-            guard
-                .as_ref()
-                .map(|index| index.distinct_reference_counts(&function_targets, &type_targets))
-                .unwrap_or_default()
-        };
         let function_counts = function_targets
             .into_iter()
             .map(|name| {
@@ -4532,6 +4783,7 @@ impl DatabaseManager {
         git_sha: &str,
     ) -> Result<Vec<crate::types::CalleeDefinition>> {
         let (bare_name, owner_path) = crate::types::split_callee_edge(function_name);
+        let dirty = self.workdir_callee_definitions(bare_name, git_sha);
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         let mut definitions = if git_manifest.is_empty() {
             Vec::new()
@@ -4544,7 +4796,6 @@ impl DatabaseManager {
         // the same file, and a definition that exists only in an edited file
         // exists. Reporting the committed rows here would answer about a file
         // the reader has already changed.
-        let dirty = self.workdir_callee_definitions(bare_name, git_sha);
         if !dirty.is_empty() {
             definitions.retain(|definition| {
                 !dirty
@@ -4575,35 +4826,30 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Vec<crate::types::CalleeDefinition> {
-        self.ensure_workdir_index_built(git_sha);
-        let guard = self.workdir_index.read().unwrap();
-        guard
-            .as_ref()
-            .map(|workdir| {
-                workdir
-                    .find_all_functions(name)
-                    .into_iter()
-                    .map(|function| crate::types::CalleeDefinition {
-                        file_path: function.file_path.clone(),
-                        line_start: function.line_start,
-                        line_end: function.line_end,
-                        callees: function
-                            .calls
-                            .clone()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|edge| edge.callee().to_string())
-                            .collect(),
-                        is_definition: crate::types::row_defines_the_function(
-                            &function.return_type,
-                            &function.body,
-                        ),
-                        guard: function.guard.clone(),
-                        qualifier: function.qualifier.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.with_workdir(git_sha, |workdir| {
+            workdir
+                .find_all_functions(name)
+                .into_iter()
+                .map(|function| crate::types::CalleeDefinition {
+                    file_path: function.file_path.clone(),
+                    line_start: function.line_start,
+                    line_end: function.line_end,
+                    callees: function
+                        .calls
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|edge| edge.callee().to_string())
+                        .collect(),
+                    is_definition: crate::types::row_defines_the_function(
+                        &function.return_type,
+                        &function.body,
+                    ),
+                    guard: function.guard.clone(),
+                    qualifier: function.qualifier.clone(),
+                })
+                .collect()
+        })
     }
 
     pub async fn get_all_call_relationships(&self) -> Result<Vec<CallRelationship>> {
@@ -5150,6 +5396,14 @@ impl DatabaseManager {
         self.processed_file_store.is_processed(git_file_sha).await
     }
 
+    /// Check if a blob has been processed at a path. The blob alone does
+    /// not qualify: a moved file re-analyzes under its new path.
+    pub async fn is_file_processed_at_path(&self, git_file_sha: &str, file: &str) -> Result<bool> {
+        self.processed_file_store
+            .is_processed_at(git_file_sha, file)
+            .await
+    }
+
     /// Get all processed files for a specific git SHA
     pub async fn get_processed_files_for_git_sha(
         &self,
@@ -5554,6 +5808,7 @@ impl DatabaseManager {
             let content_table = self.connection.open_table(&table_name).execute().await?;
             let content_results = content_table
                 .query()
+                .select(Select::columns(&["blake3_hash"]))
                 .only_if(&where_clause)
                 .execute()
                 .await?
@@ -5767,11 +6022,9 @@ impl DatabaseManager {
         git_sha: &str,
     ) -> Result<(Vec<FunctionInfo>, bool)> {
         // Get workdir overlay matches first
-        let workdir_matches = self.workdir_grep_functions(pattern, path_pattern, git_sha);
-        let workdir_files: HashSet<String> = workdir_matches
-            .iter()
-            .map(|f| f.file_path.clone())
-            .collect();
+        let (workdir_matches, overlaid) =
+            self.search_workdir(git_sha, |w| w.grep_functions(pattern, path_pattern));
+        let workdir_match_count = workdir_matches.len();
 
         // Step 1: Get all matching functions using the existing non-git-aware method
         let (all_matching_functions, limit_hit_pre_filter) =
@@ -5850,9 +6103,7 @@ impl DatabaseManager {
         // Merge workdir results with DB results, excluding dirty/deleted files from DB
         let mut merged = workdir_matches;
         for func in git_filtered_functions {
-            if !workdir_files.contains(&func.file_path)
-                && !self.workdir_is_deleted(&func.file_path, git_sha)
-            {
+            if !overlaid.contains(&func.file_path) {
                 merged.push(func);
             }
         }
@@ -5867,7 +6118,7 @@ impl DatabaseManager {
             "Git-aware grep: pattern '{}' matched {} DB functions + {} workdir, filtered to {} at git commit {}",
             pattern,
             total_matching_functions,
-            workdir_files.len(),
+            workdir_match_count,
             merged.len(),
             git_sha
         );
@@ -6025,55 +6276,55 @@ impl DatabaseManager {
         Ok(valid_callers)
     }
 
-    /// Get callers using pre-loaded git manifest for filtering
-    /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
-    /// Uses the shared git tree traversal utility for consistency
     /// The manifest for a revision, walking the tree only when it is not the
-    /// one already in hand.
+    /// one already in hand. Refreshes the overlay when due, and reuses the
+    /// cached manifest only while it applied the same overlay.
     ///
     /// `callers` asks twice — once for direct callers, once for indirect —
     /// and each walk reads about 90,000 entries on a Linux tree. The cache
     /// holds one revision: a query asks about one, and the second ask is
     /// where the saving is.
     pub async fn git_manifest_cached(&self, git_sha: &str) -> Result<GitManifest> {
-        if let Ok(cache) = self.manifest_cache.read() {
-            if let Some((sha, manifest)) = cache.as_ref() {
-                if sha == git_sha {
-                    return Ok(manifest.clone());
-                }
+        self.ensure_workdir_index_built(git_sha);
+        let stamp = self.read_workdir(git_sha, |_, stamp| Some(stamp));
+        if let Some(manifest) = self.manifest_cache.read().unwrap().as_ref() {
+            if manifest.revision() == git_sha && manifest.overlay_stamp == stamp {
+                return Ok(manifest.clone());
             }
         }
-
-        let manifest = std::sync::Arc::new(self.generate_git_manifest(git_sha).await?);
-        if let Ok(mut cache) = self.manifest_cache.write() {
-            *cache = Some((git_sha.to_string(), manifest.clone()));
-        }
-
+        let manifest = std::sync::Arc::new(self.manifest_from_overlay(git_sha));
+        *self.manifest_cache.write().unwrap() = Some(manifest.clone());
         Ok(manifest)
     }
 
+    /// A manifest for `git_sha`, including the paths modified or deleted in
+    /// the working copy when the overlay is eligible for that revision.
     pub async fn generate_git_manifest(
         &self,
         git_sha: &str,
     ) -> Result<crate::database::resolution::RevisionPaths> {
-        let (dirty, deleted) = {
-            let guard = self.workdir_index.read().unwrap();
-            match guard.as_ref() {
-                Some(w) => (w.dirty_file_paths().clone(), w.deleted_file_paths().clone()),
-                None => (
-                    std::collections::HashMap::new(),
-                    std::collections::HashSet::new(),
-                ),
-            }
-        };
+        self.ensure_workdir_index_built(git_sha);
+        Ok(self.manifest_from_overlay(git_sha))
+    }
+
+    fn manifest_from_overlay(&self, git_sha: &str) -> crate::database::resolution::RevisionPaths {
+        let (dirty, deleted, overlay_stamp) = self.read_workdir(git_sha, |w, stamp| {
+            (
+                w.dirty_file_paths().clone(),
+                w.deleted_file_paths().clone(),
+                Some(stamp),
+            )
+        });
         let valid = self.revision_resolves(git_sha);
-        Ok(crate::database::resolution::RevisionPaths::new_lazy(
+        let mut manifest = crate::database::resolution::RevisionPaths::new_lazy(
             std::path::PathBuf::from(&self.git_repo_path),
             git_sha.to_string(),
             dirty,
             deleted,
             valid,
-        ))
+        );
+        manifest.overlay_stamp = overlay_stamp;
+        manifest
     }
 
     /// Fallback callers search when not in git repository
@@ -6366,11 +6617,7 @@ impl DatabaseManager {
         function_name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
-        let memo_key = (
-            function_name.to_string(),
-            git_manifest.revision().to_string(),
-            self.workdir_command_generation.load(Ordering::Relaxed),
-        );
+        let memo_key = memo_key(function_name, git_manifest);
         if let Ok(memo) = self.callees_memo.read() {
             if let Some(hit) = memo.get(&memo_key) {
                 return Ok(hit.clone());
@@ -6501,11 +6748,7 @@ impl DatabaseManager {
         function_name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<(String, String)>> {
-        let memo_key = (
-            function_name.to_string(),
-            git_manifest.revision().to_string(),
-            self.workdir_command_generation.load(Ordering::Relaxed),
-        );
+        let memo_key = memo_key(function_name, git_manifest);
         if let Ok(memo) = self.callers_memo.read() {
             if let Some(hit) = memo.get(&memo_key) {
                 return Ok(hit.clone());
@@ -6677,29 +6920,29 @@ impl DatabaseManager {
     }
 
     /// Insert lore emails into the database, returning the indices of
-    /// any emails that could not be stored.  Callers must not record
-    /// commit SHAs for failed indices in the lore_indexed_commits
-    /// table, otherwise those emails are permanently lost.
+    /// the emails that were not stored.  Callers must not record commit
+    /// SHAs for those indices in the lore_indexed_commits table,
+    /// otherwise those emails are permanently lost.
     ///
     /// `known_ids` holds every message_id already in the lore table
     /// (see get_lore_message_ids()) and is shared by all inserters.
     /// Emails whose message_id is stored are skipped.  New ids are
     /// claimed as pending before the append, then marked stored, or
     /// released if their email failed.  An email whose id another
-    /// inserter has pending is deferred: it is returned with the failed
-    /// indices, so its SHA is not recorded and the next run retries it
-    /// against the table.
+    /// inserter has pending is deferred: it is not stored and not
+    /// failed, and inserting it again once that inserter finishes either
+    /// skips it (the other copy was stored) or stores it.
     pub async fn insert_lore_emails(
         &self,
         emails: &[crate::types::LoreEmailInfo],
         known_ids: &std::sync::Mutex<HashMap<String, LoreIdState>>,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<LoreInsertOutcome> {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::collections::hash_map::Entry;
         use std::sync::Arc;
 
         if emails.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LoreInsertOutcome::default());
         }
 
         tracing::info!(
@@ -6797,7 +7040,11 @@ impl DatabaseManager {
 
         if new_indices.is_empty() {
             tracing::info!("insert_lore_emails: no new emails to insert");
-            return Ok(deferred);
+            return Ok(LoreInsertOutcome {
+                failed: Vec::new(),
+                deferred: Self::with_duplicate_copies(emails, deferred),
+                appended: 0,
+            });
         }
 
         // Use table.add() instead of merge_insert.  merge_insert in
@@ -6864,8 +7111,32 @@ impl DatabaseManager {
 
         tracing::info!("insert_lore_emails: Batch insertion complete");
 
-        failed_indices.extend(deferred);
-        Ok(failed_indices)
+        let appended = new_indices.len() - failed_indices.len();
+        Ok(LoreInsertOutcome {
+            failed: Self::with_duplicate_copies(emails, failed_indices),
+            deferred: Self::with_duplicate_copies(emails, deferred),
+            appended,
+        })
+    }
+
+    /// Extend `indices`, which name the one copy of each message_id that
+    /// insert_lore_emails() tried, to every email of the batch with that
+    /// message_id.  The other copies are no more stored than the one
+    /// tried, and their commits must not be recorded as indexed.
+    fn with_duplicate_copies(
+        emails: &[crate::types::LoreEmailInfo],
+        indices: Vec<usize>,
+    ) -> Vec<usize> {
+        let ids: std::collections::HashSet<&str> = indices
+            .iter()
+            .map(|&i| emails[i].message_id.as_str())
+            .collect();
+        emails
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| ids.contains(e.message_id.as_str()))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Return every message_id in the lore table, marked stored, for the
@@ -8879,24 +9150,187 @@ fn callees_of_arms(arms: &[crate::types::CalleeDefinition]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_git as git;
     use arrow::array::{ArrayRef, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
-    fn git(repo: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
+    /// The checkout cache stays current across workdir moves: an
+    /// everyday commit (loose ref) flips the answer through live HEAD
+    /// resolution, and a packed-refs rewrite flips the fingerprint so
+    /// the handle is re-discovered. The decision always resolves HEAD
+    /// live, so a missed fingerprint costs a re-discovery, never a
+    /// wrong overlay; the fingerprint still covers packed-refs so the
+    /// miss does not happen.
+    #[tokio::test]
+    async fn checkout_cache_tracks_workdir_moves() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "first"]);
+        let sha1 = head_of(repo);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            db_dir.path().to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        // First call populates the cache; a wrong SHA reads false.
+        assert!(db.is_checked_out(&sha1));
+        assert!(!db.is_checked_out(&"0".repeat(40)));
+        // An everyday commit moves a loose ref: HEAD bytes unchanged,
+        // answer must still flip through live resolution.
+        std::fs::write(repo.join("b.txt"), "two\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "second"]);
+        let sha2 = head_of(repo);
+        assert_ne!(sha1, sha2);
+        assert!(db.is_checked_out(&sha2));
+        assert!(!db.is_checked_out(&sha1));
+        // A packed-refs rewrite with HEAD bytes unchanged: the
+        // fingerprint must catch it, not go stale. The loose ref is
+        // removed first so the packed one governs.
+        git(repo, &["pack-refs", "--all"]);
+        // `pack-refs` prunes the loose refs it packs; remove in case.
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/main"));
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/master"));
+        // Point every packed branch at the first commit (the fixture
+        // has no tags): HEAD's bytes do not change, only packed-refs.
+        repoint_packed_refs(repo, &sha2, &sha1);
+        assert!(db.is_checked_out(&sha1));
+        assert!(!db.is_checked_out(&sha2));
+        // A linked worktree keeps packed-refs in the common dir: the
+        // same rewrite there must move a manager pointed at the
+        // worktree. The worktree HEAD (a symref) does not change bytes;
+        // only the common packed-refs does, at the same mtime, so bytes
+        // — not stat — must drive the fingerprint.
+        let wt = repo_dir.path().join("wt");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wtbr",
+                wt.to_str().unwrap(),
+                sha2.as_str(),
+            ],
+        );
+        let wtdb_dir = tempfile::tempdir().unwrap();
+        let wtdb = DatabaseManager::new(
+            wtdb_dir.path().to_str().unwrap(),
+            wt.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(wtdb.is_checked_out(&sha2));
+        git(repo, &["pack-refs", "--all"]);
+        let _ = std::fs::remove_file(repo.join(".git/refs/heads/wtbr"));
+        let packed = repo.join(".git/packed-refs");
+        let mtime = std::fs::metadata(&packed).unwrap().modified().unwrap();
+        repoint_common_packed_refs(repo, &sha2, &sha1);
+        std::fs::File::options()
+            .write(true)
+            .open(&packed)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert!(wtdb.is_checked_out(&sha1));
+        assert!(!wtdb.is_checked_out(&sha2));
+        // Retargeting commondir between stores with identical
+        // packed-refs bytes but different loose refs must move the
+        // manager: the pointer bytes join the fingerprint, so the
+        // rewrite re-discovers instead of serving the old store.
+        git(repo, &["commit", "-q", "--allow-empty", "-m", "third"]);
+        let sha3 = head_of(repo);
+        let repo2dir = tempfile::tempdir().unwrap();
+        git(
+            repo,
+            &[
+                "clone",
+                "-q",
+                repo.to_str().unwrap(),
+                repo2dir.path().to_str().unwrap(),
+            ],
+        );
+        let repo2 = repo2dir.path();
+        git(repo2, &["branch", "wtbr", &sha3]);
+        std::fs::copy(
+            repo.join(".git/packed-refs"),
+            repo2.join(".git/packed-refs"),
+        )
+        .unwrap();
+        let wt_gitdir = std::fs::read_to_string(wt.join(".git"))
+            .unwrap()
+            .trim()
+            .strip_prefix("gitdir: ")
+            .unwrap()
+            .to_string();
+        std::fs::write(
+            std::path::Path::new(&wt_gitdir).join("commondir"),
+            repo2.join(".git").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(wtdb.is_checked_out(&sha3));
+        assert!(!wtdb.is_checked_out(&sha1));
+    }
+
+    /// Point every packed ref currently at `from` to `to` in the COMMON
+    /// packed-refs (linked worktrees share it): the worktree gitdir has
+    /// no packed-refs of its own.
+    fn repoint_common_packed_refs(repo: &std::path::Path, from: &str, to: &str) {
+        let path = repo.join(".git/packed-refs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.len() < 41 {
+                lines.push(line.to_string());
+                continue;
+            }
+            let (old, rest) = line.split_at(40);
+            if old == from {
+                lines.push(format!("{to}{rest}"));
+            } else {
+                lines.push(format!("{old}{rest}"));
+            }
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+
+    fn head_of(repo: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
             .current_dir(repo)
-            // Do not inherit developer's git configuration.
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "Semcode Test")
-            .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
-            .env("GIT_COMMITTER_NAME", "Semcode Test")
-            .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "git {args:?} failed");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Point every packed ref currently at `from` to `to`, keeping
+    /// HEAD's bytes exactly as they were.
+    fn repoint_packed_refs(repo: &std::path::Path, from: &str, to: &str) {
+        let path = repo.join(".git/packed-refs");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with('#') || line.len() < 41 {
+                lines.push(line.to_string());
+                continue;
+            }
+            let (old, rest) = line.split_at(40);
+            if old == from {
+                lines.push(format!("{to}{rest}"));
+            } else {
+                lines.push(format!("{old}{rest}"));
+            }
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
     }
 
     #[tokio::test]
@@ -9442,6 +9876,684 @@ mod tests {
             .unwrap();
         assert_eq!(function_counts["target"], 2);
         assert_eq!(type_counts["duplicate"], 3);
+
+        std::fs::write(
+            repo_path.join("a.h"),
+            "void overlay_caller(void) { target(); overlay_only(); }\n",
+        )
+        .unwrap();
+        std::fs::remove_file(repo_path.join("b.h")).unwrap();
+        db.note_repl_command();
+
+        let (function_counts, type_counts) = db
+            .get_distinct_reference_counts_git_aware(
+                &["target".to_string(), "overlay_only".to_string()],
+                &["duplicate".to_string()],
+                &git_sha,
+            )
+            .await
+            .unwrap();
+        assert_eq!(function_counts["target"], 1);
+        assert_eq!(function_counts["overlay_only"], 1);
+        assert_eq!(type_counts["duplicate"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_overlay_built_at_head_does_not_answer_for_another_revision() {
+        // The overlay is one slot per process. Once a query at the checked-out
+        // commit fills it, a later query that may not use it (git-only mode,
+        // or a commit that is not checked out) must not read the edits left
+        // there, or it counts callers that exist only on top of a different
+        // revision.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(
+            repo_path.join("a.c"),
+            "void caller_one(void) { target(); }\n",
+        )
+        .unwrap();
+        git(repo_path, &["add", "a.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let first_sha = git(repo_path, &["rev-parse", "HEAD"]);
+        let a_hash = git(repo_path, &["rev-parse", &format!("{first_sha}:a.c")]);
+        let db = test_db(repo_path).await;
+        db.insert_functions(vec![FunctionInfo {
+            name: "caller_one".to_string(),
+            file_path: "a.c".to_string(),
+            git_file_hash: a_hash.clone(),
+            line_start: 1,
+            line_end: 1,
+            return_type: "void".to_string(),
+            parameters: Vec::new(),
+            body: "void caller_one(void) { target(); }".to_string(),
+            calls: Some(vec!["target".into()]),
+            types: None,
+            guard: None,
+            qualifier: None,
+        }])
+        .await
+        .unwrap();
+
+        std::fs::write(
+            repo_path.join("a.c"),
+            "void overlay_caller(void) { target(); overlay_only(); }\n",
+        )
+        .unwrap();
+        let targets = ["target".to_string(), "overlay_only".to_string()];
+
+        // At the checked-out commit the edit replaces the indexed row.
+        let (counts, _) = db
+            .get_distinct_reference_counts_git_aware(&targets, &[], &first_sha)
+            .await
+            .unwrap();
+        assert_eq!(counts["target"], 1);
+        assert_eq!(counts["overlay_only"], 1);
+        assert!(db.has_workdir_index(), "overlay was not built");
+
+        db.note_repl_command();
+        let attempted = db.workdir_index.read().unwrap().built_for.clone();
+        let (functions, types) = db
+            .get_distinct_reference_counts_git_aware(&[], &[], &first_sha)
+            .await
+            .unwrap();
+        assert!(functions.is_empty() && types.is_empty());
+        assert_eq!(
+            db.workdir_index.read().unwrap().built_for,
+            attempted,
+            "an empty target list refreshed the overlay"
+        );
+
+        let overlay = db
+            .find_all_functions_git_aware("overlay_caller", &first_sha)
+            .await
+            .unwrap();
+        assert_eq!(overlay.len(), 1, "the edit was missing: {overlay:?}");
+        assert_eq!(overlay[0].name, "overlay_caller");
+        let cached = db.git_manifest_cached(&first_sha).await.unwrap();
+        assert_ne!(cached.hash_of("a.c").as_deref(), Some(a_hash.as_str()));
+
+        // Git-only mode ignores the overlay that is still in the slot,
+        // including through a manifest cached while it applied.
+        db.set_git_only(true);
+        let cached = db.git_manifest_cached(&first_sha).await.unwrap();
+        assert_eq!(
+            cached.hash_of("a.c").as_deref(),
+            Some(a_hash.as_str()),
+            "git-only reused a manifest carrying the overlay's paths"
+        );
+        let (counts, _) = db
+            .get_distinct_reference_counts_git_aware(&targets, &[], &first_sha)
+            .await
+            .unwrap();
+        assert_eq!(counts["target"], 1, "indexed caller was skipped");
+        assert_eq!(counts["overlay_only"], 0, "git-only read the overlay");
+        db.set_git_only(false);
+
+        // Once HEAD moves on, the first commit is no longer checked out, so
+        // the overlay built on top of it no longer describes it either.
+        git(repo_path, &["commit", "-q", "-am", "second"]);
+        db.note_repl_command();
+        let (counts, _) = db
+            .get_distinct_reference_counts_git_aware(&targets, &[], &first_sha)
+            .await
+            .unwrap();
+        assert_eq!(counts["target"], 1, "indexed caller was skipped");
+        assert_eq!(
+            counts["overlay_only"], 0,
+            "a commit that is not checked out read the overlay"
+        );
+        assert!(
+            db.find_all_functions_git_aware("overlay_caller", &first_sha)
+                .await
+                .unwrap()
+                .is_empty(),
+            "on-miss lookup read the overlay for a commit that is not checked out"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overlay_from_an_earlier_head_is_rebuilt_without_a_new_command() {
+        // HEAD can move within one command. The overlay built at the old
+        // commit must not answer for the new one, where the file it recorded
+        // as modified is now clean.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        let file = repo_path.join("a.c");
+        std::fs::write(&file, "int old_function(void) { return 0; }\n").unwrap();
+        git(repo_path, &["add", "a.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+        let first_sha = git(repo_path, &["rev-parse", "HEAD"]);
+
+        let db = test_db(repo_path).await;
+
+        write_edited_function(repo_path);
+        assert_eq!(
+            db.find_all_functions_git_aware("edited_function", &first_sha)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "overlay at the first commit missed the edit"
+        );
+
+        git(repo_path, &["commit", "-q", "-am", "second"]);
+        let second_sha = git(repo_path, &["rev-parse", "HEAD"]);
+        let hash = git(repo_path, &["rev-parse", &format!("{second_sha}:a.c")]);
+        db.insert_functions(vec![test_function("edited_function", "a.c", &hash)])
+            .await
+            .unwrap();
+
+        let manifest = db.git_manifest_cached(&second_sha).await.unwrap();
+        assert_eq!(
+            manifest.hash_of("a.c").as_deref(),
+            Some(hash.as_str()),
+            "the first commit's overlay marked a.c modified at the second"
+        );
+        let found = db
+            .find_function_git_aware("edited_function", &second_sha)
+            .await
+            .unwrap()
+            .expect("indexed row at the second commit was skipped");
+        assert_eq!(found.git_file_hash, hash);
+
+        // A query that reads the overlay rebuilds it for the new HEAD.
+        assert!(db
+            .find_all_functions_git_aware("unknown", &second_sha)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.workdir_index
+                .read()
+                .unwrap()
+                .index
+                .as_ref()
+                .unwrap()
+                .head_sha(),
+            Some(second_sha.as_str())
+        );
+    }
+
+    async fn test_db(repo: &std::path::Path) -> DatabaseManager {
+        let db = DatabaseManager::new(
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        db
+    }
+
+    fn write_edited_function(repo: &std::path::Path) {
+        std::fs::write(
+            repo.join("a.c"),
+            "int edited_function(void) { return 1; }\n",
+        )
+        .unwrap();
+    }
+
+    /// Make the Git index unreadable so an overlay build fails. Returns a
+    /// closure that restores it.
+    fn corrupt_git_index(repo: &std::path::Path) -> impl FnOnce() {
+        let path = repo.join(".git/index");
+        let index = std::fs::read(&path).unwrap();
+        let mut bad = index.clone();
+        bad[..4].copy_from_slice(b"BAD!");
+        std::fs::write(&path, bad).unwrap();
+        move || std::fs::write(path, index).unwrap()
+    }
+
+    async fn overlay_checkout_fixture() -> (tempfile::TempDir, DatabaseManager, String, String) {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(
+            repo_path.join("a.c"),
+            "int committed_caller(void) { return target(); }\nint committed_second(void) { return 0; }\n",
+        )
+        .unwrap();
+        git(repo_path, &["add", "a.c"]);
+        git(repo_path, &["commit", "-q", "-m", "first"]);
+        let first_sha = git(repo_path, &["rev-parse", "HEAD"]);
+        let hash = git(repo_path, &["rev-parse", &format!("{first_sha}:a.c")]);
+        git(
+            repo_path,
+            &["commit", "--allow-empty", "-q", "-m", "second"],
+        );
+        let second_sha = git(repo_path, &["rev-parse", "HEAD"]);
+        git(repo_path, &["checkout", "-q", "--detach", &first_sha]);
+
+        let db = test_db(repo_path).await;
+        let mut caller = test_function("committed_caller", "a.c", &hash);
+        caller.body = "int committed_caller(void) { return target(); }".to_string();
+        let mut second = test_function("committed_second", "a.c", &hash);
+        second.calls = None;
+        db.insert_functions(vec![caller, second]).await.unwrap();
+
+        (repo_dir, db, first_sha, second_sha)
+    }
+
+    #[tokio::test]
+    async fn implementors_exclude_a_file_deleted_before_the_first_lookup() {
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        let hash = git(repo.path(), &["rev-parse", &format!("{first_sha}:a.c")]);
+        let registration = crate::types::Registration {
+            container_type: "ops".into(),
+            member: "read".into(),
+            target: "committed_caller".into(),
+            file_path: "a.c".into(),
+            git_file_hash: hash,
+            byte_start: 0,
+            line: 1,
+            enclosing_function: String::new(),
+            kind: crate::types::RegistrationKind::DesignatedInit,
+            container_base_type: None,
+            container_field: None,
+        };
+        db.insert_registrations(vec![registration.clone()])
+            .await
+            .unwrap();
+
+        std::fs::remove_file(repo.path().join("a.c")).unwrap();
+        assert!(db
+            .find_registrations_for_slot_git_aware("ops", "read", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+
+        git(repo.path(), &["checkout", "-q", "--", "a.c"]);
+        db.note_repl_command();
+        assert_eq!(
+            db.find_registrations_for_slot_git_aware("ops", "read", &first_sha)
+                .await
+                .unwrap(),
+            [registration]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_historical_lookup_ignores_an_overlay_when_head_has_moved() {
+        let (repo, db, first_sha, second_sha) = overlay_checkout_fixture().await;
+        let path = repo.path();
+        let file = path.join("a.c");
+        let clean = std::fs::read(&file).unwrap();
+        write_edited_function(path);
+        let lookup = |sha| db.find_all_functions_git_aware("edited_function", sha);
+        assert_eq!(lookup(&first_sha).await.unwrap().len(), 1);
+
+        assert!(lookup(&second_sha).await.unwrap().is_empty());
+
+        std::fs::write(&file, clean).unwrap();
+        git(path, &["checkout", "-q", "--detach", &second_sha]);
+        assert!(lookup(&first_sha).await.unwrap().is_empty());
+
+        git(path, &["checkout", "-q", "--detach", &first_sha]);
+        db.note_repl_command();
+        assert!(lookup(&first_sha).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_removed_overlay_is_rebuilt_without_a_new_command() {
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        write_edited_function(repo.path());
+        let lookup = || db.find_all_functions_git_aware("edited_function", &first_sha);
+        assert_eq!(lookup().await.unwrap().len(), 1);
+
+        db.clear_workdir_index();
+        assert_eq!(lookup().await.unwrap().len(), 1);
+
+        assert!(db.take_workdir_index().is_some());
+        assert_eq!(lookup().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_is_retried_in_the_next_command() {
+        // A build that failed once must be tried again in a later command
+        // rather than hide the working copy for the rest of the session.
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        let path = repo.path();
+        write_edited_function(path);
+        let restore_index = corrupt_git_index(path);
+        assert!(db
+            .find_all_functions_git_aware("edited_function", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+
+        restore_index();
+        db.note_repl_command();
+        assert_eq!(
+            db.find_all_functions_git_aware("edited_function", &first_sha)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a failed build was never retried without a new command"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_drops_an_overlay_from_another_commit() {
+        // Readers ignore it anyway; this pins that it is not kept around
+        // until some later build succeeds.
+        let (repo, db, first_sha, second_sha) = overlay_checkout_fixture().await;
+        let path = repo.path();
+        write_edited_function(path);
+        assert_eq!(
+            db.find_all_functions_git_aware("edited_function", &first_sha)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        git(path, &["checkout", "-q", "--detach", &second_sha]);
+        let _restore_index = corrupt_git_index(path);
+        assert!(db
+            .find_all_functions_git_aware("edited_function", &second_sha)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            !db.has_workdir_index(),
+            "the first commit's overlay outlived a failed build at the second"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_refresh_keeps_the_cached_manifest() {
+        // A refresh in each REPL command must not throw away the cached
+        // manifest, and the path lookups it holds, when the working copy is
+        // as it was. A real edit must still replace it.
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        let file = repo.path().join("a.c");
+        std::fs::write(&file, "int committed_caller(void) { return 1; }\n").unwrap();
+        db.search_functions_regex_git_aware("^committed_", &first_sha)
+            .await
+            .unwrap();
+        let before = db.git_manifest_cached(&first_sha).await.unwrap();
+
+        db.note_repl_command();
+        db.search_functions_regex_git_aware("^committed_", &first_sha)
+            .await
+            .unwrap();
+        let after = db.git_manifest_cached(&first_sha).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged refresh discarded the cached manifest"
+        );
+
+        std::fs::write(&file, "int committed_caller(void) { return 2; }\n").unwrap();
+        db.note_repl_command();
+        db.search_functions_regex_git_aware("^committed_", &first_sha)
+            .await
+            .unwrap();
+        let edited = db.git_manifest_cached(&first_sha).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&after, &edited),
+            "an edit reused the manifest cached before it"
+        );
+        assert_ne!(after.hash_of("a.c"), edited.hash_of("a.c"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_overlay_build_is_tried_once_per_command() {
+        // Per-name lookups each read the overlay. A build that fails must
+        // not be retried by every one of them, only in the next command.
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        db.note_repl_command();
+        write_edited_function(repo.path());
+        let restore_index = corrupt_git_index(repo.path());
+
+        let lookup = || db.find_all_functions_git_aware("edited_function", &first_sha);
+        assert!(lookup().await.unwrap().is_empty());
+        restore_index();
+        assert!(lookup().await.unwrap().is_empty());
+
+        db.note_repl_command();
+        assert_eq!(lookup().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rebuilding_an_overlay_after_a_round_trip_replaces_the_cached_manifest() {
+        let (repo, db, first_sha, second_sha) = overlay_checkout_fixture().await;
+        let path = repo.path();
+        std::fs::remove_file(path.join("a.c")).unwrap();
+        assert!(db
+            .search_functions_regex_git_aware("^committed_", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .git_manifest_cached(&first_sha)
+            .await
+            .unwrap()
+            .hash_of("a.c")
+            .is_none());
+
+        git(path, &["checkout", "-q", "--", "a.c"]);
+        // Regex searches rebuild the overlay without replacing the cached manifest.
+        for sha in [&second_sha, &first_sha] {
+            git(path, &["checkout", "-q", "--detach", sha]);
+            assert_eq!(
+                db.search_functions_regex_git_aware("^committed_", sha)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+
+        assert!(db
+            .git_manifest_cached(&first_sha)
+            .await
+            .unwrap()
+            .hash_of("a.c")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn relationship_memos_follow_the_overlay_used_in_the_manifest() {
+        let (repo, db, first_sha, second_sha) = overlay_checkout_fixture().await;
+        let path = repo.path();
+        git(path, &["checkout", "-q", "--detach", &second_sha]);
+        assert_eq!(
+            db.get_function_callers_git_aware("target", &first_sha)
+                .await
+                .unwrap(),
+            ["committed_caller"]
+        );
+        assert_eq!(
+            db.get_function_callees_git_aware("committed_caller", &first_sha)
+                .await
+                .unwrap(),
+            ["target"]
+        );
+
+        git(path, &["checkout", "-q", "--detach", &first_sha]);
+        std::fs::write(path.join("a.c"), "int replacement(void) { return 42; }\n").unwrap();
+        assert!(db
+            .get_function_callers_git_aware("target", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .get_function_callees_git_aware("committed_caller", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_does_not_let_an_old_overlay_answer() {
+        let (repo, db, first_sha, second_sha) = overlay_checkout_fixture().await;
+        let path = repo.path();
+        std::fs::remove_file(path.join("a.c")).unwrap();
+        assert!(db
+            .search_functions_regex_git_aware("^committed_", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+        git(path, &["checkout", "-q", "--", "a.c"]);
+        git(path, &["checkout", "-q", "--detach", &second_sha]);
+
+        db.note_repl_command();
+        let restore_index = corrupt_git_index(path);
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.reopen().unwrap())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let matches = db
+            .search_functions_regex_git_aware("^committed_", &second_sha)
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(matches.len(), 2, "the old overlay hid indexed rows");
+        assert_eq!(
+            std::fs::read_to_string(log.path())
+                .unwrap()
+                .matches("workdir: could not ")
+                .count(),
+            1
+        );
+
+        restore_index();
+        std::fs::remove_file(path.join("a.c")).unwrap();
+        db.note_repl_command();
+        assert!(db
+            .search_functions_regex_git_aware("^committed_", &second_sha)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cold_lookup_includes_a_staged_definition_at_a_path_absent_from_head() {
+        // b.c is known from another indexed revision but absent from HEAD.
+        // Staging it adds a second definition, which an exact lookup reports
+        // alongside the committed one.
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        db.insert_functions(vec![test_function(
+            "committed_caller",
+            "b.c",
+            &"0".repeat(40),
+        )])
+        .await
+        .unwrap();
+        std::fs::write(
+            repo.path().join("b.c"),
+            "int committed_caller(void) { return 2; }\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "b.c"]);
+
+        let mut files: Vec<_> = db
+            .find_all_functions_git_aware("committed_caller", &first_sha)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.file_path)
+            .collect();
+        files.sort();
+        assert_eq!(files, ["a.c", "b.c"]);
+    }
+
+    #[tokio::test]
+    async fn edits_discarded_across_an_orphan_checkout_do_not_answer() {
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        let path = repo.path();
+        let file = path.join("a.c");
+        let clean = std::fs::read(&file).unwrap();
+        std::fs::write(&file, "int edited_function(void) { return target(); }\n").unwrap();
+        let callers = || db.get_function_callers_git_aware("target", &first_sha);
+        assert_eq!(callers().await.unwrap(), ["edited_function"]);
+
+        std::fs::write(&file, clean).unwrap();
+        // While HEAD is unborn the commit is historical: indexed rows answer.
+        git(path, &["checkout", "-q", "--orphan", "unborn"]);
+        db.note_repl_command();
+        assert_eq!(callers().await.unwrap(), ["committed_caller"]);
+
+        git(path, &["checkout", "-q", "-f", "--detach", &first_sha]);
+        db.note_repl_command();
+        assert_eq!(callers().await.unwrap(), ["committed_caller"]);
+    }
+
+    #[tokio::test]
+    async fn relationship_memos_hold_only_the_current_command() {
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        let file = repo.path().join("a.c");
+        let mut sizes = Vec::new();
+        for n in 0..3 {
+            std::fs::write(
+                &file,
+                format!("int caller_{n}(void) {{ return target(); }}\n"),
+            )
+            .unwrap();
+            db.note_repl_command();
+            db.get_function_callers_git_aware("target", &first_sha)
+                .await
+                .unwrap();
+            db.get_function_callees_git_aware("committed_caller", &first_sha)
+                .await
+                .unwrap();
+            sizes.push((
+                db.callers_memo.read().unwrap().len(),
+                db.callees_memo.read().unwrap().len(),
+            ));
+        }
+        assert!(
+            sizes.windows(2).all(|w| w[0] == w[1]),
+            "memos grew: {sizes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regex_search_excludes_a_function_removed_from_a_dirty_file() {
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        write_edited_function(repo.path());
+        assert!(db
+            .search_functions_regex_git_aware("^committed_caller$", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_functions_regex_git_aware("^edited_function$", &first_sha)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn set_workdir_index_marks_the_current_command_built() {
+        let (repo, db, first_sha, _) = overlay_checkout_fixture().await;
+        let workdir = WorkdirIndex::build(repo.path()).unwrap();
+        db.set_workdir_index(workdir);
+
+        // Editing after installing an overlay must not trigger an immediate
+        // rebuild within the same command; the next command refreshes it.
+        write_edited_function(repo.path());
+        assert!(db
+            .find_all_functions_git_aware("edited_function", &first_sha)
+            .await
+            .unwrap()
+            .is_empty());
+
+        db.note_repl_command();
+        assert_eq!(
+            db.find_all_functions_git_aware("edited_function", &first_sha)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

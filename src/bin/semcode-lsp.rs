@@ -144,6 +144,9 @@ impl SemcodeLspBackend {
         let Some(db) = db_guard.as_ref() else {
             return Vec::new();
         };
+        // Each request is a new command: the working copy or HEAD may have
+        // changed since the last one.
+        db.note_repl_command();
 
         // Try git-aware lookup first if we have a git SHA
         let git_sha_guard = self.git_sha.lock().await;
@@ -235,6 +238,9 @@ impl SemcodeLspBackend {
             Some(db) => db,
             None => return Vec::new(),
         };
+        // Each request is a new command: the working copy or HEAD may have
+        // changed since the last one.
+        db.note_repl_command();
 
         // Try git-aware lookup first if we have a git SHA
         let git_sha_guard = self.git_sha.lock().await;

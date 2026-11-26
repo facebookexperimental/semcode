@@ -605,6 +605,24 @@ impl WorkdirIndex {
         })
     }
 
+    /// Every macro row stored for one file: the dirty-file scope source.
+    /// A dirty file's `#define`/`#undef` intervals cannot be rescanned (the
+    /// overlay keeps rows, not text), so each overlay macro row stands as
+    /// its own single-interval scope.
+    pub(crate) fn file_macros(&self, file_path: &str) -> Vec<&FunctionInfo> {
+        self.macros
+            .values()
+            .flatten()
+            .filter(|row| row.file_path == file_path)
+            .collect()
+    }
+
+    /// Every file the overlay holds rows for: the dirty set at this
+    /// snapshot. Handover re-derivation walks these files' macro bodies.
+    pub(crate) fn dirty_files(&self) -> Vec<String> {
+        self.dirty_manifest.keys().cloned().collect()
+    }
+
     /// Check if a file path has uncommitted changes.
     pub fn is_dirty(&self, file_path: &str) -> bool {
         self.dirty_manifest.contains_key(file_path)
@@ -618,6 +636,17 @@ impl WorkdirIndex {
     /// Returns true if no dirty files were detected.
     pub fn is_empty(&self) -> bool {
         self.dirty_manifest.is_empty() && self.deleted_files.is_empty()
+    }
+
+    /// The commit HEAD named when this overlay was built. Its dirty and
+    /// deleted paths are relative to that commit and to no other.
+    pub fn head_sha(&self) -> Option<&str> {
+        self.head_sha.as_deref()
+    }
+
+    /// Whether this overlay was built with `sha` checked out.
+    pub fn built_at(&self, sha: &str) -> bool {
+        self.head_sha() == Some(sha)
     }
 
     /// Number of dirty files indexed.
@@ -649,6 +678,15 @@ impl WorkdirIndex {
     /// Get the set of deleted file paths.
     pub fn deleted_file_paths(&self) -> &HashSet<String> {
         &self.deleted_files
+    }
+
+    /// Paths modified, staged, or deleted in the working copy.
+    pub fn overlaid_paths(&self) -> HashSet<String> {
+        self.dirty_manifest
+            .keys()
+            .chain(&self.deleted_files)
+            .cloned()
+            .collect()
     }
 
     /// Iterator over all functions and macros in the overlay.

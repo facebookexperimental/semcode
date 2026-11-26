@@ -22,8 +22,8 @@ async fn database() -> (tempfile::TempDir, DatabaseManager) {
 
 async fn insert(db: &DatabaseManager, emails: &[LoreEmailInfo]) {
     let known_ids = std::sync::Mutex::new(db.get_lore_message_ids().await.unwrap());
-    let failed = db.insert_lore_emails(emails, &known_ids).await.unwrap();
-    assert!(failed.is_empty(), "emails not stored: {failed:?}");
+    let outcome = db.insert_lore_emails(emails, &known_ids).await.unwrap();
+    assert!(outcome.is_complete(), "emails not stored: {outcome:?}");
     db.create_lore_fts_indices().await.unwrap();
 }
 

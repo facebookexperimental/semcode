@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::git::walk_tree_at_commit_with_repo;
-use crate::indexer::{list_shas_in_range, process_commits_pipeline, recv_shared};
+use crate::indexer::{
+    counted_problem, join_failed, list_shas_in_range, plural, process_commits_pipeline, recv_shared,
+};
 use crate::types::{ArgumentFunction, GlobalVariable};
 use crate::{
     DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
@@ -97,10 +99,19 @@ struct StreamingConfig {
     /// Repo-relative path prefixes bounding enumeration. Empty = whole tree.
     scope_prefixes: Vec<String>,
     no_macros: bool,
-    processed_files: Arc<HashSet<String>>,
+    processed_files: Arc<HashSet<(String, String)>>,
     num_workers: usize,
     db_manager: Arc<DatabaseManager>,
     num_inserters: usize,
+}
+
+/// Generator send counts, shared across the range pipeline's generator
+/// threads and read back into the run stats at join time.
+#[derive(Clone, Default)]
+struct SendCounters {
+    sent: Arc<AtomicUsize>,
+    filtered_processed: Arc<AtomicUsize>,
+    filtered_sent: Arc<AtomicUsize>,
 }
 
 /// Depth of the extract-to-insert result channel, shared by both streaming
@@ -137,27 +148,12 @@ struct GitTupleStats {
     /// Generators that failed or panicked and workers that stopped early or
     /// panicked. Either leaves files nobody counted unread.
     failed_threads: usize,
-}
-
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
-/// Join pipeline threads and count the ones that failed: returned an error
-/// (a generator that could not list its files, a worker that stopped early)
-/// or panicked. Either leaves files no counter saw, so any failure fails the
-/// run.
-fn join_failed<T>(kind: &str, handles: Vec<thread::JoinHandle<Result<T>>>) -> usize {
-    let mut failed = 0;
-    for (id, handle) in handles.into_iter().enumerate() {
-        match handle.join() {
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => tracing::error!("{kind} {id} failed: {e:#}"),
-            Err(panic) => tracing::error!("{kind} {id} thread panicked: {panic:?}"),
-        }
-        failed += 1;
-    }
-    failed
+    /// Files the generators handed to workers, and files they skipped as
+    /// already processed or already sent. Surfaced so a rerun can assert
+    /// it sent nothing.
+    sent_files: usize,
+    filtered_already_processed: usize,
+    filtered_already_sent: usize,
 }
 
 impl GitTupleStats {
@@ -174,19 +170,18 @@ impl GitTupleStats {
     /// What the run left undone, for the summary and the error, or `None`
     /// when it finished.
     fn incomplete_summary(&self) -> Option<String> {
-        let mut problems = Vec::new();
-        if self.failed_threads > 0 {
-            problems.push(format!(
-                "{} failed",
-                plural(self.failed_threads, "pipeline thread", "pipeline threads")
-            ));
-        }
-        if self.unread_files > 0 {
-            problems.push(format!(
-                "{} could not be read",
-                plural(self.unread_files, "file", "files")
-            ));
-        }
+        let mut problems: Vec<_> = [
+            counted_problem(
+                self.failed_threads,
+                "pipeline thread",
+                "pipeline threads",
+                "failed",
+            ),
+            counted_problem(self.unread_files, "file", "files", "could not be read"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if self.failed_batches > 0 {
             problems.push(format!(
                 "{} ({}) {} not stored",
@@ -323,9 +318,10 @@ fn stream_git_file_tuples_batch(
     commit_batch: Vec<String>,
     extensions: Vec<String>,
     tuple_tx: mpsc::Sender<GitFileTuple>,
-    processed_files: Arc<HashSet<String>>,
-    sent_in_this_run: Arc<DashSet<String>>,
+    processed_files: Arc<HashSet<(String, String)>>,
+    sent_in_this_run: Arc<DashSet<(String, String)>>,
     scope_prefixes: Vec<String>,
+    send_counters: SendCounters,
 ) -> Result<()> {
     let repo = repo.to_thread_local();
 
@@ -343,16 +339,34 @@ fn stream_git_file_tuples_batch(
             let file_sha = manifest_entry.object_id.to_string();
             total_files += 1;
 
-            // Filter out files already processed in database
-            if processed_files.contains(&file_sha) {
+            // Filter out files already processed in database. The key is
+            // (blob, path): analysis can read the path (the assembly arch
+            // gate does), so a moved file re-analyzes even when its blob
+            // did not change. Rows for the old path stay in the store,
+            // but the manifest admits only the queried revision's (path,
+            // hash) pairs, so they answer no query asked at a newer SHA.
+            // One key serves both checks below: identical copies must
+            // both read, or the loser's rows depend on enumeration
+            // order — and queries match rows on (name, path, hash), so
+            // one row per path is the correct state. A second identical
+            // run writes nothing new: every pair records as processed.
+            let pair_key = (
+                file_sha.clone(),
+                manifest_entry.relative_path.to_string_lossy().to_string(),
+            );
+            if processed_files.contains(&pair_key) {
                 filtered_already_processed += 1;
+                send_counters
+                    .filtered_processed
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
-            // Filter out files already sent in this run (lock-free with DashSet)
-            if !sent_in_this_run.insert(file_sha.clone()) {
+            // Filter out files already sent in this run (lock-free with DashSet).
+            if !sent_in_this_run.insert(pair_key) {
                 // File already sent by another generator
                 filtered_already_sent += 1;
+                send_counters.filtered_sent.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
@@ -368,6 +382,7 @@ fn stream_git_file_tuples_batch(
                 break;
             }
             sent_files += 1;
+            send_counters.sent.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -889,6 +904,9 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     // Shared deduplication set across all generators (lock-free)
     let sent_in_this_run = Arc::new(DashSet::new());
 
+    // Shared send counts, read back into the run stats at join time.
+    let send_counters = SendCounters::default();
+
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
@@ -931,6 +949,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         let generator_processed_files = config.processed_files.clone();
         let generator_sent_in_run = sent_in_this_run.clone();
         let generator_scope = config.scope_prefixes.clone();
+        let generator_counters = send_counters.clone();
 
         let handle = thread::spawn(move || {
             stream_git_file_tuples_batch(
@@ -942,6 +961,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                 generator_processed_files,
                 generator_sent_in_run,
                 generator_scope,
+                generator_counters,
             )
         });
         generator_handles.push(handle);
@@ -1067,6 +1087,9 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
         failed_files: failed_files.load(Ordering::Relaxed),
         unread_files: unread_files.load(Ordering::Relaxed),
         failed_threads,
+        sent_files: send_counters.sent.load(Ordering::Relaxed),
+        filtered_already_processed: send_counters.filtered_processed.load(Ordering::Relaxed),
+        filtered_already_sent: send_counters.filtered_sent.load(Ordering::Relaxed),
     };
 
     // Finish progress bar
@@ -1088,7 +1111,7 @@ struct TreeStreamingConfig {
     /// Repo-relative path prefixes bounding enumeration. Empty = whole tree.
     scope_prefixes: Vec<String>,
     no_macros: bool,
-    processed_files: Arc<HashSet<String>>,
+    processed_files: Arc<HashSet<(String, String)>>,
     num_workers: usize,
     db_manager: Arc<DatabaseManager>,
     num_inserters: usize,
@@ -1100,7 +1123,7 @@ fn stream_tree_file_tuples(
     commit_sha: String,
     extensions: Vec<String>,
     tuple_tx: mpsc::Sender<GitFileTuple>,
-    processed_files: Arc<HashSet<String>>,
+    processed_files: Arc<HashSet<(String, String)>>,
     scope_prefixes: Vec<String>,
 ) -> Result<usize> {
     let mut sent_files = 0;
@@ -1126,8 +1149,9 @@ fn stream_tree_file_tuples(
 
         let file_sha = object_id.to_string();
 
-        // Filter out files already processed in database
-        if processed_files.contains(&file_sha) {
+        // Filter out files already processed in database, keyed by (blob,
+        // path) as above: a moved file re-analyzes under its new path.
+        if processed_files.contains(&(file_sha.clone(), relative_path.to_string())) {
             filtered_already_processed += 1;
             return Ok(());
         }
@@ -1334,8 +1358,8 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     }
 
     // Wait for the generator, then all workers, to complete
-    let failed_threads = join_failed("Tree generator", vec![generator_handle])
-        + join_failed("Worker", worker_handles);
+    let failed_threads =
+        join_failed("Tree generator", [generator_handle]) + join_failed("Worker", worker_handles);
 
     // Wait for all inserter tasks to finish
     for (inserter_id, (handle, in_flight_files)) in inserter_handles.into_iter().enumerate() {
@@ -1355,6 +1379,11 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
         failed_files: failed_files.load(Ordering::Relaxed),
         unread_files: unread_files.load(Ordering::Relaxed),
         failed_threads,
+        // The tree generator does not count sends: only the range path
+        // reports them.
+        sent_files: 0,
+        filtered_already_processed: 0,
+        filtered_already_sent: 0,
     };
 
     pb.finish_with_message(format!(
@@ -1390,7 +1419,8 @@ pub async fn process_git_tree(
     // changed, the reading of it has, so it is absent from this set and gets
     // read again on its own account.
     info!("Loading processed files from database for deduplication");
-    let processed_files: HashSet<String> = db_manager.processed_by_this_extractor().await?;
+    let processed_files: HashSet<(String, String)> =
+        db_manager.processed_by_this_extractor().await?;
 
     info!(
         "Found {} already processed files in database",
@@ -1526,7 +1556,141 @@ pub async fn process_git_tree(
     Ok(())
 }
 
-/// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
+/// What one `process_git_range` run handed to its workers: files sent
+/// vs files skipped as already processed or already sent in this run.
+/// A second identical run writes nothing new: every pair recorded as
+/// processed on the first.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RangeStats {
+    pub sent: usize,
+    pub filtered_already_processed: usize,
+    pub filtered_already_sent: usize,
+}
+
+/// Resolve what an incremental run reads with: the recorded build
+/// options win when present, otherwise every supported extension with
+/// macros on. Pure core shared by `incremental_options` and
+/// `startup_decision`, so the default lives in one place. (The stale
+/// rebuild's fallback is the indexer's defaults instead: an index too
+/// old to record its build predates the current toolchain.)
+pub fn resolve_options(recorded: &Option<(Vec<String>, bool)>) -> (Vec<String>, bool) {
+    match recorded {
+        Some((extensions, no_macros)) => (extensions.clone(), *no_macros),
+        None => (crate::file_extensions::supported_extensions(), false),
+    }
+}
+
+/// Options for an incremental run; see `resolve_options`.
+pub async fn incremental_options(db_manager: &DatabaseManager) -> Result<(Vec<String>, bool)> {
+    Ok(resolve_options(&db_manager.recorded_index_options().await?))
+}
+
+/// Changed files that can trigger or feed an incremental run: added,
+/// modified, or renamed, carrying a new blob, with an extension the index
+/// reads. Renames count by their destination: analysis reads the path, so
+/// the old path's rows are another revision's business. The extension
+/// filter is the recorded build options when the index has them — the
+/// same exact match the range path uses — so an explicit opt-out neither
+/// triggers a run nor feeds one.
+pub fn indexable_changes<'a>(
+    changed_files: &'a [crate::git::ChangedFile],
+    recorded_extensions: &Option<Vec<String>>,
+) -> Vec<&'a crate::git::ChangedFile> {
+    changed_files
+        .iter()
+        .filter(|cf| {
+            matches!(
+                cf.change_type,
+                crate::git::ChangeType::Added
+                    | crate::git::ChangeType::Modified
+                    | crate::git::ChangeType::Renamed
+            ) && cf.new_file_hash.is_some()
+                && match recorded_extensions {
+                    Some(extensions) => std::path::Path::new(&cf.path)
+                        .extension()
+                        .is_some_and(|ext| extensions.contains(&ext.to_string_lossy().to_string())),
+                    None => crate::file_extensions::is_supported_for_analysis(&cf.path),
+                }
+        })
+        .collect()
+}
+
+/// What an interactive or background startup should do about HEAD.
+pub enum StartupDecision {
+    /// Coverage is known and nothing is pending: stay out.
+    Skip,
+    /// Index HEAD with these options.
+    Run {
+        extensions: Vec<String>,
+        no_macros: bool,
+    },
+}
+
+/// One shared startup decision for the interactive and MCP entry
+/// points: the recorded build options are read once and feed both the
+/// trigger and the run, and a read error propagates instead of
+/// defaulting to every extension with macros on. An empty change list
+/// is unknown, not nothing-to-do: the range walks HEAD's whole
+/// manifest, so a tip with nothing new still picks up files a missed
+/// run left behind (a Makefile-only HEAD after an unindexed C change).
+/// Skip only when there is at least one indexable change and all of
+/// indexed; the pair filter makes an already-covered tree write
+/// nothing new.
+pub async fn startup_decision(
+    db_manager: &DatabaseManager,
+    changed_files: &[crate::git::ChangedFile],
+) -> Result<StartupDecision> {
+    let recorded = db_manager.recorded_index_options().await?;
+    let (extensions, no_macros) = resolve_options(&recorded);
+    let filter = recorded.map(|(extensions, _)| extensions);
+    let changes = indexable_changes(changed_files, &filter);
+    if changes.is_empty() {
+        return Ok(StartupDecision::Run {
+            extensions,
+            no_macros,
+        });
+    }
+    if first_pending_change(db_manager, &changes).await?.is_some() {
+        return Ok(StartupDecision::Run {
+            extensions,
+            no_macros,
+        });
+    }
+    Ok(StartupDecision::Skip)
+}
+
+/// The first changed file not yet indexed at its path, if any: a move
+/// re-analyzes under the new path even when its blob did not change.
+/// One targeted query per file up to a handful of files; above that a
+/// single pairs load wins (each targeted query opens the table, ~1 ms
+/// a file against ~30 ms for the whole load — the break-even sits near
+/// 32 files on a kernel-sized index).
+pub async fn first_pending_change(
+    db_manager: &DatabaseManager,
+    changes: &[&crate::git::ChangedFile],
+) -> Result<Option<(String, String)>> {
+    if changes.len() > 32 {
+        let pairs = db_manager.get_processed_file_pairs().await?;
+        return Ok(changes.iter().find_map(|cf| {
+            cf.new_file_hash.as_ref().and_then(|hash| {
+                let key = (cf.path.clone(), hash.clone());
+                (!pairs.contains(&key)).then_some(key)
+            })
+        }));
+    }
+    for cf in changes {
+        if let Some(new_hash) = &cf.new_file_hash {
+            if !db_manager
+                .is_file_processed_at_path(new_hash, &cf.path)
+                .await?
+            {
+                return Ok(Some((cf.path.clone(), new_hash.clone())));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Process git range using streaming file tuple pipeline
 /// This is the shared implementation used by semcode-index, query, and MCP tools
 pub async fn process_git_range(
@@ -1537,7 +1701,7 @@ pub async fn process_git_range(
     no_macros: bool,
     db_threads: usize,
     includes: &[std::path::PathBuf],
-) -> Result<()> {
+) -> Result<RangeStats> {
     info!(
         "Processing git range {} using streaming file tuple pipeline",
         git_range
@@ -1549,7 +1713,8 @@ pub async fn process_git_range(
     // in the tree path, a row written by an older extractor does not count as
     // processed: the file has not changed, the reading of it has.
     info!("Loading processed files from database for deduplication");
-    let processed_files: HashSet<String> = db_manager.processed_by_this_extractor().await?;
+    let processed_files: HashSet<(String, String)> =
+        db_manager.processed_by_this_extractor().await?;
 
     info!(
         "Found {} already processed files in database",
@@ -1715,12 +1880,176 @@ pub async fn process_git_range(
     // Do not write a database version. Part of the database was updated here,
     // but other parts could have been written by an older version of semcode.
 
-    stats.incomplete_error()
+    stats.incomplete_error().map(|()| RangeStats {
+        sent: stats.sent_files,
+        filtered_already_processed: stats.filtered_already_processed,
+        filtered_already_sent: stats.filtered_already_sent,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn decision_db(
+        dir: &tempfile::TempDir,
+        name: &str,
+        recorded: Option<(Vec<String>, bool)>,
+    ) -> crate::DatabaseManager {
+        let db = crate::DatabaseManager::new(
+            dir.path().join(name).to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        if let Some((extensions, no_macros)) = recorded {
+            db.record_index_build(&extensions, no_macros, false)
+                .await
+                .unwrap();
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn startup_decision_runs_on_unknown() {
+        // An empty change list is unknown, not nothing-to-do: the range
+        // walks HEAD's whole manifest, so a tip with nothing new still
+        // picks up files a missed run left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let run_db = decision_db(&dir, "run.db", None).await;
+        match startup_decision(&run_db, &[]).await.unwrap() {
+            StartupDecision::Run {
+                extensions,
+                no_macros,
+            } => {
+                assert_eq!(extensions, crate::file_extensions::supported_extensions());
+                assert!(!no_macros);
+            }
+            StartupDecision::Skip => panic!("fresh index with empty HEAD must run"),
+        }
+        let skip_db = decision_db(&dir, "skip.db", Some((vec!["c".to_string()], true))).await;
+        match startup_decision(&skip_db, &[]).await.unwrap() {
+            StartupDecision::Run { .. } => {}
+            StartupDecision::Skip => panic!("recorded build with empty HEAD must run"),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_decision_looks_past_the_first_change() {
+        // A first-only check would stop here: the first change is
+        // indexed, the second is not, so the decision must still run.
+        let dir = tempfile::tempdir().unwrap();
+        let db = decision_db(&dir, "past.db", Some((vec!["c".to_string()], false))).await;
+        db.mark_files_processed(vec![crate::ProcessedFileRecord {
+            file: "a.c".to_string(),
+            git_sha: None,
+            git_file_sha: "blob-a".to_string(),
+            extractor_version: None,
+        }])
+        .await
+        .unwrap();
+        let files = ["a.c", "b.c"]
+            .into_iter()
+            .map(|path| crate::git::ChangedFile {
+                path: path.to_string(),
+                old_file_hash: None,
+                new_file_hash: Some(if path == "a.c" {
+                    "blob-a".to_string()
+                } else {
+                    "blob-b".to_string()
+                }),
+                change_type: crate::git::ChangeType::Modified,
+            })
+            .collect::<Vec<_>>();
+        match startup_decision(&db, &files).await.unwrap() {
+            StartupDecision::Run { .. } => {}
+            StartupDecision::Skip => panic!("a pending second change must run"),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_pending_change_scales_past_32_files() {
+        // Above 32 files the check loads the pairs table once instead of
+        // querying per file: both paths must agree on the first gap, and
+        // on nothing pending once the gap is marked too. 32 itself still
+        // takes the per-file path.
+        let dir = tempfile::tempdir().unwrap();
+        let db = decision_db(&dir, "many.db", None).await;
+        for count in [32usize, 40] {
+            let gap = count - 1;
+            let records = (0..count)
+                .filter(|i| *i != gap)
+                .map(|i| crate::ProcessedFileRecord {
+                    file: format!("f{i}.c"),
+                    git_sha: None,
+                    git_file_sha: format!("blob{i}"),
+                    extractor_version: None,
+                })
+                .collect::<Vec<_>>();
+            db.mark_files_processed(records).await.unwrap();
+            let files = (0..count)
+                .map(|i| crate::git::ChangedFile {
+                    path: format!("f{i}.c"),
+                    old_file_hash: None,
+                    new_file_hash: Some(format!("blob{i}")),
+                    change_type: crate::git::ChangeType::Modified,
+                })
+                .collect::<Vec<_>>();
+            let refs = files.iter().collect::<Vec<_>>();
+            assert_eq!(
+                first_pending_change(&db, &refs).await.unwrap(),
+                Some((format!("f{gap}.c"), format!("blob{gap}")))
+            );
+            db.mark_files_processed(vec![crate::ProcessedFileRecord {
+                file: format!("f{gap}.c"),
+                git_sha: None,
+                git_file_sha: format!("blob{gap}"),
+                extractor_version: None,
+            }])
+            .await
+            .unwrap();
+            assert_eq!(first_pending_change(&db, &refs).await.unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn indexable_changes_honors_recorded_options() {
+        // The trigger filter is the recorded build options when the index
+        // has them: an opted-out extension neither triggers a run nor
+        // feeds one. Renames count by destination; deletions never do.
+        let changed = |path: &str, change_type: crate::git::ChangeType| crate::git::ChangedFile {
+            path: path.to_string(),
+            old_file_hash: None,
+            new_file_hash: Some("abc123".to_string()),
+            change_type,
+        };
+        let files = vec![
+            changed("a.py", crate::git::ChangeType::Added),
+            changed("b.c", crate::git::ChangeType::Modified),
+            changed("c.S", crate::git::ChangeType::Renamed),
+            crate::git::ChangedFile {
+                path: "d.c".to_string(),
+                old_file_hash: Some("abc123".to_string()),
+                new_file_hash: None,
+                change_type: crate::git::ChangeType::Deleted,
+            },
+        ];
+        let paths = |changes: Vec<&crate::git::ChangedFile>| {
+            changes
+                .into_iter()
+                .map(|cf| cf.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(indexable_changes(&files, &Some(vec!["c".to_string()]))),
+            vec!["b.c".to_string()]
+        );
+        assert_eq!(
+            paths(indexable_changes(&files, &None)),
+            vec!["a.py".to_string(), "b.c".to_string(), "c.S".to_string()]
+        );
+    }
 
     fn test_batch() -> GitTupleResults {
         GitTupleResults {
@@ -2161,6 +2490,7 @@ mod tests {
             Arc::new(HashSet::new()),
             Arc::new(DashSet::new()),
             Vec::new(),
+            SendCounters::default(),
         )
         .unwrap();
         assert_eq!(open_packs(&generator_repo), 1);
