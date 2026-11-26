@@ -7,9 +7,9 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
-    ArgumentFunction, CallEdge, DispatchKind, DispatchSite, FieldInfo, FunctionInfo,
-    GlobalTypeRegistry, GlobalVariable, MacroParams, ParameterInfo, Registration, RegistrationKind,
-    TypeInfo, ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
+    bare_use_site_target, ArgumentFunction, CallEdge, DispatchKind, DispatchSite, FieldInfo,
+    FunctionInfo, GlobalTypeRegistry, GlobalVariable, MacroParams, ParameterInfo, Registration,
+    RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -51,7 +51,7 @@ pub enum Language {
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 8;
+pub const EXTRACTOR_VERSION: u32 = 10;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -2821,7 +2821,8 @@ impl TreeSitterAnalyzer {
 
         let bound = Self::value_names(tree.root_node(), source_code);
         let locals = Self::collect_local_struct_types(tree.root_node(), source_code);
-        let walk_b = Self::collect_walk_b_facts(tree.root_node(), source_code, &bound, &locals);
+        let walk_b =
+            Self::collect_walk_b_facts(tree.root_node(), source_code, &bound, &locals, language);
         extraction.pointer_vars = walk_b.pointer_vars;
         extraction.registrations = walk_b.registrations;
         extraction.argument_functions = walk_b.argument_functions;
@@ -3730,9 +3731,14 @@ impl TreeSitterAnalyzer {
         // reachable, and that shape is already recognised.
         let snippet_bound = Self::value_names(tree.root_node(), body);
         let snippet_locals = Self::collect_local_struct_types(tree.root_node(), body);
-        let written =
-            Self::collect_walk_b_facts(tree.root_node(), body, &snippet_bound, &snippet_locals)
-                .registrations;
+        let written = Self::collect_walk_b_facts(
+            tree.root_node(),
+            body,
+            &snippet_bound,
+            &snippet_locals,
+            Language::C,
+        )
+        .registrations;
         for registration in written {
             if registration.target == parameter {
                 fates.push(ParameterFate::StoredIn {
@@ -5216,6 +5222,22 @@ impl TreeSitterAnalyzer {
         false
     }
 
+    /// The bare name a qualified use-site stores: `name` reaches the leaf
+    /// in both C++ `qualified_identifier` and Rust `scoped_identifier`.
+    /// Only an `identifier` leaf stores; a lone `::` has no owner path,
+    /// so the shared split keeps it whole and this stores nothing.
+    fn qualified_bare_use_target(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut leaf = node;
+        while matches!(leaf.kind(), "qualified_identifier" | "scoped_identifier") {
+            leaf = leaf.child_by_field_name("name")?;
+        }
+        if leaf.kind() != "identifier" {
+            return None;
+        }
+        bare_use_site_target(&source[node.byte_range()])?;
+        Some(source[leaf.byte_range()].to_string())
+    }
+
     /// Registrations, handed-over arguments, pointer variables and
     /// file-scope globals in a single preorder. `bound` and `locals` come
     /// from walk A: a call may precede its declaration textually, so the
@@ -5225,6 +5247,7 @@ impl TreeSitterAnalyzer {
         source: &str,
         bound: &ValueNames,
         locals: &std::collections::HashMap<String, String>,
+        language: Language,
     ) -> WalkBFacts {
         let mut facts = WalkBFacts::default();
         let mut visit = |node: tree_sitter::Node| -> bool {
@@ -5251,11 +5274,23 @@ impl TreeSitterAnalyzer {
 
                     for (member_node, value) in Self::initializer_members(node) {
                         let member = source[member_node.byte_range()].to_string();
-                        let target_node = match value.kind() {
-                            "identifier" => Some(value),
-                            "pointer_expression" => value
-                                .child_by_field_name("argument")
-                                .filter(|a| a.kind() == "identifier"),
+                        let target = match value.kind() {
+                            "identifier" => Some(source[value.byte_range()].to_string()),
+                            "qualified_identifier" if language == Language::Cpp => {
+                                Self::qualified_bare_use_target(value, source)
+                            }
+                            "pointer_expression" => match value.child_by_field_name("argument") {
+                                Some(argument) if argument.kind() == "identifier" => {
+                                    Some(source[argument.byte_range()].to_string())
+                                }
+                                Some(argument)
+                                    if argument.kind() == "qualified_identifier"
+                                        && language == Language::Cpp =>
+                                {
+                                    Self::qualified_bare_use_target(argument, source)
+                                }
+                                _ => None,
+                            },
                             _ => None,
                         };
                         if value.kind() == "initializer_list" && !container_type.is_empty() {
@@ -5267,10 +5302,9 @@ impl TreeSitterAnalyzer {
                             continue;
                         }
 
-                        let Some(target_node) = target_node else {
+                        let Some(target) = target else {
                             continue;
                         };
-                        let target = source[target_node.byte_range()].to_string();
                         if member.is_empty() || target.is_empty() {
                             continue;
                         }
@@ -5325,36 +5359,72 @@ impl TreeSitterAnalyzer {
 
                     for (index, argument) in crate::call_actuals(arguments).into_iter().enumerate()
                     {
-                        let (identifier, taken_address) = match argument.kind() {
-                            "identifier" => (Some(argument), false),
-                            "pointer_expression" => (
-                                argument
-                                    .child_by_field_name("argument")
-                                    .filter(|node| node.kind() == "identifier"),
-                                true,
+                        // A local of the same name does not shadow a qualified
+                        // spelling, so the shadowing filter is skipped for
+                        // those rows; a qualified self-call is still recursion.
+                        let (anchor, name, taken_address, qualified) = match argument.kind() {
+                            "identifier" => (
+                                argument,
+                                source[argument.byte_range()].to_string(),
+                                false,
+                                false,
                             ),
-                            _ => (None, false),
+                            "qualified_identifier" if language == Language::Cpp => {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
+                                    continue;
+                                };
+                                (argument, leaf, false, true)
+                            }
+                            "scoped_identifier" if language == Language::Rust => {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
+                                    continue;
+                                };
+                                (argument, leaf, false, true)
+                            }
+                            "pointer_expression" => {
+                                let Some(inner) = argument.child_by_field_name("argument") else {
+                                    continue;
+                                };
+                                match inner.kind() {
+                                    "identifier" => {
+                                        (inner, source[inner.byte_range()].to_string(), true, false)
+                                    }
+                                    "qualified_identifier" if language == Language::Cpp => {
+                                        let Some(leaf) =
+                                            Self::qualified_bare_use_target(inner, source)
+                                        else {
+                                            continue;
+                                        };
+                                        (inner, leaf, true, true)
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            _ => continue,
                         };
-                        let Some(identifier) = identifier else {
-                            continue;
-                        };
-                        let name = &source[identifier.byte_range()];
                         // A call naming itself is recursion, not a handover.
-                        if name == callee_name || Self::is_c_keyword(name) {
+                        if name == callee_name {
                             continue;
                         }
-                        if bound.contains(name, identifier.start_byte()) {
-                            continue;
+                        if !qualified {
+                            if Self::is_c_keyword(&name) {
+                                continue;
+                            }
+                            if bound.contains(&name, anchor.start_byte()) {
+                                continue;
+                            }
                         }
                         facts.argument_functions.push(RawArgumentFunction {
                             callee: callee_name.to_string(),
-                            target: name.to_string(),
+                            target: name,
                             argument_index: index as u32,
                             taken_address,
                             subject_type: subject.as_ref().map(|(type_name, _)| type_name.clone()),
                             subject_member: subject.as_ref().map(|(_, member)| member.clone()),
-                            byte_start: identifier.start_byte(),
-                            line: identifier.start_position().row as u32 + 1,
+                            byte_start: anchor.start_byte(),
+                            line: anchor.start_position().row as u32 + 1,
                         });
                     }
                 }
@@ -5371,12 +5441,27 @@ impl TreeSitterAnalyzer {
 
                     let target = match right.kind() {
                         "identifier" => source[right.byte_range()].to_string(),
-                        "pointer_expression" => match right
-                            .child_by_field_name("argument")
-                            .filter(|a| a.kind() == "identifier")
-                        {
-                            Some(a) => source[a.byte_range()].to_string(),
-                            None => return true,
+                        "qualified_identifier" if language == Language::Cpp => {
+                            let Some(leaf) = Self::qualified_bare_use_target(right, source) else {
+                                return true;
+                            };
+                            leaf
+                        }
+                        "pointer_expression" => match right.child_by_field_name("argument") {
+                            Some(argument) if argument.kind() == "identifier" => {
+                                source[argument.byte_range()].to_string()
+                            }
+                            Some(argument)
+                                if argument.kind() == "qualified_identifier"
+                                    && language == Language::Cpp =>
+                            {
+                                let Some(leaf) = Self::qualified_bare_use_target(argument, source)
+                                else {
+                                    return true;
+                                };
+                                leaf
+                            }
+                            _ => return true,
                         },
                         _ => return true,
                     };
@@ -14058,9 +14143,14 @@ mod argument_subject_tests {
         let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
         println!("locals: {locals:?}");
         let bound = TreeSitterAnalyzer::value_names(tree.root_node(), source);
-        let found =
-            TreeSitterAnalyzer::collect_walk_b_facts(tree.root_node(), source, &bound, &locals)
-                .argument_functions;
+        let found = TreeSitterAnalyzer::collect_walk_b_facts(
+            tree.root_node(),
+            source,
+            &bound,
+            &locals,
+            Language::C,
+        )
+        .argument_functions;
         println!("rows: {found:?}");
         let row = found.iter().find(|r| r.target == "i_callback").unwrap();
         assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
@@ -14096,15 +14186,312 @@ mod argument_subject_tests {
         let tree = parse(source);
         let bound = TreeSitterAnalyzer::value_names(tree.root_node(), source);
         let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
-        let found =
-            TreeSitterAnalyzer::collect_walk_b_facts(tree.root_node(), source, &bound, &locals)
-                .argument_functions;
+        let found = TreeSitterAnalyzer::collect_walk_b_facts(
+            tree.root_node(),
+            source,
+            &bound,
+            &locals,
+            Language::C,
+        )
+        .argument_functions;
         let row = found
             .iter()
             .find(|row| row.target == "i_callback")
             .unwrap_or_else(|| panic!("i_callback not recorded: {found:?}"));
         assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
         assert_eq!(row.subject_member.as_deref(), Some("i_rcu"), "{row:?}");
+    }
+}
+
+#[cfg(test)]
+mod qualified_use_site_tests {
+    use super::*;
+
+    fn handover_rows(source: &str, path: &str) -> Vec<ArgumentFunction> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap()
+            .argument_functions
+    }
+
+    fn registration_rows(source: &str, path: &str) -> Vec<Registration> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap()
+            .registrations
+    }
+
+    #[test]
+    fn a_qualified_handover_stores_the_bare_leaf() {
+        let found = handover_rows("void f() { register_dev(ns::my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_shadowing_local_does_not_hide_a_qualified_spelling() {
+        // A local `my_read` shadows the bare name, not `ns::my_read`,
+        // so the row is still recorded.
+        let found = handover_rows(
+            "void f() { int my_read = 0; register_dev(ns::my_read); }\n",
+            "t.cpp",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|row| row.callee == "register_dev" && row.target == "my_read"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_designated_init_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct file; struct file_operations { int (*read)(struct file *); };\n\
+             static const struct file_operations fops = { .read = ns::my_read };\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "read")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::DesignatedInit, "{row:?}");
+    }
+
+    #[test]
+    fn a_qualified_assignment_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct ops { int (*run)(void); };\n\
+             void setup(struct ops *o) { o->run = ns::impl_fn; }\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "run")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "impl_fn", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::Assignment, "{row:?}");
+        assert_eq!(row.container_type, "ops", "{row:?}");
+    }
+
+    #[test]
+    fn an_addressed_qualified_assignment_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct ops { int (*run)(void); };\n\
+             void setup(struct ops *o) { o->run = &ns::impl_fn; }\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "run")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "impl_fn", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::Assignment, "{row:?}");
+        assert_eq!(row.container_type, "ops", "{row:?}");
+    }
+
+    #[test]
+    fn a_spaced_qualified_handover_stores_the_bare_leaf() {
+        // Whitespace after `::` is still the same leaf: the walk holds
+        // the leaf node, so the stored target has no leading space.
+        let found = handover_rows("void f() { register_dev(ns:: my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_reduced_target_meets_its_bare_definition() {
+        // The stored target is the bare leaf, which is exactly what the
+        // definition side files under: the two meet by equality.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int my_read(void) { return 0; }\n\
+                 void f() { register_dev(ns::my_read); }\n",
+                Path::new("t.cpp"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        let row = analysis
+            .argument_functions
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {:?}", analysis.argument_functions));
+        let function = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "my_read")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no definition: {:?}",
+                    analysis
+                        .functions
+                        .iter()
+                        .map(|f| &f.name)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(row.target, function.name, "{row:?} vs {function:?}");
+    }
+
+    #[test]
+    fn an_addressed_qualified_handover_marks_taken() {
+        // `&ns::my_read` records the same row with taken=true.
+        let found = handover_rows("void f() { register_dev(&ns::my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn an_addressed_qualified_designated_init_stores_the_bare_leaf() {
+        let found = registration_rows(
+            "struct file; struct file_operations { int (*read)(struct file *); };\n\
+             static const struct file_operations fops = { .read = &ns::my_read };\n",
+            "t.cpp",
+        );
+        let row = found
+            .iter()
+            .find(|row| row.member == "read")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert_eq!(row.kind, RegistrationKind::DesignatedInit, "{row:?}");
+    }
+
+    #[test]
+    fn a_qualified_rust_handover_stores_the_bare_leaf() {
+        let found = handover_rows("fn f() { register(m::handler); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "handler", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_scoped_leading_rust_handover_stores_the_bare_leaf() {
+        // A scoped leading `::` still has an owner path, so the shared
+        // cut stores the leaf: one rule for both languages.
+        let found = handover_rows("fn f() { register(::m::handler); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "handler", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn an_aliased_rust_handler_records_the_alias() {
+        // The stored target is the name at the use-site: resolving the
+        // import and cutting again would store `handler` instead of `h`.
+        let found = handover_rows("use m::handler as h;\nfn f() { register(h); }\n", "t.rs");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "h", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_lone_leading_scope_records_nothing() {
+        // `::my_read` has no owner path, so there is no leaf to store.
+        let found = handover_rows("void f() { register_dev(::my_read); }\n", "t.cpp");
+        assert!(
+            found.iter().all(|row| row.callee != "register_dev"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn the_bare_handover_path_still_records() {
+        // The reduction must not break the existing bare path.
+        let found = handover_rows("void f() { register_dev(my_read); }\n", "t.cpp");
+        let row = found
+            .iter()
+            .find(|row| row.callee == "register_dev")
+            .unwrap_or_else(|| panic!("no row: {found:?}"));
+        assert_eq!(row.target, "my_read", "{row:?}");
+        assert!(!row.taken_address, "{row:?}");
+    }
+
+    #[test]
+    fn a_scoped_spelling_inside_a_python_string_records_nothing() {
+        // The gate keys on the node kind, not on text: a `::` inside a
+        // Python string literal must not produce a `::` target.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "register(\"::my_read\")\n",
+                Path::new("t.py"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            analysis
+                .registrations
+                .iter()
+                .all(|row| !row.target.contains("::")),
+            "{:?}",
+            analysis.registrations
+        );
+        assert!(
+            analysis
+                .argument_functions
+                .iter()
+                .all(|row| !row.target.contains("::")),
+            "{:?}",
+            analysis.argument_functions
+        );
+    }
+
+    #[test]
+    fn dotted_spellings_record_no_dotted_target() {
+        // Python and Zig walk B store no spelled-out row at all; what
+        // matters is that no future arm stores one unreduced.
+        for (source, path) in [
+            ("register(mod.func)\n", "t.py"),
+            ("fn f() void { _ = register(mod.func); }\n", "t.zig"),
+        ] {
+            let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+            let analysis = analyzer
+                .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+                .unwrap();
+            assert!(
+                analysis
+                    .registrations
+                    .iter()
+                    .all(|row| !row.target.contains('.')),
+                "{path}: {:?}",
+                analysis.registrations
+            );
+            assert!(
+                analysis
+                    .argument_functions
+                    .iter()
+                    .all(|row| !row.target.contains('.')),
+                "{path}: {:?}",
+                analysis.argument_functions
+            );
+        }
     }
 }
 
