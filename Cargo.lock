@@ -16,7 +16,6 @@ checksum = "0fca89247609239eeb6915e6991111866b92d7b31025e69302bbf430cc4d2c38"
 dependencies = [
  "cfg-if",
  "const-random",
- "getrandom 0.3.4",
  "getrandom 0.4.3",
  "once_cell",
  "serde",
@@ -2835,7 +2834,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c91d8cffac8849493a82233811bd02b2b183b8cf39bf704de0fa0841b737595"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -3445,6 +3444,9 @@ name = "hashbrown"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heapless"
@@ -4411,7 +4413,7 @@ dependencies = [
  "lance-table",
  "libm",
  "log",
- "ndarray 0.16.1",
+ "ndarray",
  "num-traits",
  "object_store",
  "prost",
@@ -5011,18 +5013,20 @@ checksum = "9bb517913cfcfb9eeda59f36020269075a152701a01606c612f547e4890be399"
 
 [[package]]
 name = "model2vec-rs"
-version = "0.1.4"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23693c16304bc11674c991f47aa33794e641204e67547e0cef31c794c38ea00f"
+checksum = "38960779ee134c9011df6201b4da7e8223aecff2b76b2cf47f40abaee933027d"
 dependencies = [
  "anyhow",
- "clap",
  "half",
  "hf-hub",
- "ndarray 0.15.6",
  "safetensors",
+ "serde",
  "serde_json",
  "tokenizers",
+ "unicode-normalization-alignments",
+ "unicode_categories",
+ "ureq",
 ]
 
 [[package]]
@@ -5084,19 +5088,6 @@ name = "murmurhash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
-
-[[package]]
-name = "ndarray"
-version = "0.15.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb12d4e967ec485a5f71c6311fe28158e9d6f4bc4a447b474184d0f91a8fa32"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "rawpointer",
-]
 
 [[package]]
 name = "ndarray"
@@ -7042,7 +7033,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
@@ -7154,7 +7145,6 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.3.4",
- "hf-hub",
  "indicatif 0.17.11",
  "itertools 0.14.0",
  "log",
