@@ -331,6 +331,11 @@ To index multiple branches for querying:
 # Index specific branches
 semcode-index -s . --branches main,stable/linux-6.1.y,stable/linux-6.12.y
 
+# Re-index only branches that moved, and write a JSON report of each
+# branch's outcome (see docs/index-result.md)
+semcode-index -s . --branches main,stable/linux-6.1.y --update-branches \
+    --result-json /tmp/result.json
+
 # Query tool with default branch
 semcode --branch stable/linux-6.12.y
 ```
