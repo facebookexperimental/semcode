@@ -4,6 +4,38 @@ use semcode::{git, DatabaseManager};
 use std::path::Path;
 use std::process::Command;
 
+#[test]
+fn lore_conflicts_with_branch_indexing_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join(".semcode.db");
+    let branch_args: &[&[&str]] = &[
+        &["--branch", "no-such-branch"],
+        &["--branches", "main,stable"],
+        &["--all-branches"],
+        &["--remote-branches"],
+        &["--update-branches"],
+    ];
+    for args in branch_args {
+        let output = Command::new(env!("CARGO_BIN_EXE_semcode-index"))
+            .arg("--source")
+            .arg(dir.path())
+            .arg("--database")
+            .arg(&db_path)
+            .arg("--lore")
+            .args(*args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("cannot be used with")
+                && stderr.contains("--lore")
+                && stderr.contains(args[0]),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
 fn git_run(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
