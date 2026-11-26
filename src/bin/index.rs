@@ -120,13 +120,7 @@ struct Args {
     /// Accepts comma-separated list of archives (e.g., --lore bpf,netdev,lkml/0)
     /// Without arguments, refreshes all previously indexed archives
     /// Run branch indexing in a separate invocation.
-    #[arg(
-        long,
-        value_name = "LIST",
-        value_delimiter = ',',
-        num_args = 0..,
-        conflicts_with_all = ["branch", "branches", "all_branches", "remote_branches", "update_branches"]
-    )]
+    #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 0..)]
     lore: Option<Vec<String>>,
 
     /// Leave the lore archive git repositories unpacked after fetching
@@ -854,6 +848,25 @@ fn branch_mode_requested(args: &Args) -> bool {
     !args.branch.is_empty() || !args.branches.is_empty() || args.all_branches
 }
 
+/// The first branch flag on the command line, if any. Lore and branch
+/// indexing never share a run; this names the flag for the rejection so
+/// every mixed invocation fails the same way with or without a report.
+fn first_branch_flag(args: &Args) -> Option<&'static str> {
+    if !args.branch.is_empty() {
+        Some("--branch")
+    } else if !args.branches.is_empty() {
+        Some("--branches")
+    } else if args.all_branches {
+        Some("--all-branches")
+    } else if args.remote_branches {
+        Some("--remote-branches")
+    } else if args.update_branches {
+        Some("--update-branches")
+    } else {
+        None
+    }
+}
+
 /// `--result-json` reports branch outcomes only; refuse it where another
 /// mode would run instead, before anything touches the database.
 fn check_result_json_mode(args: &Args) -> Result<()> {
@@ -1347,6 +1360,15 @@ async fn async_main() -> Result<()> {
         }
         None => None,
     };
+
+    // Lore and branch indexing never share a run. This rides after the
+    // report takedown so a rejected mix removes a stale report first;
+    // with a report the mode check above already refused the same mix.
+    if let (Some(_), Some(flag)) = (&args.lore, first_branch_flag(&args)) {
+        anyhow::bail!(
+            "--lore cannot be used with {flag}; run branch indexing in a separate invocation"
+        );
+    }
 
     // Process database path first (needed for lore cloning)
     let database_path = process_database_path(args.database.as_deref(), Some(&args.source));

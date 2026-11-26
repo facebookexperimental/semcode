@@ -26,7 +26,7 @@ fn lore_conflicts_with_branch_indexing_flags() {
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
         assert!(
             stderr.contains("cannot be used with")
                 && stderr.contains("--lore")
