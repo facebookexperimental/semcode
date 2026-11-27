@@ -118,6 +118,23 @@ async fn a_file_read_by_this_extractor_may_be_skipped() {
 }
 
 #[tokio::test]
+async fn a_processed_file_without_an_extractor_version_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    db.mark_files_processed(vec![semcode::ProcessedFileRecord {
+        file: "fs/old.c".to_string(),
+        git_sha: None,
+        git_file_sha: "cafe1234".to_string(),
+        extractor_version: None,
+    }])
+    .await
+    .unwrap();
+
+    assert!(db.index_predates_reader().await.unwrap());
+}
+
+#[tokio::test]
 async fn a_file_read_by_an_older_extractor_is_forgotten() {
     // After the whole tree has been read, a row still carrying an older
     // version is content the tree does not have. Left in place, one such row
@@ -443,6 +460,7 @@ async fn a_real_v11_index_starts_functions_and_types_again() {
         .execute()
         .await
         .unwrap();
+    assert!(!db.index_predates_reader().await.unwrap());
     let table = db
         .connection()
         .open_table("processed_files")
@@ -683,6 +701,7 @@ async fn a_processed_table_with_integer_versions_is_started_again() {
     )
     .unwrap();
     table.add(vec![batch]).execute().await.unwrap();
+    assert!(db.index_predates_reader().await.unwrap());
     drop(db);
 
     let db = manager(dir.path()).await;
