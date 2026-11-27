@@ -27,9 +27,9 @@ bench/bench.py run -s mcp -r 1     # one scenario, one session
 ```
 
 It builds the checkout it's in and benchmarks it. To compare two
-versions, run it in each and compare the two `summary.md` files; each
+versions, run it in each and compare the two `summary.json` files. Each
 records the commit it measured. Run both on the same machine, close
-together and with the machine otherwise idle: differences of a few
+together and with the machine otherwise idle. Differences of a few
 percent between runs can be noise.
 
 An index is built once and read many times, so the default is the read
@@ -58,9 +58,8 @@ starts with an untimed run that warms the page cache, records the
 per-phase breakdown (`--perf-json`), and fails if the index has no
 functions. Row counts cover functions and types only.
 
-Results go to `~/.cache/semcode-bench/results/<timestamp>/`:
-`summary.md` and `summary.json` (every call's latency included), plus
-logs.
+The script prints a summary to stdout and saves `summary.json` (including
+every call's latency) and logs under `~/.cache/semcode-bench/results/<timestamp>/`.
 
 ## The workload
 

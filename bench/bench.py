@@ -699,9 +699,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         lines += (report_index(s, r) if s in INDEX_SCENARIOS
                   else report_cli(r) if s == "cli" else report_mcp(s, r))
     lines += ["", "Mean ± standard deviation over runs or sessions."]
-    (out / "summary.md").write_text("\n".join(lines) + "\n")
     (out / "summary.json").write_text(json.dumps({"meta": meta, "results": results}, indent=1))
-    step(f"Done: {out}/summary.md")
+    step(f"Done: {out}/summary.json")
     print("\n".join(lines))
 
 
