@@ -1,8 +1,8 @@
 # Index result reports
 
 `semcode-index --result-json PATH` writes a JSON report of what a branch
-indexing run did, for scripts that keep an index current and need to know
-which branches to retry.
+or lore indexing run did, for scripts that keep an index current and need
+to know which branches or archives to retry.
 
 ```bash
 semcode-index -s . --branches main,dev --update-branches --result-json /tmp/result.json
@@ -11,8 +11,9 @@ semcode-index -s . --branches main,dev --update-branches --result-json /tmp/resu
 The flag works with `--branch`, `--branches` and `--all-branches`, and with
 the options that modify them (`--update-branches`, `--remote-branches`,
 `--clear`, `--extensions`, `--include`, `--no-macros`, `-j`,
-`--db-threads`). It is rejected without a branch flag and together with
-`--lore`, `--git`, `--commits` or `--vectors`.
+`--db-threads`), and with `--lore` (see [Lore archives](#lore-archives)).
+It is rejected without a branch flag or `--lore`, together with `--git`,
+`--commits` or `--vectors`, and when `--lore` and branch flags are mixed.
 
 ## Format (version 1)
 
@@ -71,6 +72,43 @@ the options that modify them (`--update-branches`, `--remote-branches`,
   killed or crashed partway, possibly after indexing some branches. The
   reason is on stderr.
 - A relative `PATH` is relative to the working directory.
+
+## Lore archives
+
+```bash
+semcode-index --lore bpf,netdev --result-json /tmp/result.json   # clone or update these
+semcode-index --lore --result-json /tmp/result.json              # refresh every archive
+```
+
+```json
+{
+  "version": 1,
+  "archives": [
+    { "name": "bpf",    "outcome": "indexed" },
+    { "name": "netdev", "outcome": "failed", "error": "…" }
+  ]
+}
+```
+
+- `archives`: one entry per archive the run handled, in place of
+  `branches`. With a list, one entry per distinct entry, in request
+  order. Without one (refresh), in no particular order. A refresh with
+  no archives gives `[]`.
+- `name`: with a list, the entry as given (a list name or a URL).
+  On refresh, the archive's path under `<db>/lore/`, such as `bpf/0`.
+  Credentials in a URL are removed here and in `error`:
+  `https://user:token@host/x` is reported as `https://host/x`.
+- `outcome`:
+  - `indexed`: the archive had commits not yet indexed, and all of them
+    are now indexed.
+  - `current`: every commit of the archive was already indexed.
+  - `failed`: anything else, such as a failed clone, fetch, or a
+    partly indexed archive. Indexing again retries what is missing.
+- `error`: as for branches.
+
+The exit status is 0 only if every archive is `indexed` or `current` and
+the report was written. The rules for the report file above apply
+unchanged.
 
 ## Compatibility
 

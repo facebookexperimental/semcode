@@ -9,14 +9,27 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Debug)]
 pub struct Report {
     pub version: u32,
-    pub branches: Vec<BranchReport>,
+    /// Each mode reports its own list; the others are left out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branches: Option<Vec<BranchReport>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archives: Option<Vec<ArchiveReport>>,
 }
 
 impl Report {
     pub fn branches(branches: Vec<BranchReport>) -> Self {
         Self {
             version: 1,
-            branches,
+            branches: Some(branches),
+            archives: None,
+        }
+    }
+
+    pub fn archives(archives: Vec<ArchiveReport>) -> Self {
+        Self {
+            version: 1,
+            branches: None,
+            archives: Some(archives),
         }
     }
 }
@@ -29,6 +42,40 @@ pub struct BranchReport {
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ArchiveReport {
+    /// The archive as requested with `--lore LIST`, or as found on disk
+    /// when `--lore` refreshes every archive.
+    pub name: String,
+    pub outcome: Outcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ArchiveReport {
+    /// An entry with any URL credentials removed from `name` and `error`:
+    /// a report is world-readable under a usual umask and meant to be
+    /// passed around.
+    pub fn new(name: &str, outcome: Outcome, error: Option<String>) -> Self {
+        Self {
+            name: redact_url_credentials(name),
+            outcome,
+            error: error.map(|e| redact_url_credentials(&e)),
+        }
+    }
+}
+
+/// Drop the userinfo of every URL in `text`:
+/// `https://user:token@host/x` becomes `https://host/x`. The match runs
+/// to the last `@` before the path, so a password holding a bare `@` is
+/// removed whole.
+fn redact_url_credentials(text: &str) -> String {
+    static USERINFO: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@").unwrap()
+    });
+    USERINFO.replace_all(text, "$1").into_owned()
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +185,53 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn serializes_archives_without_branches() {
+        let report = Report::archives(vec![
+            ArchiveReport {
+                name: "bpf".into(),
+                outcome: Outcome::Current,
+                error: None,
+            },
+            ArchiveReport {
+                name: "netdev".into(),
+                outcome: Outcome::Failed,
+                error: Some("unreachable".into()),
+            },
+        ]);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "version": 1,
+                "archives": [
+                    { "name": "bpf", "outcome": "current" },
+                    { "name": "netdev", "outcome": "failed", "error": "unreachable" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn archive_entries_carry_no_url_credentials() {
+        let entry = ArchiveReport::new(
+            "https://user:s3cr@t@example.org/bpf/0.git",
+            Outcome::Failed,
+            Some("Invalid lore URL: https://tok@example.org/bpf (see https://example.org/)".into()),
+        );
+        assert_eq!(entry.name, "https://example.org/bpf/0.git");
+        assert_eq!(
+            entry.error.as_deref(),
+            Some("Invalid lore URL: https://example.org/bpf (see https://example.org/)")
+        );
+        for plain in ["bpf/0", "netdev", "https://example.org/a@b", "mail a@b.org"] {
+            assert_eq!(
+                ArchiveReport::new(plain, Outcome::Current, None).name,
+                plain
+            );
+        }
     }
 
     #[test]
