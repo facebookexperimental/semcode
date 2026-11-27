@@ -780,6 +780,7 @@ async fn show_callchain_with_limits(
 
     if callers.is_empty()
         && callees.is_empty()
+        && dispatched.is_empty()
         && reached_through_pointer.shown == 0
         && reached_through_pointer.by_name_only == 0
     {
