@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::{Context, Result};
-use arrow::array::Array;
+use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
 use lancedb::connection::Connection;
 use lancedb::index::{scalar::BTreeIndexBuilder, scalar::FtsIndexBuilder, Index as LanceIndex};
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::{CompactionOptions, OptimizeAction, OptimizeOptions};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -711,53 +712,71 @@ impl SchemaManager {
         {
             return Ok(false);
         }
+        Ok(self.processed_file_staleness().await?.unwrap_or(false))
+    }
+
+    /// Whether any processed file has a mismatched extractor, or `None`
+    /// when the table has no processed files.
+    pub(super) async fn processed_file_staleness(&self) -> Result<Option<bool>> {
         let table = self
             .connection
             .open_table("processed_files")
             .execute()
             .await?;
-        let has_column = table
-            .schema()
-            .await?
-            .fields()
-            .iter()
-            .any(|f| f.name() == "extractor_version");
-        if !has_column {
-            return Ok(table.count_rows(None).await? > 0);
+        let schema = table.schema().await?;
+        let version_type = schema
+            .field_with_name("extractor_version")
+            .ok()
+            .map(Field::data_type);
+        if version_type != Some(&DataType::Utf8) {
+            // Every row without a per-language version predates the reader.
+            return Ok((table.count_rows(None).await? > 0).then_some(true));
         }
-        let headers_as_cpp = self
-            .meta_value("index:headers_as_cpp")
+
+        let mut batches = table
+            .query()
+            .select(Select::columns(&["file", "extractor_version"]))
+            .execute()
             .await?
-            .map(|value| value == "true")
-            .unwrap_or(false);
-        let batches: Vec<arrow::record_batch::RecordBatch> =
-            table.query().execute().await?.try_collect().await?;
-        for batch in &batches {
-            let Some(files) = batch
+            .try_filter(|batch| futures::future::ready(batch.num_rows() != 0));
+        let Some(mut batch) = batches.try_next().await? else {
+            return Ok(None);
+        };
+        let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
+        let expected_versions = crate::extractor_versions();
+        let shared_version = crate::EXTRACTOR_VERSION.to_string();
+        loop {
+            let files = batch
                 .column_by_name("file")
-                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
-            else {
-                continue;
-            };
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .context("processed_files.file must be a string column")?;
             let versions = batch
                 .column_by_name("extractor_version")
-                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>());
-            let Some(versions) = versions else {
-                // The column predates language versions: no row in it can
-                // name the language that read its file.
-                return Ok(table.count_rows(None).await? > 0);
-            };
-            for row in 0..versions.len() {
-                let current = crate::extractor_version_for_file(
-                    std::path::Path::new(files.value(row)),
-                    headers_as_cpp,
-                );
-                if !versions.is_valid(row) || versions.value(row) != current {
-                    return Ok(true);
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .context("processed_files.extractor_version must be a string column")?;
+            for (file, version) in files.iter().zip(versions.iter()) {
+                let file = file.context("processed_files.file must be non-null")?;
+                let expected =
+                    crate::Language::from_path_with_headers(Path::new(file), headers_as_cpp)
+                        .map_or(shared_version.as_str(), |language| {
+                            expected_versions[&language].as_str()
+                        });
+                if version != Some(expected) {
+                    return Ok(Some(true));
                 }
             }
+            let Some(next) = batches.try_next().await? else {
+                return Ok(Some(false));
+            };
+            batch = next;
         }
-        Ok(false)
+    }
+
+    pub(super) async fn recorded_headers_as_cpp(&self) -> Result<Option<bool>> {
+        Ok(self
+            .meta_value("index:headers_as_cpp")
+            .await?
+            .map(|value| value == "true"))
     }
 
     /// The value recorded under a key, absent when the index does not say.

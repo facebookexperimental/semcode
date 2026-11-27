@@ -495,19 +495,8 @@ impl DatabaseManager {
     /// others, and a database-wide mark would call the whole index current on
     /// the strength of those few.
     pub async fn index_predates_reader(&self) -> Result<bool> {
-        let files = self.get_all_processed_files().await?;
-        if !files.is_empty() {
-            let headers_as_cpp = self.recorded_headers_as_cpp().await?.unwrap_or(false);
-            return Ok(files.iter().any(|record| {
-                record.extractor_version.as_deref()
-                    != Some(
-                        crate::extractor_version_for_file(
-                            std::path::Path::new(&record.file),
-                            headers_as_cpp,
-                        )
-                        .as_str(),
-                    )
-            }));
+        if let Some(stale) = self.schema_manager.processed_file_staleness().await? {
+            return Ok(stale);
         }
 
         // No files to ask, so fall back to the mark on the database: an index
@@ -541,11 +530,7 @@ impl DatabaseManager {
 
     /// How `.h` headers were routed when the index was built, if recorded.
     pub async fn recorded_headers_as_cpp(&self) -> Result<Option<bool>> {
-        Ok(self
-            .schema_manager
-            .meta_value("index:headers_as_cpp")
-            .await?
-            .map(|value| value == "true"))
+        self.schema_manager.recorded_headers_as_cpp().await
     }
 
     pub async fn record_tree_sha(&self, sha: &str) -> Result<()> {
@@ -4440,8 +4425,10 @@ impl DatabaseManager {
             let db_callers = self
                 .get_function_callers_with_manifest(function_name, &git_manifest)
                 .await?;
+            let mut seen: HashSet<_> = caller_names.iter().cloned().collect();
             for (name, file_path) in db_callers {
-                if admits(&file_path) && !caller_names.contains(&name) {
+                if admits(&file_path) && !seen.contains(&name) {
+                    seen.insert(name.clone());
                     caller_names.push(name);
                 }
             }
