@@ -2586,7 +2586,7 @@ impl TreeSitterAnalyzer {
             let mut static_call_key: Option<tree_sitter::Node> = None;
             let mut static_call_site: Option<tree_sitter::Node> = None;
 
-            for capture in call_match.captures {
+            for capture in call_match.captures() {
                 match queries.call_query.capture_names()[capture.index as usize] {
                     "function_name" => {
                         if let Some(call) = Self::call_site_from_capture(capture.node, source_code)
@@ -6170,7 +6170,7 @@ impl TreeSitterAnalyzer {
         let mut comments = Vec::new();
 
         while let Some((m, _)) = captures.next() {
-            for capture in m.captures {
+            for capture in m.captures() {
                 let node = capture.node;
                 let text = &ctx.source[node.byte_range()];
                 let start_line = node.start_position().row as u32 + 1;
@@ -6210,7 +6210,7 @@ impl TreeSitterAnalyzer {
             let mut type_end_byte = 0;
             let mut type_node = None;
 
-            for capture in m.captures {
+            for capture in m.captures() {
                 let node = capture.node;
                 let text = &source[node.byte_range()];
                 let capture_name = queries.type_query.capture_names()[capture.index as usize];
@@ -6359,7 +6359,7 @@ impl TreeSitterAnalyzer {
             let mut typedef_end_byte = 0;
             let mut pointer_params: Option<String> = None;
 
-            for capture in m.captures {
+            for capture in m.captures() {
                 let node = capture.node;
                 let text = &source[node.byte_range()];
                 let capture_name = typedef_query.capture_names()[capture.index as usize];
@@ -6483,7 +6483,7 @@ impl TreeSitterAnalyzer {
             let mut is_function_like = false;
             let mut macro_node: Option<tree_sitter::Node> = None;
 
-            for capture in m.captures {
+            for capture in m.captures() {
                 let node = capture.node;
                 let text = &source[node.byte_range()];
                 let capture_name = queries.macro_query.capture_names()[capture.index as usize];
@@ -6920,7 +6920,7 @@ impl TreeSitterAnalyzer {
         // announces under one `#ifdef` read as two configurations.
         let mut declaration_node = None;
 
-        for capture in m.captures {
+        for capture in m.captures() {
             let node = capture.node;
             let text = &ctx.source[node.byte_range()];
             let capture_name = queries.function_query.capture_names()[capture.index as usize];
@@ -7011,7 +7011,7 @@ impl TreeSitterAnalyzer {
         }
         // Track which capture patterns were matched to determine if function has body
         let mut matched_patterns = std::collections::HashSet::new();
-        for capture in m.captures {
+        for capture in m.captures() {
             let capture_name = queries.function_query.capture_names()[capture.index as usize];
             matched_patterns.insert(capture_name.to_string());
         }
@@ -7019,7 +7019,7 @@ impl TreeSitterAnalyzer {
         // Fallback parameter extraction if TreeSitter query didn't capture them
         if parameters.is_empty() && !matched_patterns.contains("parameters") {
             // Try to manually find parameter_list nodes in the function AST
-            for capture in m.captures {
+            for capture in m.captures() {
                 let node = capture.node;
                 if self.try_extract_parameters_from_node(node, ctx.source, &mut parameters) {
                     if name == "btrfs_lookup_inode" {
@@ -8904,7 +8904,7 @@ impl TreeSitterAnalyzer {
         let mut captures =
             cursor.captures(&queries.call_query, tree.root_node(), wrapped.as_bytes());
         while let Some((call_match, _)) = captures.next() {
-            for capture in call_match.captures {
+            for capture in call_match.captures() {
                 match queries.call_query.capture_names()[capture.index as usize] {
                     "function_name" => {
                         let name = &wrapped[capture.node.byte_range()];
