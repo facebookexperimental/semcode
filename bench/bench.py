@@ -125,6 +125,22 @@ def strip_ansi(text: str) -> str:
 # ---------------------------------------------------------------- setup ----
 
 
+FETCH_ARGS = ["fetch", "--no-tags", f"--shallow-exclude={FLOOR}", "origin",
+              f"refs/tags/{TAG}:refs/tags/{TAG}", f"refs/tags/{BASE}:refs/tags/{BASE}"]
+
+
+def check_history() -> None:
+    """The update, mcp-behind and mcp-aged scenarios need BASE, and BASE..TAG
+    complete: a shallow clone can hold TAG without them."""
+    have_base = git("rev-parse", "--verify", "--quiet", f"refs/tags/{BASE}^{{commit}}",
+                    cwd=LINUX, check=False)
+    if not have_base or subprocess.run(["git", "merge-base", "--is-ancestor", BASE, TAG],
+                                       cwd=LINUX, capture_output=True).returncode != 0:
+        die(f"{LINUX} lacks {BASE} or the history from {BASE} to {TAG}; fetch it with\n"
+            f"  git -C {q(LINUX)} {shlex.join(FETCH_ARGS)}\n"
+            "or remove the directory and run bench/bench.py setup again")
+
+
 def cmd_setup(_args: argparse.Namespace) -> None:
     """Fetch the kernel tree: TAG checked out, history since FLOOR."""
     if (LINUX / ".git").is_dir():
@@ -133,6 +149,7 @@ def cmd_setup(_args: argparse.Namespace) -> None:
             die(f"{LINUX} has no checkout (an interrupted setup?); remove it and run setup again")
         if have != git("rev-parse", f"{TAG}^{{commit}}", cwd=LINUX, check=False):
             die(f"{LINUX} exists but is not at {TAG}; remove it and run setup again")
+        check_history()
         print(f"Kernel tree already at {TAG}: {LINUX}")
         return
 
@@ -144,11 +161,9 @@ def cmd_setup(_args: argparse.Namespace) -> None:
 
     run("init", "--quiet")
     run("remote", "add", "origin", KERNEL_URL)
-    run("fetch", "--no-tags", f"--shallow-exclude={FLOOR}", "origin",
-        f"refs/tags/{TAG}:refs/tags/{TAG}", f"refs/tags/{BASE}:refs/tags/{BASE}")
+    run(*FETCH_ARGS)
     run("-c", "advice.detachedHead=false", "checkout", "--quiet", f"refs/tags/{TAG}")
-    # The update, mcp-behind and mcp-aged scenarios need BASE..TAG complete.
-    run("merge-base", "--is-ancestor", BASE, TAG)
+    check_history()
     print(f"Ready: {LINUX}")
 
 
@@ -441,10 +456,11 @@ def response_text(msg: dict) -> tuple[str, bool]:
     return text, bool(result.get("isError"))
 
 
-def replay(session: McpSession, calls: list[Call], parallel: int) -> dict[int, tuple[float, str]]:
-    """Every call, `parallel` in flight at a time; returns latency and text
-    by call id.  Latency runs from send to response, so with several in
-    flight it includes time spent queued."""
+def replay(session: McpSession, calls: list[Call],
+           parallel: int) -> dict[int, tuple[float, str, bool]]:
+    """Every call, `parallel` in flight at a time; returns latency, text and
+    whether it was an error, by call id.  Latency runs from send to
+    response, so with several in flight it includes time spent queued."""
     results, pending, todo = {}, {}, iter(calls)
 
     def send_next() -> None:
@@ -458,15 +474,17 @@ def replay(session: McpSession, calls: list[Call], parallel: int) -> dict[int, t
     while pending:
         rid, received, msg = session.wait_any(list(pending))
         call, sent = pending.pop(rid)
-        text, is_error = response_text(msg)
-        results[call.id] = (received - sent, "error: " + text if is_error else text)
+        results[call.id] = (received - sent, *response_text(msg))
         send_next()
     return results
 
 
 # What a lookup that found nothing says.  It answers fast, so a build that
-# broke a lookup would otherwise look like a faster one.
-NOT_FOUND = ("error: ", "not found at git SHA", "not found in database", "Failed to survey")
+# broke a lookup would otherwise look like a faster one.  Anchored to the
+# start of a line, as the server writes them, so that returned source (a
+# comment, a printk string) cannot match.
+NOT_FOUND = re.compile(r"^(?:Error: )?(?:Target )?(?:Function|Function or macro|Type or typedef)"
+                       r" '[^']*' not found (?:at git SHA|in database)|^Failed to survey", re.M)
 
 
 def found(expected, text: str) -> bool:
@@ -479,12 +497,13 @@ def found(expected, text: str) -> bool:
     return expected in text
 
 
-def failures(calls: list[Call], results: dict[int, tuple[float, str]]) -> list[str]:
+def failures(calls: list[Call], results: dict[int, tuple[float, str, bool]]) -> list[str]:
     bad = []
     for call in calls:
-        text = results[call.id][1]
-        if any(n in text for n in NOT_FOUND) or not all(found(e, text) for e in call.expect):
-            bad.append(f"#{call.id} {call.tool} {json.dumps(call.args)}: {text[:300]!r}")
+        _, text, is_error = results[call.id]
+        if is_error or NOT_FOUND.search(text) or not all(found(e, text) for e in call.expect):
+            error = "error: " if is_error else ""
+            bad.append(f"#{call.id} {call.tool} {json.dumps(call.args)}: {error}{text[:300]!r}")
     return bad
 
 
@@ -495,11 +514,16 @@ def mcp_scenario(run: Run, scenario: str, index_name: str, tree: Path,
     once per pass, with that many requests in flight.  Every answer is
     checked."""
     calls = read_workload()
+    # The server refuses calls beyond its limit (-32001), so it must admit
+    # every one the widest pass has in flight.
+    in_flight = max(parallel for _, parallel in passes)
     sessions = []
     for s in range(run.runs_for(scenario)):
         sh(copy(index_name, f"{scenario}.db"))
         session = McpSession([run.bin("semcode-mcp"), "-d", str(db(f"{scenario}.db")),
-                              "--git-repo", str(tree)], run.out / f"{scenario}-{s + 1}.log")
+                              "--git-repo", str(tree),
+                              "--max-concurrent-requests", str(in_flight)],
+                             run.out / f"{scenario}-{s + 1}.log")
         result = {"ready": session.start(), "passes": {}}
         line = f"  {scenario} session {s + 1}: ready {result['ready']:.1f}s"
         for name, parallel in passes:
@@ -510,7 +534,7 @@ def mcp_scenario(run: Run, scenario: str, index_name: str, tree: Path,
                 die(f"{scenario}, {name} pass: {len(bad)} of {len(calls)} calls failed "
                     "their checks:\n  " + "\n  ".join(bad[:10]))
             result["passes"][name] = {"total": time.perf_counter() - start,
-                                      "calls": {i: lat for i, (lat, _) in answers.items()}}
+                                      "calls": {i: lat for i, (lat, *_) in answers.items()}}
             line += f", {name} {result['passes'][name]['total']:.1f}s"
         # After the passes, so the first pass pays for building the overlay
         # these look into, as a user's first lookup does.
@@ -663,6 +687,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     head = git("rev-parse", "HEAD", cwd=LINUX, check=False) if LINUX.is_dir() else ""
     if not head or head != git("rev-parse", f"{TAG}^{{commit}}", cwd=LINUX, check=False):
         die(f"no kernel tree at {TAG} in {LINUX}; run bench/bench.py setup")
+    if any(s in ("mcp-behind", "mcp-aged", "update") for s in scenarios):
+        check_history()
     if git("status", "--porcelain", "--untracked-files=no", cwd=LINUX):
         die(f"{LINUX} has local changes")
 
