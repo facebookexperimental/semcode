@@ -1363,15 +1363,11 @@ async fn async_main() -> Result<()> {
         );
     }
     // Checked now rather than when the statistics are written, after the
-    // whole indexing run.
+    // whole indexing run: a path that is a directory, or in one that does
+    // not exist or cannot take a new file, fails before the database is
+    // opened.
     if let Some(path) = &args.perf_json {
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        if !dir.is_dir() {
-            anyhow::bail!("--perf-json: directory {} does not exist", dir.display());
-        }
+        ReportSink::prepare(path).context("--perf-json")?;
     }
 
     // Set up parallelism
@@ -2376,7 +2372,10 @@ async fn run_pipeline(args: Args) -> Result<()> {
         stats.print_summary();
     }
     if let Some(path) = &args.perf_json {
-        PERF_STATS.lock().unwrap().write_json(path)?;
+        let stats = PERF_STATS.lock().unwrap().to_json();
+        ReportSink::prepare(path)
+            .and_then(|sink| sink.publish(&stats))
+            .context("--perf-json")?;
     }
 
     if args.vectors {

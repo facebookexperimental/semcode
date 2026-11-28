@@ -114,13 +114,6 @@ impl PerfStats {
         serde_json::Value::Object(metrics)
     }
 
-    /// Write [`Self::to_json`] to `path`.
-    pub fn write_json(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        let text = serde_json::to_string_pretty(&self.to_json())?;
-        std::fs::write(path, text + "\n")
-            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))
-    }
-
     pub fn reset(&mut self) {
         self.metrics.clear();
     }
