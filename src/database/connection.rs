@@ -632,7 +632,6 @@ impl DatabaseManager {
         // exists but will not open fails loudly instead of reporting a
         // wipe with rows left behind.
         let names = self.connection.table_names().execute().await?;
-        let missing = |name: &str| !names.iter().any(|n| n == name);
 
         // Delete all data from each main table
         for table_name in &[
@@ -652,10 +651,11 @@ impl DatabaseManager {
             // attribute, so a row left behind here outlives the definition.
             "object_macros",
         ] {
-            let table = match self.connection.open_table(*table_name).execute().await {
-                Ok(table) => table,
-                Err(_) if missing(table_name) => continue,
-                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            let Some(table) = super::open_table_if_present(&self.connection, &names, table_name)
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?
+            else {
+                continue;
             };
             table
                 .delete("1=1")
@@ -666,10 +666,11 @@ impl DatabaseManager {
         // Delete all data from content shard tables (content_0 through content_15)
         for shard in 0..16u8 {
             let table_name = format!("content_{shard}");
-            let table = match self.connection.open_table(&table_name).execute().await {
-                Ok(table) => table,
-                Err(_) if missing(&table_name) => continue,
-                Err(e) => return Err(anyhow::anyhow!("clearing {table_name}: {e}")),
+            let Some(table) = super::open_table_if_present(&self.connection, &names, &table_name)
+                .await
+                .map_err(|e| anyhow::anyhow!("clearing {table_name}: {e}"))?
+            else {
+                continue;
             };
             table
                 .delete("1=1")
@@ -9361,7 +9362,10 @@ mod tests {
             .unwrap();
         let dataset = table.dataset().unwrap().get().await.unwrap();
 
-        assert_eq!(dataset.manifest().data_storage_format.version, "2.2");
+        assert_eq!(
+            dataset.manifest().data_storage_format.version.to_selector(),
+            LanceFileVersion::V2_2
+        );
     }
 
     fn test_function(name: &str, file_path: &str, git_file_hash: &str) -> FunctionInfo {

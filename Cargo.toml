@@ -9,10 +9,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/facebookexperimental/semcode"
 
 [dependencies]
-lancedb = "0.27"
-arrow = "57"
-arrow-array = "57"
-arrow-schema = "57"
+lancedb = "0.41"
+# Match LanceDB's Arrow major so record batches use the same types.
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
 tokio = { version = "1.54.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -65,7 +66,7 @@ base64 = "0.23"         # Base64 decoding for MIME-encoded email bodies
 axum = "0.8"
 # Tests reach lance's WriteParams, which lancedb does not re-export.  Pin
 # the exact version lancedb resolves to, so the two cannot drift apart.
-lance = { version = "=4.0.0", default-features = false }
+lance = { version = "=14.0.2", default-features = false }
 
 [[bin]]
 name = "semcode-index"
