@@ -318,7 +318,7 @@ fn generate_commit_diff(
                 } => {
                     // Skip non-blob modifications
                     if !previous_entry_mode.is_blob() || !entry_mode.is_blob() {
-                        return Ok::<_, anyhow::Error>(Action::Continue(()));
+                        return Ok(Action::Continue(()));
                     }
 
                     let path = location.to_string();
@@ -414,7 +414,7 @@ fn generate_commit_diff(
                 gix::object::tree::diff::Change::Rewrite { .. } => {
                     // Rewrite represents a complete file replacement - rare in practice
                     // Skip for now as it's complex to handle properly
-                    Ok::<_, anyhow::Error>(Action::Continue(()))
+                    Ok(Action::Continue(()))
                 }
             }
         })?;
