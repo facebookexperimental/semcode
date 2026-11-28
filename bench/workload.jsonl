@@ -1,0 +1,95 @@
+{"meta":{"generator":"cargo run --release --features bench --example bench_workload","seed":"semcode-bench-workload-v1","calls":94}}
+{"id":1,"tool":"find_function","kind":"fanin_mid","args":{"name":"IS_APPEND"},"expect":["include/linux/fs.h"]}
+{"id":2,"tool":"find_calls","kind":"fanout_high","args":{"name":"vortex_probe1"},"expect":["AUTOSELECT"]}
+{"id":3,"tool":"find_function","kind":"fanin_high","args":{"name":"hid_dbg"},"expect":["include/linux/hid.h"]}
+{"id":4,"tool":"find_function","kind":"fanin_high","args":{"name":"num_online_cpus"},"expect":["include/linux/cpumask.h"]}
+{"id":5,"tool":"find_function","kind":"fanin_top","args":{"name":"container_of"},"expect":[["definitions with name 'container_of'","Function: container_of ("]]}
+{"id":6,"tool":"find_function","kind":"fanin_top","args":{"name":"mutex_lock"},"expect":[["definitions with name 'mutex_lock'","Function: mutex_lock ("]]}
+{"id":7,"tool":"find_callers","kind":"fanin_top","args":{"name":"mutex_unlock"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":5299}]}
+{"id":8,"tool":"find_type","kind":"by_use","args":{"name":"net_device"},"expect":["include/linux/netdevice.h"]}
+{"id":9,"tool":"find_type","kind":"by_use","args":{"name":"device_node"},"expect":["include/linux/of.h"]}
+{"id":10,"tool":"find_calls","kind":"fanout_mid","args":{"name":"shmob_drm_overlay_plane_setup"},"expect":["LDBCR_UPC"]}
+{"id":11,"tool":"find_callers","kind":"fanin_high","args":{"name":"clk_hw_get_name"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":57}]}
+{"id":12,"tool":"find_function","kind":"fanin_top","args":{"name":"atomic_inc"},"expect":[["definitions with name 'atomic_inc'","Function: atomic_inc ("]]}
+{"id":13,"tool":"grep_functions","kind":"path_filtered","args":{"pattern":"NL_SET_ERR_MSG_MOD","path_pattern":"^drivers/","limit":0},"expect":["\ndrivers/"]}
+{"id":14,"tool":"find_function","kind":"long_body","args":{"name":"pf"},"expect":["net/core/pktgen.c"]}
+{"id":15,"tool":"grep_functions","kind":"common_limited","args":{"pattern":"dev_get_drvdata","limit":50},"expect":["limit hit"]}
+{"id":16,"tool":"find_callers","kind":"fanin_mid","args":{"name":"rtl_get_rfreg"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":10}]}
+{"id":17,"tool":"find_type","kind":"by_use","args":{"name":"device_attribute"},"expect":["include/linux/device.h"]}
+{"id":18,"tool":"grep_functions","kind":"rare_full_scan","args":{"pattern":"btf_types_are_same","limit":0},"expect":["kernel/bpf/btf.c"]}
+{"id":19,"tool":"find_function","kind":"many_definitions","args":{"name":"spin_lock"},"expect":[["definitions with name 'spin_lock'","Function: spin_lock ("]]}
+{"id":20,"tool":"grep_functions","kind":"path_filtered","args":{"pattern":"dump_stack","path_pattern":"^drivers/","limit":0},"expect":["\ndrivers/"]}
+{"id":21,"tool":"find_callers","kind":"fanin_high","args":{"name":"readq"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":123}]}
+{"id":22,"tool":"find_calls","kind":"fanout_top","args":{"name":"__ext4_fill_super"},"expect":["EXT4_SB"]}
+{"id":23,"tool":"find_calls","kind":"fanout_mid","args":{"name":"rhine_reset_task"},"expect":["alloc_tbufs"]}
+{"id":24,"tool":"find_type","kind":"by_use","args":{"name":"task_struct"},"expect":["include/linux/sched.h"]}
+{"id":25,"tool":"find_function","kind":"long_body","args":{"name":"gaudi_init_nic_protection_bits"},"expect":["drivers/accel/habanalabs/gaudi/gaudi_security.c"]}
+{"id":26,"tool":"find_calls","kind":"fanout_top","args":{"name":"qla2x00_probe_one"},"expect":["INIT_LIST_HEAD"]}
+{"id":27,"tool":"grep_functions","kind":"rare_full_scan","args":{"pattern":"vhost_backend_has_feature","limit":0},"expect":["drivers/vhost/vhost.h"]}
+{"id":28,"tool":"grep_functions","kind":"rare_full_scan","args":{"pattern":"dp_set_hw_lane_settings","limit":0},"expect":["drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c"]}
+{"id":29,"tool":"find_callers","kind":"fanin_mid","args":{"name":"zd_chip_dev"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":8}]}
+{"id":30,"tool":"find_callers","kind":"fanin_top","args":{"name":"cpu_to_le16"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":1170}]}
+{"id":31,"tool":"find_calls","kind":"fanout_mid","args":{"name":"sun4i_spdif_probe"},"expect":["IS_ERR"]}
+{"id":32,"tool":"find_calls","kind":"fanout_mid","args":{"name":"f2fs_pre_evict_inode"},"expect":["F2FS_COMPRESS_INO"]}
+{"id":33,"tool":"find_callers","kind":"fanin_top","args":{"name":"dma_alloc_coherent"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":340}]}
+{"id":34,"tool":"find_function","kind":"fanin_mid","args":{"name":"pci_bus_to_host"},"expect":["arch/powerpc/include/asm/pci-bridge.h"]}
+{"id":35,"tool":"find_callers","kind":"fanin_high","args":{"name":"per_cpu_ptr"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":241}]}
+{"id":36,"tool":"find_callers","kind":"fanin_light","args":{"name":"ufshcd_quirk_tune_host_pa_tactivate"},"expect":["ufshcd_tune_unipro_params"]}
+{"id":37,"tool":"find_function","kind":"long_body","args":{"name":"netdev_cmd_to_name"},"expect":["net/core/dev.c"]}
+{"id":38,"tool":"find_type","kind":"by_use","args":{"name":"irqreturn_t"},"expect":["include/linux/irqreturn.h"]}
+{"id":39,"tool":"grep_functions","kind":"common_limited","args":{"pattern":"kunit_kzalloc","limit":50},"expect":["limit hit"]}
+{"id":40,"tool":"find_function","kind":"many_definitions","args":{"name":"writel"},"expect":[["definitions with name 'writel'","Function: writel ("]]}
+{"id":41,"tool":"find_function","kind":"fanin_mid","args":{"name":"KUNIT_ASSERT_GE"},"expect":["include/kunit/test.h"]}
+{"id":42,"tool":"find_function","kind":"fanin_top","args":{"name":"memcpy"},"expect":[["definitions with name 'memcpy'","Function: memcpy ("]]}
+{"id":43,"tool":"find_calls","kind":"fanout_high","args":{"name":"am65_cpsw_nuss_probe"},"expect":["BUILD_BUG_ON_MSG"]}
+{"id":44,"tool":"find_function","kind":"fanin_top","args":{"name":"list_for_each_entry"},"expect":[["definitions with name 'list_for_each_entry'","Function: list_for_each_entry ("]]}
+{"id":45,"tool":"grep_functions","kind":"path_filtered","args":{"pattern":"memmove","path_pattern":"^drivers/","limit":0},"expect":["\ndrivers/"]}
+{"id":46,"tool":"grep_functions","kind":"rare_full_scan","args":{"pattern":"cifs_autodisable_serverino","limit":0},"expect":["fs/smb/client/misc.c"]}
+{"id":47,"tool":"find_function","kind":"fanin_mid","args":{"name":"SETPORT"},"expect":["drivers/scsi/aha152x.h"]}
+{"id":48,"tool":"find_callers","kind":"fanin_high","args":{"name":"do_div"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":242}]}
+{"id":49,"tool":"find_calls","kind":"fanout_high","args":{"name":"tipc_link_proto_rcv"},"expect":["buf_msg"]}
+{"id":50,"tool":"find_callers","kind":"fanin_top","args":{"name":"dev_info"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":1461}]}
+{"id":51,"tool":"find_calls","kind":"fanout_top","args":{"name":"__ext4_new_inode"},"expect":["BUFFER_TRACE"]}
+{"id":52,"tool":"find_calls","kind":"fanout_mid","args":{"name":"rtl8180_handle_rx"},"expect":["IEEE80211_SKB_RXCB"]}
+{"id":53,"tool":"find_function","kind":"fanin_high","args":{"name":"netdev_warn"},"expect":["include/net/net_debug.h"]}
+{"id":54,"tool":"find_callers","kind":"fanin_high","args":{"name":"hid_err"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":88}]}
+{"id":55,"tool":"find_calls","kind":"fanout_mid","args":{"name":"snd_gusmax_probe"},"expect":["ARRAY_SIZE"]}
+{"id":56,"tool":"find_function","kind":"fanin_high","args":{"name":"timer_setup"},"expect":["include/linux/timer.h"]}
+{"id":57,"tool":"find_calls","kind":"fanout_top","args":{"name":"iterate_generic_mmio"},"expect":["BCLRPAT"]}
+{"id":58,"tool":"grep_functions","kind":"path_filtered","args":{"pattern":"eth_type_trans","path_pattern":"^drivers/","limit":0},"expect":["\ndrivers/"]}
+{"id":59,"tool":"find_callers","kind":"fanin_high","args":{"name":"e_dbg"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":38}]}
+{"id":60,"tool":"grep_functions","kind":"common_limited","args":{"pattern":"mutex_init","limit":50},"expect":["limit hit"]}
+{"id":61,"tool":"find_function","kind":"long_body","args":{"name":"gaudi_init_tpc_protection_bits"},"expect":["drivers/accel/habanalabs/gaudi/gaudi_security.c"]}
+{"id":62,"tool":"find_callers","kind":"fanin_mid","args":{"name":"cpumask_check"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":5}]}
+{"id":63,"tool":"find_function","kind":"fanin_high","args":{"name":"i2c_smbus_read_word_data"},"expect":[["definitions with name 'i2c_smbus_read_word_data'","Function: i2c_smbus_read_word_data ("]]}
+{"id":64,"tool":"find_calls","kind":"fanout_top","args":{"name":"f2fs_fill_super"},"expect":["CURSEG_I"]}
+{"id":65,"tool":"find_callers","kind":"fanin_light","args":{"name":"pvr_fw_find_layout_entry"},"expect":["pvr_mips_fw_process"]}
+{"id":66,"tool":"find_type","kind":"by_use","args":{"name":"device"},"expect":["include/linux/device.h"]}
+{"id":67,"tool":"find_callers","kind":"fanin_light","args":{"name":"MAKE_PC_FROM_RA"},"expect":["__get_wchan"]}
+{"id":68,"tool":"find_callers","kind":"fanin_top","args":{"name":"dev_dbg"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":3972}]}
+{"id":69,"tool":"find_function","kind":"fanin_mid","args":{"name":"i915_vma_pin"},"expect":[["definitions with name 'i915_vma_pin'","Function: i915_vma_pin ("]]}
+{"id":70,"tool":"find_function","kind":"fanin_high","args":{"name":"v4l2_device_register"},"expect":[["definitions with name 'v4l2_device_register'","Function: v4l2_device_register ("]]}
+{"id":71,"tool":"find_function","kind":"fanin_high","args":{"name":"get_unaligned_le16"},"expect":[["definitions with name 'get_unaligned_le16'","Function: get_unaligned_le16 ("]]}
+{"id":72,"tool":"find_type","kind":"by_use","args":{"name":"nft_regs"},"expect":["include/net/netfilter/nf_tables.h"]}
+{"id":73,"tool":"find_calls","kind":"fanout_top","args":{"name":"sparx5_sd25g28_apply_params"},"expect":["SD25G_LANE_CMU_09"]}
+{"id":74,"tool":"find_callers","kind":"fanin_mid","args":{"name":"REG_UPDATE_3"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":19}]}
+{"id":75,"tool":"find_type","kind":"by_use","args":{"name":"mem_ctl_info"},"expect":["include/linux/edac.h"]}
+{"id":76,"tool":"grep_functions","kind":"common_limited","args":{"pattern":"IS_ERR","limit":50},"expect":["limit hit"]}
+{"id":77,"tool":"find_function","kind":"fanin_mid","args":{"name":"HPI_DEBUG_LOG"},"expect":["sound/pci/asihpi/hpidebug.h"]}
+{"id":78,"tool":"find_callers","kind":"fanin_top","args":{"name":"seq_puts"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":289}]}
+{"id":79,"tool":"find_calls","kind":"fanout_high","args":{"name":"tegra_xusb_probe"},"expect":["BUILD_BUG_ON"]}
+{"id":80,"tool":"find_callers","kind":"fanin_light","args":{"name":"ext4_fc_get_tl"},"expect":["ext4_fc_replay"]}
+{"id":81,"tool":"find_type","kind":"by_use","args":{"name":"mlx5_core_dev"},"expect":["include/linux/mlx5/driver.h"]}
+{"id":82,"tool":"find_type","kind":"by_use","args":{"name":"serdev_device"},"expect":["include/linux/serdev.h"]}
+{"id":83,"tool":"find_calls","kind":"fanout_high","args":{"name":"ofdrm_device_create"},"expect":["ARRAY_SIZE"]}
+{"id":84,"tool":"find_function","kind":"fanin_top","args":{"name":"kfree"},"expect":[["definitions with name 'kfree'","Function: kfree ("]]}
+{"id":85,"tool":"find_calls","kind":"fanout_high","args":{"name":"qla_start_scsi_type6"},"expect":["GET_CMD_SP"]}
+{"id":86,"tool":"find_callers","kind":"fanin_high","args":{"name":"mlx5_cmd_exec_in"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":35}]}
+{"id":87,"tool":"find_callers","kind":"fanin_high","args":{"name":"REG_READ"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":118}]}
+{"id":88,"tool":"find_callers","kind":"fanin_mid","args":{"name":"get_amp_nid"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":6}]}
+{"id":89,"tool":"find_function","kind":"many_definitions","args":{"name":"pr_warn"},"expect":[["definitions with name 'pr_warn'","Function: pr_warn ("]]}
+{"id":90,"tool":"find_function","kind":"long_body","args":{"name":"gaudi_init_dma_protection_bits"},"expect":["drivers/accel/habanalabs/gaudi/gaudi_security.c"]}
+{"id":91,"tool":"find_type","kind":"by_use","args":{"name":"usb_serial_port"},"expect":["include/linux/usb/serial.h"]}
+{"id":92,"tool":"find_callers","kind":"fanin_mid","args":{"name":"nvmem_cell_put"},"expect":[{"count":"(\\d+) functions (?:directly )?call","min":9}]}
+{"id":93,"tool":"find_type","kind":"by_use","args":{"name":"sk_buff"},"expect":["include/linux/skbuff.h"]}
+{"id":94,"tool":"find_function","kind":"fanin_high","args":{"name":"pr_cont"},"expect":[["definitions with name 'pr_cont'","Function: pr_cont ("]]}

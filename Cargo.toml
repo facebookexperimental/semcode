@@ -66,6 +66,7 @@ axum = "0.8"
 # Tests reach lance's WriteParams, which lancedb does not re-export.  Pin
 # the exact version lancedb resolves to, so the two cannot drift apart.
 lance = { version = "=4.0.0", default-features = false }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "html_reports"] }
 
 [[bin]]
 name = "semcode-index"
@@ -82,6 +83,21 @@ path = "src/bin/semcode-mcp.rs"
 [[bin]]
 name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
+
+[[bench]]
+name = "analyzer"
+harness = false
+
+[features]
+# Builds the bench_workload example.
+bench = []
+
+# Generates bench/workload.jsonl; benchmark tooling, so it lives in bench/.
+# Behind a feature, since cargo test otherwise builds and links every example.
+[[example]]
+name = "bench_workload"
+path = "bench/workload.rs"
+required-features = ["bench"]
 
 [profile.dev]
 debug = "line-tables-only"

@@ -441,14 +441,17 @@ fn process_git_file_tuple_with_repo(
     let source_code = String::from_utf8_lossy(&source_bytes);
 
     // Each thread needs its own TreeSitter analyzer
-    let mut ts_analyzer = TreeSitterAnalyzer::new()
+    let mut ts_analyzer = crate::measure!("analyzer_new", TreeSitterAnalyzer::new())
         .map_err(|e| anyhow::anyhow!("Failed to create TreeSitter analyzer: {}", e))?;
 
-    let analysis_result = ts_analyzer.analyze_source_with_metadata(
-        &source_code,
-        &tuple.file_path,
-        &tuple.file_sha,
-        Some(source_root),
+    let analysis_result = crate::measure!(
+        "analyze_file",
+        ts_analyzer.analyze_source_with_metadata(
+            &source_code,
+            &tuple.file_path,
+            &tuple.file_sha,
+            Some(source_root),
+        )
     );
 
     // Cleanup temp file before checking results
@@ -692,6 +695,7 @@ async fn insert_batch_and_mark(
     types_counter: &AtomicUsize,
     batches_inserted_counter: &AtomicUsize,
 ) -> Option<usize> {
+    let _perf = crate::perf_monitor::perf_guard("db_insert_batch");
     // Exhaustive: a new fact table must be inserted and checked here, not
     // silently left out of the batch the mark commits.
     let GitTupleResults {
@@ -1419,8 +1423,10 @@ pub async fn process_git_tree(
     // changed, the reading of it has, so it is absent from this set and gets
     // read again on its own account.
     info!("Loading processed files from database for deduplication");
-    let processed_files: HashSet<(String, String)> =
-        db_manager.processed_by_this_extractor().await?;
+    let processed_files: HashSet<(String, String)> = crate::measure!(
+        "phase_load_processed_files",
+        db_manager.processed_by_this_extractor().await?
+    );
 
     info!(
         "Found {} already processed files in database",
@@ -1463,7 +1469,10 @@ pub async fn process_git_tree(
         db_manager: db_manager.clone(),
         num_inserters: db_threads,
     };
-    let stats = process_git_tree_streaming(config).await?;
+    let stats = crate::measure!(
+        "phase_file_pipeline",
+        process_git_tree_streaming(config).await?
+    );
 
     let processing_time = processing_start.elapsed();
 
@@ -1493,7 +1502,10 @@ pub async fn process_git_tree(
         Ok((needs_optimization, message)) => {
             if needs_optimization {
                 println!("\n{}", message);
-                match db_manager.optimize_database().await {
+                match crate::measure!(
+                    "phase_optimize_database",
+                    db_manager.optimize_database().await
+                ) {
                     Ok(_) => println!("Database optimization completed successfully"),
                     Err(e) => error!("Failed to optimize database: {}", e),
                 }
@@ -1508,7 +1520,10 @@ pub async fn process_git_tree(
 
     // The edge index must exist after data lands, whether or not the
     // health check wanted a full optimization pass.
-    if let Err(e) = db_manager.ensure_call_edges_index().await {
+    if let Err(e) = crate::measure!(
+        "phase_call_edges_index",
+        db_manager.ensure_call_edges_index().await
+    ) {
         error!("Failed to ensure call_edges index: {}", e);
     }
 
@@ -1713,8 +1728,10 @@ pub async fn process_git_range(
     // in the tree path, a row written by an older extractor does not count as
     // processed: the file has not changed, the reading of it has.
     info!("Loading processed files from database for deduplication");
-    let processed_files: HashSet<(String, String)> =
-        db_manager.processed_by_this_extractor().await?;
+    let processed_files: HashSet<(String, String)> = crate::measure!(
+        "phase_load_processed_files",
+        db_manager.processed_by_this_extractor().await?
+    );
 
     info!(
         "Found {} already processed files in database",
@@ -1781,16 +1798,19 @@ pub async fn process_git_range(
             let batch_size = 100;
             let num_workers = num_cpus::get();
 
-            process_commits_pipeline(
-                repo_path,
-                new_commit_shas,
-                db_manager.clone(),
-                batch_size,
-                num_workers,
-                existing_commits,
-                db_threads,
-            )
-            .await?;
+            crate::measure!(
+                "phase_commit_metadata",
+                process_commits_pipeline(
+                    repo_path,
+                    new_commit_shas,
+                    db_manager.clone(),
+                    batch_size,
+                    num_workers,
+                    existing_commits,
+                    db_threads,
+                )
+                .await?
+            );
 
             info!(
                 "Total commit metadata extraction time: {:.1}s",
@@ -1824,7 +1844,10 @@ pub async fn process_git_range(
         db_manager: db_manager.clone(),
         num_inserters: db_threads,
     };
-    let stats = process_git_tuples_streaming(config).await?;
+    let stats = crate::measure!(
+        "phase_file_pipeline",
+        process_git_tuples_streaming(config).await?
+    );
 
     let processing_time = processing_start.elapsed();
 
@@ -1858,7 +1881,10 @@ pub async fn process_git_range(
         Ok((needs_optimization, message)) => {
             if needs_optimization {
                 info!("\n{}", message);
-                match db_manager.optimize_database().await {
+                match crate::measure!(
+                    "phase_optimize_database",
+                    db_manager.optimize_database().await
+                ) {
                     Ok(_) => info!("Database optimization completed successfully"),
                     Err(e) => error!("Failed to optimize database: {}", e),
                 }
@@ -1873,7 +1899,10 @@ pub async fn process_git_range(
 
     // The edge index must exist after data lands, whether or not the
     // health check wanted a full optimization pass.
-    if let Err(e) = db_manager.ensure_call_edges_index().await {
+    if let Err(e) = crate::measure!(
+        "phase_call_edges_index",
+        db_manager.ensure_call_edges_index().await
+    ) {
         error!("Failed to ensure call_edges index: {}", e);
     }
 

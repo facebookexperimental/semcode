@@ -86,6 +86,34 @@ impl PerfStats {
         println!("\nTotal time tracked: {:.2}s", total_time.as_secs_f64());
     }
 
+    /// The metrics as JSON, keyed by name, with durations in milliseconds.
+    ///
+    /// Durations recorded on worker threads overlap, so a per-file metric's
+    /// `total_ms` is elapsed time summed across threads, including time spent
+    /// waiting: neither wall time nor CPU time.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut sorted_metrics: Vec<_> = self.metrics.iter().collect();
+        sorted_metrics.sort_by_key(|(name, _)| name.as_str());
+
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let metrics: serde_json::Map<String, serde_json::Value> = sorted_metrics
+            .into_iter()
+            .map(|(name, data)| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "count": data.count,
+                        "total_ms": ms(data.total_duration),
+                        "mean_ms": ms(data.total_duration) / data.count.max(1) as f64,
+                        "min_ms": ms(data.min_duration.unwrap_or_default()),
+                        "max_ms": ms(data.max_duration.unwrap_or_default()),
+                    }),
+                )
+            })
+            .collect();
+        serde_json::Value::Object(metrics)
+    }
+
     pub fn reset(&mut self) {
         self.metrics.clear();
     }

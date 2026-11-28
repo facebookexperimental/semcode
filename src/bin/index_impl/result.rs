@@ -137,7 +137,7 @@ impl ReportSink {
     }
 
     /// Write the report beside the destination and rename it into place.
-    pub fn publish(self, report: &Report) -> Result<()> {
+    pub fn publish(self, report: &impl Serialize) -> Result<()> {
         let mut temp = self.temp_file()?;
         serde_json::to_writer_pretty(&mut temp, report)?;
         temp.write_all(b"\n")?;

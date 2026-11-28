@@ -367,6 +367,27 @@ fn an_unusable_report_path_fails_before_indexing() {
 }
 
 #[test]
+fn an_unusable_perf_json_path_fails_before_indexing() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.dir.path().join("taken")).unwrap();
+    for path in ["missing/perf.json", "perf.json/", "taken"] {
+        let path = f.dir.path().join(path);
+        let out = f.index(&["--perf-json", path.to_str().unwrap()]);
+        assert!(!out.status.success(), "{path:?} must be refused");
+        assert!(!f.db().exists(), "{path:?}: indexing must not start");
+    }
+    assert!(f.dir.path().join("taken").is_dir());
+    f.assert_no_temp_files();
+
+    let path = f.dir.path().join("perf.json");
+    let out = f.index(&["--perf-json", path.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    let perf: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(perf.is_object(), "{perf}");
+    f.assert_no_temp_files();
+}
+
+#[test]
 fn a_relative_report_path_resolves_against_the_working_directory() {
     let f = Fixture::new();
     let out = semcode_index()
